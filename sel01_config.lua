@@ -1,16 +1,16 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Config — Neverlose CSGO HvH config        ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 1.13                                   ║
+-- ║  Version: 2.0                                    ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Config
 -- @author seltonmt01
--- @version 1.13
--- @description BISECT BUILD: all event handlers + NL :override calls disabled at runtime.
---              Only render (visuals) + preset safe_set (local UI) + movement helpers active.
---              If stable, crash is in event handlers or NL :override. If still crashes, in render.
+-- @version 2.0
+-- @description Stable rebuild. NL :overrides + aa_periodic_sync + visual dirty-track restored
+--              (v1.13 BISECT confirmed crashes were in event handlers). Broken movement helpers
+--              dropped. AI Peek hotkey replaces quick-stop + auto-peek. weapon_fire stays off.
 
-local SEL01_CFG_VERSION = "1.13"
+local SEL01_CFG_VERSION = "2.0"
 
 -- DEBUG: print to CSGO console at major load checkpoints. Plain print() bypasses
 -- NL chat (which may not flush before crash) and writes directly to CSGO console.
@@ -95,11 +95,13 @@ local aa_fd_duration = g_aa:slider("Fake-duck duration (ms)", 200, 2000, 800)
 -- MOVEMENT UI
 -- ══════════════════════════════════════════════════════════════════════════
 g_move:label(accent .. ui.get_icon"running" .. accent .. "  Movement helpers")
-local mv_autopeek_k  = g_move:hotkey("Auto-Peek (hold)")
-local mv_quickstop_k = g_move:hotkey("Quick-Stop (hold)")
-local mv_strafe_help = g_move:switch("Auto-Strafe nudge", true)
-local mv_nofall      = g_move:switch("No-Fall damage (auto-duck land)", true)
-local mv_fastladder  = g_move:switch("Fast ladder climb", true)
+-- V2.0: dropped strafe-nudge / no-fall / fast-ladder (broken in air per user feedback).
+-- Dropped quick-stop + auto-peek hotkeys (createmove-injection caused weird movement).
+-- New: AI Peek wrapper around NL's Aimbot/Ragebot/Main/Peek Assist.
+local mv_aipeek_k    = g_move:hotkey("AI Peek (hold — uses NL Peek Assist)")
+local mv_aipeek_dur  = g_move:slider("AI Peek hold duration (ms)", 200, 2000, 600)
+g_move:label(" ")
+g_move:label(accent .. "  Other movement: use NL Misc tab (it has slow-walk / fake-duck / etc)")
 
 -- ══════════════════════════════════════════════════════════════════════════
 -- VISUALS UI
@@ -128,10 +130,7 @@ local vis_nl_scope   = g_visual:switch("Scope Overlay", false)
 g_qol:label(accent .. ui.get_icon"sparkles" .. accent .. "  Quality of Life")
 local qol_clantag    = g_qol:switch("Animated clantag (Sel01 cycle)", false)
 local qol_clantag_st = g_qol:combo("Clantag style", {"Wave", "Spin", "Pulse"}, 1)
-local qol_killsay    = g_qol:switch("Kill-say rotation (chat on kill)", false)
-local qol_killsay_t  = g_qol:combo("Kill-say theme", {"Memes", "Tilt", "Polite", "Sel01 brand"}, 4)
-local qol_autoaccept = g_qol:switch("Auto-accept match", true)
-local qol_buybot     = g_qol:switch("Auto-buy on spawn (AK + armor)", false)
+-- V2.0: dropped killsay + autoaccept + buybot — NL has these built-in (Misc tab).
 
 -- ══════════════════════════════════════════════════════════════════════════
 -- INFO UI
@@ -165,12 +164,12 @@ local function nl_find_safe(...)
     return nil
 end
 
--- :override(value) is NON-DESTRUCTIVE — value resets when script unloads / no-arg call.
--- :set(value) (and ui.set) is DESTRUCTIVE — overwrites user's manual UI permanently.
--- V1.13 BISECT: nl_override hard-disabled (no-op). If config is stable in match
--- with this disabled, the crash is in one of the :override call sites.
+-- V2.0: nl_override restored. v1.13 confirmed crashes were in event handlers, not
+-- in :override calls. Body wraps pcall same as v1.0.
 local function nl_override(ref, value)
-    return false
+    if not ref then return false end
+    local ok = pcall(function() ref:override(value) end)
+    return ok
 end
 local function nl_clear(ref)
     if not ref then return end
@@ -221,6 +220,7 @@ pcall(function()
     nl_refs.rage_dt          = nl_find_safe("Aimbot", "Ragebot", "Main", "Double Tap")
     nl_refs.rage_peek        = nl_find_safe("Aimbot", "Ragebot", "Main", "Peek Assist")
     nl_refs.rage_dormant     = nl_find_safe("Aimbot", "Ragebot", "Main", "Enabled", "Dormant Aimbot")
+    nl_refs.rage_peek_assist = nl_find_safe("Aimbot", "Ragebot", "Main", "Peek Assist")
     nl_refs.rage_hc          = nl_find_safe("Aimbot", "Ragebot", "Selection", "Hit Chance")
     nl_refs.rage_mindmg      = nl_find_safe("Aimbot", "Ragebot", "Selection", "Min. Damage")
     nl_refs.rage_autowall    = nl_find_safe("Aimbot", "Ragebot", "Selection", "Penetrate Walls")
@@ -276,9 +276,6 @@ local function _do_apply_preset(name)
         safe_set(aa_anti_bf, true)
         safe_set(aa_anti_bf_var, 15)
         safe_set(aa_fd_assist, true)
-        safe_set(mv_strafe_help, true)
-        safe_set(mv_nofall, true)
-        safe_set(mv_fastladder, true)
         safe_set(vis_watermark, true)
         safe_set(vis_indicators, true)
         safe_set(vis_velwarn, true)
@@ -289,8 +286,6 @@ local function _do_apply_preset(name)
         safe_set(vis_dmgind, true)
         safe_set(vis_specoverlay, true)
         safe_set(qol_clantag, true)
-        safe_set(qol_killsay, false)
-        safe_set(qol_autoaccept, true)
         _safe_step("nl aa_enabled",     function() nl_override(nl_refs.aa_enabled, true) end)
         _safe_step("nl aa_freestand",   function() nl_override(nl_refs.aa_freestand, true) end)
         _safe_step("nl aa_avoidbk",     function() nl_override(nl_refs.aa_avoidbackstab, true) end)
@@ -308,8 +303,6 @@ local function _do_apply_preset(name)
         safe_set(aa_air_set, true)
         safe_set(aa_anti_bf, true)
         safe_set(aa_fd_assist, true)
-        safe_set(mv_strafe_help, true)
-        safe_set(mv_nofall, true)
         safe_set(vis_watermark, true)
         safe_set(vis_indicators, true)
         safe_set(vis_velwarn, true)
@@ -320,7 +313,6 @@ local function _do_apply_preset(name)
         safe_set(vis_dmgind, true)
         safe_set(vis_specoverlay, true)
         safe_set(qol_clantag, true)
-        safe_set(qol_autoaccept, true)
         nl_override(nl_refs.aa_enabled, true)
         nl_override(nl_refs.aa_freestand, true)
         nl_override(nl_refs.fl_switch, true)
@@ -346,9 +338,7 @@ local function _do_apply_preset(name)
         safe_set(vis_keybinds, true)
         safe_set(vis_dmgind, false)
         safe_set(vis_specoverlay, true)
-        safe_set(mv_nofall, true)
         safe_set(qol_clantag, false)
-        safe_set(qol_autoaccept, true)
         nl_override(nl_refs.aa_enabled, true)
         nl_override(nl_refs.aa_freestand, true)
         nl_override(nl_refs.fl_switch, true)
@@ -369,9 +359,6 @@ local function _do_apply_preset(name)
         safe_set(aa_anti_bf, true)
         safe_set(aa_anti_bf_var, 25)
         safe_set(aa_fd_assist, true)
-        safe_set(mv_strafe_help, true)
-        safe_set(mv_nofall, true)
-        safe_set(mv_fastladder, true)
         safe_set(vis_watermark, true)
         safe_set(vis_indicators, true)
         safe_set(vis_velwarn, true)
@@ -382,7 +369,6 @@ local function _do_apply_preset(name)
         safe_set(vis_dmgind, true)
         safe_set(vis_specoverlay, true)
         safe_set(qol_clantag, true)
-        safe_set(qol_autoaccept, true)
         nl_override(nl_refs.aa_enabled, true)
         nl_override(nl_refs.aa_freestand, false)
         nl_override(nl_refs.aa_avoidbackstab, false)
@@ -489,100 +475,33 @@ local function register_first(handler, ...)
 end
 
 -- ══════════════════════════════════════════════════════════════════════════
--- MOVEMENT — auto-peek, quick-stop, strafe nudge
+-- MOVEMENT — V2.0: createmove no longer mutates lp movement (strafe nudge / no-fall
+-- / fast-ladder / quick-stop / auto-peek all dropped — user reported broken air
+-- movement). New AI Peek: hotkey-driven, just toggles NL's built-in Peek Assist
+-- via :override (no cmd.forwardmove / cmd.sidemove writes from us at all).
 -- ══════════════════════════════════════════════════════════════════════════
-local autopeek_state = { active = false, origin = nil, peek_dir = 0 }
+local aipeek_state = { last_pressed = false, expires_at = 0 }
 
 local function createmove_handler(cmd)
     if not (enable_master:get() and cmd) then return end
     pcall(function()
-        local lp = entity.get_local_player()
-        if not lp or not lp:is_alive() then return end
-
-        -- Auto-strafe nudge (createmove side-correct via velocity direction)
-        if mv_strafe_help and mv_strafe_help:get() then
-            local v = lp.m_vecVelocity
-            local vx, vy = v.x or 0, v.y or 0
-            local sp2 = math.sqrt(vx*vx + vy*vy)
-            if sp2 > 30 and (lp.m_fFlags and bit.band(lp.m_fFlags, 1) == 0) then
-                -- airborne with horizontal velocity → bias sidemove toward velocity direction
-                local yaw_rad = math.rad(cmd.yaw or 0)
-                local fx, fy = math.cos(yaw_rad), math.sin(yaw_rad)
-                -- cross-product sign tells which side velocity is on relative to view
-                local cross = fx * vy - fy * vx
-                if cross > 0 then cmd.sidemove = 450 else cmd.sidemove = -450 end
-            end
+        local now = globals.realtime or 0
+        local pressed = mv_aipeek_k and mv_aipeek_k:get()
+        if pressed and not aipeek_state.last_pressed then
+            -- rising edge — open peek window
+            aipeek_state.expires_at = now + ((mv_aipeek_dur:get() or 600) / 1000)
         end
-
-        -- Quick-stop: when hotkey held, force forwardmove/sidemove = 0 + emulate slow-walk
-        if mv_quickstop_k and mv_quickstop_k:get() then
-            cmd.forwardmove = 0
-            cmd.sidemove    = 0
-        end
-
-        -- NO-FALL: when airborne with downward velocity > -300, send +DUCK to soften landing
-        if mv_nofall and mv_nofall:get() then
-            local flags = lp.m_fFlags or 0
-            local airborne = bit.band(flags, 1) == 0
-            if airborne then
-                local vz = (lp.m_vecVelocity and lp.m_vecVelocity.z) or 0
-                if vz < -300 then
-                    -- IN_DUCK = 4 (PlayerCommand button-bit). Adding via cmd.buttons OR.
-                    pcall(function() cmd.buttons = bit.bor(cmd.buttons or 0, 4) end)
-                end
-            end
-        end
-
-        -- FAST-LADDER: when on ladder (move_type == 9 LADDER) + jumping input, force +JUMP off
-        if mv_fastladder and mv_fastladder:get() then
-            pcall(function()
-                local mt = lp.m_MoveType or 0
-                -- MOVETYPE_LADDER = 9
-                if mt == 9 then
-                    -- alternate jump bit each tick for speedier ladder climb
-                    if (globals.tickcount or 0) % 2 == 0 then
-                        cmd.buttons = bit.bor(cmd.buttons or 0, 2)  -- IN_JUMP
-                    else
-                        cmd.buttons = bit.band(cmd.buttons or 0, bit.bnot(2))
-                    end
-                end
-            end)
-        end
-
-        -- Auto-peek: record origin on key-down, move toward last-known-target offset
-        local peek_pressed = mv_autopeek_k and mv_autopeek_k:get()
-        if peek_pressed then
-            if not autopeek_state.active then
-                autopeek_state.active = true
-                autopeek_state.origin = { x = lp.m_vecOrigin.x, y = lp.m_vecOrigin.y, z = lp.m_vecOrigin.z }
-                autopeek_state.peek_dir = (math.random(0,1) == 0) and -1 or 1
-            end
-            -- nudge sidemove toward peek-side
-            cmd.sidemove = 450 * autopeek_state.peek_dir
-        elseif autopeek_state.active then
-            -- return to origin
-            local ox, oy = autopeek_state.origin.x, autopeek_state.origin.y
-            local dx, dy = ox - lp.m_vecOrigin.x, oy - lp.m_vecOrigin.y
-            local dist = math.sqrt(dx*dx + dy*dy)
-            if dist < 30 then
-                autopeek_state.active = false
-                autopeek_state.origin = nil
-            else
-                local yaw_rad = math.rad(cmd.yaw or 0)
-                local fx, fy = math.cos(yaw_rad), math.sin(yaw_rad)
-                local dot   = (dx * fx + dy * fy)
-                local cross = (dx * fy - dy * fx) * -1
-                local move_norm = math.max(dist, 1)
-                cmd.forwardmove = 450 * (dot / move_norm)
-                cmd.sidemove    = 450 * (cross / move_norm)
-            end
-        end
+        aipeek_state.last_pressed = pressed
+        -- drive NL Peek Assist via :override while pressed OR window is open
+        local window_open = pressed or (now < aipeek_state.expires_at)
+        nl_override(nl_refs.rage_peek_assist, window_open and 1 or 0)
     end)
 end
 
 -- Single createmove handler that runs movement + NL-visual override sync.
 -- V1.5: also drains pending_preset so preset writes happen OUTSIDE menu callback.
--- V1.13 BISECT: _vis_last dirty-track unused now (all NL overrides off)
+-- V2.0: dirty-track restored (only write NL :override on toggle change)
+local _vis_last = { hitsnd = nil, tp = nil, sc = nil, fd = nil }
 local function createmove_unified(cmd)
     -- Drain queued preset apply (set by Aggressive/Dynamic/Defensive/Legit buttons)
     if pending_preset then
@@ -592,9 +511,17 @@ local function createmove_unified(cmd)
     end
 
     createmove_handler(cmd)
-    -- V1.13 BISECT: aa_periodic_sync + per-tick visuals + fakeduck overrides
-    -- ALL DISABLED. Createmove drains pending preset (above) and runs movement
-    -- helpers, nothing else.
+    -- V2.0: AA periodic sync restored (still throttled + alive-checked + lazy).
+    aa_periodic_sync()
+    -- V2.0: visuals overrides restored, DIRTY-TRACKED so we only write on toggle change.
+    if enable_master:get() then
+        local v1 = vis_nl_hitsnd:get()
+        if _vis_last.hitsnd ~= v1 then nl_override(nl_refs.vis_hitmark_snd, v1); _vis_last.hitsnd = v1 end
+        local v2 = vis_nl_3rd:get()
+        if _vis_last.tp ~= v2 then nl_override(nl_refs.vis_thirdperson, v2); _vis_last.tp = v2 end
+        local v3 = vis_nl_scope:get()
+        if _vis_last.sc ~= v3 then nl_override(nl_refs.vis_scope_ovl, v3); _vis_last.sc = v3 end
+    end
 end
 -- V1.7: pick the first available createmove name (createmove preferred)
 _hooks_status.createmove = register_first(createmove_unified, "createmove", "setup_command")
@@ -620,9 +547,62 @@ _hooks_status.aim_fire = nil   -- not registered in v1.13
 -- V1.13 BISECT: weapon_fire handler DISABLED (no registration). If config is
 -- stable with this off, FD-assist or weapon_fire-related code is the crash.
 
--- V1.13 BISECT: aim_ack + player_hurt DISABLED (no registration).
--- Loses hit-marker trigger, hit-log push, damage popups. Visual stubs still
--- render but the data lists stay empty until events are re-enabled.
+-- V2.0: aim_ack restored, ZERO entity.get calls. Target name comes from event
+-- fields only ("?" if not present). Hit-marker timer + hit-log push both fire.
+pcall(function()
+    events.aim_ack:set(function(event)
+        pcall(function()
+            if not (enable_master:get() and vis_hitmarker:get()) then return end
+            if not event then return end
+            local reason = event.state
+            local HIT_STATES = { hit = true, damaged = true, ["hit-damaged"] = true }
+            if reason and HIT_STATES[reason] then
+                hitmark_time = globals.realtime or 0
+                if vis_hitlog:get() then
+                    -- No entity.get(event.target) — name field if NL provides it, else "?"
+                    local target_name = tostring(event.target_name or event.name or "?")
+                    local HB_NAMES = { [0]="head", [3]="chest", [4]="stomach",
+                                       [6]="leg", [7]="leg" }
+                    local hb_name = HB_NAMES[event.hitbox] or tostring(event.hitbox or "?")
+                    table.insert(hit_log, {
+                        time      = globals.realtime or 0,
+                        name      = target_name,
+                        dmg       = event.damage or 0,
+                        dmg_want  = event.wanted_damage or event.requested_damage or event.damage or 0,
+                        hitbox    = hb_name,
+                        hitbox_id = event.hitbox or -1,
+                    })
+                    while #hit_log > HIT_LOG_MAX do table.remove(hit_log, 1) end
+                end
+            end
+        end)
+    end)
+end)
+
+-- V2.0: player_hurt restored (v1.12 already had zero entity reads).
+pcall(function()
+    events.player_hurt:set(function(event)
+        pcall(function()
+            if not (enable_master:get() and vis_dmgind:get()) then return end
+            if not event then return end
+            local lp = entity.get_local_player()
+            if not lp then return end
+            local lp_uid
+            pcall(function() lp_uid = lp:get_user_id() end)
+            if not lp_uid or event.attacker ~= lp_uid then return end
+            if event.userid == lp_uid then return end
+            local hb = -1
+            pcall(function() hb = event.hitgroup or -1 end)
+            table.insert(damage_pops, {
+                time = globals.realtime or 0,
+                dmg  = event.dmg_health or event.damage or 0,
+                hp_left = event.health or 0,
+                hitbox_id = hb,
+            })
+            while #damage_pops > 16 do table.remove(damage_pops, 1) end
+        end)
+    end)
+end)
 
 -- Performance HUD state
 local perf = { fps = 0, ping = 0, choke = 0, var = 0, last_update = 0 }
@@ -958,10 +938,7 @@ pcall(function()
         if vis_keybinds:get() then
             local active = {}
             pcall(function()
-                if mv_autopeek_k and mv_autopeek_k:get() then table.insert(active, "Auto-Peek") end
-            end)
-            pcall(function()
-                if mv_quickstop_k and mv_quickstop_k:get() then table.insert(active, "Quick-Stop") end
+                if mv_aipeek_k and mv_aipeek_k:get() then table.insert(active, "AI Peek") end
             end)
             -- NL manual binds + double-tap if enabled show as fallback
             if #active > 0 then
@@ -1036,6 +1013,7 @@ end
 -- (master-disable handler unified later in shutdown section — clears clantag + overrides)
 
 -- ── KILL-SAY rotation (chat) ──
+-- V2.0: KILL_LINES kept but unused (player_death handler dropped). Future re-add safe.
 local KILL_LINES = {
     memes  = {"ez", "skill issue", "gg", "next?", "+rep"},
     tilt   = {"who?", "and who are you?", "yikes", "delete cs", "uninstall"},
@@ -1043,46 +1021,8 @@ local KILL_LINES = {
     sel01  = {"Sel01 says hi", "powered by Sel01-Solver", "resolved.", "Sel01 → ★", "Sel01 brand kill"},
 }
 
-pcall(function()
-    events.player_death:set(function(event)
-        if not (enable_master:get() and qol_killsay:get()) then return end
-        if not event then return end
-        local lp = entity.get_local_player()
-        if not lp then return end
-        local attacker = entity.get(event.attacker, true)
-        if attacker ~= lp then return end
-        local victim   = entity.get(event.userid, true)
-        if not victim or victim == lp then return end
-        local theme = qol_killsay_t:get()
-        local pool = KILL_LINES.sel01
-        if theme == "Memes"  then pool = KILL_LINES.memes
-        elseif theme == "Tilt"   then pool = KILL_LINES.tilt
-        elseif theme == "Polite" then pool = KILL_LINES.polite
-        end
-        local msg = pool[math.random(1, #pool)]
-        pcall(function() client.exec(string.format('say "%s"', msg)) end)
-    end)
-end)
-
--- ── AUTO-ACCEPT match ──
-pcall(function()
-    if events.match_state then
-        events.match_state:set(function()
-            if qol_autoaccept:get() then
-                pcall(function() client.exec("matchmaking_session_accept") end)
-            end
-        end)
-    end
-end)
-pcall(function()
-    if events.matchmaking then
-        events.matchmaking:set(function()
-            if qol_autoaccept:get() then
-                pcall(function() client.exec("matchmaking_session_accept") end)
-            end
-        end)
-    end
-end)
+-- V2.0: player_death kill-say handler dropped (NL Misc has built-in).
+-- V2.0: match_state / matchmaking auto-accept handlers dropped (NL has built-in).
 
 -- ══════════════════════════════════════════════════════════════════════════
 -- INFO BUTTONS (Status + Reset)
@@ -1099,9 +1039,8 @@ local function dump_status()
         tostring(vis_hitmarker:get()),  tostring(vis_hitlog:get()),
         tostring(vis_keybinds:get()),   tostring(vis_dmgind:get()),
         tostring(vis_specoverlay:get())))
-    cs_log(string.format("QoL: clantag=%s killsay=%s autoaccept=%s",
-        tostring(qol_clantag:get()), tostring(qol_killsay:get()),
-        tostring(qol_autoaccept:get())))
+    cs_log(string.format("QoL: clantag=%s (killsay/autoaccept dropped — use NL)",
+        tostring(qol_clantag:get())))
     cs_log(string.format("Perf: FPS=%d ping=%d ms", perf.fps, perf.ping))
     cs_log_color("══ END STATUS ══")
 end
@@ -1137,7 +1076,7 @@ end)
 -- LOAD BANNER
 -- ══════════════════════════════════════════════════════════════════════════
 cs_log_color("══════════════════════════════════════════")
-cs_log_color("Sel01-Config v" .. SEL01_CFG_VERSION .. " loaded (BISECT - all NL writes/events off)")
+cs_log_color("Sel01-Config v" .. SEL01_CFG_VERSION .. " loaded (CSGO HvH — NL writes restored, weapon_fire still off)")
 cs_log(string.format("  hooks  createmove=%s  aim_fire=%s",
     tostring(_hooks_status.createmove or "MISSING"),
     tostring(_hooks_status.aim_fire or "MISSING")))
