@@ -1,14 +1,14 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Config — Neverlose CS2 AA + Misc + Visuals║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 1.3                                    ║
+-- ║  Version: 1.4                                    ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Config
 -- @author seltonmt01
--- @version 1.3
--- @description Hotfix: NL ui.find popup error. Use pui.find primary + pcall(fn, ...) style + outer pcall block.
+-- @version 1.4
+-- @description Hotfix: combo:set takes STRING not index (preset crash). Strip emoji + use NL icons.
 
-local SEL01_CFG_VERSION = "1.3"
+local SEL01_CFG_VERSION = "1.4"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -81,22 +81,22 @@ local mv_fastladder  = g_move:switch("Fast ladder climb", true)
 -- ══════════════════════════════════════════════════════════════════════════
 -- VISUALS UI
 -- ══════════════════════════════════════════════════════════════════════════
-g_visual:label(accent .. ui.get_icon"eye" .. accent .. "  Visual additions (single-toggle, no config)")
-local vis_watermark  = g_visual:switch("⌚ Watermark (name + FPS + ping)", true)
-local vis_indicators = g_visual:switch("⚡ Bottom indicators (AA/DT/HS/BAIM state)", true)
-local vis_velwarn    = g_visual:switch("🐢 Velocity warning (pulse when need to slow)", true)
-local vis_aaarrows   = g_visual:switch("← → Manual AA arrows (desync side)", true)
-local vis_hitmarker  = g_visual:switch("✕ Hit marker (crosshair X + sound)", true)
-local vis_hitlog     = g_visual:switch("📜 Hit log (last 5 shots on-screen)", true)
-local vis_keybinds   = g_visual:switch("⌨ Keybinds panel (active hotkeys)", true)
-local vis_dmgind     = g_visual:switch("💥 Damage popup (floating −X HP on enemy)", true)
-local vis_specoverlay= g_visual:switch("👁 Spectator overlay (who watches us)", true)
+g_visual:label(accent .. ui.get_icon"eye" .. accent .. "  Visual additions")
+local vis_watermark  = g_visual:switch(accent .. ui.get_icon"clock"      .. accent .. "  Watermark (user / FPS / ping)", true)
+local vis_indicators = g_visual:switch(accent .. ui.get_icon"bolt"       .. accent .. "  State indicators (AA / DT / HS / FREE)", true)
+local vis_velwarn    = g_visual:switch(accent .. ui.get_icon"feather"    .. accent .. "  Velocity warning", true)
+local vis_aaarrows   = g_visual:switch(accent .. ui.get_icon"sliders"    .. accent .. "  Manual AA arrows", true)
+local vis_hitmarker  = g_visual:switch(accent .. ui.get_icon"crosshairs" .. accent .. "  Hit marker", true)
+local vis_hitlog     = g_visual:switch(accent .. ui.get_icon"bullseye"   .. accent .. "  Hit log (last 5 shots)", true)
+local vis_keybinds   = g_visual:switch(accent .. ui.get_icon"user"       .. accent .. "  Keybinds panel", true)
+local vis_dmgind     = g_visual:switch(accent .. ui.get_icon"skull"      .. accent .. "  Damage popup (-X HP on enemy)", true)
+local vis_specoverlay= g_visual:switch(accent .. ui.get_icon"eye"        .. accent .. "  Spectator overlay", true)
 g_visual:label(" ")
-g_visual:label(accent .. "  NL built-in toggles")
+g_visual:label(accent .. ui.get_icon"sparkles" .. accent .. "  NL built-in toggles")
 local vis_nl_hitsnd  = g_visual:switch("NL Hit Marker Sound", true)
-local vis_nl_3rd     = g_visual:switch("Force Thirdperson (NL)", false)
-local vis_nl_scope   = g_visual:switch("Scope Overlay (NL)", false)
-local vis_nl_selfglw = g_visual:switch("Self-Glow (NL chams)", false)
+local vis_nl_3rd     = g_visual:switch("Force Thirdperson", false)
+local vis_nl_scope   = g_visual:switch("Scope Overlay", false)
+local vis_nl_selfglw = g_visual:switch("Self-Glow", false)
 
 -- ══════════════════════════════════════════════════════════════════════════
 -- QOL UI
@@ -112,8 +112,8 @@ local qol_buybot     = g_qol:switch("Auto-buy on spawn (AK + armor)", false)
 -- ══════════════════════════════════════════════════════════════════════════
 -- INFO UI
 -- ══════════════════════════════════════════════════════════════════════════
-local btn_status = g_info:button("📋 Print Status", function() end) -- callback wired later
-local btn_reset  = g_info:button("🔄 Reset Settings (defaults)", function() end)
+local btn_status = g_info:button("Print Status", function() end) -- callback wired later
+local btn_reset  = g_info:button("Reset Settings", function() end)
 g_info:label(" ")
 g_info:label(accent .. "  Sel01-Solver handles RESOLVING (separate tab)")
 g_info:label(accent .. "  This script handles AA / Movement / Visuals / QoL only")
@@ -218,146 +218,150 @@ end)  -- outer pcall
 -- ══════════════════════════════════════════════════════════════════════════
 -- PRESETS
 -- ══════════════════════════════════════════════════════════════════════════
+-- V1.4: combo :set(value) takes STRING not index (per CLAUDE.md). Previous int args
+-- crashed the preset apply. Every single preset write is also wrapped in safe_set
+-- (which pcalls) and the whole body is wrapped in outer pcall so no preset click can
+-- crash the script.
 local function apply_preset(name)
-    if name == "aggressive" then
-        -- AA: max desync, jitter, backward base
-        safe_set(aa_enable, true)
-        safe_set(aa_pitch, 2)           -- Down
-        safe_set(aa_yaw_base, 2)        -- Backward
-        safe_set(aa_yaw_add, 0)
-        safe_set(aa_yaw_mod, 5)         -- Jitter
-        safe_set(aa_yaw_mod_mag, 45)
-        safe_set(aa_yaw_mod_int, 2)
-        safe_set(aa_desync, 58)
-        safe_set(aa_desync_side, 1)     -- Auto
-        safe_set(aa_freestanding, true)
-        safe_set(aa_at_targets, false)
-        -- Movement: peek + strafe nudge ON
-        safe_set(mv_strafe_help, true)
-        -- Visuals: full set
-        safe_set(vis_watermark, true)
-        safe_set(vis_indicators, true)
-        safe_set(vis_velwarn, true)
-        safe_set(vis_aaarrows, true)
-        safe_set(vis_hitmarker, true)
-        safe_set(vis_hitlog, true)
-        safe_set(vis_keybinds, true)
-        safe_set(vis_dmgind, true)
-        safe_set(vis_specoverlay, true)
-        safe_set(mv_nofall, true)
-        safe_set(mv_fastladder, true)
-        -- QoL: brand + auto-accept
-        safe_set(qol_clantag, true)
-        safe_set(qol_clantag_st, 1)
-        safe_set(qol_killsay, false)
-        safe_set(qol_autoaccept, true)
-        -- NL :override() writes (non-destructive — clears on script unload)
-        nl_override(nl_refs.aa_enabled, true)
-        nl_override(nl_refs.aa_yaw_base, "Backward")
-        nl_override(nl_refs.aa_yaw_offset, 0)
-        nl_override(nl_refs.aa_yawmod, "Jitter")
-        nl_override(nl_refs.aa_yawmod_offset, 45)
-        nl_override(nl_refs.aa_bodyyaw, "Static")
-        nl_override(nl_refs.aa_bodyyaw_l, 58)
-        nl_override(nl_refs.aa_bodyyaw_r, 58)
-        nl_override(nl_refs.aa_freestand, true)
-        nl_override(nl_refs.aa_avoidbackstab, true)
-        nl_override(nl_refs.fl_switch, true)
-        nl_override(nl_refs.fl_limit, 7)
-        nl_override(nl_refs.fl_variability, 2)
-        nl_override(nl_refs.vis_hitmark_snd, true)
-        cs_log_color("⚡ AGGRESSIVE preset applied (full-send AA + visuals)")
-    elseif name == "dynamic" then
-        safe_set(aa_enable, true)
-        safe_set(aa_pitch, 2)
-        safe_set(aa_yaw_base, 2)
-        safe_set(aa_yaw_mod, 5)
-        safe_set(aa_yaw_mod_mag, 28)
-        safe_set(aa_yaw_mod_int, 3)
-        safe_set(aa_desync, 45)
-        safe_set(aa_desync_side, 1)
-        safe_set(aa_freestanding, true)
-        safe_set(aa_at_targets, true)   -- at-target = better aimpoint
-        safe_set(vis_watermark, true)
-        safe_set(vis_indicators, true)
-        safe_set(vis_velwarn, true)
-        safe_set(vis_aaarrows, true)
-        safe_set(vis_hitmarker, true)
-        safe_set(vis_hitlog, true)
-        safe_set(vis_keybinds, true)
-        safe_set(vis_dmgind, true)
-        safe_set(vis_specoverlay, true)
-        safe_set(mv_nofall, true)
-        safe_set(qol_clantag, true)
-        safe_set(qol_clantag_st, 2)
-        safe_set(qol_autoaccept, true)
-        nl_override(nl_refs.aa_enabled, true)
-        nl_override(nl_refs.aa_yaw_base, "Backward")
-        nl_override(nl_refs.aa_yawmod, "Center")
-        nl_override(nl_refs.aa_bodyyaw, "Jitter")
-        nl_override(nl_refs.aa_bodyyaw_l, 45)
-        nl_override(nl_refs.aa_bodyyaw_r, 45)
-        nl_override(nl_refs.aa_freestand, true)
-        nl_override(nl_refs.fl_switch, true)
-        nl_override(nl_refs.fl_limit, 5)
-        nl_override(nl_refs.vis_hitmark_snd, true)
-        cs_log_color("🎯 DYNAMIC preset applied (balanced AA + visuals)")
-    elseif name == "defensive" then
-        safe_set(aa_enable, true)
-        safe_set(aa_pitch, 2)
-        safe_set(aa_yaw_base, 2)
-        safe_set(aa_yaw_mod, 3)         -- Offset (smaller jitter)
-        safe_set(aa_yaw_mod_mag, 15)
-        safe_set(aa_yaw_mod_int, 4)
-        safe_set(aa_desync, 35)
-        safe_set(aa_desync_side, 1)
-        safe_set(aa_freestanding, true)
-        safe_set(aa_at_targets, false)
-        safe_set(vis_watermark, true)
-        safe_set(vis_indicators, true)
-        safe_set(vis_velwarn, true)
-        safe_set(vis_aaarrows, true)
-        safe_set(vis_hitmarker, true)
-        safe_set(vis_hitlog, false)     -- less clutter
-        safe_set(vis_keybinds, true)
-        safe_set(vis_dmgind, false)     -- less screen clutter
-        safe_set(vis_specoverlay, true)
-        safe_set(mv_nofall, true)
-        safe_set(qol_clantag, false)
-        safe_set(qol_autoaccept, true)
-        nl_override(nl_refs.aa_enabled, true)
-        nl_override(nl_refs.aa_yaw_base, "Backward")
-        nl_override(nl_refs.aa_yawmod, "Offset")
-        nl_override(nl_refs.aa_yawmod_offset, 15)
-        nl_override(nl_refs.aa_bodyyaw, "Static")
-        nl_override(nl_refs.aa_bodyyaw_l, 35)
-        nl_override(nl_refs.aa_bodyyaw_r, 35)
-        nl_override(nl_refs.aa_freestand, true)
-        nl_override(nl_refs.fl_switch, true)
-        nl_override(nl_refs.fl_limit, 3)
-        nl_override(nl_refs.vis_hitmark_snd, true)
-        cs_log_color("🛡 DEFENSIVE preset applied (safe AA, minimal visuals)")
-    elseif name == "legit" then
-        safe_set(aa_enable, false)      -- legit = NO custom AA
-        safe_set(aa_pitch, 1)           -- Off
-        safe_set(aa_yaw_mod, 1)         -- None
-        safe_set(vis_watermark, true)
-        safe_set(vis_indicators, false)  -- legit = minimal
-        safe_set(vis_velwarn, false)
-        safe_set(vis_aaarrows, false)
-        safe_set(vis_hitmarker, true)
-        safe_set(vis_hitlog, false)
-        safe_set(vis_keybinds, false)
-        safe_set(vis_dmgind, false)
-        safe_set(vis_specoverlay, false)
-        safe_set(mv_nofall, false)
-        safe_set(mv_fastladder, false)
-        safe_set(qol_clantag, false)
-        safe_set(qol_killsay, false)
-        nl_override(nl_refs.aa_enabled, false)
-        nl_override(nl_refs.aa_freestand, false)
-        nl_override(nl_refs.fl_switch, false)
-        cs_log_color("👤 LEGIT-BOT preset applied (AA off, minimal visuals)")
+    local ok, err = pcall(function()
+        if name == "aggressive" then
+            safe_set(aa_enable, true)
+            safe_set(aa_pitch,        "Down")
+            safe_set(aa_yaw_base,     "Backward")
+            safe_set(aa_yaw_add, 0)
+            safe_set(aa_yaw_mod,      "Jitter")
+            safe_set(aa_yaw_mod_mag, 45)
+            safe_set(aa_yaw_mod_int, 2)
+            safe_set(aa_desync, 58)
+            safe_set(aa_desync_side,  "Auto (alternate)")
+            safe_set(aa_freestanding, true)
+            safe_set(aa_at_targets, false)
+            safe_set(mv_strafe_help, true)
+            safe_set(vis_watermark, true)
+            safe_set(vis_indicators, true)
+            safe_set(vis_velwarn, true)
+            safe_set(vis_aaarrows, true)
+            safe_set(vis_hitmarker, true)
+            safe_set(vis_hitlog, true)
+            safe_set(vis_keybinds, true)
+            safe_set(vis_dmgind, true)
+            safe_set(vis_specoverlay, true)
+            safe_set(mv_nofall, true)
+            safe_set(mv_fastladder, true)
+            safe_set(qol_clantag, true)
+            safe_set(qol_clantag_st,  "Wave")
+            safe_set(qol_killsay, false)
+            safe_set(qol_autoaccept, true)
+            nl_override(nl_refs.aa_enabled, true)
+            nl_override(nl_refs.aa_yaw_base, "Backward")
+            nl_override(nl_refs.aa_yaw_offset, 0)
+            nl_override(nl_refs.aa_yawmod, "Jitter")
+            nl_override(nl_refs.aa_yawmod_offset, 45)
+            nl_override(nl_refs.aa_bodyyaw, "Static")
+            nl_override(nl_refs.aa_bodyyaw_l, 58)
+            nl_override(nl_refs.aa_bodyyaw_r, 58)
+            nl_override(nl_refs.aa_freestand, true)
+            nl_override(nl_refs.aa_avoidbackstab, true)
+            nl_override(nl_refs.fl_switch, true)
+            nl_override(nl_refs.fl_limit, 7)
+            nl_override(nl_refs.fl_variability, 2)
+            nl_override(nl_refs.vis_hitmark_snd, true)
+            cs_log_color("AGGRESSIVE preset applied")
+        elseif name == "dynamic" then
+            safe_set(aa_enable, true)
+            safe_set(aa_pitch,        "Down")
+            safe_set(aa_yaw_base,     "Backward")
+            safe_set(aa_yaw_mod,      "Jitter")
+            safe_set(aa_yaw_mod_mag, 28)
+            safe_set(aa_yaw_mod_int, 3)
+            safe_set(aa_desync, 45)
+            safe_set(aa_desync_side,  "Auto (alternate)")
+            safe_set(aa_freestanding, true)
+            safe_set(aa_at_targets, true)
+            safe_set(vis_watermark, true)
+            safe_set(vis_indicators, true)
+            safe_set(vis_velwarn, true)
+            safe_set(vis_aaarrows, true)
+            safe_set(vis_hitmarker, true)
+            safe_set(vis_hitlog, true)
+            safe_set(vis_keybinds, true)
+            safe_set(vis_dmgind, true)
+            safe_set(vis_specoverlay, true)
+            safe_set(mv_nofall, true)
+            safe_set(qol_clantag, true)
+            safe_set(qol_clantag_st,  "Spin")
+            safe_set(qol_autoaccept, true)
+            nl_override(nl_refs.aa_enabled, true)
+            nl_override(nl_refs.aa_yaw_base, "Backward")
+            nl_override(nl_refs.aa_yawmod, "Center")
+            nl_override(nl_refs.aa_bodyyaw, "Jitter")
+            nl_override(nl_refs.aa_bodyyaw_l, 45)
+            nl_override(nl_refs.aa_bodyyaw_r, 45)
+            nl_override(nl_refs.aa_freestand, true)
+            nl_override(nl_refs.fl_switch, true)
+            nl_override(nl_refs.fl_limit, 5)
+            nl_override(nl_refs.vis_hitmark_snd, true)
+            cs_log_color("DYNAMIC preset applied")
+        elseif name == "defensive" then
+            safe_set(aa_enable, true)
+            safe_set(aa_pitch,        "Down")
+            safe_set(aa_yaw_base,     "Backward")
+            safe_set(aa_yaw_mod,      "Offset")
+            safe_set(aa_yaw_mod_mag, 15)
+            safe_set(aa_yaw_mod_int, 4)
+            safe_set(aa_desync, 35)
+            safe_set(aa_desync_side,  "Auto (alternate)")
+            safe_set(aa_freestanding, true)
+            safe_set(aa_at_targets, false)
+            safe_set(vis_watermark, true)
+            safe_set(vis_indicators, true)
+            safe_set(vis_velwarn, true)
+            safe_set(vis_aaarrows, true)
+            safe_set(vis_hitmarker, true)
+            safe_set(vis_hitlog, false)
+            safe_set(vis_keybinds, true)
+            safe_set(vis_dmgind, false)
+            safe_set(vis_specoverlay, true)
+            safe_set(mv_nofall, true)
+            safe_set(qol_clantag, false)
+            safe_set(qol_autoaccept, true)
+            nl_override(nl_refs.aa_enabled, true)
+            nl_override(nl_refs.aa_yaw_base, "Backward")
+            nl_override(nl_refs.aa_yawmod, "Offset")
+            nl_override(nl_refs.aa_yawmod_offset, 15)
+            nl_override(nl_refs.aa_bodyyaw, "Static")
+            nl_override(nl_refs.aa_bodyyaw_l, 35)
+            nl_override(nl_refs.aa_bodyyaw_r, 35)
+            nl_override(nl_refs.aa_freestand, true)
+            nl_override(nl_refs.fl_switch, true)
+            nl_override(nl_refs.fl_limit, 3)
+            nl_override(nl_refs.vis_hitmark_snd, true)
+            cs_log_color("DEFENSIVE preset applied")
+        elseif name == "legit" then
+            safe_set(aa_enable, false)
+            safe_set(aa_pitch,        "Off")
+            safe_set(aa_yaw_mod,      "None")
+            safe_set(vis_watermark, true)
+            safe_set(vis_indicators, false)
+            safe_set(vis_velwarn, false)
+            safe_set(vis_aaarrows, false)
+            safe_set(vis_hitmarker, true)
+            safe_set(vis_hitlog, false)
+            safe_set(vis_keybinds, false)
+            safe_set(vis_dmgind, false)
+            safe_set(vis_specoverlay, false)
+            safe_set(mv_nofall, false)
+            safe_set(mv_fastladder, false)
+            safe_set(qol_clantag, false)
+            safe_set(qol_killsay, false)
+            nl_override(nl_refs.aa_enabled, false)
+            nl_override(nl_refs.aa_freestand, false)
+            nl_override(nl_refs.fl_switch, false)
+            cs_log_color("LEGIT-BOT preset applied")
+        end
+    end)
+    if not ok then
+        cs_log_color("[ERROR] preset '" .. tostring(name) .. "' failed: " .. tostring(err))
     end
 end
 apply_preset_fwd = apply_preset  -- resolve forward-decl
@@ -910,9 +914,9 @@ local clantag_phase = 1
 local clantag_last_change = 0
 
 local CLANTAG_FRAMES = {
-    wave  = {"Sel01", "≥el01", "S≥l01", "Se≥01", "Sel≥1", "Sel0≥", "Sel01"},
-    spin  = {"|Sel01", "/Sel01", "—Sel01", "\\Sel01"},
-    pulse = {"Sel01", "[Sel01]", "{Sel01}", "[Sel01]"},
+    wave  = {"Sel01", "sel01", "SEL01", "sel01", "Sel01"},
+    spin  = {"Sel01 |", "Sel01 /", "Sel01 -", "Sel01 \\"},
+    pulse = {"Sel01", "[Sel01]", "Sel01", "(Sel01)"},
 }
 
 update_clantag = function()
