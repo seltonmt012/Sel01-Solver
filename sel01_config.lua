@@ -1,15 +1,14 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Config — Neverlose CS2 AA + Misc + Visuals║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 1.2                                    ║
+-- ║  Version: 1.3                                    ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Config
 -- @author seltonmt01
--- @version 1.2
--- @description Adds watermark, bottom indicators, velocity warning, manual AA arrows,
---              hit log, keybinds panel, no-fall, fast ladder. All single-toggle, simple UI.
+-- @version 1.3
+-- @description Hotfix: NL ui.find popup error. Use pui.find primary + pcall(fn, ...) style + outer pcall block.
 
-local SEL01_CFG_VERSION = "1.2"
+local SEL01_CFG_VERSION = "1.3"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -127,10 +126,17 @@ local function safe_set(elem, v)
     pcall(function() elem:set(v) end)
 end
 
--- Wrap NL ui.find — many UI paths vary by NL version, all writes guarded
+-- V1.3 hotfix: previous wrapper raised "couldn't find the menu item" on missing paths
+-- because the closure-wrapped pcall did not catch NL's popup-side-effect cleanly.
+-- pui.find (require'd from neverlose/pui above) is the safer variant used by JAG0YAW
+-- and nyanza snapshot. We prefer it. Fallback to ui.find as last resort.
+-- pcall(fn, ...) avoids closure-capture issues.
 local function nl_find_safe(...)
-    local args = {...}
-    local ok, ref = pcall(function() return ui.find(table.unpack and table.unpack(args) or unpack(args)) end)
+    if pui and pui.find then
+        local ok, ref = pcall(pui.find, ...)
+        if ok and ref then return ref end
+    end
+    local ok, ref = pcall(ui.find, ...)
     if ok and ref then return ref end
     return nil
 end
@@ -153,7 +159,10 @@ end
 -- All pcall-wrapped; if a path is gone in a future NL update, write fails silently.
 -- ══════════════════════════════════════════════════════════════════════════
 local nl_refs = {}
-do
+-- Outer pcall: even if pui.find / ui.find pops the NL "couldn't find menu item" dialog
+-- for some path that is gone in this NL build, the remaining lookups still run and
+-- the rest of the script loads.
+pcall(function()
     -- Anti-Aim (Angles)
     nl_refs.aa_enabled       = nl_find_safe("Aimbot", "Anti Aim", "Angles", "Enabled")
     nl_refs.aa_pitch         = nl_find_safe("Aimbot", "Anti Aim", "Angles", "Pitch")
@@ -204,7 +213,7 @@ do
     nl_refs.vis_hitmark_snd  = nl_find_safe("Visuals", "World", "Other", "Hit Marker Sound")
     nl_refs.vis_self_chams   = nl_find_safe("Visuals", "Players", "Self", "Chams", "Weapon")
     nl_refs.vis_self_glow    = nl_find_safe("Visuals", "Players", "Self", "Chams", "Glow")
-end
+end)  -- outer pcall
 
 -- ══════════════════════════════════════════════════════════════════════════
 -- PRESETS
