@@ -1,16 +1,15 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Config — Neverlose CS2 AA + Misc + Visuals║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 1.1                                    ║
+-- ║  Version: 1.2                                    ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Config
 -- @author seltonmt01
--- @version 1.1
--- @description Companion to Sel01-Solver. Verified NL ui.find paths (from JAG0YAW/bettervisal/bloodwings/nyanza analysis).
---              Uses :override() API for non-destructive runtime writes (resets when script unloads).
---              Sel01-Solver_59853.lua untouched.
+-- @version 1.2
+-- @description Adds watermark, bottom indicators, velocity warning, manual AA arrows,
+--              hit log, keybinds panel, no-fall, fast ladder. All single-toggle, simple UI.
 
-local SEL01_CFG_VERSION = "1.1"
+local SEL01_CFG_VERSION = "1.2"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -75,26 +74,26 @@ local aa_at_targets  = g_aa:switch("Yaw points at targets (At-Target mode)", fal
 -- ══════════════════════════════════════════════════════════════════════════
 g_move:label(accent .. ui.get_icon"running" .. accent .. "  Movement helpers")
 local mv_autopeek_k  = g_move:hotkey("Auto-Peek (hold)")
-local mv_autopeek_d  = g_move:slider("Auto-Peek distance (units)", 50, 600, 250)
 local mv_quickstop_k = g_move:hotkey("Quick-Stop (hold)")
-local mv_strafe_help = g_move:switch("Auto-Strafe nudge (createmove side-correct)", true)
+local mv_strafe_help = g_move:switch("Auto-Strafe nudge", true)
+local mv_nofall      = g_move:switch("No-Fall damage (auto-duck land)", true)
+local mv_fastladder  = g_move:switch("Fast ladder climb", true)
 
 -- ══════════════════════════════════════════════════════════════════════════
 -- VISUALS UI
 -- ══════════════════════════════════════════════════════════════════════════
-g_visual:label(accent .. ui.get_icon"eye" .. accent .. "  Visual additions")
-local vis_hitmarker  = g_visual:switch("Hit-marker (X + sound)", true)
-local vis_hitmark_dur= g_visual:slider("Hit-marker duration (ms)", 50, 1000, 300)
-local vis_hitsound   = g_visual:switch("Hit-marker sound (NL ding)", true)
-local vis_dmgind     = g_visual:switch("Damage indicator (floating −X HP)", true)
-local vis_dmgind_dur = g_visual:slider("Damage indicator hold (ms)", 200, 3000, 1500)
-local vis_perfhud    = g_visual:switch("Performance HUD (FPS/ping/choke)", true)
-local vis_perfhud_pos= g_visual:combo("Perf HUD position", {"Top-Right", "Bottom-Right", "Bottom-Left", "Top-Left"}, 2)
-local vis_specoverlay= g_visual:switch("Spectator overlay (who watches us)", true)
-local vis_killcam    = g_visual:switch("Kill highlight (flash on kill)", true)
-local vis_bullet_tr  = g_visual:switch("Bullet tracer line (custom)", false)
+g_visual:label(accent .. ui.get_icon"eye" .. accent .. "  Visual additions (single-toggle, no config)")
+local vis_watermark  = g_visual:switch("⌚ Watermark (name + FPS + ping)", true)
+local vis_indicators = g_visual:switch("⚡ Bottom indicators (AA/DT/HS/BAIM state)", true)
+local vis_velwarn    = g_visual:switch("🐢 Velocity warning (pulse when need to slow)", true)
+local vis_aaarrows   = g_visual:switch("← → Manual AA arrows (desync side)", true)
+local vis_hitmarker  = g_visual:switch("✕ Hit marker (crosshair X + sound)", true)
+local vis_hitlog     = g_visual:switch("📜 Hit log (last 5 shots on-screen)", true)
+local vis_keybinds   = g_visual:switch("⌨ Keybinds panel (active hotkeys)", true)
+local vis_dmgind     = g_visual:switch("💥 Damage popup (floating −X HP on enemy)", true)
+local vis_specoverlay= g_visual:switch("👁 Spectator overlay (who watches us)", true)
 g_visual:label(" ")
-g_visual:label(accent .. "  NL built-in toggles (override during script runtime)")
+g_visual:label(accent .. "  NL built-in toggles")
 local vis_nl_hitsnd  = g_visual:switch("NL Hit Marker Sound", true)
 local vis_nl_3rd     = g_visual:switch("Force Thirdperson (NL)", false)
 local vis_nl_scope   = g_visual:switch("Scope Overlay (NL)", false)
@@ -227,12 +226,17 @@ local function apply_preset(name)
         -- Movement: peek + strafe nudge ON
         safe_set(mv_strafe_help, true)
         -- Visuals: full set
+        safe_set(vis_watermark, true)
+        safe_set(vis_indicators, true)
+        safe_set(vis_velwarn, true)
+        safe_set(vis_aaarrows, true)
         safe_set(vis_hitmarker, true)
-        safe_set(vis_hitsound, true)
+        safe_set(vis_hitlog, true)
+        safe_set(vis_keybinds, true)
         safe_set(vis_dmgind, true)
-        safe_set(vis_perfhud, true)
         safe_set(vis_specoverlay, true)
-        safe_set(vis_killcam, true)
+        safe_set(mv_nofall, true)
+        safe_set(mv_fastladder, true)
         -- QoL: brand + auto-accept
         safe_set(qol_clantag, true)
         safe_set(qol_clantag_st, 1)
@@ -265,10 +269,16 @@ local function apply_preset(name)
         safe_set(aa_desync_side, 1)
         safe_set(aa_freestanding, true)
         safe_set(aa_at_targets, true)   -- at-target = better aimpoint
+        safe_set(vis_watermark, true)
+        safe_set(vis_indicators, true)
+        safe_set(vis_velwarn, true)
+        safe_set(vis_aaarrows, true)
         safe_set(vis_hitmarker, true)
+        safe_set(vis_hitlog, true)
+        safe_set(vis_keybinds, true)
         safe_set(vis_dmgind, true)
-        safe_set(vis_perfhud, true)
         safe_set(vis_specoverlay, true)
+        safe_set(mv_nofall, true)
         safe_set(qol_clantag, true)
         safe_set(qol_clantag_st, 2)
         safe_set(qol_autoaccept, true)
@@ -294,10 +304,16 @@ local function apply_preset(name)
         safe_set(aa_desync_side, 1)
         safe_set(aa_freestanding, true)
         safe_set(aa_at_targets, false)
+        safe_set(vis_watermark, true)
+        safe_set(vis_indicators, true)
+        safe_set(vis_velwarn, true)
+        safe_set(vis_aaarrows, true)
         safe_set(vis_hitmarker, true)
+        safe_set(vis_hitlog, false)     -- less clutter
+        safe_set(vis_keybinds, true)
         safe_set(vis_dmgind, false)     -- less screen clutter
-        safe_set(vis_perfhud, true)
         safe_set(vis_specoverlay, true)
+        safe_set(mv_nofall, true)
         safe_set(qol_clantag, false)
         safe_set(qol_autoaccept, true)
         nl_override(nl_refs.aa_enabled, true)
@@ -316,11 +332,17 @@ local function apply_preset(name)
         safe_set(aa_enable, false)      -- legit = NO custom AA
         safe_set(aa_pitch, 1)           -- Off
         safe_set(aa_yaw_mod, 1)         -- None
+        safe_set(vis_watermark, true)
+        safe_set(vis_indicators, false)  -- legit = minimal
+        safe_set(vis_velwarn, false)
+        safe_set(vis_aaarrows, false)
         safe_set(vis_hitmarker, true)
+        safe_set(vis_hitlog, false)
+        safe_set(vis_keybinds, false)
         safe_set(vis_dmgind, false)
-        safe_set(vis_perfhud, true)
         safe_set(vis_specoverlay, false)
-        safe_set(vis_killcam, false)
+        safe_set(mv_nofall, false)
+        safe_set(mv_fastladder, false)
         safe_set(qol_clantag, false)
         safe_set(qol_killsay, false)
         nl_override(nl_refs.aa_enabled, false)
@@ -426,6 +448,35 @@ local function createmove_handler(cmd)
             cmd.sidemove    = 0
         end
 
+        -- NO-FALL: when airborne with downward velocity > -300, send +DUCK to soften landing
+        if mv_nofall and mv_nofall:get() then
+            local flags = lp.m_fFlags or 0
+            local airborne = bit.band(flags, 1) == 0
+            if airborne then
+                local vz = (lp.m_vecVelocity and lp.m_vecVelocity.z) or 0
+                if vz < -300 then
+                    -- IN_DUCK = 4 (PlayerCommand button-bit). Adding via cmd.buttons OR.
+                    pcall(function() cmd.buttons = bit.bor(cmd.buttons or 0, 4) end)
+                end
+            end
+        end
+
+        -- FAST-LADDER: when on ladder (move_type == 9 LADDER) + jumping input, force +JUMP off
+        if mv_fastladder and mv_fastladder:get() then
+            pcall(function()
+                local mt = lp.m_MoveType or 0
+                -- MOVETYPE_LADDER = 9
+                if mt == 9 then
+                    -- alternate jump bit each tick for speedier ladder climb
+                    if (globals.tickcount or 0) % 2 == 0 then
+                        cmd.buttons = bit.bor(cmd.buttons or 0, 2)  -- IN_JUMP
+                    else
+                        cmd.buttons = bit.band(cmd.buttons or 0, bit.bnot(2))
+                    end
+                end
+            end)
+        end
+
         -- Auto-peek: record origin on key-down, move toward last-known-target offset
         local peek_pressed = mv_autopeek_k and mv_autopeek_k:get()
         if peek_pressed then
@@ -496,8 +547,28 @@ pcall(function()
         if reason and HIT_STATES[reason] then
             hitmark_time = globals.realtime or 0
             hitmark_dmg  = event.damage or 0
-            if vis_hitsound:get() then
-                pcall(function() client.exec("play buttons/arena_switch_press_02.wav") end)
+            -- HIT-LOG push: name + dmg + hitbox
+            if vis_hitlog:get() then
+                local target_name = "?"
+                local hb_name     = "?"
+                pcall(function()
+                    if event.target then
+                        local t = entity.get(event.target, true)
+                        if t and t.get_name then target_name = t:get_name() end
+                    end
+                end)
+                pcall(function()
+                    local HB_NAMES = { [0]="head", [3]="chest", [4]="stomach",
+                                       [6]="leg", [7]="leg" }
+                    hb_name = HB_NAMES[event.hitbox] or tostring(event.hitbox or "?")
+                end)
+                table.insert(hit_log, {
+                    time   = globals.realtime or 0,
+                    name   = target_name,
+                    dmg    = event.damage or 0,
+                    hitbox = hb_name,
+                })
+                while #hit_log > HIT_LOG_MAX do table.remove(hit_log, 1) end
             end
         end
     end)
@@ -576,6 +647,21 @@ local function update_specs()
     end)
 end
 
+-- Hit-log ring (last 5 entries: {time, target_name, dmg, hitbox})
+local hit_log = {}
+local HIT_LOG_MAX = 5
+
+-- Hardcoded durations (no slider clutter)
+local HITMARK_DURATION_S = 0.3
+local DMGPOP_DURATION_S  = 1.5
+local HITLOG_DURATION_S  = 4.0
+local VELWARN_PULSE_HZ   = 4
+
+-- Helper: pulse alpha 0..255 from a frequency
+local function pulse_alpha(hz)
+    return math.floor(127 + 127 * math.sin((globals.realtime or 0) * math.pi * 2 * hz))
+end
+
 -- Render loop
 pcall(function()
     events.render:set(function()
@@ -585,14 +671,13 @@ pcall(function()
 
         local sx, sy = render.screen_size().x, render.screen_size().y
         local now = globals.realtime or 0
+        local cx, cy = sx / 2, sy / 2
 
-        -- ── HIT-MARKER (4 short lines around crosshair, fade-out) ──
+        -- ── HIT-MARKER (4 short diagonal lines around crosshair, fade) ──
         if vis_hitmarker:get() then
-            local dur = (vis_hitmark_dur:get() or 300) / 1000
             local age = now - hitmark_time
-            if age >= 0 and age < dur then
-                local alpha = math.floor(255 * (1 - age / dur))
-                local cx, cy = sx / 2, sy / 2
+            if age >= 0 and age < HITMARK_DURATION_S then
+                local alpha = math.floor(255 * (1 - age / HITMARK_DURATION_S))
                 local L = 8
                 local col = color(255, 80, 80, alpha)
                 pcall(function()
@@ -604,23 +689,44 @@ pcall(function()
             end
         end
 
-        -- ── DAMAGE-INDICATOR (floating −X HP near hit position) ──
+        -- ── MANUAL AA ARROWS (left + right desync side at crosshair) ──
+        if vis_aaarrows:get() then
+            local lp = entity.get_local_player()
+            if lp and lp:is_alive() then
+                -- read current desync side from NL bodyyaw inverter if available,
+                -- else fall back to our own aa_jitter_dir
+                local side = aa_jitter_dir or 1
+                pcall(function()
+                    if nl_refs.aa_bodyyaw_inv then
+                        local v = nl_refs.aa_bodyyaw_inv:get()
+                        if type(v) == "boolean" then side = v and -1 or 1 end
+                    end
+                end)
+                local lcol = (side < 0) and color(255, 230, 80, 255) or color(60, 60, 60, 140)
+                local rcol = (side > 0) and color(255, 230, 80, 255) or color(60, 60, 60, 140)
+                pcall(function()
+                    render.text(4, vector(cx - 22, cy - 6), lcol, nil, "<")
+                    render.text(4, vector(cx + 14, cy - 6), rcol, nil, ">")
+                end)
+            end
+        end
+
+        -- ── DAMAGE POPUPS (floating −X HP near victim, fade upward) ──
         if vis_dmgind:get() then
-            local dur = (vis_dmgind_dur:get() or 1500) / 1000
             for i = #damage_pops, 1, -1 do
                 local pop = damage_pops[i]
                 local age = now - pop.time
-                if age > dur then
+                if age > DMGPOP_DURATION_S then
                     table.remove(damage_pops, i)
                 else
-                    local alpha = math.floor(255 * (1 - age / dur))
-                    local yoff  = age * 30   -- float upward
+                    local alpha = math.floor(255 * (1 - age / DMGPOP_DURATION_S))
+                    local yoff  = age * 30
                     pcall(function()
                         local p2d = render.world_to_screen(vector(pop.x, pop.y, pop.z))
                         if p2d and p2d.x and p2d.x > 0 and p2d.y > 0 then
-                            local txt = string.format("−%d HP", pop.dmg)
-                            local col = color(255, 200, 80, alpha)
-                            render.text(4, vector(p2d.x + 6, p2d.y - yoff), col, nil, txt)
+                            render.text(4, vector(p2d.x + 6, p2d.y - yoff),
+                                        color(255, 200, 80, alpha), nil,
+                                        string.format("-%d HP", pop.dmg))
                             if pop.hp_left > 0 then
                                 render.text(3, vector(p2d.x + 6, p2d.y - yoff + 14),
                                             color(180, 180, 180, alpha), nil,
@@ -632,30 +738,145 @@ pcall(function()
             end
         end
 
-        -- ── PERFORMANCE HUD ──
-        if vis_perfhud:get() then
-            local pos = vis_perfhud_pos:get()
-            local hx, hy = 16, 16
-            if pos == "Top-Right"    then hx, hy = sx - 220, 16
-            elseif pos == "Bottom-Right" then hx, hy = sx - 220, sy - 90
-            elseif pos == "Bottom-Left"  then hx, hy = 16, sy - 90
-            end
+        -- ── WATERMARK (top-right: user + FPS + ping + version) ──
+        if vis_watermark:get() then
+            local lp_name = common and common.get_username and common.get_username() or "Player"
+            local txt = string.format("Sel01 | %s | %d fps | %d ms", lp_name, perf.fps, perf.ping)
+            local tw = 0
+            pcall(function() tw = render.measure_text(3, nil, txt).x end)
+            local pad = 8
+            local wx, wy = sx - tw - pad * 2 - 12, 12
             pcall(function()
-                render.rect(vector(hx, hy), vector(hx + 200, hy + 70), color(15, 15, 20, 200))
-                render.rect_outline(vector(hx, hy), vector(hx + 200, hy + 70), color(120, 180, 255, 220), 1)
-                render.text(3, vector(hx + 8, hy + 6),  color(180, 220, 255, 255), nil,
-                            string.format("FPS:  %d", perf.fps))
-                render.text(3, vector(hx + 8, hy + 22), color(180, 220, 255, 255), nil,
-                            string.format("Ping: %d ms", perf.ping))
-                render.text(3, vector(hx + 8, hy + 38), color(150, 150, 150, 220), nil,
-                            "Sel01-Config v" .. SEL01_CFG_VERSION)
+                render.rect(vector(wx, wy), vector(wx + tw + pad * 2, wy + 22), color(15, 15, 20, 200))
+                render.rect_outline(vector(wx, wy), vector(wx + tw + pad * 2, wy + 22), color(120, 180, 255, 220), 1)
+                render.text(3, vector(wx + pad, wy + 5), color(220, 230, 255, 255), nil, txt)
             end)
+        end
+
+        -- ── BOTTOM STATE INDICATORS (DT/HS/BAIM/AA/FREE) ──
+        if vis_indicators:get() then
+            local indicators = {}
+            -- AA enabled
+            local aa_on = aa_enable:get()
+            if aa_on then table.insert(indicators, {txt = "AA",   col = color(120, 220, 120, 255)}) end
+            -- Double Tap (NL)
+            pcall(function()
+                if nl_refs.rage_dt and nl_refs.rage_dt:get() then
+                    table.insert(indicators, {txt = "DT", col = color(255, 100, 100, 255)})
+                end
+            end)
+            -- Hide Shots (NL)
+            pcall(function()
+                if nl_refs.rage_hide and nl_refs.rage_hide:get() then
+                    table.insert(indicators, {txt = "HS", col = color(255, 180, 80, 255)})
+                end
+            end)
+            -- Freestanding
+            if aa_on and aa_freestanding:get() then
+                table.insert(indicators, {txt = "FREE", col = color(180, 200, 255, 255)})
+            end
+            -- Slow Walk (NL)
+            pcall(function()
+                if nl_refs.aa_slowwalk and nl_refs.aa_slowwalk:get() then
+                    table.insert(indicators, {txt = "SW", col = color(255, 220, 120, 255)})
+                end
+            end)
+            -- Fake Duck (NL)
+            pcall(function()
+                if nl_refs.aa_fakeduck and nl_refs.aa_fakeduck:get() then
+                    table.insert(indicators, {txt = "FD", col = color(255, 220, 120, 255)})
+                end
+            end)
+            -- draw stacked at bottom-center, line height 16
+            local base_y = sy - 110
+            for i, ind in ipairs(indicators) do
+                local tw = 0
+                pcall(function() tw = render.measure_text(4, nil, ind.txt).x end)
+                pcall(function()
+                    render.text(4, vector(cx - tw / 2, base_y + (i - 1) * 18), ind.col, nil, ind.txt)
+                end)
+            end
+        end
+
+        -- ── VELOCITY WARNING (red pulse when slow-walk or fake-duck needs it) ──
+        if vis_velwarn:get() then
+            local lp = entity.get_local_player()
+            if lp and lp:is_alive() then
+                local warn_text = nil
+                pcall(function()
+                    local v = lp.m_vecVelocity
+                    local sp = math.sqrt((v.x or 0)^2 + (v.y or 0)^2)
+                    -- read NL slow-walk + fake-duck state
+                    local sw_on, fd_on = false, false
+                    if nl_refs.aa_slowwalk then sw_on = nl_refs.aa_slowwalk:get() == true end
+                    if nl_refs.aa_fakeduck then fd_on = nl_refs.aa_fakeduck:get() == true end
+                    -- Warn if moving too fast while slow-walk should be active
+                    if sw_on and sp > 90 then warn_text = "STOP / SLOW WALK"
+                    elseif fd_on and sp > 90 then warn_text = "STOP / FAKE DUCK"
+                    end
+                end)
+                if warn_text then
+                    local a = pulse_alpha(VELWARN_PULSE_HZ)
+                    local tw = 0
+                    pcall(function() tw = render.measure_text(5, nil, warn_text).x end)
+                    pcall(function()
+                        render.text(5, vector(cx - tw / 2, cy + 40), color(255, 60, 60, a), nil, warn_text)
+                    end)
+                end
+            end
+        end
+
+        -- ── HIT LOG (top-left, last 5 shots, fade) ──
+        if vis_hitlog:get() then
+            local hx, hy = 16, 16
+            local row = 0
+            for i = #hit_log, 1, -1 do
+                local entry = hit_log[i]
+                local age = now - entry.time
+                if age > HITLOG_DURATION_S then
+                    table.remove(hit_log, i)
+                else
+                    local alpha = math.floor(255 * (1 - age / HITLOG_DURATION_S))
+                    local txt = string.format("HIT %s  %d dmg  [%s]",
+                                              entry.name or "?", entry.dmg or 0, entry.hitbox or "?")
+                    pcall(function()
+                        render.text(3, vector(hx, hy + row * 14), color(160, 255, 160, alpha), nil, txt)
+                    end)
+                    row = row + 1
+                end
+            end
+        end
+
+        -- ── KEYBINDS PANEL (right-middle, active hotkeys list) ──
+        if vis_keybinds:get() then
+            local active = {}
+            pcall(function()
+                if mv_autopeek_k and mv_autopeek_k:get() then table.insert(active, "Auto-Peek") end
+            end)
+            pcall(function()
+                if mv_quickstop_k and mv_quickstop_k:get() then table.insert(active, "Quick-Stop") end
+            end)
+            -- NL manual binds + double-tap if enabled show as fallback
+            if #active > 0 then
+                local lh = 14
+                local h = #active * lh + 18
+                local bx, by = sx - 180, sy / 2 + 80
+                pcall(function()
+                    render.rect(vector(bx, by), vector(bx + 160, by + h), color(15, 15, 20, 200))
+                    render.rect_outline(vector(bx, by), vector(bx + 160, by + h), color(120, 180, 255, 220), 1)
+                    render.text(3, vector(bx + 8, by + 4), color(180, 220, 255, 255), nil, "Active Keys")
+                    for i, name in ipairs(active) do
+                        render.text(3, vector(bx + 8, by + 4 + i * lh), color(220, 220, 220, 240), nil,
+                                    "• " .. name)
+                    end
+                end)
+            end
         end
 
         -- ── CLANTAG UPDATE (cheap, throttled inside) ──
         update_clantag()
 
-        -- ── SPECTATOR OVERLAY ──
+        -- ── SPECTATOR OVERLAY (left-middle) ──
         if vis_specoverlay:get() and #specs > 0 then
             local lh = 14
             local h = #specs * lh + 18
@@ -664,7 +885,7 @@ pcall(function()
                 render.rect(vector(bx, by), vector(bx + 180, by + h), color(15, 15, 20, 200))
                 render.rect_outline(vector(bx, by), vector(bx + 180, by + h), color(255, 180, 80, 220), 1)
                 render.text(3, vector(bx + 8, by + 4), color(255, 180, 80, 255), nil,
-                            string.format("👁 Spectators (%d)", #specs))
+                            string.format("Spectators (%d)", #specs))
                 for i, name in ipairs(specs) do
                     render.text(3, vector(bx + 8, by + 4 + i * lh), color(220, 220, 220, 240), nil, name)
                 end
@@ -767,9 +988,12 @@ local function dump_status()
     cs_log(string.format("AA override: %s | pitch=%s yaw_base=%s desync=%d",
         tostring(aa_enable:get()), tostring(aa_pitch:get()),
         tostring(aa_yaw_base:get()), aa_desync:get()))
-    cs_log(string.format("Visuals: hitmark=%s dmgind=%s perfhud=%s specoverlay=%s",
-        tostring(vis_hitmarker:get()), tostring(vis_dmgind:get()),
-        tostring(vis_perfhud:get()), tostring(vis_specoverlay:get())))
+    cs_log(string.format("Visuals: watermark=%s indic=%s velwarn=%s arrows=%s hitmark=%s hitlog=%s keybinds=%s dmgind=%s spec=%s",
+        tostring(vis_watermark:get()),  tostring(vis_indicators:get()),
+        tostring(vis_velwarn:get()),    tostring(vis_aaarrows:get()),
+        tostring(vis_hitmarker:get()),  tostring(vis_hitlog:get()),
+        tostring(vis_keybinds:get()),   tostring(vis_dmgind:get()),
+        tostring(vis_specoverlay:get())))
     cs_log(string.format("QoL: clantag=%s killsay=%s autoaccept=%s",
         tostring(qol_clantag:get()), tostring(qol_killsay:get()),
         tostring(qol_autoaccept:get())))
