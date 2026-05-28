@@ -1,15 +1,15 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Config — Neverlose CSGO HvH config        ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 2.8                                    ║
+-- ║  Version: 2.9                                    ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Config
 -- @author seltonmt01
--- @version 2.8
--- @description Peek Boost = hotkey (hold). Hits-taken log: snapshot our AA state when we get
---              shot so we can analyze why. Extended dump_stats with hits-taken section.
+-- @version 2.9
+-- @description aim_ack hit-detection fixed (nil-reason = HIT now, matches resolver). Added
+--              MISS_STATES + unknown-state logging. Per-mode shot counter, deaths log.
 
-local SEL01_CFG_VERSION = "2.8"
+local SEL01_CFG_VERSION = "2.9"
 
 -- DEBUG: print to CSGO console at major load checkpoints. Plain print() bypasses
 -- NL chat (which may not flush before crash) and writes directly to CSGO console.
@@ -116,7 +116,7 @@ local vis_indicators = g_visual:switch(accent .. ui.get_icon"bolt"       .. acce
 local vis_velwarn    = g_visual:switch(accent .. ui.get_icon"feather"    .. accent .. "  Velocity warning", true)
 local vis_aaarrows   = g_visual:switch(accent .. ui.get_icon"sliders"    .. accent .. "  Manual AA arrows", true)
 local vis_hitmarker  = g_visual:switch(accent .. ui.get_icon"crosshairs" .. accent .. "  Hit marker", true)
-local vis_hitlog     = g_visual:switch(accent .. ui.get_icon"bullseye"   .. accent .. "  Hit log (last 5 shots)", true)
+local vis_hitlog     = g_visual:switch(accent .. ui.get_icon"bullseye"   .. accent .. "  Event log (hits + misses + kills)", true)
 local vis_keybinds   = g_visual:switch(accent .. ui.get_icon"user"       .. accent .. "  Keybinds panel", true)
 local vis_dmgind     = g_visual:switch(accent .. ui.get_icon"skull"      .. accent .. "  Damage popup (-X HP on enemy)", true)
 local vis_specoverlay= g_visual:switch(accent .. ui.get_icon"eye"        .. accent .. "  Spectator overlay", true)
@@ -343,7 +343,7 @@ local function _do_apply_preset(name)
         safe_set(vis_velwarn, true)
         safe_set(vis_aaarrows, true)
         safe_set(vis_hitmarker, true)
-        safe_set(vis_hitlog, false)
+        safe_set(vis_hitlog, true)        -- V2.9: always ON for kill/miss/hit log
         safe_set(vis_keybinds, true)
         safe_set(vis_dmgind, false)
         safe_set(vis_specoverlay, true)
@@ -667,19 +667,28 @@ local function _stats_clear()
     hits_taken_log       = {}  -- clear hits-taken log too
 end
 
--- V2.0: aim_ack restored, ZERO entity.get calls. Target name comes from event
--- fields only ("?" if not present). Hit-marker timer + hit-log push both fire.
--- V2.6: stats accumulator runs at top of handler regardless of vis_hitmarker.
+-- V2.9: aim_ack hit-detection FIXED. Resolver pattern: nil reason = HIT (was MISS
+-- in v2.6-v2.8 -> caused config to show 0 hits while resolver showed 11). Also
+-- unified hit_log to include HITS + MISSES (kills added via player_death below).
+local HIT_STATES_C  = { hit = true, damaged = true, ["hit-damaged"] = true }
+local MISS_STATES_C = { miss = true, missed = true, spread = true, correction = true,
+                        ["prediction error"] = true, death = true,
+                        ["damage rejection"] = true, ["unregistered shot"] = true,
+                        ["backtrack failure"] = true, backtrack_failure = true }
+local HB_NAMES_C    = { [0]="head", [3]="chest", [4]="stomach", [6]="leg", [7]="leg" }
 pcall(function()
     events.aim_ack:set(function(event)
         pcall(function()
             if not enable_master:get() then return end
             if not event then return end
             local reason = event.state
-            local HIT_STATES = { hit = true, damaged = true, ["hit-damaged"] = true }
-            -- V2.6: every aim_ack = a shot. Count first, then visual gating below.
+            -- V2.9: nil reason defaults to HIT (resolver pattern). Previously
+            -- treated nil as MISS which made every nil-state shot count as miss.
+            local is_hit = (reason == nil) or HIT_STATES_C[reason]
             stats.shots_fired = stats.shots_fired + 1
-            if reason and HIT_STATES[reason] then
+            local target_name = tostring(event.target_name or event.name or "?")
+            local hb_name     = HB_NAMES_C[event.hitbox] or tostring(event.hitbox or "?")
+            if is_hit then
                 stats.shots_hit = stats.shots_hit + 1
                 local hb = event.hitbox or -1
                 if     hb == 0 then stats.hits_head    = stats.hits_head    + 1
@@ -688,21 +697,11 @@ pcall(function()
                 elseif hb == 6 or hb == 7 then stats.hits_leg = stats.hits_leg + 1
                 else stats.hits_other = stats.hits_other + 1
                 end
-            else
-                stats.shots_missed = stats.shots_missed + 1
-            end
-            -- visual gate for hitmarker render trigger
-            if not vis_hitmarker:get() then return end
-            if reason and HIT_STATES[reason] then
-                hitmark_time = globals.realtime or 0
+                if vis_hitmarker:get() then hitmark_time = globals.realtime or 0 end
                 if vis_hitlog:get() then
-                    -- No entity.get(event.target) — name field if NL provides it, else "?"
-                    local target_name = tostring(event.target_name or event.name or "?")
-                    local HB_NAMES = { [0]="head", [3]="chest", [4]="stomach",
-                                       [6]="leg", [7]="leg" }
-                    local hb_name = HB_NAMES[event.hitbox] or tostring(event.hitbox or "?")
                     table.insert(hit_log, {
                         time      = globals.realtime or 0,
+                        kind      = "hit",
                         name      = target_name,
                         dmg       = event.damage or 0,
                         dmg_want  = event.wanted_damage or event.requested_damage or event.damage or 0,
@@ -711,6 +710,45 @@ pcall(function()
                     })
                     while #hit_log > HIT_LOG_MAX do table.remove(hit_log, 1) end
                 end
+            else
+                stats.shots_missed = stats.shots_missed + 1
+                if vis_hitlog:get() then
+                    table.insert(hit_log, {
+                        time      = globals.realtime or 0,
+                        kind      = "miss",
+                        name      = target_name,
+                        hitbox    = hb_name,
+                        hitbox_id = event.hitbox or -1,
+                        reason    = tostring(reason or "?"),
+                    })
+                    while #hit_log > HIT_LOG_MAX do table.remove(hit_log, 1) end
+                end
+            end
+        end)
+    end)
+end)
+
+-- V2.9: kill detection via player_death (no entity reads on victim except name)
+pcall(function()
+    events.player_death:set(function(event)
+        pcall(function()
+            if not enable_master:get() then return end
+            if not event then return end
+            local lp = entity.get_local_player()
+            if not lp then return end
+            local attacker = entity.get(event.attacker, true)
+            if attacker ~= lp then return end
+            local victim = entity.get(event.userid, true)
+            if not victim or victim == lp then return end
+            local victim_name = "?"
+            pcall(function() victim_name = victim:get_name() end)
+            if vis_hitlog:get() then
+                table.insert(hit_log, {
+                    time = globals.realtime or 0,
+                    kind = "kill",
+                    name = victim_name,
+                })
+                while #hit_log > HIT_LOG_MAX do table.remove(hit_log, 1) end
             end
         end)
     end)
@@ -820,7 +858,7 @@ end
 
 -- Hit-log ring (last 5 entries: {time, target_name, dmg, hitbox})
 local hit_log = {}
-local HIT_LOG_MAX = 5
+local HIT_LOG_MAX = 8   -- V2.9: bigger since hits + misses + kills all share log
 
 -- Hardcoded durations (no slider clutter)
 local HITMARK_DURATION_S = 0.3
@@ -1058,9 +1096,10 @@ pcall(function()
             end
         end
 
-        -- ── V1.6 K: SKEET-STYLE HIT LOG (top-left) ──
-        -- format:  > hit NAME in HITBOX for DMG (wanted WANT)
-        -- HITBOX gets hitbox-color (head red / chest green / etc), dmg gets damage-tier color
+        -- ── V2.9: EVENT LOG (top-left) — HITS + MISSES + KILLS unified ──
+        -- KILL: green block "▶ KILL <name>"
+        -- HIT:  yellow/green "✓ hit <name> [hb] +<dmg>"
+        -- MISS: red          "✗ miss <name> [hb] (<reason>)"
         if vis_hitlog:get() then
             local hx, hy = 16, 16
             local row = 0
@@ -1071,42 +1110,33 @@ pcall(function()
                     table.remove(hit_log, i)
                 else
                     local alpha = math.floor(255 * (1 - age / HITLOG_DURATION_S))
-                    local hb_id = entry.hitbox_id or -1
-                    local hb_r, hb_g, hb_b = 200, 200, 200
-                    if hb_id == 0 then hb_r, hb_g, hb_b = 255, 80, 80
-                    elseif hb_id == 3 then hb_r, hb_g, hb_b = 120, 220, 120
-                    elseif hb_id == 4 then hb_r, hb_g, hb_b = 255, 220, 80
-                    elseif hb_id == 6 or hb_id == 7 then hb_r, hb_g, hb_b = 120, 180, 255
-                    end
-                    local dmg = entry.dmg or 0
-                    local dmg_r, dmg_g, dmg_b = 220, 220, 220
-                    if dmg >= 100 then dmg_r, dmg_g, dmg_b = 255, 100, 100   -- 1-tap
-                    elseif dmg >= 70 then dmg_r, dmg_g, dmg_b = 255, 200, 80
-                    elseif dmg >= 40 then dmg_r, dmg_g, dmg_b = 200, 220, 120
-                    end
-                    -- V1.7 perf: cache measure_text widths on entry first render
-                    if not entry._w then
-                        entry._w = { name = 0, hb = 0, dmg = 0 }
-                        pcall(function() entry._w.name = render.measure_text(3, nil, entry.name or "?").x end)
-                        pcall(function() entry._w.hb   = render.measure_text(3, nil, entry.hitbox or "?").x end)
-                        pcall(function() entry._w.dmg  = render.measure_text(3, nil, tostring(dmg)).x end)
-                    end
-                    local nw, hw, dw = entry._w.name, entry._w.hb, entry._w.dmg
-                    -- Skeet-style: "> hit NAME in HITBOX for DMG (wanted WANT)"
-                    local y = hy + row * 14
+                    local y     = hy + row * 14
+                    local kind  = entry.kind or "hit"
                     pcall(function()
-                        render.text(3, vector(hx, y), color(160, 160, 160, alpha), nil, ">")
-                        render.text(3, vector(hx + 10, y), color(220, 220, 220, alpha), nil, "hit")
-                        render.text(3, vector(hx + 30, y), color(180, 220, 255, alpha), nil, entry.name or "?")
-                        render.text(3, vector(hx + 34 + nw, y), color(220, 220, 220, alpha), nil, "in")
-                        render.text(3, vector(hx + 50 + nw, y), color(hb_r, hb_g, hb_b, alpha), nil, entry.hitbox or "?")
-                        render.text(3, vector(hx + 54 + nw + hw, y), color(220, 220, 220, alpha), nil, "for")
-                        render.text(3, vector(hx + 74 + nw + hw, y), color(dmg_r, dmg_g, dmg_b, alpha), nil,
-                                    tostring(dmg))
-                        if entry.dmg_want and entry.dmg_want > dmg then
-                            render.text(3, vector(hx + 78 + nw + hw + dw, y),
-                                        color(150, 150, 150, alpha), nil,
-                                        string.format("(wanted %d)", entry.dmg_want))
+                        if kind == "kill" then
+                            render.text(4, vector(hx, y),
+                                color(120, 255, 120, alpha), nil,
+                                string.format("KILL  %s", entry.name or "?"))
+                        elseif kind == "miss" then
+                            render.text(3, vector(hx, y),
+                                color(255, 100, 100, alpha), nil,
+                                string.format("MISS  %s  [%s]  (%s)",
+                                    entry.name or "?",
+                                    entry.hitbox or "?",
+                                    entry.reason or "?"))
+                        else  -- hit
+                            local dmg = entry.dmg or 0
+                            local dmg_r, dmg_g, dmg_b = 220, 220, 220
+                            if dmg >= 100 then dmg_r, dmg_g, dmg_b = 255, 100, 100
+                            elseif dmg >= 70 then dmg_r, dmg_g, dmg_b = 255, 200, 80
+                            elseif dmg >= 40 then dmg_r, dmg_g, dmg_b = 200, 220, 120
+                            end
+                            render.text(3, vector(hx, y),
+                                color(dmg_r, dmg_g, dmg_b, alpha), nil,
+                                string.format("HIT   %s  [%s]  +%d",
+                                    entry.name or "?",
+                                    entry.hitbox or "?",
+                                    dmg))
                         end
                     end)
                     row = row + 1
@@ -1309,7 +1339,7 @@ end)
 -- LOAD BANNER
 -- ══════════════════════════════════════════════════════════════════════════
 cs_log_color("══════════════════════════════════════════")
-cs_log_color("Sel01-Config v" .. SEL01_CFG_VERSION .. " loaded (CSGO HvH — Peek Boost hold-hotkey + Hits-taken log)")
+cs_log_color("Sel01-Config v" .. SEL01_CFG_VERSION .. " loaded (CSGO HvH — Hit-detect fix + Kill/Miss/Hit event log)")
 cs_log(string.format("  hooks  createmove=%s  aim_fire=%s",
     tostring(_hooks_status.createmove or "MISSING"),
     tostring(_hooks_status.aim_fire or "MISSING")))
