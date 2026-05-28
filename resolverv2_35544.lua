@@ -1,14 +1,14 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 9.7                                    ║
+-- ║  Version: 9.8                                    ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 9.7
--- @description Still-Alt for switch-AA stationary + still/slow hard-reset on yaw spike
+-- @version 9.8
+-- @description Counter-fire detection — enemy shoots at us → bypass cancel-conf + force fire attempt
 
-local SEL01_VERSION = "9.7"
+local SEL01_VERSION = "9.8"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -3000,11 +3000,44 @@ local lby_snap_handler = function(event)
     local uid = event.userid or event.user_id or event.player
     if not uid then return end
     local shooter = entity.get(uid, true)
-    if not shooter or shooter == entity.get_local_player() then return end
+    local lp_e = entity.get_local_player()
+    if not shooter or shooter == lp_e then return end
     if not shooter:is_enemy() or not shooter:is_alive() then return end
     local s = get_state(shooter)
     s.lby_snap  = true
     s.last_shot = globals.curtime
+    -- V9.8: HOSTILE-FIRE DETECTION — mark when enemy fires within engagement range,
+    -- and (best-effort) check if their eye-yaw points toward us. Used by ragebot_target
+    -- counter-fire override to bypass cancel-low-conf during their fire-window.
+    if lp_e and lp_e:is_alive() then
+        local sx, sy_pos, sz, lx, ly, lz = 0, 0, 0, 0, 0, 0
+        local ok_pos = pcall(function()
+            sx, sy_pos, sz = shooter.m_vecOrigin.x, shooter.m_vecOrigin.y, shooter.m_vecOrigin.z
+            lx, ly, lz     = lp_e.m_vecOrigin.x,    lp_e.m_vecOrigin.y,    lp_e.m_vecOrigin.z
+        end)
+        if ok_pos then
+            local dx, dy, dz = lx - sx, ly - sy_pos, lz - sz
+            local dist = math.sqrt(dx*dx + dy*dy + dz*dz)
+            if dist < 3500 then
+                s.last_hostile_fire  = globals.tickcount or 0
+                s.hostile_fire_count = (s.hostile_fire_count or 0) + 1
+                local aimed_at_us = false
+                pcall(function()
+                    local ang = shooter.m_angEyeAngles
+                    local their = ang and (ang.y or ang[2])
+                    if their then
+                        local desired = math.deg(math.atan2(dy, dx))
+                        local diff = NormalizeAngle(their - desired)
+                        if math.abs(diff) < 35 then aimed_at_us = true end
+                    end
+                end)
+                s.last_hostile_aimed = aimed_at_us
+                cs_log_verbose("hostile-fire idx=%d dist=%.0f aimed=%s tick=%d",
+                               shooter:get_index(), dist, tostring(aimed_at_us),
+                               s.last_hostile_fire)
+            end
+        end
+    end
 end
 
 local lby_event_set = false
@@ -3269,8 +3302,27 @@ pcall(function()
             return
         end
 
+        -- V9.8: COUNTER-FIRE OVERRIDE — enemy fired at us in last 1s → bypass cancel-low-conf,
+        -- lower hitchance/min-damage to force return-fire attempt within their fire-window.
+        -- Skip if conf too low to even guess (would waste shot) or if sniper (precision class).
+        local counter_fire_active = false
+        if s and (s.last_hostile_fire or 0) > 0 then
+            local ticks_since = (globals.tickcount or 0) - s.last_hostile_fire
+            if ticks_since >= 0 and ticks_since <= 64 then
+                local wc_cf = get_weapon_class()
+                if wc_cf ~= "sniper" and intel and intel.conf >= 10 then
+                    counter_fire_active = true
+                    pcall(function() ctx:override_hitchance(25) end)
+                    pcall(function() ctx:override_min_damage(1) end)
+                    cs_log_verbose("counter-fire idx=%d conf=%d aimed=%s (fired %d ticks ago)",
+                                   target:get_index(), intel.conf,
+                                   tostring(s.last_hostile_aimed), ticks_since)
+                end
+            end
+        end
+
         -- V3+V5+V6: CANCEL LOW-CONFIDENCE — intel-aware (known mode-match = trust)
-        if exp_cancel_conf and exp_cancel_conf:get() and s then
+        if not counter_fire_active and exp_cancel_conf and exp_cancel_conf:get() and s then
             local sd = resolve_stddev(s)
             local wc = get_weapon_class()
             local in_peek_window = false
