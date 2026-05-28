@@ -1,15 +1,16 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Config — Neverlose CSGO HvH config        ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 1.7                                    ║
+-- ║  Version: 1.8                                    ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Config
 -- @author seltonmt01
--- @version 1.7
--- @description Audit cleanup: split jitter counters, clamp anti-BF mag, dedup event hooks + load logging,
---              perf passes (specs / hit-log width cache), drop dead code.
+-- @version 1.8
+-- @description CRASH FIX: drop aa_handler cmd-field writes (NL panic on unknown fields). AA values now flow
+--              through NL UI refs only, same path JAG0YAW + bloodwings use. Air desync, on-shot, anti-BF
+--              variance now drive nl_refs.aa_bodyyaw_l/r via :override every tick.
 
-local SEL01_CFG_VERSION = "1.7"
+local SEL01_CFG_VERSION = "1.8"
 
 local pui      = require("neverlose/pui");
 local ffi      = require("ffi");
@@ -390,102 +391,73 @@ apply_preset_fwd = apply_preset  -- resolve forward-decl
 -- NL exposes events.antiaim (signature varies). Best-effort write to cmd
 -- (pitch, yaw_base, yaw_add, yaw_modifier, jitter, desync). All pcall.
 -- ══════════════════════════════════════════════════════════════════════════
--- V1.7 fix: split pitch + yaw jitter counters. Sharing one counter caused
--- effective rate to double when both jitter modes were active simultaneously.
-local aa_pitch_jitter_counter = 0
-local aa_yaw_jitter_counter   = 0
-local aa_jitter_dir           = 1
+-- V1.8: aa_handler with cmd.* field writes was deleted because no other NL script
+-- (JAG0YAW oracle, bloodwings, nyanza, bettervisal, gingersense) uses that pattern.
+-- They all drive anti-aim through ui.find:override() on NL's own AA elements. Writing
+-- to undefined fields on the events.antiaim cmd userdata likely caused the CTD the
+-- user hit a few seconds after team-select. This version routes everything through
+-- aa_periodic_sync (called from createmove_unified) which only uses :override on
+-- NL refs — same well-tested path the other scripts use.
+
+local aa_yaw_jitter_counter = 0
 -- Kept alias for indicator's rotating-line animation (still uses yaw rhythm)
-local aa_jitter_counter       = 0
+local aa_jitter_counter     = 0
+local aa_jitter_dir         = 1
 -- V1.6 HvH state — runtime flags shared with indicators + AA decisions
 local aa_state = {
-    on_shot_until = 0,   -- realtime; while > now, force defensive set
-    fakeduck_until = 0,  -- realtime; H assist
+    on_shot_until = 0,
+    fakeduck_until = 0,
     last_fire_time = 0,
 }
-local function aa_handler(cmd)
+
+-- V1.8: drives NL Body Yaw Left/Right Limit every createmove tick.
+-- Combines: base desync slider, air override, on-shot defensive, anti-BF variance.
+local function aa_periodic_sync()
     if not (enable_master:get() and aa_enable:get()) then return end
-    if not cmd then return end
-    pcall(function()
-        local now = globals.realtime or 0
-        local on_shot = aa_onshot:get() and (now < aa_state.on_shot_until)
+    local now = globals.realtime or 0
 
-        -- Pitch — uses own counter (V1.7 fix)
-        local pmode = aa_pitch:get()
-        if pmode == "Down"             then cmd.pitch = -89
-        elseif pmode == "Up"           then cmd.pitch =  89
-        elseif pmode == "Jitter Down/Up" then
-            aa_pitch_jitter_counter = aa_pitch_jitter_counter + 1
-            cmd.pitch = (aa_pitch_jitter_counter % 2 == 0) and -89 or 89
-        elseif pmode == "Custom"       then cmd.pitch = aa_pitch_cust:get()
-        end
-        -- Yaw base
-        local ybase = aa_yaw_base:get()
-        if ybase == "Forward"  then cmd.yaw_base = 0
-        elseif ybase == "Backward" then cmd.yaw_base = 180
-        elseif ybase == "Left"     then cmd.yaw_base = 90
-        elseif ybase == "Right"    then cmd.yaw_base = -90
-        elseif ybase == "AtTarget" and aa_at_targets:get() then
-            cmd.yaw_base_at_targets = true
-        end
-        -- Yaw add
-        cmd.yaw_add = (cmd.yaw_add or 0) + aa_yaw_add:get()
-        -- Yaw modifier
-        local ymod = aa_yaw_mod:get()
-        if ymod == "Center" then
-            cmd.yaw_modifier = 0
-        elseif ymod == "Offset" then
-            cmd.yaw_modifier = aa_yaw_mod_mag:get()
-        elseif ymod == "Random" then
-            cmd.yaw_modifier = (math.random() * 2 - 1) * aa_yaw_mod_mag:get()
-        elseif ymod == "Jitter" then
-            aa_yaw_jitter_counter = aa_yaw_jitter_counter + 1
-            aa_jitter_counter     = aa_yaw_jitter_counter  -- mirror for indicator animation
-            local int = math.max(1, aa_yaw_mod_int:get())
-            if aa_yaw_jitter_counter % int == 0 then aa_jitter_dir = -aa_jitter_dir end
-            local mag = aa_yaw_mod_mag:get()
-            -- G: anti-bruteforce variance (random per-tick offset)
-            if aa_anti_bf:get() then
-                mag = mag + (math.random() * 2 - 1) * aa_anti_bf_var:get()
-            end
-            -- V1.7 fix: clamp to CSGO max 58 deg. Without clamp, anti-BF overflow
-            -- pushed mag > 58 which NL silently rejected/clamped, breaking jitter.
-            if mag > 58 then mag = 58 end
-            if mag < 0  then mag = 0  end
-            cmd.yaw_modifier = aa_jitter_dir * mag
-        end
-        -- Desync — base value, then air override + on-shot override
-        local dval = aa_desync:get()
-        -- F: air desync override (read airborne via lp.m_fFlags bit 1 = FL_ONGROUND)
-        if aa_air_set:get() then
-            local lp = entity.get_local_player()
-            if lp then
-                local f = 0
-                pcall(function() f = lp.m_fFlags or 0 end)
-                if bit.band(f, 1) == 0 then  -- airborne
-                    dval = aa_air_mag:get()
-                end
-            end
-        end
-        -- D: on-shot defensive — reduce desync briefly after fire
-        if on_shot then dval = math.max(15, math.floor(dval * 0.5)) end
-        cmd.desync_range = dval
+    -- yaw-jitter rhythm counter (drives indicator animation; flipped every N ticks)
+    aa_yaw_jitter_counter = aa_yaw_jitter_counter + 1
+    aa_jitter_counter     = aa_yaw_jitter_counter
+    local int = math.max(1, aa_yaw_mod_int:get())
+    if aa_yaw_jitter_counter % int == 0 then aa_jitter_dir = -aa_jitter_dir end
 
-        local dside = aa_desync_side:get()
-        if dside == "Left"   then cmd.desync_side = -1
-        elseif dside == "Right"  then cmd.desync_side = 1
-        elseif dside == "Random" then cmd.desync_side = (math.random(0,1) == 0) and -1 or 1
-        else cmd.desync_side = (math.floor(aa_yaw_jitter_counter / 4) % 2 == 0) and -1 or 1
+    -- base limit
+    local lim = aa_desync:get()
+
+    -- F: air desync override
+    if aa_air_set:get() then
+        local lp = entity.get_local_player()
+        if lp then
+            local f = 0
+            pcall(function() f = lp.m_fFlags or 0 end)
+            if bit.band(f, 1) == 0 then lim = aa_air_mag:get() end
         end
-        -- Freestanding
-        cmd.freestanding = aa_freestanding:get()
-    end)
+    end
+
+    -- D: on-shot defensive — reduce briefly after fire
+    if aa_onshot:get() and now < aa_state.on_shot_until then
+        lim = math.max(15, math.floor(lim * 0.5))
+    end
+
+    -- G: anti-BF variance (per-tick random offset, clamped 0..58)
+    local l_lim, r_lim = lim, lim
+    if aa_anti_bf:get() then
+        local var = aa_anti_bf_var:get()
+        l_lim = lim + (math.random() * 2 - 1) * var
+        r_lim = lim + (math.random() * 2 - 1) * var
+    end
+    if l_lim < 0 then l_lim = 0 elseif l_lim > 58 then l_lim = 58 end
+    if r_lim < 0 then r_lim = 0 elseif r_lim > 58 then r_lim = 58 end
+
+    -- Drive NL body-yaw limits + freestanding through verified :override path.
+    nl_override(nl_refs.aa_bodyyaw_l, math.floor(l_lim))
+    nl_override(nl_refs.aa_bodyyaw_r, math.floor(r_lim))
+    nl_override(nl_refs.aa_freestand, aa_freestanding:get())
 end
 
--- V1.7: first-found-wins event registration + log status. Previously we registered
--- the handler on all three event-name aliases, but if more than one exists the
--- later registration silently overwrites the earlier one and the first hook is
--- dead code. We track which name actually exists and log it once.
+-- V1.8: events.antiaim hook DELETED (writing to cmd userdata fields caused CTD).
+-- AA now flows entirely through aa_periodic_sync -> nl_override on NL UI refs.
 local _hooks_status = {}
 local function register_first(handler, ...)
     for _, name in ipairs({...}) do
@@ -494,7 +466,6 @@ local function register_first(handler, ...)
     end
     return nil
 end
-_hooks_status.aa        = register_first(aa_handler, "antiaim", "anti_aim", "aa")
 
 -- ══════════════════════════════════════════════════════════════════════════
 -- MOVEMENT — auto-peek, quick-stop, strafe nudge
@@ -599,6 +570,8 @@ local function createmove_unified(cmd)
     end
 
     createmove_handler(cmd)
+    -- V1.8: AA periodic sync (replaces aa_handler cmd-writes)
+    aa_periodic_sync()
     if enable_master:get() then
         nl_override(nl_refs.vis_hitmark_snd, vis_nl_hitsnd:get())
         nl_override(nl_refs.vis_thirdperson, vis_nl_3rd:get())
@@ -1259,13 +1232,8 @@ end)
 -- ══════════════════════════════════════════════════════════════════════════
 cs_log_color("══════════════════════════════════════════")
 cs_log_color("Sel01-Config v" .. SEL01_CFG_VERSION .. " loaded (CSGO HvH)")
--- V1.7: report which NL event names actually resolved on this build
-cs_log(string.format("  hooks  aa=%s  createmove=%s  aim_fire=%s",
-    tostring(_hooks_status.aa or "MISSING"),
+cs_log(string.format("  hooks  createmove=%s  aim_fire=%s",
     tostring(_hooks_status.createmove or "MISSING"),
     tostring(_hooks_status.aim_fire or "MISSING")))
-if not _hooks_status.aa then
-    cs_log_color("  WARNING: no antiaim event hook found — AA override will not fire")
-end
-cs_log_color("Pick a preset under Sel01-Config → Main")
+cs_log_color("  AA via NL :override path (no cmd writes). Pick preset → Main.")
 cs_log_color("══════════════════════════════════════════")
