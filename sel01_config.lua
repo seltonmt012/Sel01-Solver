@@ -1,17 +1,21 @@
 -- ╔══════════════════════════════════════════════════╗
--- ║  Sel01-Config — Neverlose CS2 AA + Misc + Visuals║
+-- ║  Sel01-Config — Neverlose CSGO HvH config        ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 1.5                                    ║
+-- ║  Version: 1.6                                    ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Config
 -- @author seltonmt01
--- @version 1.5
--- @description Hotfix: preset crash. Deferred to next-tick createmove (out of menu callback) + skip combo:set entirely.
+-- @version 1.6
+-- @description CSGO HvH companion: Spin preset replaces Legit, on-shot AA, air desync, anti-BF jitter,
+--              fake-duck assist on hostile-fire, animated gradient watermark, HvH state indicators,
+--              skeet-style hit log, color-coded damage popup, rotating AA indicator.
 
-local SEL01_CFG_VERSION = "1.5"
+local SEL01_CFG_VERSION = "1.6"
 
-local pui = require("neverlose/pui");
-local ffi = require("ffi");
+local pui      = require("neverlose/pui");
+local ffi      = require("ffi");
+local gradient = nil
+pcall(function() gradient = require("neverlose/gradient") end)
 
 local CS_PREFIX = "[Sel01-Config]"
 local function cs_log(msg)
@@ -46,7 +50,7 @@ local apply_preset_fwd
 local btn_aggressive = g_main:button("Aggressive (full send)",   function() apply_preset_fwd("aggressive") end)
 local btn_dynamic    = g_main:button("Dynamic (balanced)",       function() apply_preset_fwd("dynamic")    end)
 local btn_defensive  = g_main:button("Defensive (safe AA)",      function() apply_preset_fwd("defensive")  end)
-local btn_legit      = g_main:button("Legit-Bot (minimal AA)",   function() apply_preset_fwd("legit")      end)
+local btn_spin       = g_main:button("Spin (full spinbot)",      function() apply_preset_fwd("spin")       end)
 
 g_main:label(" ")
 local enable_master = g_main:switch(accent .. ui.get_icon"power" .. accent .. "  Master Enable (all features)", true)
@@ -67,6 +71,20 @@ local aa_desync      = g_aa:slider("Desync Range (deg)", 0, 60, 58)
 local aa_desync_side = g_aa:combo("Desync Side", {"Auto (alternate)", "Left", "Right", "Random"}, 1)
 local aa_freestanding= g_aa:switch("Freestanding (auto-best-side)", true)
 local aa_at_targets  = g_aa:switch("Yaw points at targets (At-Target mode)", false)
+g_aa:label(" ")
+g_aa:label(accent .. ui.get_icon"bolt" .. accent .. "  HvH extras")
+-- D: Force on-shot AA — different values during/after ragebot fire
+local aa_onshot      = g_aa:switch("Force on-shot AA (more defensive after fire)", true)
+local aa_onshot_dur  = g_aa:slider("On-shot duration (ms)", 100, 1500, 600)
+-- F: Air desync override
+local aa_air_set     = g_aa:switch("Air desync override (airborne = different AA)", true)
+local aa_air_mag     = g_aa:slider("Air desync magnitude (deg)", 10, 58, 35)
+-- G: Anti-bruteforce jitter variance
+local aa_anti_bf     = g_aa:switch("Anti-bruteforce jitter (random mag variance)", true)
+local aa_anti_bf_var = g_aa:slider("Anti-BF variance (deg)", 5, 25, 15)
+-- H: Fake-duck assist (uses resolver's V9.8 hostile-fire detection via shared event)
+local aa_fd_assist   = g_aa:switch("Fake-duck assist (auto on hostile-fire)", true)
+local aa_fd_duration = g_aa:slider("Fake-duck duration (ms)", 200, 2000, 800)
 
 -- ══════════════════════════════════════════════════════════════════════════
 -- MOVEMENT UI
@@ -238,6 +256,12 @@ local function _do_apply_preset(name)
         safe_set(aa_yaw_add, 0)
         safe_set(aa_yaw_mod_mag, 45)
         safe_set(aa_yaw_mod_int, 2)
+        safe_set(aa_onshot, true)
+        safe_set(aa_air_set, true)
+        safe_set(aa_air_mag, 35)
+        safe_set(aa_anti_bf, true)
+        safe_set(aa_anti_bf_var, 15)
+        safe_set(aa_fd_assist, true)
         safe_set(mv_strafe_help, true)
         safe_set(mv_nofall, true)
         safe_set(mv_fastladder, true)
@@ -266,6 +290,10 @@ local function _do_apply_preset(name)
         safe_set(aa_desync, 45)
         safe_set(aa_yaw_mod_mag, 28)
         safe_set(aa_yaw_mod_int, 3)
+        safe_set(aa_onshot, true)
+        safe_set(aa_air_set, true)
+        safe_set(aa_anti_bf, true)
+        safe_set(aa_fd_assist, true)
         safe_set(mv_strafe_help, true)
         safe_set(mv_nofall, true)
         safe_set(vis_watermark, true)
@@ -291,6 +319,10 @@ local function _do_apply_preset(name)
         safe_set(aa_desync, 35)
         safe_set(aa_yaw_mod_mag, 15)
         safe_set(aa_yaw_mod_int, 4)
+        safe_set(aa_onshot, true)
+        safe_set(aa_air_set, true)
+        safe_set(aa_anti_bf, false)  -- defensive = predictable static
+        safe_set(aa_fd_assist, true)
         safe_set(vis_watermark, true)
         safe_set(vis_indicators, true)
         safe_set(vis_velwarn, true)
@@ -308,25 +340,41 @@ local function _do_apply_preset(name)
         nl_override(nl_refs.fl_switch, true)
         nl_override(nl_refs.vis_hitmark_snd, true)
         cs_log_color("DEFENSIVE preset applied")
-    elseif name == "legit" then
-        safe_set(aa_enable, false)
+    elseif name == "spin" then
+        -- Full spinbot — fast yaw rotation, high-freq jitter, NO freestanding (we WANT spin)
+        safe_set(aa_enable, true)
+        safe_set(aa_freestanding, false)
+        safe_set(aa_at_targets, false)
+        safe_set(aa_desync, 58)
+        safe_set(aa_yaw_add, 0)
+        safe_set(aa_yaw_mod_mag, 58)
+        safe_set(aa_yaw_mod_int, 1)  -- every tick flip
+        safe_set(aa_onshot, false)   -- spin = always spin, no defensive interrupt
+        safe_set(aa_air_set, true)
+        safe_set(aa_air_mag, 58)
+        safe_set(aa_anti_bf, true)
+        safe_set(aa_anti_bf_var, 25)
+        safe_set(aa_fd_assist, true)
+        safe_set(mv_strafe_help, true)
+        safe_set(mv_nofall, true)
+        safe_set(mv_fastladder, true)
         safe_set(vis_watermark, true)
-        safe_set(vis_indicators, false)
-        safe_set(vis_velwarn, false)
-        safe_set(vis_aaarrows, false)
+        safe_set(vis_indicators, true)
+        safe_set(vis_velwarn, true)
+        safe_set(vis_aaarrows, true)
         safe_set(vis_hitmarker, true)
-        safe_set(vis_hitlog, false)
-        safe_set(vis_keybinds, false)
-        safe_set(vis_dmgind, false)
-        safe_set(vis_specoverlay, false)
-        safe_set(mv_nofall, false)
-        safe_set(mv_fastladder, false)
-        safe_set(qol_clantag, false)
-        safe_set(qol_killsay, false)
-        nl_override(nl_refs.aa_enabled, false)
+        safe_set(vis_hitlog, true)
+        safe_set(vis_keybinds, true)
+        safe_set(vis_dmgind, true)
+        safe_set(vis_specoverlay, true)
+        safe_set(qol_clantag, true)
+        safe_set(qol_autoaccept, true)
+        nl_override(nl_refs.aa_enabled, true)
         nl_override(nl_refs.aa_freestand, false)
-        nl_override(nl_refs.fl_switch, false)
-        cs_log_color("LEGIT-BOT preset applied")
+        nl_override(nl_refs.aa_avoidbackstab, false)
+        nl_override(nl_refs.fl_switch, true)
+        nl_override(nl_refs.vis_hitmark_snd, true)
+        cs_log_color("SPIN preset applied (full spinbot — no freestanding, max jitter)")
     end
 end
 
@@ -344,10 +392,20 @@ apply_preset_fwd = apply_preset  -- resolve forward-decl
 -- ══════════════════════════════════════════════════════════════════════════
 local aa_jitter_counter = 0
 local aa_jitter_dir = 1
+-- V1.6 HvH state — runtime flags shared with indicators + AA decisions
+local aa_state = {
+    on_shot_until = 0,   -- realtime; while > now, force defensive set
+    fakeduck_until = 0,  -- realtime; H assist
+    last_hostile_fire = 0,
+    last_fire_time = 0,
+}
 local function aa_handler(cmd)
     if not (enable_master:get() and aa_enable:get()) then return end
     if not cmd then return end
     pcall(function()
+        local now = globals.realtime or 0
+        local on_shot = aa_onshot:get() and (now < aa_state.on_shot_until)
+
         -- Pitch
         local pmode = aa_pitch:get()
         if pmode == "Down"             then cmd.pitch = -89
@@ -380,11 +438,30 @@ local function aa_handler(cmd)
             aa_jitter_counter = aa_jitter_counter + 1
             local int = math.max(1, aa_yaw_mod_int:get())
             if aa_jitter_counter % int == 0 then aa_jitter_dir = -aa_jitter_dir end
-            cmd.yaw_modifier = aa_jitter_dir * aa_yaw_mod_mag:get()
+            local mag = aa_yaw_mod_mag:get()
+            -- G: anti-bruteforce variance (random per-tick offset)
+            if aa_anti_bf:get() then
+                mag = mag + (math.random() * 2 - 1) * aa_anti_bf_var:get()
+            end
+            cmd.yaw_modifier = aa_jitter_dir * mag
         end
-        -- Desync
+        -- Desync — base value, then air override + on-shot override
         local dval = aa_desync:get()
+        -- F: air desync override (read airborne via lp.m_fFlags bit 1 = FL_ONGROUND)
+        if aa_air_set:get() then
+            local lp = entity.get_local_player()
+            if lp then
+                local f = 0
+                pcall(function() f = lp.m_fFlags or 0 end)
+                if bit.band(f, 1) == 0 then  -- airborne
+                    dval = aa_air_mag:get()
+                end
+            end
+        end
+        -- D: on-shot defensive — reduce desync briefly after fire
+        if on_shot then dval = math.max(15, math.floor(dval * 0.5)) end
         cmd.desync_range = dval
+
         local dside = aa_desync_side:get()
         if dside == "Left"   then cmd.desync_side = -1
         elseif dside == "Right"  then cmd.desync_side = 1
@@ -510,6 +587,10 @@ local function createmove_unified(cmd)
         if vis_nl_selfglw:get() then
             nl_override(nl_refs.vis_self_glow, true)
         end
+        -- V1.6 H: drive NL fake-duck via :override during hostile-fire window
+        if aa_fd_assist:get() and (globals.realtime or 0) < aa_state.fakeduck_until then
+            nl_override(nl_refs.aa_fakeduck, true)
+        end
     end
 end
 pcall(function() events.createmove:set(createmove_unified) end)
@@ -528,6 +609,55 @@ local hitmark_dmg  = 0
 -- time — without this forward-decl the closure would bind to a global of the same
 -- name (nil at call-time).
 local update_clantag = function() end
+
+-- V1.6 D: aim_fire / ragebot_fire → set on-shot timer for defensive AA window
+local function on_local_fire(event)
+    if not enable_master:get() then return end
+    if aa_onshot:get() then
+        local dur_ms = aa_onshot_dur:get() or 600
+        aa_state.on_shot_until = (globals.realtime or 0) + (dur_ms / 1000)
+    end
+    aa_state.last_fire_time = globals.realtime or 0
+end
+pcall(function() events.aim_fire:set(on_local_fire) end)
+pcall(function() events.ragebot_fire:set(on_local_fire) end)
+
+-- V1.6 H: weapon_fire → detect hostile enemy fire toward us → trigger fake-duck assist
+pcall(function()
+    events.weapon_fire:set(function(event)
+        if not (enable_master:get() and aa_fd_assist:get()) then return end
+        if not event or not event.userid then return end
+        local lp = entity.get_local_player()
+        if not lp or not lp:is_alive() then return end
+        local shooter = entity.get(event.userid, true)
+        if not shooter or shooter == lp then return end
+        if not shooter:is_enemy() or not shooter:is_alive() then return end
+        -- distance + crude aim-direction check
+        local sx, sy_o, sz, lx, ly, lz = 0, 0, 0, 0, 0, 0
+        local ok = pcall(function()
+            sx, sy_o, sz = shooter.m_vecOrigin.x, shooter.m_vecOrigin.y, shooter.m_vecOrigin.z
+            lx, ly, lz   = lp.m_vecOrigin.x,      lp.m_vecOrigin.y,      lp.m_vecOrigin.z
+        end)
+        if not ok then return end
+        local dx, dy, dz = lx - sx, ly - sy_o, lz - sz
+        local dist = math.sqrt(dx*dx + dy*dy + dz*dz)
+        if dist > 3500 then return end
+        local aimed = false
+        pcall(function()
+            local ang = shooter.m_angEyeAngles
+            local their = ang and (ang.y or ang[2])
+            if their then
+                local desired = math.deg(math.atan2(dy, dx))
+                local diff = math.abs(((their - desired + 180) % 360) - 180)
+                if diff < 35 then aimed = true end
+            end
+        end)
+        if aimed then
+            aa_state.last_hostile_fire = globals.realtime or 0
+            aa_state.fakeduck_until   = (globals.realtime or 0) + ((aa_fd_duration:get() or 800) / 1000)
+        end
+    end)
+end)
 
 -- Aim_ack — hit-marker trigger
 pcall(function()
@@ -554,11 +684,14 @@ pcall(function()
                                        [6]="leg", [7]="leg" }
                     hb_name = HB_NAMES[event.hitbox] or tostring(event.hitbox or "?")
                 end)
+                -- V1.6 K: skeet-style entry — also store wanted vs dealt damage
                 table.insert(hit_log, {
-                    time   = globals.realtime or 0,
-                    name   = target_name,
-                    dmg    = event.damage or 0,
-                    hitbox = hb_name,
+                    time      = globals.realtime or 0,
+                    name      = target_name,
+                    dmg       = event.damage or 0,
+                    dmg_want  = event.wanted_damage or event.requested_damage or event.damage or 0,
+                    hitbox    = hb_name,
+                    hitbox_id = event.hitbox or -1,
                 })
                 while #hit_log > HIT_LOG_MAX do table.remove(hit_log, 1) end
             end
@@ -583,11 +716,15 @@ pcall(function()
             oy = victim.m_vecOrigin.y
             oz = victim.m_vecOrigin.z + 70
         end)
+        -- V1.6 L: store hitbox group for color-coding
+        local hb = -1
+        pcall(function() hb = event.hitgroup or -1 end)
         table.insert(damage_pops, {
             time = globals.realtime or 0,
             dmg  = event.dmg_health or event.damage or 0,
             x = ox, y = oy, z = oz,
             hp_left = event.health or 0,
+            hitbox_id = hb,
         })
         -- prune to last 16 entries
         while #damage_pops > 16 do table.remove(damage_pops, 1) end
@@ -681,12 +818,10 @@ pcall(function()
             end
         end
 
-        -- ── MANUAL AA ARROWS (left + right desync side at crosshair) ──
+        -- ── V1.6 M: ROTATING AA INDICATOR (animated line around crosshair) ──
         if vis_aaarrows:get() then
             local lp = entity.get_local_player()
             if lp and lp:is_alive() then
-                -- read current desync side from NL bodyyaw inverter if available,
-                -- else fall back to our own aa_jitter_dir
                 local side = aa_jitter_dir or 1
                 pcall(function()
                     if nl_refs.aa_bodyyaw_inv then
@@ -694,16 +829,25 @@ pcall(function()
                         if type(v) == "boolean" then side = v and -1 or 1 end
                     end
                 end)
-                local lcol = (side < 0) and color(255, 230, 80, 255) or color(60, 60, 60, 140)
-                local rcol = (side > 0) and color(255, 230, 80, 255) or color(60, 60, 60, 140)
+                -- main desync arrow (color-coded by side: yellow=left, cyan=right)
+                local mcol = (side < 0) and color(255, 230, 80, 255) or color(80, 200, 255, 255)
+                local txt  = (side < 0) and "<" or ">"
+                local ox   = (side < 0) and -22 or 14
+                pcall(function() render.text(4, vector(cx + ox, cy - 6), mcol, nil, txt) end)
+                -- rotating accent line — small dash that spins with jitter_counter (animation)
+                local ang = (aa_jitter_counter * 0.35) + now * 1.8
+                local r1, r2 = 18, 28
+                local x1 = cx + math.cos(ang) * r1
+                local y1 = cy + math.sin(ang) * r1
+                local x2 = cx + math.cos(ang) * r2
+                local y2 = cy + math.sin(ang) * r2
                 pcall(function()
-                    render.text(4, vector(cx - 22, cy - 6), lcol, nil, "<")
-                    render.text(4, vector(cx + 14, cy - 6), rcol, nil, ">")
+                    render.line(vector(x1, y1), vector(x2, y2), color(120, 180, 255, 180))
                 end)
             end
         end
 
-        -- ── DAMAGE POPUPS (floating −X HP near victim, fade upward) ──
+        -- ── V1.6 L: COLOR-CODED DAMAGE POPUPS (head=red / chest=green / stomach=yellow / leg=blue) ──
         if vis_dmgind:get() then
             for i = #damage_pops, 1, -1 do
                 local pop = damage_pops[i]
@@ -713,11 +857,19 @@ pcall(function()
                 else
                     local alpha = math.floor(255 * (1 - age / DMGPOP_DURATION_S))
                     local yoff  = age * 30
+                    -- color by hitbox: 0=head, 3=chest, 4=stomach, 6/7=legs
+                    local r, g, b = 255, 200, 80
+                    local hb = pop.hitbox_id
+                    if hb == 0 then r, g, b = 255, 80, 80         -- head: red
+                    elseif hb == 3 then r, g, b = 120, 220, 120   -- chest: green
+                    elseif hb == 4 then r, g, b = 255, 220, 80    -- stomach: yellow
+                    elseif hb == 6 or hb == 7 then r, g, b = 120, 180, 255  -- legs: blue
+                    end
                     pcall(function()
                         local p2d = render.world_to_screen(vector(pop.x, pop.y, pop.z))
                         if p2d and p2d.x and p2d.x > 0 and p2d.y > 0 then
                             render.text(4, vector(p2d.x + 6, p2d.y - yoff),
-                                        color(255, 200, 80, alpha), nil,
+                                        color(r, g, b, alpha), nil,
                                         string.format("-%d HP", pop.dmg))
                             if pop.hp_left > 0 then
                                 render.text(3, vector(p2d.x + 6, p2d.y - yoff + 14),
@@ -730,7 +882,7 @@ pcall(function()
             end
         end
 
-        -- ── WATERMARK (top-right: user + FPS + ping + version) ──
+        -- ── V1.6 I: ANIMATED GRADIENT WATERMARK (color cycle via sine waves on RGB) ──
         if vis_watermark:get() then
             local lp_name = common and common.get_username and common.get_username() or "Player"
             local txt = string.format("Sel01 | %s | %d fps | %d ms", lp_name, perf.fps, perf.ping)
@@ -738,42 +890,77 @@ pcall(function()
             pcall(function() tw = render.measure_text(3, nil, txt).x end)
             local pad = 8
             local wx, wy = sx - tw - pad * 2 - 12, 12
+            -- animated RGB via 3 phase-shifted sine waves (no neverlose/gradient dep)
+            local t = now * 1.5
+            local g_r = math.floor(160 + 60 * math.sin(t))
+            local g_g = math.floor(160 + 60 * math.sin(t + 2.09))  -- +2pi/3
+            local g_b = math.floor(220 + 35 * math.sin(t + 4.19))  -- +4pi/3
             pcall(function()
-                render.rect(vector(wx, wy), vector(wx + tw + pad * 2, wy + 22), color(15, 15, 20, 200))
-                render.rect_outline(vector(wx, wy), vector(wx + tw + pad * 2, wy + 22), color(120, 180, 255, 220), 1)
-                render.text(3, vector(wx + pad, wy + 5), color(220, 230, 255, 255), nil, txt)
+                render.rect(vector(wx, wy), vector(wx + tw + pad * 2, wy + 22), color(15, 15, 20, 220))
+                render.rect_outline(vector(wx, wy), vector(wx + tw + pad * 2, wy + 22), color(g_r, g_g, g_b, 255), 1)
+                -- "Sel01" prefix gets the animated color, rest is white-ish
+                render.text(3, vector(wx + pad, wy + 5), color(g_r, g_g, g_b, 255), nil, "Sel01")
+                render.text(3, vector(wx + pad + 32, wy + 5), color(220, 230, 255, 255), nil,
+                            string.format("| %s | %d fps | %d ms", lp_name, perf.fps, perf.ping))
             end)
         end
 
-        -- ── BOTTOM STATE INDICATORS (DT/HS/BAIM/AA/FREE) ──
+        -- ── V1.6 J: HVH STATE INDICATORS (DT/HS/FAKE/MANUAL/DEF/ONSHOT/FREE/SW/FD) ──
         if vis_indicators:get() then
             local indicators = {}
-            -- AA enabled
             local aa_on = aa_enable:get()
-            if aa_on then table.insert(indicators, {txt = "AA",   col = color(120, 220, 120, 255)}) end
-            -- Double Tap (NL)
+            -- DT (Double Tap) — red, highest priority
             pcall(function()
                 if nl_refs.rage_dt and nl_refs.rage_dt:get() then
                     table.insert(indicators, {txt = "DT", col = color(255, 100, 100, 255)})
                 end
             end)
-            -- Hide Shots (NL)
+            -- HS (Hide Shots) — orange
             pcall(function()
                 if nl_refs.rage_hide and nl_refs.rage_hide:get() then
                     table.insert(indicators, {txt = "HS", col = color(255, 180, 80, 255)})
                 end
             end)
-            -- Freestanding
+            -- ON-SHOT — magenta pulse while window active
+            if aa_on and aa_onshot:get() and now < aa_state.on_shot_until then
+                local a = pulse_alpha(8)
+                table.insert(indicators, {txt = "ON-SHOT", col = color(255, 80, 200, a)})
+            end
+            -- FAKE-DUCK assist active — cyan pulse
+            if aa_fd_assist:get() and now < aa_state.fakeduck_until then
+                local a = pulse_alpha(6)
+                table.insert(indicators, {txt = "FD-ASSIST", col = color(80, 220, 255, a)})
+            end
+            -- AA basic
+            if aa_on then table.insert(indicators, {txt = "AA", col = color(120, 220, 120, 255)}) end
+            -- Manual side L / R from local desync_side combo
+            local mside = aa_desync_side:get()
+            if mside == "Left"  then table.insert(indicators, {txt = "MANUAL L", col = color(255, 230, 80, 255)}) end
+            if mside == "Right" then table.insert(indicators, {txt = "MANUAL R", col = color(80, 200, 255, 255)}) end
+            -- AIR override active when airborne
+            if aa_on and aa_air_set:get() then
+                local lp = entity.get_local_player()
+                if lp then
+                    local f = 0; pcall(function() f = lp.m_fFlags or 0 end)
+                    if bit.band(f, 1) == 0 then
+                        table.insert(indicators, {txt = "AIR", col = color(180, 220, 255, 220)})
+                    end
+                end
+            end
+            -- Anti-BF variance
+            if aa_on and aa_anti_bf:get() then
+                table.insert(indicators, {txt = "ANTI-BF", col = color(200, 180, 255, 220)})
+            end
+            -- FREE (Freestanding)
             if aa_on and aa_freestanding:get() then
                 table.insert(indicators, {txt = "FREE", col = color(180, 200, 255, 255)})
             end
-            -- Slow Walk (NL)
+            -- Slow Walk / Fake Duck (NL state)
             pcall(function()
                 if nl_refs.aa_slowwalk and nl_refs.aa_slowwalk:get() then
                     table.insert(indicators, {txt = "SW", col = color(255, 220, 120, 255)})
                 end
             end)
-            -- Fake Duck (NL)
             pcall(function()
                 if nl_refs.aa_fakeduck and nl_refs.aa_fakeduck:get() then
                     table.insert(indicators, {txt = "FD", col = color(255, 220, 120, 255)})
@@ -818,7 +1005,9 @@ pcall(function()
             end
         end
 
-        -- ── HIT LOG (top-left, last 5 shots, fade) ──
+        -- ── V1.6 K: SKEET-STYLE HIT LOG (top-left) ──
+        -- format:  > hit NAME in HITBOX for DMG (wanted WANT)
+        -- HITBOX gets hitbox-color (head red / chest green / etc), dmg gets damage-tier color
         if vis_hitlog:get() then
             local hx, hy = 16, 16
             local row = 0
@@ -829,10 +1018,41 @@ pcall(function()
                     table.remove(hit_log, i)
                 else
                     local alpha = math.floor(255 * (1 - age / HITLOG_DURATION_S))
-                    local txt = string.format("HIT %s  %d dmg  [%s]",
-                                              entry.name or "?", entry.dmg or 0, entry.hitbox or "?")
+                    local hb_id = entry.hitbox_id or -1
+                    local hb_r, hb_g, hb_b = 200, 200, 200
+                    if hb_id == 0 then hb_r, hb_g, hb_b = 255, 80, 80
+                    elseif hb_id == 3 then hb_r, hb_g, hb_b = 120, 220, 120
+                    elseif hb_id == 4 then hb_r, hb_g, hb_b = 255, 220, 80
+                    elseif hb_id == 6 or hb_id == 7 then hb_r, hb_g, hb_b = 120, 180, 255
+                    end
+                    local dmg = entry.dmg or 0
+                    local dmg_r, dmg_g, dmg_b = 220, 220, 220
+                    if dmg >= 100 then dmg_r, dmg_g, dmg_b = 255, 100, 100   -- 1-tap
+                    elseif dmg >= 70 then dmg_r, dmg_g, dmg_b = 255, 200, 80
+                    elseif dmg >= 40 then dmg_r, dmg_g, dmg_b = 200, 220, 120
+                    end
+                    -- Skeet-style: "> hit NAME in HITBOX for DMG (wanted WANT)"
+                    local y = hy + row * 14
                     pcall(function()
-                        render.text(3, vector(hx, hy + row * 14), color(160, 255, 160, alpha), nil, txt)
+                        render.text(3, vector(hx, y), color(160, 160, 160, alpha), nil, ">")
+                        render.text(3, vector(hx + 10, y), color(220, 220, 220, alpha), nil, "hit")
+                        render.text(3, vector(hx + 30, y), color(180, 220, 255, alpha), nil, entry.name or "?")
+                        local nw = 0
+                        pcall(function() nw = render.measure_text(3, nil, entry.name or "?").x end)
+                        render.text(3, vector(hx + 34 + nw, y), color(220, 220, 220, alpha), nil, "in")
+                        render.text(3, vector(hx + 50 + nw, y), color(hb_r, hb_g, hb_b, alpha), nil, entry.hitbox or "?")
+                        local hw = 0
+                        pcall(function() hw = render.measure_text(3, nil, entry.hitbox or "?").x end)
+                        render.text(3, vector(hx + 54 + nw + hw, y), color(220, 220, 220, alpha), nil, "for")
+                        render.text(3, vector(hx + 74 + nw + hw, y), color(dmg_r, dmg_g, dmg_b, alpha), nil,
+                                    tostring(dmg))
+                        local dw = 0
+                        pcall(function() dw = render.measure_text(3, nil, tostring(dmg)).x end)
+                        if entry.dmg_want and entry.dmg_want > dmg then
+                            render.text(3, vector(hx + 78 + nw + hw + dw, y),
+                                        color(150, 150, 150, alpha), nil,
+                                        string.format("(wanted %d)", entry.dmg_want))
+                        end
                     end)
                     row = row + 1
                 end
