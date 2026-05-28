@@ -1,14 +1,14 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 9.6                                    ║
+-- ║  Version: 9.7                                    ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 9.6
--- @description Faster head-find + delta=0 bug fix + LBY auto-flip + streak hardening
+-- @version 9.7
+-- @description Still-Alt for switch-AA stationary + still/slow hard-reset on yaw spike
 
-local SEL01_VERSION = "9.6"
+local SEL01_VERSION = "9.7"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -2305,6 +2305,24 @@ local function _pick_first_shot_impl(p, s, anim, eye_yaw, max_desync, preset)
     if s.is_slow_target then
         -- V8.4: STATIONARY → server-yaw is most reliable for standing-still
         if s.is_stationary then
+            -- V9.7: switch-AA stationary with hit-data → ALTERNATE side (prev: Still-Server/Still-Meas stuck on last-hit side, BF:opposite kept saving us)
+            local sw_both = (s.samples_left or 0) >= 1 and (s.samples_right or 0) >= 1
+            local sw_corr = ((s.correction_left or 0) + (s.correction_right or 0)) >= 2
+            if s.aa_type == "switch" and s.last_hit_side ~= 0 and (sw_both or sw_corr) then
+                local side = -s.last_hit_side
+                local mag
+                if side > 0 and (s.samples_right or 0) >= 1 and (s.measured_right or 0) > 5 then
+                    mag = s.measured_right
+                elseif side < 0 and (s.samples_left or 0) >= 1 and (s.measured_left or 0) > 5 then
+                    mag = s.measured_left
+                elseif (s.measured_desync or 0) > 5 then
+                    mag = s.measured_desync
+                else
+                    mag = 29
+                end
+                s.mode = "Still-Alt"
+                return eye_yaw + mag * side
+            end
             local sy = RebuildServerYaw(p)
             local sy_delta = NormalizeAngle(sy - eye_yaw)
             if math.abs(sy_delta) >= 5 and math.abs(sy_delta) <= 65 then
@@ -2812,9 +2830,10 @@ local function resolve_player(p)
 
     update_jitter(p, s)
 
-    -- V7.8 + V8.4: slow-walker + fully-stationary detection
+    -- V7.8 + V8.4 + V9.7: slow-walker + fully-stationary detection
     -- slow-walker: velocity < 35 + yaw < 30 for 10+ ticks
-    -- stationary: velocity < 5 + yaw < 5 for 10+ ticks (much tighter, completely still)
+    -- stationary: velocity < 5 + yaw < 5 for 8+ ticks (much tighter, completely still)
+    -- V9.7: HARD-RESET both counters on big spike (>100°/s yaw or >50u/s velocity) — prevents stale flag for ~280ms after sudden break-out
     do
         local sp = 0
         pcall(function()
@@ -2822,19 +2841,24 @@ local function resolve_player(p)
             sp = math.sqrt((v.x or 0)^2 + (v.y or 0)^2)
         end)
         local yr = math.abs(s.yaw_rate or 0)
-        if sp < 35 and yr < 30 then
-            s.slow_ticks = math.min((s.slow_ticks or 0) + 1, 64)
+        local spike = yr > 100 or sp > 50
+        if spike then
+            s.slow_ticks = 0
+            s.still_ticks = 0
         else
-            s.slow_ticks = math.max((s.slow_ticks or 0) - 2, 0)
+            if sp < 35 and yr < 30 then
+                s.slow_ticks = math.min((s.slow_ticks or 0) + 1, 64)
+            else
+                s.slow_ticks = math.max((s.slow_ticks or 0) - 2, 0)
+            end
+            if sp < 5 and yr < 5 then
+                s.still_ticks = math.min((s.still_ticks or 0) + 1, 64)
+            else
+                s.still_ticks = math.max((s.still_ticks or 0) - 3, 0)
+            end
         end
-        s.is_slow_target = s.slow_ticks >= 10   -- V8.4: faster commit (was 20)
-        -- V8.4: fully-stationary flag (completely still, no aim movement)
-        if sp < 5 and yr < 5 then
-            s.still_ticks = math.min((s.still_ticks or 0) + 1, 64)
-        else
-            s.still_ticks = math.max((s.still_ticks or 0) - 3, 0)
-        end
-        s.is_stationary = (s.still_ticks or 0) >= 8
+        s.is_slow_target = (s.slow_ticks or 0) >= 10
+        s.is_stationary  = (s.still_ticks or 0) >= 8
     end
 
     -- AA-classify periodically — V9.0: stronger hysteresis (5 consecutive + 1s post-commit lock)
