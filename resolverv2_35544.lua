@@ -1,14 +1,14 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 9.9                                    ║
+-- ║  Version: 9.10                                   ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 9.9
--- @description Bulk easy-wins: dominant-side boost, 2-miss blacklist, crouch hitbox, hostile HUD, perf cache, sym low-conf, bt-fail penalty, yaw-consistent extrap
+-- @version 9.10
+-- @description Log buffer cap 80->200 + AA-type hysteresis tightened (7 consecutive + 2s lockout) to stop classifier flap
 
-local SEL01_VERSION = "9.9"
+local SEL01_VERSION = "9.10"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -410,7 +410,9 @@ local log_enabled      = g_logging:switch(accent .. ui.get_icon"link-slash" .. a
 local log_verbose      = g_logging:switch(accent .. ui.get_icon"sliders"    .. accent .. "  Verbose (per-shot)", false)
 local log_debug        = g_logging:switch(accent .. ui.get_icon"link-slash" .. accent .. "  DEBUG MODE (full dump)", false)
 -- V7.1 + V9.3: log-buffer as ring (O(1) push). All state in single table to save locals.
-local log_buffer = { cap = 80, head = 0, count = 0 }
+-- V9.10: cap 80 -> 200. User reported "not all logs sent" — bigger ring keeps more
+-- aa-commit / hit / miss / snapshot history in the copy-logs dump for long sessions.
+local log_buffer = { cap = 200, head = 0, count = 0 }
 local function log_buffer_push(line)
     log_buffer.head = (log_buffer.head % log_buffer.cap) + 1
     log_buffer[log_buffer.head] = line
@@ -2913,19 +2915,33 @@ local function resolve_player(p)
         s.is_stationary  = (s.still_ticks or 0) >= 8
     end
 
-    -- AA-classify periodically — V9.0: stronger hysteresis (5 consecutive + 1s post-commit lock)
+    -- AA-classify periodically — V9.10: 7 consecutive + 2s lockout (V9.0 was 5+1s).
+    -- User logs showed idx=14 committing static->jitter->static->jitter rapidly — too
+    -- many false flips. Higher consecutive threshold + longer lockout stabilizes classification.
+    -- Also: V9.10 anti-flap protection — if same player commits >3 times within 10s,
+    -- freeze the classifier for 5s.
     if exp_aa_classify and exp_aa_classify:get() then
         local now_rt = globals.realtime or 0
-        local commit_lock_active = (s.aa_committed_at or 0) > 0 and (now_rt - s.aa_committed_at) < 1.0
+        local commit_lock_active = (s.aa_committed_at or 0) > 0 and (now_rt - s.aa_committed_at) < 2.0
         if s.aa_classify_cd <= 0 and not commit_lock_active then
             local new_type = classify_aa(s)
-            -- V5+V9.0: require 5 consecutive (was 3) before flipping committed type
             if new_type == s.pending_aa_type then
                 s.pending_aa_count = s.pending_aa_count + 1
-                if s.pending_aa_count >= 5 and s.aa_type ~= new_type then
+                if s.pending_aa_count >= 7 and s.aa_type ~= new_type then
                     s.aa_type = new_type
-                    s.aa_committed_at = now_rt  -- V9.0: lock-out 1s before next change
-                    cs_log_verbose("aa_type commit idx=%d → %s", p:get_index(), new_type)
+                    s.aa_committed_at = now_rt
+                    -- V9.10 anti-flap: track commits in 10s window; freeze 5s if >3
+                    s.commit_history = s.commit_history or {}
+                    table.insert(s.commit_history, now_rt)
+                    while #s.commit_history > 0 and (now_rt - s.commit_history[1]) > 10 do
+                        table.remove(s.commit_history, 1)
+                    end
+                    if #s.commit_history > 3 then
+                        s.aa_committed_at = now_rt + 5  -- freeze 5s on top of normal lock
+                        cs_log_verbose("aa_type FREEZE idx=%d (>3 flaps in 10s)", p:get_index())
+                    else
+                        cs_log_verbose("aa_type commit idx=%d → %s", p:get_index(), new_type)
+                    end
                 end
             else
                 s.pending_aa_type = new_type
