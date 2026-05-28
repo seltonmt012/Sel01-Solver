@@ -1,14 +1,14 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 9.8                                    ║
+-- ║  Version: 9.9                                    ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 9.8
--- @description Counter-fire detection — enemy shoots at us → bypass cancel-conf + force fire attempt
+-- @version 9.9
+-- @description Bulk easy-wins: dominant-side boost, 2-miss blacklist, crouch hitbox, hostile HUD, perf cache, sym low-conf, bt-fail penalty, yaw-consistent extrap
 
-local SEL01_VERSION = "9.8"
+local SEL01_VERSION = "9.9"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -172,7 +172,7 @@ local SteamMemory  = {}
 local LearnedModel = {}
 local mode_stats   = {}
 local PlayerState  = setmetatable({}, {__index = function() return nil end})
-local tick_cache   = { tick = -1, curtime = 0, frametime = 0, tickint = 1/64, lp = nil, lp_yaw = 0, lp_ox = 0, lp_oy = 0, lp_oz = 0, valid = false, ping_ms = 0 }
+local tick_cache   = { tick = -1, curtime = 0, frametime = 0, tickint = 1/64, lp = nil, lp_yaw = 0, lp_ox = 0, lp_oy = 0, lp_oz = 0, valid = false, ping_ms = 0, wc = nil, lp_ducking = false }
 local NormalizeAngle
 NormalizeAngle = function(angle)
     if angle == nil then return 0 end
@@ -793,7 +793,20 @@ confidence = function(s)
         elseif mr >= 25 then miss_pen = 10  -- below 75% hit → small
         end
     end
-    local raw = sample_score + sd_score - age_pen - miss_pen + 10
+    -- V9.9-A: DOMINANT-SIDE BOOST — when one side has >=3 more REAL hits than other,
+    -- side-pick is clearly trustworthy → +15 conf bonus.
+    local hit_l, hit_r = s.real_left or 0, s.real_right or 0
+    local dom_bonus = 0
+    if math.abs(hit_l - hit_r) >= 3 then dom_bonus = 15 end
+    -- V9.9-F: SYMMETRIC-DATA LOW-CONF — when L and R have similar magnitudes (<5° diff)
+    -- AND small sample count (each side <=2), the true side is genuinely unknown. Drop -20.
+    local sym_pen = 0
+    if (s.samples_left or 0) >= 1 and (s.samples_right or 0) >= 1
+       and (s.samples_left or 0) <= 2 and (s.samples_right or 0) <= 2 then
+        local ml, mr = s.measured_left or 0, s.measured_right or 0
+        if math.abs(ml - mr) < 5 then sym_pen = 20 end
+    end
+    local raw = sample_score + sd_score - age_pen - miss_pen + 10 + dom_bonus - sym_pen
     -- additionally clamp ceiling to 65 if recent_miss_rate >= 50
     if n_recent >= 4 and (s.recent_miss_rate or 0) >= 50 then
         if raw > 50 then raw = 50 end
@@ -1800,11 +1813,39 @@ events.aim_ack:set(function(event)
     end
     -- V6.5: skip non-resolver-fault states (death, damage rejection, etc.)
     if reason and NON_RESOLVER_MISS[reason] then
+        -- V9.9-G: BACKTRACK-FAIL PENALTY — count backtrack failures per-player.
+        -- After 3+ failures, mark player as backtrack-resistant so extrapolation predict_ticks -1.
+        if tostring(reason):lower():find("backtrack") then
+            s.bt_fail_count = (s.bt_fail_count or 0) + 1
+            if s.bt_fail_count >= 3 then
+                s.backtrack_resistant = true
+                cs_log_verbose("backtrack-resistant idx=%d (bt_fails=%d) — predict_ticks-1",
+                               Ent:get_index(), s.bt_fail_count)
+            end
+        end
         cs_log_verbose("aim_ack reason=%s — not counting (not resolver fault)", tostring(reason))
         return
     end
     if not is_hit then
         s.missed = s.missed + 1
+        -- V9.9-B: 2-MISS MODE-BLACKLIST — track misses per mode within engagement.
+        -- After 2 misses with same base mode, blacklist it for 3 ticks so alternate path runs.
+        do
+            local mode_clean = tostring(s.mode or ""):gsub("%+Pred","")
+                                                     :gsub("%-DefInv","")
+                                                     :gsub("%-Recall","")
+                                                     :gsub("%-CorrFlip","")
+            if mode_clean ~= "" then
+                s.mode_misses = s.mode_misses or {}
+                s.mode_blacklist_until = s.mode_blacklist_until or {}
+                s.mode_misses[mode_clean] = (s.mode_misses[mode_clean] or 0) + 1
+                if s.mode_misses[mode_clean] >= 2 then
+                    s.mode_blacklist_until[mode_clean] = (globals.tickcount or 0) + 192  -- 3s @64-tick window
+                    cs_log_verbose("mode-blacklist idx=%d mode=%s misses=%d -> banned 192 ticks",
+                                   Ent:get_index(), mode_clean, s.mode_misses[mode_clean])
+                end
+            end
+        end
         steam_mem_on_miss(Ent)
         -- defensive-AA hint: enemy moved post-fire ("spread" state)
         if reason == "spread" and exp_def_aa and exp_def_aa:get() then
@@ -1874,6 +1915,15 @@ events.aim_ack:set(function(event)
             )
         end
     else
+        -- V9.9-B: clear mode-blacklist + miss-counter on HIT (mode proven working)
+        if s.mode_misses then
+            local mode_clean = tostring(s.mode or ""):gsub("%+Pred","")
+                                                     :gsub("%-DefInv","")
+                                                     :gsub("%-Recall","")
+                                                     :gsub("%-CorrFlip","")
+            s.mode_misses[mode_clean] = 0
+            if s.mode_blacklist_until then s.mode_blacklist_until[mode_clean] = 0 end
+        end
         -- HIT: prefer snapshot from aim_fire if available (accurate per-shot state)
         local src_eye, src_res = s.last_eye_yaw, s.last_resolved
         if exp_aim_fire_snap and exp_aim_fire_snap:get() and #s.shot_snapshots > 0 then
@@ -2236,32 +2286,27 @@ local function _pick_first_shot_impl(p, s, anim, eye_yaw, max_desync, preset)
             if d > 1800 then ticks = ticks + 1
             elseif d < 400 then ticks = math.max(1, ticks - 1)
             end
-            -- V9.3: per-weapon predict scaling
-            local lp_wpn_cls = nil
-            pcall(function()
-                local lp = entity.get_local_player()
-                if lp then
-                    local w = lp:get_weapon()
-                    local name = w and ((w.get_class_name and w:get_class_name()) or (w.get_name and w:get_name())) or ""
-                    name = tostring(name):lower()
-                    if name:find("awp") or name:find("ssg") or name:find("scout") then lp_wpn_cls = "sniper"
-                    elseif name:find("deagle") or name:find("revolver") then lp_wpn_cls = "heavy_pistol"
-                    elseif name:find("glock") or name:find("usp") or name:find("p250") or name:find("cz") or name:find("five") or name:find("tec") then lp_wpn_cls = "pistol"
-                    elseif name:find("ak47") or name:find("m4") or name:find("aug") or name:find("sg") then lp_wpn_cls = "auto"
-                    end
-                end
-            end)
+            -- V9.3 + V9.9-E: per-weapon predict scaling via tick-cached get_weapon_class()
+            local lp_wpn_cls = get_weapon_class()
             if lp_wpn_cls == "sniper" then ticks = ticks + 1     -- 1-tap needs precise predict
-            elseif lp_wpn_cls == "pistol" then ticks = math.max(1, ticks - 1)  -- light gun = less commit
+            elseif lp_wpn_cls == "heavy_pistol" or lp_wpn_cls == "other" then
+                -- 'other' covers pistols/smgs — light commit
+                if lp_wpn_cls == "other" then ticks = math.max(1, ticks - 1) end
             end
             -- V7.0: locked target — gentle +1 bonus
             local total_samp = (s.samples_left or 0) + (s.samples_right or 0)
             if total_samp >= 8 and p_conf >= 60 then ticks = ticks + 1 end
+            -- V9.9-H: yaw-rate-consistent target with stable buffer → +1 tick lead (clean signal)
+            if s.yaw_rate_consistent and s.yaw_rate_buf and #s.yaw_rate_buf >= 6 then
+                ticks = ticks + 1
+            end
+            -- V9.9-G: backtrack-resistant player → -1 tick (NL backtrack can't replay them)
+            if s.backtrack_resistant then ticks = math.max(1, ticks - 1) end
             ticks = math.max(1, math.min(4, ticks))   -- hard cap 4 (was 6)
-            -- peek-snap reduces
+            -- peek-snap reduces — V9.9-E: use tick_cache.lp
             local lp_peek = false
             pcall(function()
-                local lp = entity.get_local_player()
+                local lp = tick_cache.lp or entity.get_local_player()
                 if lp then
                     local v = lp.m_vecVelocity
                     local sp = math.sqrt((v.x or 0)^2 + (v.y or 0)^2)
@@ -2282,16 +2327,20 @@ local function _pick_first_shot_impl(p, s, anim, eye_yaw, max_desync, preset)
         end
     end
 
-    -- V7.7 + V8.9: KNOWN-PLAYER FAST-PATH — use historical best-mode for current aa_type
+    -- V7.7 + V8.9 + V9.9-B: KNOWN-PLAYER FAST-PATH — use historical best-mode for current aa_type
     -- V8.9 fix: strip existing -Recall suffix before appending to avoid name explosion
+    -- V9.9-B: skip if mode is currently blacklisted (2+ misses within blacklist window)
     if s.boot_best_modes and s.aa_type and s.boot_best_modes[s.aa_type] then
         local best = s.boot_best_modes[s.aa_type]
         if best and best ~= "" then
-            if best:find("Static") or best:find("Jitter%-Cls") or best:find("Jitter%-Lock") then
+            local clean = best:gsub("%-Recall", "")
+            local blacklisted = false
+            if s.mode_blacklist_until and (s.mode_blacklist_until[clean] or 0) > (globals.tickcount or 0) then
+                blacklisted = true
+            end
+            if not blacklisted and (best:find("Static") or best:find("Jitter%-Cls") or best:find("Jitter%-Lock")) then
                 if s.measured_desync > 5 then
                     local side = s.last_hit_side ~= 0 and s.last_hit_side or 1
-                    -- V8.9: clean recall — strip any prior -Recall suffix chain, append single
-                    local clean = best:gsub("%-Recall", "")
                     s.mode = clean .. "-Recall"
                     return eye_yaw + s.measured_desync * side
                 end
@@ -2668,6 +2717,8 @@ tick_cache.lp_oy     = 0
 tick_cache.lp_oz     = 0
 tick_cache.valid     = false
 tick_cache.ping_ms   = 0
+tick_cache.wc        = nil    -- V9.9-E: weapon-class cache (avoid repeated FFI in ragebot_target hot-path)
+tick_cache.lp_ducking= false  -- V9.9-C: local crouch flag
 local function refresh_tick_cache()
     local tick = globals.tickcount or 0
     if tick == tick_cache.tick then return tick_cache.valid end
@@ -2677,6 +2728,7 @@ local function refresh_tick_cache()
     tick_cache.tickint   = globals.tickinterval or (1/64)
     local lp = entity.get_local_player()
     tick_cache.lp = lp
+    tick_cache.wc = nil  -- invalidate every tick — weapon may swap mid-tick (edge-case rare but cheap)
     if lp then
         local ang_ok, ang = pcall(function() return lp:get_angles() end)
         tick_cache.lp_yaw = (ang_ok and ang and ang.y) or 0
@@ -3178,22 +3230,36 @@ local function resolve_stddev(s)
     return math.sqrt(sq_sum / n)
 end
 
--- V3: weapon class detection for per-weapon presets
+-- V3 + V9.9-E: weapon class detection — tick-cached to avoid 3-5x FFI calls per ragebot_target stack
 local function get_weapon_class()
-    local lp = entity.get_local_player()
-    if not lp then return nil end
+    -- V9.9-E: serve from tick_cache if already resolved this tick
+    if tick_cache and tick_cache.wc ~= nil then
+        return (tick_cache.wc ~= false) and tick_cache.wc or nil
+    end
+    local lp = (tick_cache and tick_cache.lp) or entity.get_local_player()
+    if not lp then
+        if tick_cache then tick_cache.wc = false end
+        return nil
+    end
     local ok, name = pcall(function()
         local w = lp:get_weapon()
         if not w then return nil end
         local cn = (w.get_class_name and w:get_class_name()) or (w.get_name and w:get_name()) or ""
         return tostring(cn):lower()
     end)
-    if not ok or not name or name == "" then return nil end
-    if name:find("awp") or name:find("ssg") or name:find("scout") then return "sniper" end
-    if name:find("ak47") or name:find("m4") or name:find("aug") or name:find("sg") or name:find("famas") or name:find("galil") then return "auto" end
-    if name:find("deagle") or name:find("revolver") or name:find("r8") then return "heavy_pistol" end
-    if name:find("knife") or name:find("bayonet") or name:find("karambit") then return "knife" end
-    return "other"
+    if not ok or not name or name == "" then
+        if tick_cache then tick_cache.wc = false end
+        return nil
+    end
+    local cls
+    if name:find("awp") or name:find("ssg") or name:find("scout") then cls = "sniper"
+    elseif name:find("ak47") or name:find("m4") or name:find("aug") or name:find("sg") or name:find("famas") or name:find("galil") then cls = "auto"
+    elseif name:find("deagle") or name:find("revolver") or name:find("r8") then cls = "heavy_pistol"
+    elseif name:find("knife") or name:find("bayonet") or name:find("karambit") then cls = "knife"
+    else cls = "other"
+    end
+    if tick_cache then tick_cache.wc = cls end
+    return cls
 end
 
 -- V3: hitbox-chain attempt (head → chest → stomach)
@@ -3224,8 +3290,8 @@ pcall(function()
         current_target.aa_type   = intel.aa_type or "?"
         current_target.time      = globals.curtime or 0
 
-        -- V5 #1: SHOT-COOLDOWN AWARENESS (SSG/sniper reload-skip)
-        local lp = entity.get_local_player()
+        -- V5 #1: SHOT-COOLDOWN AWARENESS (SSG/sniper reload-skip) — V9.9-E: tick-cached lp
+        local lp = tick_cache.lp or entity.get_local_player()
         if lp then
             local cooldown_skip = false
             pcall(function()
@@ -3401,6 +3467,15 @@ pcall(function()
                            target:get_index(), intel.conf, intel.samples, fast_hc)
         end
 
+        -- V9.9-C: CROUCH-AWARE HITBOX — target ducked → head harder to hit (smaller + lower).
+        -- Detect FL_DUCKING (bit 1 of m_fFlags). Used by HEAD-STRICT to swap head→chest,
+        -- and by all other hitbox modes to widen multipoint scale for body coverage.
+        local target_crouched = false
+        pcall(function()
+            local tflags = target.m_fFlags or 0
+            if bit.band(tflags, 2) ~= 0 then target_crouched = true end
+        end)
+
         -- NOSPREAD MODE: head every shot, hitchance 1%, min-dmg 100, no multipoint, no safepoint
         if exp_nospread and exp_nospread:get() then
             pcall(function() ctx:override_hitbox(0) end)            -- head ALWAYS
@@ -3409,14 +3484,23 @@ pcall(function()
             pcall(function() ctx:override_safe_point(false) end)
             pcall(function() ctx:override_multipoint(false) end)
             cs_log_verbose("NOSPREAD head-shot mode=%s missed=%d", tostring(s and s.mode), s and s.missed or 0)
-        -- V7.9: HEADSHOT-ONLY STRICT (normal spread server) — head every shot, reasonable hc
+        -- V7.9 + V9.9-C: HEADSHOT-ONLY STRICT — head every shot.
+        -- Crouched target swaps to chest (head too low/occluded when ducked), tighter hc + higher mindmg.
         elseif exp_head_strict and exp_head_strict:get() then
-            pcall(function() ctx:override_hitbox(0) end)            -- head ALWAYS
-            pcall(function() ctx:override_hitchance(45) end)        -- reasonable for spread
-            pcall(function() ctx:override_min_damage(30) end)
+            if target_crouched then
+                pcall(function() ctx:override_hitbox(3) end)        -- chest (head occluded when crouched)
+                pcall(function() ctx:override_hitchance(40) end)
+                pcall(function() ctx:override_min_damage(50) end)
+            else
+                pcall(function() ctx:override_hitbox(0) end)        -- head ALWAYS
+                pcall(function() ctx:override_hitchance(45) end)
+                pcall(function() ctx:override_min_damage(30) end)
+            end
             pcall(function() ctx:override_safe_point(false) end)
             pcall(function() ctx:override_multipoint(false) end)
-            cs_log_verbose("HEAD-STRICT head-shot mode=%s missed=%d", tostring(s and s.mode), s and s.missed or 0)
+            cs_log_verbose("HEAD-STRICT %s mode=%s missed=%d",
+                           target_crouched and "CHEST(crouched)" or "head",
+                           tostring(s and s.mode), s and s.missed or 0)
         -- AGGRESSIVE HEAD-FOCUS: bias toward head via multipoint + low hitchance + low min-dmg
         elseif exp_head_focus and exp_head_focus:get() and mode_str() == "Aggressive" and s and s.missed == 0 then
             -- V3 #11: try hitbox-chain first, fallback to single head override
@@ -3672,9 +3756,18 @@ local esp_paint_handler = function()
             elseif samples >= 4 then
                 lock_tag = " ★"
             end
+            -- V9.9-D: HOSTILE-FIRE INDICATOR — show ⚡FIRED when V9.8 counter-fire window active
+            local hostile_tag = ""
+            if target_s and (target_s.last_hostile_fire or 0) > 0 then
+                local ticks_since = (globals.tickcount or 0) - target_s.last_hostile_fire
+                if ticks_since >= 0 and ticks_since <= 64 then
+                    hostile_tag = " ⚡FIRED"
+                    cr, cg, cb = 255, 180, 80  -- orange = counter-fire active
+                end
+            end
             render.text(3, vector(x0, y0 + line_h * 7 + 2), color(cr, cg, cb, 255), nil,
-                string.format("→Target #%d %s %d%%%s [%s] %s",
-                    current_target.idx, marker, current_target.conf, lock_tag,
+                string.format("→Target #%d %s %d%%%s%s [%s] %s",
+                    current_target.idx, marker, current_target.conf, lock_tag, hostile_tag,
                     tostring(current_target.aa_type), tostring(current_target.mode)))
         end
 
