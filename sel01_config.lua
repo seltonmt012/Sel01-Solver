@@ -1,16 +1,15 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Config — Neverlose CSGO HvH config        ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 1.8                                    ║
+-- ║  Version: 1.9                                    ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Config
 -- @author seltonmt01
--- @version 1.8
--- @description CRASH FIX: drop aa_handler cmd-field writes (NL panic on unknown fields). AA values now flow
---              through NL UI refs only, same path JAG0YAW + bloodwings use. Air desync, on-shot, anti-BF
---              variance now drive nl_refs.aa_bodyyaw_l/r via :override every tick.
+-- @version 1.9
+-- @description Spawn-crash fix: throttle periodic sync 16Hz, skip writes when no override active,
+--              outer-pcall weapon_fire/player_hurt, fake-duck assist default OFF.
 
-local SEL01_CFG_VERSION = "1.8"
+local SEL01_CFG_VERSION = "1.9"
 
 local pui      = require("neverlose/pui");
 local ffi      = require("ffi");
@@ -82,8 +81,9 @@ local aa_air_mag     = g_aa:slider("Air desync magnitude (deg)", 10, 58, 35)
 -- G: Anti-bruteforce jitter variance
 local aa_anti_bf     = g_aa:switch("Anti-bruteforce jitter (random mag variance)", true)
 local aa_anti_bf_var = g_aa:slider("Anti-BF variance (deg)", 5, 25, 15)
--- H: Fake-duck assist (uses resolver's V9.8 hostile-fire detection via shared event)
-local aa_fd_assist   = g_aa:switch("Fake-duck assist (auto on hostile-fire)", true)
+-- H: Fake-duck assist (V1.9: default OFF — hooks events.weapon_fire which fires for
+-- audio/init events on spawn, suspected contributor to v1.8 spawn-crash)
+local aa_fd_assist   = g_aa:switch("Fake-duck assist (auto on hostile-fire)", false)
 local aa_fd_duration = g_aa:slider("Fake-duck duration (ms)", 200, 2000, 800)
 
 -- ══════════════════════════════════════════════════════════════════════════
@@ -410,50 +410,53 @@ local aa_state = {
     last_fire_time = 0,
 }
 
--- V1.8: drives NL Body Yaw Left/Right Limit every createmove tick.
--- Combines: base desync slider, air override, on-shot defensive, anti-BF variance.
+-- V1.9: throttled 16Hz + skip NL writes when no override active. Previous v1.8 wrote
+-- to NL body_yaw_l/r EVERY createmove tick (~64Hz) which is the suspected spawn-crash
+-- cause (GC pressure or :override re-entry on a freshly-spawned UI state).
+local aa_periodic_last_tick = 0
 local function aa_periodic_sync()
     if not (enable_master:get() and aa_enable:get()) then return end
-    local now = globals.realtime or 0
-
-    -- yaw-jitter rhythm counter (drives indicator animation; flipped every N ticks)
+    local tick = globals.tickcount or 0
+    -- jitter rhythm counter (drives indicator animation only — runs every tick, cheap)
     aa_yaw_jitter_counter = aa_yaw_jitter_counter + 1
     aa_jitter_counter     = aa_yaw_jitter_counter
-    local int = math.max(1, aa_yaw_mod_int:get())
-    if aa_yaw_jitter_counter % int == 0 then aa_jitter_dir = -aa_jitter_dir end
+    local jint = math.max(1, aa_yaw_mod_int:get())
+    if aa_yaw_jitter_counter % jint == 0 then aa_jitter_dir = -aa_jitter_dir end
+    -- THROTTLE: write to NL refs at most every 4 ticks (~16Hz on a 64-tick server)
+    if tick - aa_periodic_last_tick < 4 then return end
+    aa_periodic_last_tick = tick
 
-    -- base limit
-    local lim = aa_desync:get()
-
-    -- F: air desync override
+    local now = globals.realtime or 0
+    -- Detect whether ANY override path is actually active. If none, skip the writes
+    -- entirely — user's manual NL Body Yaw limits stay untouched.
+    local air_active     = false
+    local on_shot_active = aa_onshot:get() and now < aa_state.on_shot_until
+    local anti_bf_active = aa_anti_bf:get()
     if aa_air_set:get() then
         local lp = entity.get_local_player()
         if lp then
             local f = 0
             pcall(function() f = lp.m_fFlags or 0 end)
-            if bit.band(f, 1) == 0 then lim = aa_air_mag:get() end
+            if bit.band(f, 1) == 0 then air_active = true end
         end
     end
+    if not (air_active or on_shot_active or anti_bf_active) then return end
 
-    -- D: on-shot defensive — reduce briefly after fire
-    if aa_onshot:get() and now < aa_state.on_shot_until then
-        lim = math.max(15, math.floor(lim * 0.5))
-    end
+    -- Compute base limit + apply overrides
+    local lim = air_active and aa_air_mag:get() or aa_desync:get()
+    if on_shot_active then lim = math.max(15, math.floor(lim * 0.5)) end
 
-    -- G: anti-BF variance (per-tick random offset, clamped 0..58)
     local l_lim, r_lim = lim, lim
-    if aa_anti_bf:get() then
+    if anti_bf_active then
         local var = aa_anti_bf_var:get()
         l_lim = lim + (math.random() * 2 - 1) * var
         r_lim = lim + (math.random() * 2 - 1) * var
     end
     if l_lim < 0 then l_lim = 0 elseif l_lim > 58 then l_lim = 58 end
     if r_lim < 0 then r_lim = 0 elseif r_lim > 58 then r_lim = 58 end
-
-    -- Drive NL body-yaw limits + freestanding through verified :override path.
     nl_override(nl_refs.aa_bodyyaw_l, math.floor(l_lim))
     nl_override(nl_refs.aa_bodyyaw_r, math.floor(r_lim))
-    nl_override(nl_refs.aa_freestand, aa_freestanding:get())
+    -- V1.9: aa_freestand removed from per-tick path — only changes on preset apply
 end
 
 -- V1.8: events.antiaim hook DELETED (writing to cmd userdata fields caused CTD).
@@ -611,40 +614,47 @@ end
 -- V1.7: aim_fire preferred over ragebot_fire (more reliable timing)
 _hooks_status.aim_fire = register_first(on_local_fire, "aim_fire", "ragebot_fire")
 
--- V1.6 H: weapon_fire → detect hostile enemy fire toward us → trigger fake-duck assist
+-- V1.6 H + V1.9 hardening: weapon_fire fires for audio + grenade + AI events at
+-- round-start. Entity.get on those non-player userids + method calls like
+-- :is_enemy() / :is_alive() on weapon entities crashed CSGO on spawn. The whole
+-- body is now wrapped in an outer pcall and every method call has its own pcall.
 pcall(function()
     events.weapon_fire:set(function(event)
-        if not (enable_master:get() and aa_fd_assist:get()) then return end
-        if not event or not event.userid then return end
-        local lp = entity.get_local_player()
-        if not lp or not lp:is_alive() then return end
-        local shooter = entity.get(event.userid, true)
-        if not shooter or shooter == lp then return end
-        if not shooter:is_enemy() or not shooter:is_alive() then return end
-        -- distance + crude aim-direction check
-        local sx, sy_o, sz, lx, ly, lz = 0, 0, 0, 0, 0, 0
-        local ok = pcall(function()
-            sx, sy_o, sz = shooter.m_vecOrigin.x, shooter.m_vecOrigin.y, shooter.m_vecOrigin.z
-            lx, ly, lz   = lp.m_vecOrigin.x,      lp.m_vecOrigin.y,      lp.m_vecOrigin.z
-        end)
-        if not ok then return end
-        local dx, dy, dz = lx - sx, ly - sy_o, lz - sz
-        local dist = math.sqrt(dx*dx + dy*dy + dz*dz)
-        if dist > 3500 then return end
-        local aimed = false
         pcall(function()
-            local ang = shooter.m_angEyeAngles
-            local their = ang and (ang.y or ang[2])
-            if their then
-                local desired = math.deg(math.atan2(dy, dx))
-                local diff = math.abs(((their - desired + 180) % 360) - 180)
-                if diff < 35 then aimed = true end
+            if not (enable_master:get() and aa_fd_assist:get()) then return end
+            if not event or not event.userid then return end
+            local lp = entity.get_local_player()
+            if not lp or not lp:is_alive() then return end
+            local shooter
+            pcall(function() shooter = entity.get(event.userid, true) end)
+            if not shooter or shooter == lp then return end
+            local is_enemy, is_alive = false, false
+            pcall(function() is_enemy = shooter:is_enemy() end)
+            pcall(function() is_alive = shooter:is_alive() end)
+            if not (is_enemy and is_alive) then return end
+            local sx, sy_o, sz, lx, ly, lz = 0, 0, 0, 0, 0, 0
+            local ok = pcall(function()
+                sx, sy_o, sz = shooter.m_vecOrigin.x, shooter.m_vecOrigin.y, shooter.m_vecOrigin.z
+                lx, ly, lz   = lp.m_vecOrigin.x,      lp.m_vecOrigin.y,      lp.m_vecOrigin.z
+            end)
+            if not ok then return end
+            local dx, dy, dz = lx - sx, ly - sy_o, lz - sz
+            local dist = math.sqrt(dx*dx + dy*dy + dz*dz)
+            if dist > 3500 then return end
+            local aimed = false
+            pcall(function()
+                local ang = shooter.m_angEyeAngles
+                local their = ang and (ang.y or ang[2])
+                if their then
+                    local desired = math.deg(math.atan2(dy, dx))
+                    local diff = math.abs(((their - desired + 180) % 360) - 180)
+                    if diff < 35 then aimed = true end
+                end
+            end)
+            if aimed then
+                aa_state.fakeduck_until = (globals.realtime or 0) + ((aa_fd_duration:get() or 800) / 1000)
             end
         end)
-        if aimed then
-            aa_state.last_hostile_fire = globals.realtime or 0
-            aa_state.fakeduck_until   = (globals.realtime or 0) + ((aa_fd_duration:get() or 800) / 1000)
-        end
     end)
 end)
 
@@ -688,16 +698,19 @@ pcall(function()
 end)
 
 -- Player hurt event — damage indicator floating text on enemy
+-- V1.9 hardening: outer pcall + entity.get pcall'd (attacker=0 for world damage)
 pcall(function()
     events.player_hurt:set(function(event)
-        if not (enable_master:get() and vis_dmgind:get()) then return end
-        if not event then return end
-        local lp = entity.get_local_player()
-        if not lp then return end
-        local attacker = entity.get(event.attacker, true)
-        local victim   = entity.get(event.userid,   true)
-        if not attacker or attacker ~= lp then return end
-        if not victim or victim == lp then return end
+        pcall(function()
+            if not (enable_master:get() and vis_dmgind:get()) then return end
+            if not event then return end
+            local lp = entity.get_local_player()
+            if not lp then return end
+            local attacker, victim
+            pcall(function() attacker = entity.get(event.attacker, true) end)
+            pcall(function() victim   = entity.get(event.userid,   true) end)
+            if not attacker or attacker ~= lp then return end
+            if not victim or victim == lp then return end
         local ox, oy, oz = 0, 0, 0
         pcall(function()
             ox = victim.m_vecOrigin.x
@@ -714,8 +727,9 @@ pcall(function()
             hp_left = event.health or 0,
             hitbox_id = hb,
         })
-        -- prune to last 16 entries
-        while #damage_pops > 16 do table.remove(damage_pops, 1) end
+            -- prune to last 16 entries
+            while #damage_pops > 16 do table.remove(damage_pops, 1) end
+        end)
     end)
 end)
 
