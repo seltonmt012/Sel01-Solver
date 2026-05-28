@@ -1,14 +1,14 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 9.10                                   ║
+-- ║  Version: 9.11                                   ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 9.10
--- @description Log buffer cap 80->200 + AA-type hysteresis tightened (7 consecutive + 2s lockout) to stop classifier flap
+-- @version 9.11
+-- @description Enhanced counter-fire (force head + safepoint-off + HC 15) + fast-fire lowered conf threshold 70->50 / samples 2->1
 
-local SEL01_VERSION = "9.10"
+local SEL01_VERSION = "9.11"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -3384,9 +3384,13 @@ pcall(function()
             return
         end
 
-        -- V9.8: COUNTER-FIRE OVERRIDE — enemy fired at us in last 1s → bypass cancel-low-conf,
-        -- lower hitchance/min-damage to force return-fire attempt within their fire-window.
-        -- Skip if conf too low to even guess (would waste shot) or if sniper (precision class).
+        -- V9.8 + V9.11: COUNTER-FIRE OVERRIDE — enemy fired at us in last 1s →
+        -- bypass cancel-low-conf, force HEAD hitbox (their head is visible if they
+        -- are shooting at us), drop hitchance to 15, mindmg to 1, disable safepoint.
+        -- NL backtracks to the latest record where the shot lands; with safepoint
+        -- off + head forced + low HC, ragebot fires the first frame it sees their
+        -- head (which is the exact peek tick they used to shoot us).
+        -- Skip on sniper (precision class) or conf < 10 (no data, waste shot).
         local counter_fire_active = false
         if s and (s.last_hostile_fire or 0) > 0 then
             local ticks_since = (globals.tickcount or 0) - s.last_hostile_fire
@@ -3394,9 +3398,13 @@ pcall(function()
                 local wc_cf = get_weapon_class()
                 if wc_cf ~= "sniper" and intel and intel.conf >= 10 then
                     counter_fire_active = true
-                    pcall(function() ctx:override_hitchance(25) end)
+                    pcall(function() ctx:override_hitchance(15) end)        -- was 25, fires sooner
                     pcall(function() ctx:override_min_damage(1) end)
-                    cs_log_verbose("counter-fire idx=%d conf=%d aimed=%s (fired %d ticks ago)",
+                    pcall(function() ctx:override_hitbox(0) end)            -- V9.11: force head
+                    pcall(function() ctx:override_safe_point(false) end)    -- V9.11: backtrack to head-visible tick
+                    pcall(function() ctx:override_multipoint(true) end)     -- multipoint head scan for missed-hitbox cases
+                    pcall(function() ctx:override_multipoint_scale(0.85) end)
+                    cs_log_verbose("counter-fire+head idx=%d conf=%d aimed=%s (fired %d ticks ago)",
                                    target:get_index(), intel.conf,
                                    tostring(s.last_hostile_aimed), ticks_since)
                 end
@@ -3472,15 +3480,24 @@ pcall(function()
             end
         end
 
-        -- V9.6: FAST-FIRE on high-confidence locked targets
+        -- V9.6 + V9.11: FAST-FIRE on confident targets. Thresholds lowered:
+        -- conf 70->50, samples 2->1 (one real hit + decent conf is enough). HC tiers:
+        --   conf >= 85 + samples >= 2  -> hc 15 (most aggressive)
+        --   conf >= 70                  -> hc 22
+        --   conf >= 50 + samples >= 1   -> hc 30
         -- skip when respect-manual on (preserve user's NL hc)
         local respect_active = (wc == "sniper") and exp_respect_man and exp_respect_man:get()
-        if not respect_active and s and intel.conf >= 70 and intel.samples >= 2 and s.missed == 0 then
-            -- stable resolve + 2+ real samples → ragebot can shoot sooner (lower hc threshold)
-            local fast_hc = intel.conf >= 85 and 20 or 28
-            pcall(function() ctx:override_hitchance(fast_hc) end)
-            cs_log_verbose("fast-fire idx=%d conf=%d samples=%d hc=%d",
-                           target:get_index(), intel.conf, intel.samples, fast_hc)
+        if not respect_active and s and s.missed == 0 then
+            local fast_hc
+            if intel.conf >= 85 and intel.samples >= 2 then fast_hc = 15
+            elseif intel.conf >= 70                       then fast_hc = 22
+            elseif intel.conf >= 50 and intel.samples >= 1 then fast_hc = 30
+            end
+            if fast_hc then
+                pcall(function() ctx:override_hitchance(fast_hc) end)
+                cs_log_verbose("fast-fire idx=%d conf=%d samples=%d hc=%d",
+                               target:get_index(), intel.conf, intel.samples, fast_hc)
+            end
         end
 
         -- V9.9-C: CROUCH-AWARE HITBOX — target ducked → head harder to hit (smaller + lower).
