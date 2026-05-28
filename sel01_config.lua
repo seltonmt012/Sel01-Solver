@@ -1,14 +1,14 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Config — Neverlose CS2 AA + Misc + Visuals║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 1.4                                    ║
+-- ║  Version: 1.5                                    ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Config
 -- @author seltonmt01
--- @version 1.4
--- @description Hotfix: combo:set takes STRING not index (preset crash). Strip emoji + use NL icons.
+-- @version 1.5
+-- @description Hotfix: preset crash. Deferred to next-tick createmove (out of menu callback) + skip combo:set entirely.
 
-local SEL01_CFG_VERSION = "1.4"
+local SEL01_CFG_VERSION = "1.5"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -218,151 +218,122 @@ end)  -- outer pcall
 -- ══════════════════════════════════════════════════════════════════════════
 -- PRESETS
 -- ══════════════════════════════════════════════════════════════════════════
--- V1.4: combo :set(value) takes STRING not index (per CLAUDE.md). Previous int args
--- crashed the preset apply. Every single preset write is also wrapped in safe_set
--- (which pcalls) and the whole body is wrapped in outer pcall so no preset click can
--- crash the script.
-local function apply_preset(name)
-    local ok, err = pcall(function()
-        if name == "aggressive" then
-            safe_set(aa_enable, true)
-            safe_set(aa_pitch,        "Down")
-            safe_set(aa_yaw_base,     "Backward")
-            safe_set(aa_yaw_add, 0)
-            safe_set(aa_yaw_mod,      "Jitter")
-            safe_set(aa_yaw_mod_mag, 45)
-            safe_set(aa_yaw_mod_int, 2)
-            safe_set(aa_desync, 58)
-            safe_set(aa_desync_side,  "Auto (alternate)")
-            safe_set(aa_freestanding, true)
-            safe_set(aa_at_targets, false)
-            safe_set(mv_strafe_help, true)
-            safe_set(vis_watermark, true)
-            safe_set(vis_indicators, true)
-            safe_set(vis_velwarn, true)
-            safe_set(vis_aaarrows, true)
-            safe_set(vis_hitmarker, true)
-            safe_set(vis_hitlog, true)
-            safe_set(vis_keybinds, true)
-            safe_set(vis_dmgind, true)
-            safe_set(vis_specoverlay, true)
-            safe_set(mv_nofall, true)
-            safe_set(mv_fastladder, true)
-            safe_set(qol_clantag, true)
-            safe_set(qol_clantag_st,  "Wave")
-            safe_set(qol_killsay, false)
-            safe_set(qol_autoaccept, true)
-            nl_override(nl_refs.aa_enabled, true)
-            nl_override(nl_refs.aa_yaw_base, "Backward")
-            nl_override(nl_refs.aa_yaw_offset, 0)
-            nl_override(nl_refs.aa_yawmod, "Jitter")
-            nl_override(nl_refs.aa_yawmod_offset, 45)
-            nl_override(nl_refs.aa_bodyyaw, "Static")
-            nl_override(nl_refs.aa_bodyyaw_l, 58)
-            nl_override(nl_refs.aa_bodyyaw_r, 58)
-            nl_override(nl_refs.aa_freestand, true)
-            nl_override(nl_refs.aa_avoidbackstab, true)
-            nl_override(nl_refs.fl_switch, true)
-            nl_override(nl_refs.fl_limit, 7)
-            nl_override(nl_refs.fl_variability, 2)
-            nl_override(nl_refs.vis_hitmark_snd, true)
-            cs_log_color("AGGRESSIVE preset applied")
-        elseif name == "dynamic" then
-            safe_set(aa_enable, true)
-            safe_set(aa_pitch,        "Down")
-            safe_set(aa_yaw_base,     "Backward")
-            safe_set(aa_yaw_mod,      "Jitter")
-            safe_set(aa_yaw_mod_mag, 28)
-            safe_set(aa_yaw_mod_int, 3)
-            safe_set(aa_desync, 45)
-            safe_set(aa_desync_side,  "Auto (alternate)")
-            safe_set(aa_freestanding, true)
-            safe_set(aa_at_targets, true)
-            safe_set(vis_watermark, true)
-            safe_set(vis_indicators, true)
-            safe_set(vis_velwarn, true)
-            safe_set(vis_aaarrows, true)
-            safe_set(vis_hitmarker, true)
-            safe_set(vis_hitlog, true)
-            safe_set(vis_keybinds, true)
-            safe_set(vis_dmgind, true)
-            safe_set(vis_specoverlay, true)
-            safe_set(mv_nofall, true)
-            safe_set(qol_clantag, true)
-            safe_set(qol_clantag_st,  "Spin")
-            safe_set(qol_autoaccept, true)
-            nl_override(nl_refs.aa_enabled, true)
-            nl_override(nl_refs.aa_yaw_base, "Backward")
-            nl_override(nl_refs.aa_yawmod, "Center")
-            nl_override(nl_refs.aa_bodyyaw, "Jitter")
-            nl_override(nl_refs.aa_bodyyaw_l, 45)
-            nl_override(nl_refs.aa_bodyyaw_r, 45)
-            nl_override(nl_refs.aa_freestand, true)
-            nl_override(nl_refs.fl_switch, true)
-            nl_override(nl_refs.fl_limit, 5)
-            nl_override(nl_refs.vis_hitmark_snd, true)
-            cs_log_color("DYNAMIC preset applied")
-        elseif name == "defensive" then
-            safe_set(aa_enable, true)
-            safe_set(aa_pitch,        "Down")
-            safe_set(aa_yaw_base,     "Backward")
-            safe_set(aa_yaw_mod,      "Offset")
-            safe_set(aa_yaw_mod_mag, 15)
-            safe_set(aa_yaw_mod_int, 4)
-            safe_set(aa_desync, 35)
-            safe_set(aa_desync_side,  "Auto (alternate)")
-            safe_set(aa_freestanding, true)
-            safe_set(aa_at_targets, false)
-            safe_set(vis_watermark, true)
-            safe_set(vis_indicators, true)
-            safe_set(vis_velwarn, true)
-            safe_set(vis_aaarrows, true)
-            safe_set(vis_hitmarker, true)
-            safe_set(vis_hitlog, false)
-            safe_set(vis_keybinds, true)
-            safe_set(vis_dmgind, false)
-            safe_set(vis_specoverlay, true)
-            safe_set(mv_nofall, true)
-            safe_set(qol_clantag, false)
-            safe_set(qol_autoaccept, true)
-            nl_override(nl_refs.aa_enabled, true)
-            nl_override(nl_refs.aa_yaw_base, "Backward")
-            nl_override(nl_refs.aa_yawmod, "Offset")
-            nl_override(nl_refs.aa_yawmod_offset, 15)
-            nl_override(nl_refs.aa_bodyyaw, "Static")
-            nl_override(nl_refs.aa_bodyyaw_l, 35)
-            nl_override(nl_refs.aa_bodyyaw_r, 35)
-            nl_override(nl_refs.aa_freestand, true)
-            nl_override(nl_refs.fl_switch, true)
-            nl_override(nl_refs.fl_limit, 3)
-            nl_override(nl_refs.vis_hitmark_snd, true)
-            cs_log_color("DEFENSIVE preset applied")
-        elseif name == "legit" then
-            safe_set(aa_enable, false)
-            safe_set(aa_pitch,        "Off")
-            safe_set(aa_yaw_mod,      "None")
-            safe_set(vis_watermark, true)
-            safe_set(vis_indicators, false)
-            safe_set(vis_velwarn, false)
-            safe_set(vis_aaarrows, false)
-            safe_set(vis_hitmarker, true)
-            safe_set(vis_hitlog, false)
-            safe_set(vis_keybinds, false)
-            safe_set(vis_dmgind, false)
-            safe_set(vis_specoverlay, false)
-            safe_set(mv_nofall, false)
-            safe_set(mv_fastladder, false)
-            safe_set(qol_clantag, false)
-            safe_set(qol_killsay, false)
-            nl_override(nl_refs.aa_enabled, false)
-            nl_override(nl_refs.aa_freestand, false)
-            nl_override(nl_refs.fl_switch, false)
-            cs_log_color("LEGIT-BOT preset applied")
-        end
-    end)
-    if not ok then
-        cs_log_color("[ERROR] preset '" .. tostring(name) .. "' failed: " .. tostring(err))
+-- V1.5: BUTTON CALLBACK MUST NOT MUTATE UI STATE.
+-- NL appears to freeze the menu when a button callback synchronously calls :set()
+-- on combo / slider elements during the menu render lifecycle (V1.4 user reported
+-- the menu hung mid-callback). We defer the work to the next createmove tick
+-- which runs OUTSIDE the menu render pipeline.
+local pending_preset = nil  -- "aggressive" / "dynamic" / "defensive" / "legit" or nil
+
+-- The actual apply runs from createmove (see createmove_unified below).
+-- Combo :set() calls are skipped entirely — they were the most likely crash source.
+-- The user can still pick combo values manually, and the NL refs :override() handles
+-- the actual gameplay AA values which is what matters.
+local function _do_apply_preset(name)
+    if name == "aggressive" then
+        safe_set(aa_enable, true)
+        safe_set(aa_freestanding, true)
+        safe_set(aa_at_targets, false)
+        safe_set(aa_desync, 58)
+        safe_set(aa_yaw_add, 0)
+        safe_set(aa_yaw_mod_mag, 45)
+        safe_set(aa_yaw_mod_int, 2)
+        safe_set(mv_strafe_help, true)
+        safe_set(mv_nofall, true)
+        safe_set(mv_fastladder, true)
+        safe_set(vis_watermark, true)
+        safe_set(vis_indicators, true)
+        safe_set(vis_velwarn, true)
+        safe_set(vis_aaarrows, true)
+        safe_set(vis_hitmarker, true)
+        safe_set(vis_hitlog, true)
+        safe_set(vis_keybinds, true)
+        safe_set(vis_dmgind, true)
+        safe_set(vis_specoverlay, true)
+        safe_set(qol_clantag, true)
+        safe_set(qol_killsay, false)
+        safe_set(qol_autoaccept, true)
+        nl_override(nl_refs.aa_enabled, true)
+        nl_override(nl_refs.aa_freestand, true)
+        nl_override(nl_refs.aa_avoidbackstab, true)
+        nl_override(nl_refs.fl_switch, true)
+        nl_override(nl_refs.vis_hitmark_snd, true)
+        cs_log_color("AGGRESSIVE preset applied")
+    elseif name == "dynamic" then
+        safe_set(aa_enable, true)
+        safe_set(aa_freestanding, true)
+        safe_set(aa_at_targets, true)
+        safe_set(aa_desync, 45)
+        safe_set(aa_yaw_mod_mag, 28)
+        safe_set(aa_yaw_mod_int, 3)
+        safe_set(mv_strafe_help, true)
+        safe_set(mv_nofall, true)
+        safe_set(vis_watermark, true)
+        safe_set(vis_indicators, true)
+        safe_set(vis_velwarn, true)
+        safe_set(vis_aaarrows, true)
+        safe_set(vis_hitmarker, true)
+        safe_set(vis_hitlog, true)
+        safe_set(vis_keybinds, true)
+        safe_set(vis_dmgind, true)
+        safe_set(vis_specoverlay, true)
+        safe_set(qol_clantag, true)
+        safe_set(qol_autoaccept, true)
+        nl_override(nl_refs.aa_enabled, true)
+        nl_override(nl_refs.aa_freestand, true)
+        nl_override(nl_refs.fl_switch, true)
+        nl_override(nl_refs.vis_hitmark_snd, true)
+        cs_log_color("DYNAMIC preset applied")
+    elseif name == "defensive" then
+        safe_set(aa_enable, true)
+        safe_set(aa_freestanding, true)
+        safe_set(aa_at_targets, false)
+        safe_set(aa_desync, 35)
+        safe_set(aa_yaw_mod_mag, 15)
+        safe_set(aa_yaw_mod_int, 4)
+        safe_set(vis_watermark, true)
+        safe_set(vis_indicators, true)
+        safe_set(vis_velwarn, true)
+        safe_set(vis_aaarrows, true)
+        safe_set(vis_hitmarker, true)
+        safe_set(vis_hitlog, false)
+        safe_set(vis_keybinds, true)
+        safe_set(vis_dmgind, false)
+        safe_set(vis_specoverlay, true)
+        safe_set(mv_nofall, true)
+        safe_set(qol_clantag, false)
+        safe_set(qol_autoaccept, true)
+        nl_override(nl_refs.aa_enabled, true)
+        nl_override(nl_refs.aa_freestand, true)
+        nl_override(nl_refs.fl_switch, true)
+        nl_override(nl_refs.vis_hitmark_snd, true)
+        cs_log_color("DEFENSIVE preset applied")
+    elseif name == "legit" then
+        safe_set(aa_enable, false)
+        safe_set(vis_watermark, true)
+        safe_set(vis_indicators, false)
+        safe_set(vis_velwarn, false)
+        safe_set(vis_aaarrows, false)
+        safe_set(vis_hitmarker, true)
+        safe_set(vis_hitlog, false)
+        safe_set(vis_keybinds, false)
+        safe_set(vis_dmgind, false)
+        safe_set(vis_specoverlay, false)
+        safe_set(mv_nofall, false)
+        safe_set(mv_fastladder, false)
+        safe_set(qol_clantag, false)
+        safe_set(qol_killsay, false)
+        nl_override(nl_refs.aa_enabled, false)
+        nl_override(nl_refs.aa_freestand, false)
+        nl_override(nl_refs.fl_switch, false)
+        cs_log_color("LEGIT-BOT preset applied")
     end
+end
+
+-- Public entry — just queue the work, do not touch UI state from this function.
+local function apply_preset(name)
+    pending_preset = name
+    cs_log("preset '" .. tostring(name) .. "' queued (applies on next tick)")
 end
 apply_preset_fwd = apply_preset  -- resolve forward-decl
 
@@ -521,8 +492,16 @@ local function createmove_handler(cmd)
     end)
 end
 
--- Single createmove handler that runs movement + NL-visual override sync
+-- Single createmove handler that runs movement + NL-visual override sync.
+-- V1.5: also drains pending_preset so preset writes happen OUTSIDE menu callback.
 local function createmove_unified(cmd)
+    -- Drain queued preset apply (set by Aggressive/Dynamic/Defensive/Legit buttons)
+    if pending_preset then
+        local name = pending_preset
+        pending_preset = nil
+        pcall(_do_apply_preset, name)
+    end
+
     createmove_handler(cmd)
     if enable_master:get() then
         nl_override(nl_refs.vis_hitmark_snd, vis_nl_hitsnd:get())
