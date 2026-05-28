@@ -1,15 +1,15 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Config — Neverlose CSGO HvH config        ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 2.5                                    ║
+-- ║  Version: 2.6                                    ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Config
 -- @author seltonmt01
--- @version 2.5
--- @description AI Peek upgraded to tap-style auto-cycle: peek out -> hold for shot -> return.
---              Timings configurable. NL Peek Assist still binds on same key for 2-in-1.
+-- @version 2.6
+-- @description Debug stats accumulator (shots, hits, miss-rate, HS-rate, hitbox breakdown,
+--              damage dealt, session time) + dump button. Same idea as resolver's copy-logs.
 
-local SEL01_CFG_VERSION = "2.5"
+local SEL01_CFG_VERSION = "2.6"
 
 -- DEBUG: print to CSGO console at major load checkpoints. Plain print() bypasses
 -- NL chat (which may not flush before crash) and writes directly to CSGO console.
@@ -142,6 +142,8 @@ local qol_clantag_st = g_qol:combo("Clantag style", {"Wave", "Spin", "Pulse"}, 1
 -- ══════════════════════════════════════════════════════════════════════════
 local btn_status = g_info:button("Print Status", function() end) -- callback wired later
 local btn_reset  = g_info:button("Reset Settings", function() end)
+local btn_stats  = g_info:button("Dump Debug Stats", function() end) -- V2.6
+local btn_clear  = g_info:button("Clear Stats", function() end) -- V2.6
 g_info:label(" ")
 g_info:label(accent .. "  Sel01-Solver handles RESOLVING (separate tab)")
 g_info:label(accent .. "  This script handles AA / Movement / Visuals / QoL only")
@@ -612,15 +614,65 @@ _hooks_status.aim_fire = nil   -- not registered in v1.13
 -- V1.13 BISECT: weapon_fire handler DISABLED (no registration). If config is
 -- stable with this off, FD-assist or weapon_fire-related code is the crash.
 
+-- V2.6: debug stats accumulator. Same idea as resolver's session_stats — track
+-- shot counts + hit/miss + hitbox breakdown + total damage so the user can dump
+-- a session summary and tune presets accordingly.
+local stats = {
+    session_start  = globals.realtime or 0,
+    shots_fired    = 0,    -- aim_ack fired regardless of outcome
+    shots_hit      = 0,
+    shots_missed   = 0,
+    hits_head      = 0,
+    hits_chest     = 0,
+    hits_stomach   = 0,
+    hits_leg       = 0,
+    hits_other     = 0,
+    total_dmg      = 0,
+    biggest_hit    = 0,
+    one_taps       = 0,    -- >= 100 dmg single hit
+}
+
+local function _stats_clear()
+    stats.session_start  = globals.realtime or 0
+    stats.shots_fired    = 0
+    stats.shots_hit      = 0
+    stats.shots_missed   = 0
+    stats.hits_head      = 0
+    stats.hits_chest     = 0
+    stats.hits_stomach   = 0
+    stats.hits_leg       = 0
+    stats.hits_other     = 0
+    stats.total_dmg      = 0
+    stats.biggest_hit    = 0
+    stats.one_taps       = 0
+end
+
 -- V2.0: aim_ack restored, ZERO entity.get calls. Target name comes from event
 -- fields only ("?" if not present). Hit-marker timer + hit-log push both fire.
+-- V2.6: stats accumulator runs at top of handler regardless of vis_hitmarker.
 pcall(function()
     events.aim_ack:set(function(event)
         pcall(function()
-            if not (enable_master:get() and vis_hitmarker:get()) then return end
+            if not enable_master:get() then return end
             if not event then return end
             local reason = event.state
             local HIT_STATES = { hit = true, damaged = true, ["hit-damaged"] = true }
+            -- V2.6: every aim_ack = a shot. Count first, then visual gating below.
+            stats.shots_fired = stats.shots_fired + 1
+            if reason and HIT_STATES[reason] then
+                stats.shots_hit = stats.shots_hit + 1
+                local hb = event.hitbox or -1
+                if     hb == 0 then stats.hits_head    = stats.hits_head    + 1
+                elseif hb == 3 then stats.hits_chest   = stats.hits_chest   + 1
+                elseif hb == 4 then stats.hits_stomach = stats.hits_stomach + 1
+                elseif hb == 6 or hb == 7 then stats.hits_leg = stats.hits_leg + 1
+                else stats.hits_other = stats.hits_other + 1
+                end
+            else
+                stats.shots_missed = stats.shots_missed + 1
+            end
+            -- visual gate for hitmarker render trigger
+            if not vis_hitmarker:get() then return end
             if reason and HIT_STATES[reason] then
                 hitmark_time = globals.realtime or 0
                 if vis_hitlog:get() then
@@ -652,19 +704,27 @@ end)
 pcall(function()
     events.player_hurt:set(function(event)
         pcall(function()
-            if not (enable_master:get() and vis_dmgind:get()) then return end
+            if not enable_master:get() then return end
             if not event then return end
             local attacker = entity.get(event.attacker, true)
             local lp = entity.get_local_player()
             if attacker ~= lp then return end
             local victim = entity.get(event.userid, true)
             if not victim or victim == lp then return end
-            local hb = -1
-            pcall(function() hb = event.hitgroup or -1 end)
+            local hb  = -1
+            local dmg = 0
+            pcall(function() hb  = event.hitgroup or -1 end)
+            pcall(function() dmg = event.dmg_health or event.damage or 0 end)
+            -- V2.6: damage stats accumulator
+            stats.total_dmg = stats.total_dmg + dmg
+            if dmg > stats.biggest_hit then stats.biggest_hit = dmg end
+            if dmg >= 100 then stats.one_taps = stats.one_taps + 1 end
+            -- visual gate (popup render)
+            if not vis_dmgind:get() then return end
             table.insert(damage_pops, {
-                time = globals.realtime or 0,
-                dmg  = event.dmg_health or event.damage or 0,
-                hp_left = event.health or 0,
+                time      = globals.realtime or 0,
+                dmg       = dmg,
+                hp_left   = event.health or 0,
                 hitbox_id = hb,
             })
             while #damage_pops > 16 do table.remove(damage_pops, 1) end
@@ -1126,6 +1186,36 @@ end
 pcall(function() btn_status:set_callback(function() dump_status() end) end)
 pcall(function() btn_reset:set_callback(function() apply_preset("dynamic") end) end)
 
+-- V2.6: debug stats dump (mirrors resolver's session_stats / mode-stats style)
+local function dump_stats()
+    local now      = globals.realtime or 0
+    local elapsed  = now - (stats.session_start or now)
+    local fired    = stats.shots_fired
+    local hits     = stats.shots_hit
+    local misses   = stats.shots_missed
+    local hit_rate = fired > 0 and (hits / fired * 100) or 0
+    local hs_rate  = hits  > 0 and (stats.hits_head / hits * 100) or 0
+    cs_log_color("══ Sel01-Config v" .. SEL01_CFG_VERSION .. " DEBUG STATS ══")
+    cs_log(string.format("Session: %.1f min  |  Master=%s  AA=%s",
+        elapsed / 60, tostring(enable_master:get()), tostring(aa_enable:get())))
+    cs_log(string.format("Shots: %d fired  %d hit  %d miss  -> %.1f%% hit-rate",
+        fired, hits, misses, hit_rate))
+    cs_log(string.format("Hitbox: head=%d chest=%d stomach=%d leg=%d other=%d  -> HS-rate %.1f%%",
+        stats.hits_head, stats.hits_chest, stats.hits_stomach, stats.hits_leg,
+        stats.hits_other, hs_rate))
+    cs_log(string.format("Damage: total=%d  biggest-hit=%d  1-taps(>=100)=%d",
+        stats.total_dmg, stats.biggest_hit, stats.one_taps))
+    cs_log(string.format("Per-shot avg: %.1f dmg  |  per-hit avg: %.1f dmg",
+        fired > 0 and (stats.total_dmg / fired) or 0,
+        hits  > 0 and (stats.total_dmg / hits)  or 0))
+    cs_log_color("══ END STATS ══")
+end
+pcall(function() btn_stats:set_callback(function() dump_stats() end) end)
+pcall(function() btn_clear:set_callback(function()
+    _stats_clear()
+    cs_log_color("Stats cleared.")
+end) end)
+
 -- ══════════════════════════════════════════════════════════════════════════
 -- SHUTDOWN
 -- ══════════════════════════════════════════════════════════════════════════
@@ -1155,7 +1245,7 @@ end)
 -- LOAD BANNER
 -- ══════════════════════════════════════════════════════════════════════════
 cs_log_color("══════════════════════════════════════════")
-cs_log_color("Sel01-Config v" .. SEL01_CFG_VERSION .. " loaded (CSGO HvH — AI Peek tap-cycle: out + hold + back)")
+cs_log_color("Sel01-Config v" .. SEL01_CFG_VERSION .. " loaded (CSGO HvH — Debug stats + AI Peek tap-cycle)")
 cs_log(string.format("  hooks  createmove=%s  aim_fire=%s",
     tostring(_hooks_status.createmove or "MISSING"),
     tostring(_hooks_status.aim_fire or "MISSING")))
