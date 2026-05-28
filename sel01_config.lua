@@ -1,15 +1,15 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Config — Neverlose CSGO HvH config        ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 2.1                                    ║
+-- ║  Version: 2.2                                    ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Config
 -- @author seltonmt01
--- @version 2.1
--- @description Drop AI Peek wrapper (Peek Assist is hotkey element, :override(int) per-tick = crash).
---              Switch player_hurt to JAG0YAW entity-compare pattern (drops lp:get_user_id risk).
+-- @version 2.2
+-- @description Drop visual NL :overrides (Scope Overlay confirmed combo via JAG0YAW; Hit Marker Sound +
+--              Force Thirdperson likely combo too — :override(bool) on combo segfaults).
 
-local SEL01_CFG_VERSION = "2.1"
+local SEL01_CFG_VERSION = "2.2"
 
 -- DEBUG: print to CSGO console at major load checkpoints. Plain print() bypasses
 -- NL chat (which may not flush before crash) and writes directly to CSGO console.
@@ -116,10 +116,8 @@ local vis_keybinds   = g_visual:switch(accent .. ui.get_icon"user"       .. acce
 local vis_dmgind     = g_visual:switch(accent .. ui.get_icon"skull"      .. accent .. "  Damage popup (-X HP on enemy)", true)
 local vis_specoverlay= g_visual:switch(accent .. ui.get_icon"eye"        .. accent .. "  Spectator overlay", true)
 g_visual:label(" ")
-g_visual:label(accent .. ui.get_icon"sparkles" .. accent .. "  NL built-in toggles")
-local vis_nl_hitsnd  = g_visual:switch("NL Hit Marker Sound", true)
-local vis_nl_3rd     = g_visual:switch("Force Thirdperson", false)
-local vis_nl_scope   = g_visual:switch("Scope Overlay", false)
+g_visual:label(accent .. "  NL Hit Marker Sound / Force Thirdperson / Scope Overlay:")
+g_visual:label(accent .. "  Set those directly in NL Visuals tab (they're combo elements)")
 -- V1.7: self-glow toggle dropped — NL glow is a multi-value combo, our :override(true)
 -- on a combo silently no-op'd. Users can configure glow directly in NL Visuals tab.
 
@@ -228,13 +226,11 @@ pcall(function()
     nl_refs.rage_hitsafety   = nl_find_safe("Aimbot", "Ragebot", "Safety", "Ensure Hitbox Safety")
     nl_refs.rage_autoscope   = nl_find_safe("Aimbot", "Ragebot", "Accuracy", "Auto Scope")
     -- Visuals
-    nl_refs.vis_thirdperson  = nl_find_safe("Visuals", "World", "Main", "Force Thirdperson")
-    nl_refs.vis_scope_ovl    = nl_find_safe("Visuals", "World", "Main", "Override Zoom", "Scope Overlay")
     nl_refs.vis_viewmodel    = nl_find_safe("Visuals", "World", "Main", "Override Zoom", "Force Viewmodel")
     nl_refs.vis_removals     = nl_find_safe("Visuals", "World", "Main", "Removals")
-    nl_refs.vis_hitmark_snd  = nl_find_safe("Visuals", "World", "Other", "Hit Marker Sound")
-    nl_refs.vis_self_chams   = nl_find_safe("Visuals", "Players", "Self", "Chams", "Weapon")
-    nl_refs.vis_self_glow    = nl_find_safe("Visuals", "Players", "Self", "Chams", "Glow")
+    -- V2.2: vis_hitmark_snd / vis_thirdperson / vis_scope_ovl / vis_self_chams / vis_self_glow
+    -- refs removed — they are combo elements and :override(bool) on a combo segfaults.
+    -- vis_thirdperson + vis_scope_ovl were referenced via separate lookups elsewhere; same fate.
 end)  -- outer pcall
 
 -- ══════════════════════════════════════════════════════════════════════════
@@ -289,7 +285,6 @@ local function _do_apply_preset(name)
         _safe_step("nl aa_freestand",   function() nl_override(nl_refs.aa_freestand, true) end)
         _safe_step("nl aa_avoidbk",     function() nl_override(nl_refs.aa_avoidbackstab, true) end)
         _safe_step("nl fl_switch",      function() nl_override(nl_refs.fl_switch, true) end)
-        _safe_step("nl vis_hitmark",    function() nl_override(nl_refs.vis_hitmark_snd, true) end)
         cs_log_color("AGGRESSIVE preset applied")
     elseif name == "dynamic" then
         safe_set(aa_enable, true)
@@ -315,7 +310,6 @@ local function _do_apply_preset(name)
         nl_override(nl_refs.aa_enabled, true)
         nl_override(nl_refs.aa_freestand, true)
         nl_override(nl_refs.fl_switch, true)
-        nl_override(nl_refs.vis_hitmark_snd, true)
         cs_log_color("DYNAMIC preset applied")
     elseif name == "defensive" then
         safe_set(aa_enable, true)
@@ -341,7 +335,6 @@ local function _do_apply_preset(name)
         nl_override(nl_refs.aa_enabled, true)
         nl_override(nl_refs.aa_freestand, true)
         nl_override(nl_refs.fl_switch, true)
-        nl_override(nl_refs.vis_hitmark_snd, true)
         cs_log_color("DEFENSIVE preset applied")
     elseif name == "spin" then
         -- Full spinbot — fast yaw rotation, high-freq jitter, NO freestanding (we WANT spin)
@@ -372,7 +365,6 @@ local function _do_apply_preset(name)
         nl_override(nl_refs.aa_freestand, false)
         nl_override(nl_refs.aa_avoidbackstab, false)
         nl_override(nl_refs.fl_switch, true)
-        nl_override(nl_refs.vis_hitmark_snd, true)
         cs_log_color("SPIN preset applied (full spinbot — no freestanding, max jitter)")
     end
 end
@@ -483,7 +475,6 @@ local function createmove_handler(cmd) end
 -- Single createmove handler that runs movement + NL-visual override sync.
 -- V1.5: also drains pending_preset so preset writes happen OUTSIDE menu callback.
 -- V2.0: dirty-track restored (only write NL :override on toggle change)
-local _vis_last = { hitsnd = nil, tp = nil, sc = nil, fd = nil }
 local function createmove_unified(cmd)
     -- Drain queued preset apply (set by Aggressive/Dynamic/Defensive/Legit buttons)
     if pending_preset then
@@ -495,15 +486,10 @@ local function createmove_unified(cmd)
     createmove_handler(cmd)
     -- V2.0: AA periodic sync restored (still throttled + alive-checked + lazy).
     aa_periodic_sync()
-    -- V2.0: visuals overrides restored, DIRTY-TRACKED so we only write on toggle change.
-    if enable_master:get() then
-        local v1 = vis_nl_hitsnd:get()
-        if _vis_last.hitsnd ~= v1 then nl_override(nl_refs.vis_hitmark_snd, v1); _vis_last.hitsnd = v1 end
-        local v2 = vis_nl_3rd:get()
-        if _vis_last.tp ~= v2 then nl_override(nl_refs.vis_thirdperson, v2); _vis_last.tp = v2 end
-        local v3 = vis_nl_scope:get()
-        if _vis_last.sc ~= v3 then nl_override(nl_refs.vis_scope_ovl, v3); _vis_last.sc = v3 end
-    end
+    -- V2.2: visual NL :overrides REMOVED. Scope Overlay is a combo element
+    -- (confirmed via JAG0YAW :set("Remove All")). Hit Marker Sound + Force
+    -- Thirdperson are also likely combos. :override(bool) on a combo userdata
+    -- segfaults. User can configure these directly in NL's Visuals tab.
 end
 -- V1.7: pick the first available createmove name (createmove preferred)
 _hooks_status.createmove = register_first(createmove_unified, "createmove", "setup_command")
@@ -1059,7 +1045,7 @@ end)
 -- LOAD BANNER
 -- ══════════════════════════════════════════════════════════════════════════
 cs_log_color("══════════════════════════════════════════")
-cs_log_color("Sel01-Config v" .. SEL01_CFG_VERSION .. " loaded (CSGO HvH — AI Peek removed, JAG0YAW player_hurt pattern)")
+cs_log_color("Sel01-Config v" .. SEL01_CFG_VERSION .. " loaded (CSGO HvH — visual NL overrides dropped: combos)")
 cs_log(string.format("  hooks  createmove=%s  aim_fire=%s",
     tostring(_hooks_status.createmove or "MISSING"),
     tostring(_hooks_status.aim_fire or "MISSING")))
