@@ -1,15 +1,16 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Config — Neverlose CS2 AA + Misc + Visuals║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 1.0                                    ║
+-- ║  Version: 1.1                                    ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Config
 -- @author seltonmt01
--- @version 1.0
--- @description Companion script to Sel01-Solver — handles Anti-Aim, Movement, Visuals, QoL.
---              Sel01-Solver_59853.lua remains untouched and continues to handle resolving.
+-- @version 1.1
+-- @description Companion to Sel01-Solver. Verified NL ui.find paths (from JAG0YAW/bettervisal/bloodwings/nyanza analysis).
+--              Uses :override() API for non-destructive runtime writes (resets when script unloads).
+--              Sel01-Solver_59853.lua untouched.
 
-local SEL01_CFG_VERSION = "1.0"
+local SEL01_CFG_VERSION = "1.1"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -92,6 +93,12 @@ local vis_perfhud_pos= g_visual:combo("Perf HUD position", {"Top-Right", "Bottom
 local vis_specoverlay= g_visual:switch("Spectator overlay (who watches us)", true)
 local vis_killcam    = g_visual:switch("Kill highlight (flash on kill)", true)
 local vis_bullet_tr  = g_visual:switch("Bullet tracer line (custom)", false)
+g_visual:label(" ")
+g_visual:label(accent .. "  NL built-in toggles (override during script runtime)")
+local vis_nl_hitsnd  = g_visual:switch("NL Hit Marker Sound", true)
+local vis_nl_3rd     = g_visual:switch("Force Thirdperson (NL)", false)
+local vis_nl_scope   = g_visual:switch("Scope Overlay (NL)", false)
+local vis_nl_selfglw = g_visual:switch("Self-Glow (NL chams)", false)
 
 -- ══════════════════════════════════════════════════════════════════════════
 -- QOL UI
@@ -129,34 +136,75 @@ local function nl_find_safe(...)
     return nil
 end
 
-local function nl_set(ref, value)
+-- :override(value) is NON-DESTRUCTIVE — value resets when script unloads / no-arg call.
+-- :set(value) (and ui.set) is DESTRUCTIVE — overwrites user's manual UI permanently.
+-- Always prefer override for runtime writes.
+local function nl_override(ref, value)
     if not ref then return false end
-    local ok = pcall(function() ui.set(ref, value) end)
+    local ok = pcall(function() ref:override(value) end)
     return ok
+end
+local function nl_clear(ref)
+    if not ref then return end
+    pcall(function() ref:override() end)
 end
 
 -- ══════════════════════════════════════════════════════════════════════════
--- NL UI REFERENCES (best-effort discovery, all pcall-wrapped)
--- These paths target common NL UI element locations. If a path doesn't exist
--- in user's NL version, write silently fails — no crash.
+-- NL UI REFERENCES — verified paths from JAG0YAW/bettervisal/bloodwings/nyanza
+-- All pcall-wrapped; if a path is gone in a future NL update, write fails silently.
 -- ══════════════════════════════════════════════════════════════════════════
 local nl_refs = {}
 do
-    -- Anti-Aim references
-    nl_refs.aa_enabled    = nl_find_safe("Anti-Aim", "General", "Enabled")
-    nl_refs.aa_pitch      = nl_find_safe("Anti-Aim", "Angles",  "Pitch")
-    nl_refs.aa_yaw_base   = nl_find_safe("Anti-Aim", "Angles",  "Yaw Base")
-    nl_refs.aa_yaw_add    = nl_find_safe("Anti-Aim", "Angles",  "Yaw Add")
-    nl_refs.aa_yaw_mod    = nl_find_safe("Anti-Aim", "Angles",  "Yaw Modifier")
-    nl_refs.aa_jitter_mag = nl_find_safe("Anti-Aim", "Angles",  "Modifier Degree")
-    nl_refs.aa_desync     = nl_find_safe("Anti-Aim", "Fake",    "Desync Range")
-    nl_refs.aa_freestand  = nl_find_safe("Anti-Aim", "Fake",    "Freestanding")
-    -- Misc references
-    nl_refs.misc_autopeek = nl_find_safe("Misc",     "Movement","Auto Peek")
-    nl_refs.misc_bhop     = nl_find_safe("Misc",     "Movement","Auto Bunny-Hop")
-    nl_refs.misc_strafe   = nl_find_safe("Misc",     "Movement","Auto Strafe")
-    nl_refs.misc_clantag  = nl_find_safe("Misc",     "Misc",    "Clantag Spammer")
-    nl_refs.misc_autoacc  = nl_find_safe("Misc",     "Misc",    "Auto Accept Match")
+    -- Anti-Aim (Angles)
+    nl_refs.aa_enabled       = nl_find_safe("Aimbot", "Anti Aim", "Angles", "Enabled")
+    nl_refs.aa_pitch         = nl_find_safe("Aimbot", "Anti Aim", "Angles", "Pitch")
+    nl_refs.aa_yaw           = nl_find_safe("Aimbot", "Anti Aim", "Angles", "Yaw")
+    nl_refs.aa_yaw_base      = nl_find_safe("Aimbot", "Anti Aim", "Angles", "Yaw", "Base")
+    nl_refs.aa_yaw_offset    = nl_find_safe("Aimbot", "Anti Aim", "Angles", "Yaw", "Offset")
+    nl_refs.aa_yaw_hidden    = nl_find_safe("Aimbot", "Anti Aim", "Angles", "Yaw", "Hidden")
+    nl_refs.aa_avoidbackstab = nl_find_safe("Aimbot", "Anti Aim", "Angles", "Yaw", "Avoid Backstab")
+    nl_refs.aa_yawmod        = nl_find_safe("Aimbot", "Anti Aim", "Angles", "Yaw Modifier")
+    nl_refs.aa_yawmod_offset = nl_find_safe("Aimbot", "Anti Aim", "Angles", "Yaw Modifier", "Offset")
+    -- Body Yaw (desync)
+    nl_refs.aa_bodyyaw       = nl_find_safe("Aimbot", "Anti Aim", "Angles", "Body Yaw")
+    nl_refs.aa_bodyyaw_inv   = nl_find_safe("Aimbot", "Anti Aim", "Angles", "Body Yaw", "Inverter")
+    nl_refs.aa_bodyyaw_l     = nl_find_safe("Aimbot", "Anti Aim", "Angles", "Body Yaw", "Left Limit")
+    nl_refs.aa_bodyyaw_r     = nl_find_safe("Aimbot", "Anti Aim", "Angles", "Body Yaw", "Right Limit")
+    nl_refs.aa_bodyyaw_opts  = nl_find_safe("Aimbot", "Anti Aim", "Angles", "Body Yaw", "Options")
+    nl_refs.aa_bodyyaw_free  = nl_find_safe("Aimbot", "Anti Aim", "Angles", "Body Yaw", "Freestanding")
+    -- Freestanding (yaw-level)
+    nl_refs.aa_freestand     = nl_find_safe("Aimbot", "Anti Aim", "Angles", "Freestanding")
+    nl_refs.aa_free_disab_ym = nl_find_safe("Aimbot", "Anti Aim", "Angles", "Freestanding", "Disable Yaw Modifiers")
+    nl_refs.aa_free_body     = nl_find_safe("Aimbot", "Anti Aim", "Angles", "Freestanding", "Body Freestanding")
+    -- Misc (under Anti Aim)
+    nl_refs.aa_leg_movement  = nl_find_safe("Aimbot", "Anti Aim", "Misc", "Leg Movement")
+    nl_refs.aa_slowwalk      = nl_find_safe("Aimbot", "Anti Aim", "Misc", "Slow Walk")
+    nl_refs.aa_fakeduck      = nl_find_safe("Aimbot", "Anti Aim", "Misc", "Fake Duck")
+    -- Fake Lag
+    nl_refs.fl_switch        = nl_find_safe("Aimbot", "Anti Aim", "Fake Lag", "Enabled")
+    nl_refs.fl_limit         = nl_find_safe("Aimbot", "Anti Aim", "Fake Lag", "Limit")
+    nl_refs.fl_variability   = nl_find_safe("Aimbot", "Anti Aim", "Fake Lag", "Variability")
+    -- Ragebot
+    nl_refs.rage_fov         = nl_find_safe("Aimbot", "Ragebot", "Main", "Field of View")
+    nl_refs.rage_hide        = nl_find_safe("Aimbot", "Ragebot", "Main", "Hide Shots")
+    nl_refs.rage_dt          = nl_find_safe("Aimbot", "Ragebot", "Main", "Double Tap")
+    nl_refs.rage_peek        = nl_find_safe("Aimbot", "Ragebot", "Main", "Peek Assist")
+    nl_refs.rage_dormant     = nl_find_safe("Aimbot", "Ragebot", "Main", "Enabled", "Dormant Aimbot")
+    nl_refs.rage_hc          = nl_find_safe("Aimbot", "Ragebot", "Selection", "Hit Chance")
+    nl_refs.rage_mindmg      = nl_find_safe("Aimbot", "Ragebot", "Selection", "Min. Damage")
+    nl_refs.rage_autowall    = nl_find_safe("Aimbot", "Ragebot", "Selection", "Penetrate Walls")
+    nl_refs.rage_bodyaim     = nl_find_safe("Aimbot", "Ragebot", "Safety", "Body Aim")
+    nl_refs.rage_safepoint   = nl_find_safe("Aimbot", "Ragebot", "Safety", "Safe Points")
+    nl_refs.rage_hitsafety   = nl_find_safe("Aimbot", "Ragebot", "Safety", "Ensure Hitbox Safety")
+    nl_refs.rage_autoscope   = nl_find_safe("Aimbot", "Ragebot", "Accuracy", "Auto Scope")
+    -- Visuals
+    nl_refs.vis_thirdperson  = nl_find_safe("Visuals", "World", "Main", "Force Thirdperson")
+    nl_refs.vis_scope_ovl    = nl_find_safe("Visuals", "World", "Main", "Override Zoom", "Scope Overlay")
+    nl_refs.vis_viewmodel    = nl_find_safe("Visuals", "World", "Main", "Override Zoom", "Force Viewmodel")
+    nl_refs.vis_removals     = nl_find_safe("Visuals", "World", "Main", "Removals")
+    nl_refs.vis_hitmark_snd  = nl_find_safe("Visuals", "World", "Other", "Hit Marker Sound")
+    nl_refs.vis_self_chams   = nl_find_safe("Visuals", "Players", "Self", "Chams", "Weapon")
+    nl_refs.vis_self_glow    = nl_find_safe("Visuals", "Players", "Self", "Chams", "Glow")
 end
 
 -- ══════════════════════════════════════════════════════════════════════════
@@ -190,9 +238,21 @@ local function apply_preset(name)
         safe_set(qol_clantag_st, 1)
         safe_set(qol_killsay, false)
         safe_set(qol_autoaccept, true)
-        -- NL fallback writes
-        nl_set(nl_refs.aa_enabled, true)
-        nl_set(nl_refs.aa_freestand, true)
+        -- NL :override() writes (non-destructive — clears on script unload)
+        nl_override(nl_refs.aa_enabled, true)
+        nl_override(nl_refs.aa_yaw_base, "Backward")
+        nl_override(nl_refs.aa_yaw_offset, 0)
+        nl_override(nl_refs.aa_yawmod, "Jitter")
+        nl_override(nl_refs.aa_yawmod_offset, 45)
+        nl_override(nl_refs.aa_bodyyaw, "Static")
+        nl_override(nl_refs.aa_bodyyaw_l, 58)
+        nl_override(nl_refs.aa_bodyyaw_r, 58)
+        nl_override(nl_refs.aa_freestand, true)
+        nl_override(nl_refs.aa_avoidbackstab, true)
+        nl_override(nl_refs.fl_switch, true)
+        nl_override(nl_refs.fl_limit, 7)
+        nl_override(nl_refs.fl_variability, 2)
+        nl_override(nl_refs.vis_hitmark_snd, true)
         cs_log_color("⚡ AGGRESSIVE preset applied (full-send AA + visuals)")
     elseif name == "dynamic" then
         safe_set(aa_enable, true)
@@ -212,8 +272,16 @@ local function apply_preset(name)
         safe_set(qol_clantag, true)
         safe_set(qol_clantag_st, 2)
         safe_set(qol_autoaccept, true)
-        nl_set(nl_refs.aa_enabled, true)
-        nl_set(nl_refs.aa_freestand, true)
+        nl_override(nl_refs.aa_enabled, true)
+        nl_override(nl_refs.aa_yaw_base, "Backward")
+        nl_override(nl_refs.aa_yawmod, "Center")
+        nl_override(nl_refs.aa_bodyyaw, "Jitter")
+        nl_override(nl_refs.aa_bodyyaw_l, 45)
+        nl_override(nl_refs.aa_bodyyaw_r, 45)
+        nl_override(nl_refs.aa_freestand, true)
+        nl_override(nl_refs.fl_switch, true)
+        nl_override(nl_refs.fl_limit, 5)
+        nl_override(nl_refs.vis_hitmark_snd, true)
         cs_log_color("🎯 DYNAMIC preset applied (balanced AA + visuals)")
     elseif name == "defensive" then
         safe_set(aa_enable, true)
@@ -232,8 +300,17 @@ local function apply_preset(name)
         safe_set(vis_specoverlay, true)
         safe_set(qol_clantag, false)
         safe_set(qol_autoaccept, true)
-        nl_set(nl_refs.aa_enabled, true)
-        nl_set(nl_refs.aa_freestand, true)
+        nl_override(nl_refs.aa_enabled, true)
+        nl_override(nl_refs.aa_yaw_base, "Backward")
+        nl_override(nl_refs.aa_yawmod, "Offset")
+        nl_override(nl_refs.aa_yawmod_offset, 15)
+        nl_override(nl_refs.aa_bodyyaw, "Static")
+        nl_override(nl_refs.aa_bodyyaw_l, 35)
+        nl_override(nl_refs.aa_bodyyaw_r, 35)
+        nl_override(nl_refs.aa_freestand, true)
+        nl_override(nl_refs.fl_switch, true)
+        nl_override(nl_refs.fl_limit, 3)
+        nl_override(nl_refs.vis_hitmark_snd, true)
         cs_log_color("🛡 DEFENSIVE preset applied (safe AA, minimal visuals)")
     elseif name == "legit" then
         safe_set(aa_enable, false)      -- legit = NO custom AA
@@ -246,8 +323,9 @@ local function apply_preset(name)
         safe_set(vis_killcam, false)
         safe_set(qol_clantag, false)
         safe_set(qol_killsay, false)
-        nl_set(nl_refs.aa_enabled, false)
-        nl_set(nl_refs.aa_freestand, false)
+        nl_override(nl_refs.aa_enabled, false)
+        nl_override(nl_refs.aa_freestand, false)
+        nl_override(nl_refs.fl_switch, false)
         cs_log_color("👤 LEGIT-BOT preset applied (AA off, minimal visuals)")
     end
 end
@@ -379,8 +457,20 @@ local function createmove_handler(cmd)
     end)
 end
 
-pcall(function() events.createmove:set(createmove_handler) end)
-pcall(function() events.setup_command:set(createmove_handler) end)
+-- Single createmove handler that runs movement + NL-visual override sync
+local function createmove_unified(cmd)
+    createmove_handler(cmd)
+    if enable_master:get() then
+        nl_override(nl_refs.vis_hitmark_snd, vis_nl_hitsnd:get())
+        nl_override(nl_refs.vis_thirdperson, vis_nl_3rd:get())
+        nl_override(nl_refs.vis_scope_ovl,   vis_nl_scope:get())
+        if vis_nl_selfglw:get() then
+            nl_override(nl_refs.vis_self_glow, true)
+        end
+    end
+end
+pcall(function() events.createmove:set(createmove_unified) end)
+pcall(function() events.setup_command:set(createmove_unified) end)
 
 -- ══════════════════════════════════════════════════════════════════════════
 -- VISUALS — hit-marker + damage indicator + perf HUD + spectator overlay
@@ -607,9 +697,8 @@ update_clantag = function()
     end
     clantag_phase = (clantag_phase % #frames) + 1
     pcall(function()
-        if common and common.set_clantag then common.set_clantag(frames[clantag_phase])
-        elseif client and client.set_clan_tag then client.set_clan_tag(frames[clantag_phase])
-        end
+        -- Verified API from nyanza snapshot + bloodwings: common.set_clan_tag
+        if common and common.set_clan_tag then common.set_clan_tag(frames[clantag_phase]) end
     end)
 end
 
@@ -618,13 +707,7 @@ end
 -- We patch the existing render closure indirectly via a per-tick flag.
 local _clantag_tick_flag = true   -- always-true sentinel; update_clantag is gated by master+toggle inside
 
--- Reset clantag on master-disable
-enable_master:set_callback(function(r)
-    if not r:get() then
-        pcall(function() common.set_clantag("") end)
-        pcall(function() client.set_clan_tag("") end)
-    end
-end)
+-- (master-disable handler unified later in shutdown section — clears clantag + overrides)
 
 -- ── KILL-SAY rotation (chat) ──
 local KILL_LINES = {
@@ -699,12 +782,26 @@ pcall(function() btn_reset:set_callback(function() apply_preset("dynamic") end) 
 -- ══════════════════════════════════════════════════════════════════════════
 -- SHUTDOWN
 -- ══════════════════════════════════════════════════════════════════════════
+-- Clear all NL :override() writes so user's manual UI returns to its real state.
+local function clear_all_nl_overrides()
+    for _, ref in pairs(nl_refs) do nl_clear(ref) end
+end
+
 pcall(function()
     events.shutdown:set(function()
-        pcall(function() common.set_clantag("") end)
-        pcall(function() client.set_clan_tag("") end)
-        cs_log_color("Sel01-Config v" .. SEL01_CFG_VERSION .. " — unloaded")
+        pcall(function() common.set_clan_tag("") end)
+        clear_all_nl_overrides()
+        cs_log_color("Sel01-Config v" .. SEL01_CFG_VERSION .. " — unloaded (overrides cleared)")
     end)
+end)
+
+-- Also clear on master-disable
+enable_master:set_callback(function(r)
+    if not r:get() then
+        clear_all_nl_overrides()
+        pcall(function() common.set_clan_tag("") end)
+        cs_log_color("Master DISABLED — overrides + clantag cleared")
+    end
 end)
 
 -- ══════════════════════════════════════════════════════════════════════════
