@@ -1,15 +1,15 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Config — Neverlose CSGO HvH config        ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 1.9                                    ║
+-- ║  Version: 1.10                                   ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Config
 -- @author seltonmt01
--- @version 1.9
--- @description Spawn-crash fix: throttle periodic sync 16Hz, skip writes when no override active,
---              outer-pcall weapon_fire/player_hurt, fake-duck assist default OFF.
+-- @version 1.10
+-- @description Spectator-crash fix: aa_periodic_sync bails if not alive, visuals overrides dirty-tracked,
+--              preset apply step-logged + per-line pcall.
 
-local SEL01_CFG_VERSION = "1.9"
+local SEL01_CFG_VERSION = "1.10"
 
 local pui      = require("neverlose/pui");
 local ffi      = require("ffi");
@@ -248,7 +248,16 @@ local pending_preset = nil  -- "aggressive" / "dynamic" / "defensive" / "legit" 
 -- Combo :set() calls are skipped entirely — they were the most likely crash source.
 -- The user can still pick combo values manually, and the NL refs :override() handles
 -- the actual gameplay AA values which is what matters.
+-- V1.10: each step pcall'd so a single bad call can't abort the whole preset,
+-- and the step prints to chat so the user sees where a future crash lands.
+local function _safe_step(label, fn)
+    local ok, err = pcall(fn)
+    if not ok then
+        cs_log("[STEP-FAIL] " .. label .. " — " .. tostring(err))
+    end
+end
 local function _do_apply_preset(name)
+    cs_log("[apply] start " .. tostring(name))
     if name == "aggressive" then
         safe_set(aa_enable, true)
         safe_set(aa_freestanding, true)
@@ -278,11 +287,11 @@ local function _do_apply_preset(name)
         safe_set(qol_clantag, true)
         safe_set(qol_killsay, false)
         safe_set(qol_autoaccept, true)
-        nl_override(nl_refs.aa_enabled, true)
-        nl_override(nl_refs.aa_freestand, true)
-        nl_override(nl_refs.aa_avoidbackstab, true)
-        nl_override(nl_refs.fl_switch, true)
-        nl_override(nl_refs.vis_hitmark_snd, true)
+        _safe_step("nl aa_enabled",     function() nl_override(nl_refs.aa_enabled, true) end)
+        _safe_step("nl aa_freestand",   function() nl_override(nl_refs.aa_freestand, true) end)
+        _safe_step("nl aa_avoidbk",     function() nl_override(nl_refs.aa_avoidbackstab, true) end)
+        _safe_step("nl fl_switch",      function() nl_override(nl_refs.fl_switch, true) end)
+        _safe_step("nl vis_hitmark",    function() nl_override(nl_refs.vis_hitmark_snd, true) end)
         cs_log_color("AGGRESSIVE preset applied")
     elseif name == "dynamic" then
         safe_set(aa_enable, true)
@@ -410,12 +419,20 @@ local aa_state = {
     last_fire_time = 0,
 }
 
--- V1.9: throttled 16Hz + skip NL writes when no override active. Previous v1.8 wrote
--- to NL body_yaw_l/r EVERY createmove tick (~64Hz) which is the suspected spawn-crash
--- cause (GC pressure or :override re-entry on a freshly-spawned UI state).
+-- V1.10: bail entirely if local player is not alive (spectator / main menu /
+-- between rounds). Per-tick NL :override calls in those states are the suspected
+-- "applied" never printing crash — NL UI state is in transition and constant
+-- writes from a spectating script can crash CSGO.
 local aa_periodic_last_tick = 0
 local function aa_periodic_sync()
     if not (enable_master:get() and aa_enable:get()) then return end
+    -- bail if not in an alive match state
+    local lp = entity.get_local_player()
+    if not lp then return end
+    local alive = false
+    pcall(function() alive = lp:is_alive() end)
+    if not alive then return end
+
     local tick = globals.tickcount or 0
     -- jitter rhythm counter (drives indicator animation only — runs every tick, cheap)
     aa_yaw_jitter_counter = aa_yaw_jitter_counter + 1
@@ -433,12 +450,9 @@ local function aa_periodic_sync()
     local on_shot_active = aa_onshot:get() and now < aa_state.on_shot_until
     local anti_bf_active = aa_anti_bf:get()
     if aa_air_set:get() then
-        local lp = entity.get_local_player()
-        if lp then
-            local f = 0
-            pcall(function() f = lp.m_fFlags or 0 end)
-            if bit.band(f, 1) == 0 then air_active = true end
-        end
+        local f = 0
+        pcall(function() f = lp.m_fFlags or 0 end)
+        if bit.band(f, 1) == 0 then air_active = true end
     end
     if not (air_active or on_shot_active or anti_bf_active) then return end
 
@@ -564,6 +578,8 @@ end
 
 -- Single createmove handler that runs movement + NL-visual override sync.
 -- V1.5: also drains pending_preset so preset writes happen OUTSIDE menu callback.
+-- V1.10: dirty-tracking for NL visual overrides (only write on toggle change)
+local _vis_last = { hitsnd = nil, tp = nil, sc = nil, fd = nil }
 local function createmove_unified(cmd)
     -- Drain queued preset apply (set by Aggressive/Dynamic/Defensive/Legit buttons)
     if pending_preset then
@@ -575,14 +591,22 @@ local function createmove_unified(cmd)
     createmove_handler(cmd)
     -- V1.8: AA periodic sync (replaces aa_handler cmd-writes)
     aa_periodic_sync()
+    -- V1.10: visual overrides DIRTY-TRACKED. Previously fired :override every tick
+    -- (~64Hz) even when the value never changed. NL UI write pressure suspected as
+    -- the spectator-crash trigger. Only write when the local toggle's value differs
+    -- from the last value we sent.
     if enable_master:get() then
-        nl_override(nl_refs.vis_hitmark_snd, vis_nl_hitsnd:get())
-        nl_override(nl_refs.vis_thirdperson, vis_nl_3rd:get())
-        nl_override(nl_refs.vis_scope_ovl,   vis_nl_scope:get())
-        -- V1.7: self-glow override removed (combo value mismatch).
-        -- V1.6 H: drive NL fake-duck via :override during hostile-fire window
-        if aa_fd_assist:get() and (globals.realtime or 0) < aa_state.fakeduck_until then
-            nl_override(nl_refs.aa_fakeduck, true)
+        local v1 = vis_nl_hitsnd:get()
+        if _vis_last.hitsnd ~= v1 then nl_override(nl_refs.vis_hitmark_snd, v1); _vis_last.hitsnd = v1 end
+        local v2 = vis_nl_3rd:get()
+        if _vis_last.tp ~= v2 then nl_override(nl_refs.vis_thirdperson, v2); _vis_last.tp = v2 end
+        local v3 = vis_nl_scope:get()
+        if _vis_last.sc ~= v3 then nl_override(nl_refs.vis_scope_ovl, v3); _vis_last.sc = v3 end
+        -- V1.6 H + V1.10: fake-duck override only while window is open AND only on first tick
+        local fd_window = aa_fd_assist:get() and (globals.realtime or 0) < aa_state.fakeduck_until
+        if fd_window ~= _vis_last.fd then
+            nl_override(nl_refs.aa_fakeduck, fd_window)
+            _vis_last.fd = fd_window
         end
     end
 end
