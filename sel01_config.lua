@@ -1,16 +1,16 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Config — Neverlose CSGO HvH config        ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 1.12                                   ║
+-- ║  Version: 1.13                                   ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Config
 -- @author seltonmt01
--- @version 1.12
--- @description Match-crash fix: weapon_fire + player_hurt handlers no longer read enemy entity
---              properties. FD-assist triggers on any enemy fire (no distance/aim check).
---              Damage popup stacks at screen edge (no world position read). Debug marks removed.
+-- @version 1.13
+-- @description BISECT BUILD: all event handlers + NL :override calls disabled at runtime.
+--              Only render (visuals) + preset safe_set (local UI) + movement helpers active.
+--              If stable, crash is in event handlers or NL :override. If still crashes, in render.
 
-local SEL01_CFG_VERSION = "1.12"
+local SEL01_CFG_VERSION = "1.13"
 
 -- DEBUG: print to CSGO console at major load checkpoints. Plain print() bypasses
 -- NL chat (which may not flush before crash) and writes directly to CSGO console.
@@ -167,11 +167,10 @@ end
 
 -- :override(value) is NON-DESTRUCTIVE — value resets when script unloads / no-arg call.
 -- :set(value) (and ui.set) is DESTRUCTIVE — overwrites user's manual UI permanently.
--- Always prefer override for runtime writes.
+-- V1.13 BISECT: nl_override hard-disabled (no-op). If config is stable in match
+-- with this disabled, the crash is in one of the :override call sites.
 local function nl_override(ref, value)
-    if not ref then return false end
-    local ok = pcall(function() ref:override(value) end)
-    return ok
+    return false
 end
 local function nl_clear(ref)
     if not ref then return end
@@ -583,8 +582,7 @@ end
 
 -- Single createmove handler that runs movement + NL-visual override sync.
 -- V1.5: also drains pending_preset so preset writes happen OUTSIDE menu callback.
--- V1.10: dirty-tracking for NL visual overrides (only write on toggle change)
-local _vis_last = { hitsnd = nil, tp = nil, sc = nil, fd = nil }
+-- V1.13 BISECT: _vis_last dirty-track unused now (all NL overrides off)
 local function createmove_unified(cmd)
     -- Drain queued preset apply (set by Aggressive/Dynamic/Defensive/Legit buttons)
     if pending_preset then
@@ -594,26 +592,9 @@ local function createmove_unified(cmd)
     end
 
     createmove_handler(cmd)
-    -- V1.8: AA periodic sync (replaces aa_handler cmd-writes)
-    aa_periodic_sync()
-    -- V1.10: visual overrides DIRTY-TRACKED. Previously fired :override every tick
-    -- (~64Hz) even when the value never changed. NL UI write pressure suspected as
-    -- the spectator-crash trigger. Only write when the local toggle's value differs
-    -- from the last value we sent.
-    if enable_master:get() then
-        local v1 = vis_nl_hitsnd:get()
-        if _vis_last.hitsnd ~= v1 then nl_override(nl_refs.vis_hitmark_snd, v1); _vis_last.hitsnd = v1 end
-        local v2 = vis_nl_3rd:get()
-        if _vis_last.tp ~= v2 then nl_override(nl_refs.vis_thirdperson, v2); _vis_last.tp = v2 end
-        local v3 = vis_nl_scope:get()
-        if _vis_last.sc ~= v3 then nl_override(nl_refs.vis_scope_ovl, v3); _vis_last.sc = v3 end
-        -- V1.6 H + V1.10: fake-duck override only while window is open AND only on first tick
-        local fd_window = aa_fd_assist:get() and (globals.realtime or 0) < aa_state.fakeduck_until
-        if fd_window ~= _vis_last.fd then
-            nl_override(nl_refs.aa_fakeduck, fd_window)
-            _vis_last.fd = fd_window
-        end
-    end
+    -- V1.13 BISECT: aa_periodic_sync + per-tick visuals + fakeduck overrides
+    -- ALL DISABLED. Createmove drains pending preset (above) and runs movement
+    -- helpers, nothing else.
 end
 -- V1.7: pick the first available createmove name (createmove preferred)
 _hooks_status.createmove = register_first(createmove_unified, "createmove", "setup_command")
@@ -631,112 +612,17 @@ local hitmark_time = 0
 -- name (nil at call-time).
 local update_clantag = function() end
 
--- V1.6 D: aim_fire / ragebot_fire → set on-shot timer for defensive AA window
-local function on_local_fire(event)
-    if not enable_master:get() then return end
-    if aa_onshot:get() then
-        local dur_ms = aa_onshot_dur:get() or 600
-        aa_state.on_shot_until = (globals.realtime or 0) + (dur_ms / 1000)
-    end
-    aa_state.last_fire_time = globals.realtime or 0
-end
--- V1.7: aim_fire preferred over ragebot_fire (more reliable timing)
-_hooks_status.aim_fire = register_first(on_local_fire, "aim_fire", "ragebot_fire")
+-- V1.13 BISECT: aim_fire / ragebot_fire / weapon_fire / aim_ack / player_hurt
+-- registrations DISABLED. on_local_fire kept as a stub for any future re-enable.
+local function on_local_fire(event) end
+_hooks_status.aim_fire = nil   -- not registered in v1.13
 
--- V1.12: weapon_fire reads ZERO entity properties on the shooter. v1.6-1.11 all
--- did entity.get + shooter.m_vecOrigin / m_angEyeAngles property reads. User
--- reported repeated CSGO CTDs once in-match. CSGO returns invalid memory for
--- entity properties on players in transition (just-respawned, dying, weapon-
--- switching) and pcall does NOT catch C++ segfault. Trimmed handler trades
--- hostile-aim precision for stability: ANY enemy fire opens the fake-duck window.
-pcall(function()
-    events.weapon_fire:set(function(event)
-        pcall(function()
-            if not (enable_master:get() and aa_fd_assist:get()) then return end
-            if not event or not event.userid then return end
-            local lp = entity.get_local_player()
-            if not lp then return end
-            local alive = false
-            pcall(function() alive = lp:is_alive() end)
-            if not alive then return end
-            -- Skip if shooter is local player (don't fd-assist our own shots).
-            -- lp:get_user_id() is a Lua method call on the lp object we already
-            -- verified, so no entity.get(event.userid) lookup needed.
-            local lp_uid
-            pcall(function() lp_uid = lp:get_user_id() end)
-            if lp_uid and event.userid == lp_uid then return end
-            aa_state.fakeduck_until = (globals.realtime or 0) + ((aa_fd_duration:get() or 800) / 1000)
-        end)
-    end)
-end)
+-- V1.13 BISECT: weapon_fire handler DISABLED (no registration). If config is
+-- stable with this off, FD-assist or weapon_fire-related code is the crash.
 
--- Aim_ack — hit-marker trigger
-pcall(function()
-    events.aim_ack:set(function(event)
-        if not (enable_master:get() and vis_hitmarker:get()) then return end
-        if not event then return end
-        local reason = event.state
-        local HIT_STATES = { hit = true, damaged = true, ["hit-damaged"] = true }
-        if reason and HIT_STATES[reason] then
-            hitmark_time = globals.realtime or 0
-            -- HIT-LOG push: name + dmg + hitbox
-            if vis_hitlog:get() then
-                local target_name = "?"
-                local hb_name     = "?"
-                pcall(function()
-                    if event.target then
-                        local t = entity.get(event.target, true)
-                        if t and t.get_name then target_name = t:get_name() end
-                    end
-                end)
-                pcall(function()
-                    local HB_NAMES = { [0]="head", [3]="chest", [4]="stomach",
-                                       [6]="leg", [7]="leg" }
-                    hb_name = HB_NAMES[event.hitbox] or tostring(event.hitbox or "?")
-                end)
-                -- V1.6 K: skeet-style entry — also store wanted vs dealt damage
-                table.insert(hit_log, {
-                    time      = globals.realtime or 0,
-                    name      = target_name,
-                    dmg       = event.damage or 0,
-                    dmg_want  = event.wanted_damage or event.requested_damage or event.damage or 0,
-                    hitbox    = hb_name,
-                    hitbox_id = event.hitbox or -1,
-                })
-                while #hit_log > HIT_LOG_MAX do table.remove(hit_log, 1) end
-            end
-        end
-    end)
-end)
-
--- Player hurt event — damage indicator floating text on enemy
--- V1.9 hardening: outer pcall + entity.get pcall'd (attacker=0 for world damage)
-pcall(function()
-    events.player_hurt:set(function(event)
-        pcall(function()
-            if not (enable_master:get() and vis_dmgind:get()) then return end
-            if not event then return end
-            local lp = entity.get_local_player()
-            if not lp then return end
-            -- V1.12: skip entity.get(victim, ...) — only check that attacker is us
-            -- via userid comparison. No victim.m_vecOrigin read; popup stacks at
-            -- screen edge instead of anchoring to the enemy's 3D position.
-            local lp_uid
-            pcall(function() lp_uid = lp:get_user_id() end)
-            if not lp_uid or event.attacker ~= lp_uid then return end
-            if event.userid == lp_uid then return end  -- not self-damage
-            local hb = -1
-            pcall(function() hb = event.hitgroup or -1 end)
-            table.insert(damage_pops, {
-                time = globals.realtime or 0,
-                dmg  = event.dmg_health or event.damage or 0,
-                hp_left = event.health or 0,
-                hitbox_id = hb,
-            })
-            while #damage_pops > 16 do table.remove(damage_pops, 1) end
-        end)
-    end)
-end)
+-- V1.13 BISECT: aim_ack + player_hurt DISABLED (no registration).
+-- Loses hit-marker trigger, hit-log push, damage popups. Visual stubs still
+-- render but the data lists stay empty until events are re-enabled.
 
 -- Performance HUD state
 local perf = { fps = 0, ping = 0, choke = 0, var = 0, last_update = 0 }
@@ -1251,7 +1137,7 @@ end)
 -- LOAD BANNER
 -- ══════════════════════════════════════════════════════════════════════════
 cs_log_color("══════════════════════════════════════════")
-cs_log_color("Sel01-Config v" .. SEL01_CFG_VERSION .. " loaded (CSGO HvH)")
+cs_log_color("Sel01-Config v" .. SEL01_CFG_VERSION .. " loaded (BISECT - all NL writes/events off)")
 cs_log(string.format("  hooks  createmove=%s  aim_fire=%s",
     tostring(_hooks_status.createmove or "MISSING"),
     tostring(_hooks_status.aim_fire or "MISSING")))
