@@ -1,15 +1,15 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Config — Neverlose CSGO HvH config        ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 2.2                                    ║
+-- ║  Version: 2.3                                    ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Config
 -- @author seltonmt01
--- @version 2.2
--- @description Drop visual NL :overrides (Scope Overlay confirmed combo via JAG0YAW; Hit Marker Sound +
---              Force Thirdperson likely combo too — :override(bool) on combo segfaults).
+-- @version 2.3
+-- @description Air-AA improvements (HvH-grade): rapid inverter flip, max-jitter boost, optional
+--              fake-duck, 1.5x anti-BF variance airborne. Transition handling clears overrides on land.
 
-local SEL01_CFG_VERSION = "2.2"
+local SEL01_CFG_VERSION = "2.3"
 
 -- DEBUG: print to CSGO console at major load checkpoints. Plain print() bypasses
 -- NL chat (which may not flush before crash) and writes directly to CSGO console.
@@ -79,9 +79,12 @@ g_aa:label(accent .. ui.get_icon"bolt" .. accent .. "  HvH extras")
 -- D: Force on-shot AA — different values during/after ragebot fire
 local aa_onshot      = g_aa:switch("Force on-shot AA (more defensive after fire)", true)
 local aa_onshot_dur  = g_aa:slider("On-shot duration (ms)", 100, 1500, 600)
--- F: Air desync override
-local aa_air_set     = g_aa:switch("Air desync override (airborne = different AA)", true)
-local aa_air_mag     = g_aa:slider("Air desync magnitude (deg)", 10, 58, 35)
+-- F: Air desync override (V2.3 air-AA improvements for jumping aggressive play)
+local aa_air_set      = g_aa:switch("Air desync override (airborne = different AA)", true)
+local aa_air_mag      = g_aa:slider("Air desync magnitude (deg)", 10, 58, 35)
+local aa_air_flip     = g_aa:switch("  └ Air rapid inverter flip (LBY break)", true)
+local aa_air_boost    = g_aa:switch("  └ Air max jitter boost (yaw mod offset = 58)", true)
+local aa_air_fakeduck = g_aa:switch("  └ Air force fake-duck (LBY break alt)", false)
 -- G: Anti-bruteforce jitter variance
 local aa_anti_bf     = g_aa:switch("Anti-bruteforce jitter (random mag variance)", true)
 local aa_anti_bf_var = g_aa:slider("Anti-BF variance (deg)", 5, 25, 15)
@@ -94,13 +97,12 @@ local aa_fd_duration = g_aa:slider("Fake-duck duration (ms)", 200, 2000, 800)
 -- MOVEMENT UI
 -- ══════════════════════════════════════════════════════════════════════════
 g_move:label(accent .. ui.get_icon"running" .. accent .. "  Movement helpers")
--- V2.1: ALL movement helpers dropped. v1.13 BISECT showed createmove movement
--- is stable; v2.0 added AI Peek which writes :override(int) every tick on the
--- NL Peek Assist element — Peek Assist is a HOTKEY element and JAG0YAW only
--- STORES the ref, never overrides it. The per-tick override caused the spawn CTD.
--- Use NL's built-in hotkey bindings for Peek Assist + slow-walk + fake-duck directly.
-g_move:label(accent .. "  Use NL Aimbot/Ragebot/Main/Peek Assist directly (assign hotkey there)")
+-- AI Peek removed — NL Peek Assist is a HOTKEY element; our :override on a
+-- hotkey userdata crashed CSGO. There is no Lua API to programmatically trigger
+-- NL hotkeys from a script. The only reliable peek is NL's own.
+g_move:label(accent .. "  AI Peek: assign NL Aimbot/Ragebot/Main/Peek Assist hotkey")
 g_move:label(accent .. "  Slow-walk / Fake-duck: NL Aimbot/Anti Aim/Misc tab")
+g_move:label(accent .. "  (NL has these built-in — no need to duplicate here)")
 
 -- ══════════════════════════════════════════════════════════════════════════
 -- VISUALS UI
@@ -268,6 +270,9 @@ local function _do_apply_preset(name)
         safe_set(aa_onshot, true)
         safe_set(aa_air_set, true)
         safe_set(aa_air_mag, 35)
+        safe_set(aa_air_flip, true)      -- V2.3: rapid inverter flip in air
+        safe_set(aa_air_boost, true)     -- V2.3: max jitter offset in air
+        safe_set(aa_air_fakeduck, false) -- V2.3: optional LBY break (noisy on ground sync, skip)
         safe_set(aa_anti_bf, true)
         safe_set(aa_anti_bf_var, 15)
         safe_set(aa_fd_assist, true)
@@ -295,6 +300,8 @@ local function _do_apply_preset(name)
         safe_set(aa_yaw_mod_int, 3)
         safe_set(aa_onshot, true)
         safe_set(aa_air_set, true)
+        safe_set(aa_air_flip, true)
+        safe_set(aa_air_boost, false)    -- dynamic = balanced, no max boost
         safe_set(aa_anti_bf, true)
         safe_set(aa_fd_assist, true)
         safe_set(vis_watermark, true)
@@ -320,6 +327,8 @@ local function _do_apply_preset(name)
         safe_set(aa_yaw_mod_int, 4)
         safe_set(aa_onshot, true)
         safe_set(aa_air_set, true)
+        safe_set(aa_air_flip, false)     -- defensive = no rapid flip
+        safe_set(aa_air_boost, false)
         safe_set(aa_anti_bf, false)  -- defensive = predictable static
         safe_set(aa_fd_assist, true)
         safe_set(vis_watermark, true)
@@ -348,6 +357,9 @@ local function _do_apply_preset(name)
         safe_set(aa_onshot, false)   -- spin = always spin, no defensive interrupt
         safe_set(aa_air_set, true)
         safe_set(aa_air_mag, 58)
+        safe_set(aa_air_flip, true)      -- spin = full chaos in air
+        safe_set(aa_air_boost, true)
+        safe_set(aa_air_fakeduck, true)  -- spin allows fake-duck LBY break
         safe_set(aa_anti_bf, true)
         safe_set(aa_anti_bf_var, 25)
         safe_set(aa_fd_assist, true)
@@ -400,14 +412,14 @@ local aa_state = {
     last_fire_time = 0,
 }
 
--- V1.10: bail entirely if local player is not alive (spectator / main menu /
--- between rounds). Per-tick NL :override calls in those states are the suspected
--- "applied" never printing crash — NL UI state is in transition and constant
--- writes from a spectating script can crash CSGO.
+-- V2.3: air-AA improvements for jumping aggressive play. New air-extras (rapid
+-- inverter flip, max-jitter boost, force fake-duck). Transition handling clears
+-- overrides on land so ground AA returns to user's preset state.
 local aa_periodic_last_tick = 0
+local _was_airborne = false
+
 local function aa_periodic_sync()
     if not (enable_master:get() and aa_enable:get()) then return end
-    -- bail if not in an alive match state
     local lp = entity.get_local_player()
     if not lp then return end
     local alive = false
@@ -415,35 +427,44 @@ local function aa_periodic_sync()
     if not alive then return end
 
     local tick = globals.tickcount or 0
-    -- jitter rhythm counter (drives indicator animation only — runs every tick, cheap)
+    -- jitter rhythm counter (runs every tick, cheap, drives indicator animation)
     aa_yaw_jitter_counter = aa_yaw_jitter_counter + 1
     aa_jitter_counter     = aa_yaw_jitter_counter
     local jint = math.max(1, aa_yaw_mod_int:get())
     if aa_yaw_jitter_counter % jint == 0 then aa_jitter_dir = -aa_jitter_dir end
-    -- THROTTLE: write to NL refs at most every 4 ticks (~16Hz on a 64-tick server)
     if tick - aa_periodic_last_tick < 4 then return end
     aa_periodic_last_tick = tick
 
+    -- airborne detection (FL_ONGROUND bit 0)
+    local f = 0
+    pcall(function() f = lp.m_fFlags or 0 end)
+    local airborne = (bit.band(f, 1) == 0)
+
+    -- transition handling: just landed -> clear air-extra overrides so ground AA
+    -- returns to user's preset / manual values
+    if _was_airborne and not airborne then
+        nl_clear(nl_refs.aa_bodyyaw_inv)
+        nl_clear(nl_refs.aa_yawmod_offset)
+        nl_clear(nl_refs.aa_fakeduck)
+    end
+    _was_airborne = airborne
+
     local now = globals.realtime or 0
-    -- Detect whether ANY override path is actually active. If none, skip the writes
-    -- entirely — user's manual NL Body Yaw limits stay untouched.
-    local air_active     = false
     local on_shot_active = aa_onshot:get() and now < aa_state.on_shot_until
     local anti_bf_active = aa_anti_bf:get()
-    if aa_air_set:get() then
-        local f = 0
-        pcall(function() f = lp.m_fFlags or 0 end)
-        if bit.band(f, 1) == 0 then air_active = true end
-    end
-    if not (air_active or on_shot_active or anti_bf_active) then return end
+    local air_set_active = aa_air_set:get() and airborne
 
-    -- Compute base limit + apply overrides
-    local lim = air_active and aa_air_mag:get() or aa_desync:get()
+    if not (air_set_active or on_shot_active or anti_bf_active) then return end
+
+    -- desync magnitude: air > on-shot > base
+    local lim = air_set_active and aa_air_mag:get() or aa_desync:get()
     if on_shot_active then lim = math.max(15, math.floor(lim * 0.5)) end
 
     local l_lim, r_lim = lim, lim
     if anti_bf_active then
         local var = aa_anti_bf_var:get()
+        -- 1.5x variance airborne for more chaos
+        if air_set_active then var = math.min(58, var * 1.5) end
         l_lim = lim + (math.random() * 2 - 1) * var
         r_lim = lim + (math.random() * 2 - 1) * var
     end
@@ -451,7 +472,23 @@ local function aa_periodic_sync()
     if r_lim < 0 then r_lim = 0 elseif r_lim > 58 then r_lim = 58 end
     nl_override(nl_refs.aa_bodyyaw_l, math.floor(l_lim))
     nl_override(nl_refs.aa_bodyyaw_r, math.floor(r_lim))
-    -- V1.9: aa_freestand removed from per-tick path — only changes on preset apply
+
+    -- V2.3 AIR EXTRAS — only when airborne
+    if air_set_active then
+        -- rapid inverter flip every periodic tick (~16Hz) — LBY break in air
+        if aa_air_flip:get() then
+            local flip_state = (aa_yaw_jitter_counter % 2 == 0)
+            nl_override(nl_refs.aa_bodyyaw_inv, flip_state)
+        end
+        -- boost yaw modifier offset to 58 (max jitter angle) for max desync chaos
+        if aa_air_boost:get() then
+            nl_override(nl_refs.aa_yawmod_offset, 58)
+        end
+        -- force fake-duck in air — alt LBY break, ragebot harder to hit ducked target
+        if aa_air_fakeduck:get() then
+            nl_override(nl_refs.aa_fakeduck, true)
+        end
+    end
 end
 
 -- V1.8: events.antiaim hook DELETED (writing to cmd userdata fields caused CTD).
@@ -661,17 +698,27 @@ pcall(function()
             end
         end
 
-        -- ── V1.6 M: ROTATING AA INDICATOR (animated line around crosshair) ──
+        -- ── V1.6 M + V2.3: ROTATING AA INDICATOR (animated line around crosshair)
+        -- V2.3 bugfix: arrow was reading nl_refs.aa_bodyyaw_inv:get() which returns
+        -- the user's manual inverter (default false -> always right ">"). Now uses
+        -- aa_jitter_dir as primary so the arrow animates with our jitter rhythm
+        -- and shows actual current side. Only falls back to NL inverter if AA
+        -- override is OFF (user is on NL's manual AA).
         if vis_aaarrows:get() then
             local lp = entity.get_local_player()
             if lp and lp:is_alive() then
-                local side = aa_jitter_dir or 1
-                pcall(function()
-                    if nl_refs.aa_bodyyaw_inv then
-                        local v = nl_refs.aa_bodyyaw_inv:get()
-                        if type(v) == "boolean" then side = v and -1 or 1 end
-                    end
-                end)
+                local side
+                if aa_enable:get() then
+                    side = aa_jitter_dir or 1
+                else
+                    side = 1
+                    pcall(function()
+                        if nl_refs.aa_bodyyaw_inv then
+                            local v = nl_refs.aa_bodyyaw_inv:get()
+                            if type(v) == "boolean" then side = v and -1 or 1 end
+                        end
+                    end)
+                end
                 -- main desync arrow (color-coded by side: yellow=left, cyan=right)
                 local mcol = (side < 0) and color(255, 230, 80, 255) or color(80, 200, 255, 255)
                 local txt  = (side < 0) and "<" or ">"
@@ -1045,7 +1092,7 @@ end)
 -- LOAD BANNER
 -- ══════════════════════════════════════════════════════════════════════════
 cs_log_color("══════════════════════════════════════════")
-cs_log_color("Sel01-Config v" .. SEL01_CFG_VERSION .. " loaded (CSGO HvH — visual NL overrides dropped: combos)")
+cs_log_color("Sel01-Config v" .. SEL01_CFG_VERSION .. " loaded (CSGO HvH — air-AA improvements: flip + boost + fakeduck)")
 cs_log(string.format("  hooks  createmove=%s  aim_fire=%s",
     tostring(_hooks_status.createmove or "MISSING"),
     tostring(_hooks_status.aim_fire or "MISSING")))
