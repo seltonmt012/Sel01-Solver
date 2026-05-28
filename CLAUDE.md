@@ -194,13 +194,25 @@ All `render.*` pcall-wrapped. Border via 4 thin rects (avoid uncertain `render.r
 
 ## Git workflow
 
-Repo initialized V9.6. Branch: not pushed yet. `.gitignore` excludes private data (`learned.lua/json/last_logs.txt/logo.png`).
+**Remote**: `origin → https://github.com/seltonmt012/ownlua.git` (branch: `master`). Auto-pushed since V9.6.
 
-To push to GitHub (user must do — needs their account):
+**Auto-commit + push policy** (user-explicit V9.6): every `SEL01_VERSION` bump triggers commit + push. No manual approval needed for these. Commit format:
 ```
-git commit -m "Initial commit"
-gh repo create Sel01-Solver --public --source=. --push
+Sel01-Solver vX.Y — <short summary>
+
+<bullet list of changes per V-section>
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
 ```
+
+`.gitignore` excludes private data (`learned.lua/json/last_logs.txt/logo.png`, `.claude/`, `.vscode/`).
+
+Push command:
+```powershell
+git push origin master
+```
+
+If hook failure on commit: investigate root cause, fix, create NEW commit (don't amend — pre-commit hooks fail means commit didn't happen, amend would modify previous one).
 
 ## Common mistakes to avoid
 
