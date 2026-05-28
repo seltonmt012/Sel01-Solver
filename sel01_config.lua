@@ -1,16 +1,15 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Config — Neverlose CSGO HvH config        ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 1.6                                    ║
+-- ║  Version: 1.7                                    ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Config
 -- @author seltonmt01
--- @version 1.6
--- @description CSGO HvH companion: Spin preset replaces Legit, on-shot AA, air desync, anti-BF jitter,
---              fake-duck assist on hostile-fire, animated gradient watermark, HvH state indicators,
---              skeet-style hit log, color-coded damage popup, rotating AA indicator.
+-- @version 1.7
+-- @description Audit cleanup: split jitter counters, clamp anti-BF mag, dedup event hooks + load logging,
+--              perf passes (specs / hit-log width cache), drop dead code.
 
-local SEL01_CFG_VERSION = "1.6"
+local SEL01_CFG_VERSION = "1.7"
 
 local pui      = require("neverlose/pui");
 local ffi      = require("ffi");
@@ -114,7 +113,8 @@ g_visual:label(accent .. ui.get_icon"sparkles" .. accent .. "  NL built-in toggl
 local vis_nl_hitsnd  = g_visual:switch("NL Hit Marker Sound", true)
 local vis_nl_3rd     = g_visual:switch("Force Thirdperson", false)
 local vis_nl_scope   = g_visual:switch("Scope Overlay", false)
-local vis_nl_selfglw = g_visual:switch("Self-Glow", false)
+-- V1.7: self-glow toggle dropped — NL glow is a multi-value combo, our :override(true)
+-- on a combo silently no-op'd. Users can configure glow directly in NL Visuals tab.
 
 -- ══════════════════════════════════════════════════════════════════════════
 -- QOL UI
@@ -390,13 +390,17 @@ apply_preset_fwd = apply_preset  -- resolve forward-decl
 -- NL exposes events.antiaim (signature varies). Best-effort write to cmd
 -- (pitch, yaw_base, yaw_add, yaw_modifier, jitter, desync). All pcall.
 -- ══════════════════════════════════════════════════════════════════════════
-local aa_jitter_counter = 0
-local aa_jitter_dir = 1
+-- V1.7 fix: split pitch + yaw jitter counters. Sharing one counter caused
+-- effective rate to double when both jitter modes were active simultaneously.
+local aa_pitch_jitter_counter = 0
+local aa_yaw_jitter_counter   = 0
+local aa_jitter_dir           = 1
+-- Kept alias for indicator's rotating-line animation (still uses yaw rhythm)
+local aa_jitter_counter       = 0
 -- V1.6 HvH state — runtime flags shared with indicators + AA decisions
 local aa_state = {
     on_shot_until = 0,   -- realtime; while > now, force defensive set
     fakeduck_until = 0,  -- realtime; H assist
-    last_hostile_fire = 0,
     last_fire_time = 0,
 }
 local function aa_handler(cmd)
@@ -406,13 +410,13 @@ local function aa_handler(cmd)
         local now = globals.realtime or 0
         local on_shot = aa_onshot:get() and (now < aa_state.on_shot_until)
 
-        -- Pitch
+        -- Pitch — uses own counter (V1.7 fix)
         local pmode = aa_pitch:get()
         if pmode == "Down"             then cmd.pitch = -89
         elseif pmode == "Up"           then cmd.pitch =  89
         elseif pmode == "Jitter Down/Up" then
-            aa_jitter_counter = aa_jitter_counter + 1
-            cmd.pitch = (aa_jitter_counter % 2 == 0) and -89 or 89
+            aa_pitch_jitter_counter = aa_pitch_jitter_counter + 1
+            cmd.pitch = (aa_pitch_jitter_counter % 2 == 0) and -89 or 89
         elseif pmode == "Custom"       then cmd.pitch = aa_pitch_cust:get()
         end
         -- Yaw base
@@ -435,14 +439,19 @@ local function aa_handler(cmd)
         elseif ymod == "Random" then
             cmd.yaw_modifier = (math.random() * 2 - 1) * aa_yaw_mod_mag:get()
         elseif ymod == "Jitter" then
-            aa_jitter_counter = aa_jitter_counter + 1
+            aa_yaw_jitter_counter = aa_yaw_jitter_counter + 1
+            aa_jitter_counter     = aa_yaw_jitter_counter  -- mirror for indicator animation
             local int = math.max(1, aa_yaw_mod_int:get())
-            if aa_jitter_counter % int == 0 then aa_jitter_dir = -aa_jitter_dir end
+            if aa_yaw_jitter_counter % int == 0 then aa_jitter_dir = -aa_jitter_dir end
             local mag = aa_yaw_mod_mag:get()
             -- G: anti-bruteforce variance (random per-tick offset)
             if aa_anti_bf:get() then
                 mag = mag + (math.random() * 2 - 1) * aa_anti_bf_var:get()
             end
+            -- V1.7 fix: clamp to CSGO max 58 deg. Without clamp, anti-BF overflow
+            -- pushed mag > 58 which NL silently rejected/clamped, breaking jitter.
+            if mag > 58 then mag = 58 end
+            if mag < 0  then mag = 0  end
             cmd.yaw_modifier = aa_jitter_dir * mag
         end
         -- Desync — base value, then air override + on-shot override
@@ -466,16 +475,26 @@ local function aa_handler(cmd)
         if dside == "Left"   then cmd.desync_side = -1
         elseif dside == "Right"  then cmd.desync_side = 1
         elseif dside == "Random" then cmd.desync_side = (math.random(0,1) == 0) and -1 or 1
-        else cmd.desync_side = (math.floor(aa_jitter_counter / 4) % 2 == 0) and -1 or 1
+        else cmd.desync_side = (math.floor(aa_yaw_jitter_counter / 4) % 2 == 0) and -1 or 1
         end
         -- Freestanding
         cmd.freestanding = aa_freestanding:get()
     end)
 end
 
-pcall(function() events.antiaim:set(aa_handler) end)
-pcall(function() events.anti_aim:set(aa_handler) end)
-pcall(function() events.aa:set(aa_handler) end)
+-- V1.7: first-found-wins event registration + log status. Previously we registered
+-- the handler on all three event-name aliases, but if more than one exists the
+-- later registration silently overwrites the earlier one and the first hook is
+-- dead code. We track which name actually exists and log it once.
+local _hooks_status = {}
+local function register_first(handler, ...)
+    for _, name in ipairs({...}) do
+        local ok = pcall(function() events[name]:set(handler) end)
+        if ok then return name end
+    end
+    return nil
+end
+_hooks_status.aa        = register_first(aa_handler, "antiaim", "anti_aim", "aa")
 
 -- ══════════════════════════════════════════════════════════════════════════
 -- MOVEMENT — auto-peek, quick-stop, strafe nudge
@@ -584,25 +603,22 @@ local function createmove_unified(cmd)
         nl_override(nl_refs.vis_hitmark_snd, vis_nl_hitsnd:get())
         nl_override(nl_refs.vis_thirdperson, vis_nl_3rd:get())
         nl_override(nl_refs.vis_scope_ovl,   vis_nl_scope:get())
-        if vis_nl_selfglw:get() then
-            nl_override(nl_refs.vis_self_glow, true)
-        end
+        -- V1.7: self-glow override removed (combo value mismatch).
         -- V1.6 H: drive NL fake-duck via :override during hostile-fire window
         if aa_fd_assist:get() and (globals.realtime or 0) < aa_state.fakeduck_until then
             nl_override(nl_refs.aa_fakeduck, true)
         end
     end
 end
-pcall(function() events.createmove:set(createmove_unified) end)
-pcall(function() events.setup_command:set(createmove_unified) end)
+-- V1.7: pick the first available createmove name (createmove preferred)
+_hooks_status.createmove = register_first(createmove_unified, "createmove", "setup_command")
 
 -- ══════════════════════════════════════════════════════════════════════════
 -- VISUALS — hit-marker + damage indicator + perf HUD + spectator overlay
 -- ══════════════════════════════════════════════════════════════════════════
-local hit_events  = {}   -- {time, dmg, origin, hp_left, hit_idx}
+-- V1.7: dropped hit_events (never used) + hitmark_dmg (set but never read)
 local damage_pops = {}   -- floating "−X HP" entries
 local hitmark_time = 0
-local hitmark_dmg  = 0
 
 -- Forward-decl: update_clantag is defined further down but referenced inside the
 -- events.render closure created below. NL UI callbacks capture upvalues at parse-
@@ -619,8 +635,8 @@ local function on_local_fire(event)
     end
     aa_state.last_fire_time = globals.realtime or 0
 end
-pcall(function() events.aim_fire:set(on_local_fire) end)
-pcall(function() events.ragebot_fire:set(on_local_fire) end)
+-- V1.7: aim_fire preferred over ragebot_fire (more reliable timing)
+_hooks_status.aim_fire = register_first(on_local_fire, "aim_fire", "ragebot_fire")
 
 -- V1.6 H: weapon_fire → detect hostile enemy fire toward us → trigger fake-duck assist
 pcall(function()
@@ -668,7 +684,6 @@ pcall(function()
         local HIT_STATES = { hit = true, damaged = true, ["hit-damaged"] = true }
         if reason and HIT_STATES[reason] then
             hitmark_time = globals.realtime or 0
-            hitmark_dmg  = event.damage or 0
             -- HIT-LOG push: name + dmg + hitbox
             if vis_hitlog:get() then
                 local target_name = "?"
@@ -753,21 +768,20 @@ local function update_specs()
     local lp = entity.get_local_player()
     if not lp then specs = {}; return end
     specs = {}
+    -- V1.7 perf: cap loop at globals.maxplayers when exposed (typical 10-12 for MM),
+    -- read all NL handles inside a single pcall to avoid 64 nested pcall calls
+    local maxp = 64
+    pcall(function() maxp = math.min(maxp, globals.maxplayers or 64) end)
     pcall(function()
-        local lp_idx = lp:get_index()
-        for i = 1, 64 do
+        for i = 1, maxp do
             local p = entity.get(i, false)
-            if p and not p:is_alive() and p ~= lp then
-                local target_obs
-                pcall(function()
-                    -- m_hObserverTarget is a handle, NL may expose differently
-                    target_obs = p.m_hObserverTarget
-                end)
+            -- Spectators are dead and not lp; skip early to avoid prop reads on alive players
+            if p and p ~= lp and not p:is_alive() then
+                local target_obs = p.m_hObserverTarget
                 if target_obs then
                     local watching = entity.get(target_obs, true)
                     if watching and watching == lp then
-                        local name
-                        pcall(function() name = p:get_name() end)
+                        local name = p:get_name()
                         if name then table.insert(specs, name) end
                     end
                 end
@@ -1031,23 +1045,25 @@ pcall(function()
                     elseif dmg >= 70 then dmg_r, dmg_g, dmg_b = 255, 200, 80
                     elseif dmg >= 40 then dmg_r, dmg_g, dmg_b = 200, 220, 120
                     end
+                    -- V1.7 perf: cache measure_text widths on entry first render
+                    if not entry._w then
+                        entry._w = { name = 0, hb = 0, dmg = 0 }
+                        pcall(function() entry._w.name = render.measure_text(3, nil, entry.name or "?").x end)
+                        pcall(function() entry._w.hb   = render.measure_text(3, nil, entry.hitbox or "?").x end)
+                        pcall(function() entry._w.dmg  = render.measure_text(3, nil, tostring(dmg)).x end)
+                    end
+                    local nw, hw, dw = entry._w.name, entry._w.hb, entry._w.dmg
                     -- Skeet-style: "> hit NAME in HITBOX for DMG (wanted WANT)"
                     local y = hy + row * 14
                     pcall(function()
                         render.text(3, vector(hx, y), color(160, 160, 160, alpha), nil, ">")
                         render.text(3, vector(hx + 10, y), color(220, 220, 220, alpha), nil, "hit")
                         render.text(3, vector(hx + 30, y), color(180, 220, 255, alpha), nil, entry.name or "?")
-                        local nw = 0
-                        pcall(function() nw = render.measure_text(3, nil, entry.name or "?").x end)
                         render.text(3, vector(hx + 34 + nw, y), color(220, 220, 220, alpha), nil, "in")
                         render.text(3, vector(hx + 50 + nw, y), color(hb_r, hb_g, hb_b, alpha), nil, entry.hitbox or "?")
-                        local hw = 0
-                        pcall(function() hw = render.measure_text(3, nil, entry.hitbox or "?").x end)
                         render.text(3, vector(hx + 54 + nw + hw, y), color(220, 220, 220, alpha), nil, "for")
                         render.text(3, vector(hx + 74 + nw + hw, y), color(dmg_r, dmg_g, dmg_b, alpha), nil,
                                     tostring(dmg))
-                        local dw = 0
-                        pcall(function() dw = render.measure_text(3, nil, tostring(dmg)).x end)
                         if entry.dmg_want and entry.dmg_want > dmg then
                             render.text(3, vector(hx + 78 + nw + hw + dw, y),
                                         color(150, 150, 150, alpha), nil,
@@ -1135,10 +1151,8 @@ update_clantag = function()
     end)
 end
 
--- clantag updater is invoked from main events.render handler (which is registered
--- above with a single set() call — registering twice would overwrite the first hook).
--- We patch the existing render closure indirectly via a per-tick flag.
-local _clantag_tick_flag = true   -- always-true sentinel; update_clantag is gated by master+toggle inside
+-- clantag updater is invoked from main events.render handler (single set() call).
+-- V1.7: dropped unused _clantag_tick_flag sentinel.
 
 -- (master-disable handler unified later in shutdown section — clears clantag + overrides)
 
@@ -1244,7 +1258,14 @@ end)
 -- LOAD BANNER
 -- ══════════════════════════════════════════════════════════════════════════
 cs_log_color("══════════════════════════════════════════")
-cs_log_color("Sel01-Config v" .. SEL01_CFG_VERSION .. " loaded")
-cs_log_color("Companion to Sel01-Solver — handles AA + Misc + Visuals + QoL")
+cs_log_color("Sel01-Config v" .. SEL01_CFG_VERSION .. " loaded (CSGO HvH)")
+-- V1.7: report which NL event names actually resolved on this build
+cs_log(string.format("  hooks  aa=%s  createmove=%s  aim_fire=%s",
+    tostring(_hooks_status.aa or "MISSING"),
+    tostring(_hooks_status.createmove or "MISSING"),
+    tostring(_hooks_status.aim_fire or "MISSING")))
+if not _hooks_status.aa then
+    cs_log_color("  WARNING: no antiaim event hook found — AA override will not fire")
+end
 cs_log_color("Pick a preset under Sel01-Config → Main")
 cs_log_color("══════════════════════════════════════════")
