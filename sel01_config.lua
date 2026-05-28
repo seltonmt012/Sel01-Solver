@@ -1,16 +1,15 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Config — Neverlose CSGO HvH config        ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 2.4                                    ║
+-- ║  Version: 2.5                                    ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Config
 -- @author seltonmt01
--- @version 2.4
--- @description Add AI Peek strafe-out hotkey (bindable alongside NL Peek Assist for 2-in-1).
---              While held, cmd.sidemove forces strafe in chosen direction. No origin tracking,
---              no entity reads on enemies. Grounded-only.
+-- @version 2.5
+-- @description AI Peek upgraded to tap-style auto-cycle: peek out -> hold for shot -> return.
+--              Timings configurable. NL Peek Assist still binds on same key for 2-in-1.
 
-local SEL01_CFG_VERSION = "2.4"
+local SEL01_CFG_VERSION = "2.5"
 
 -- DEBUG: print to CSGO console at major load checkpoints. Plain print() bypasses
 -- NL chat (which may not flush before crash) and writes directly to CSGO console.
@@ -98,11 +97,15 @@ local aa_fd_duration = g_aa:slider("Fake-duck duration (ms)", 200, 2000, 800)
 -- MOVEMENT UI
 -- ══════════════════════════════════════════════════════════════════════════
 g_move:label(accent .. ui.get_icon"running" .. accent .. "  Movement helpers")
--- V2.4: Sel01 AI Peek — basic strafe-out hotkey. Pure cmd.sidemove write, no
--- entity reads, no NL :override on hotkey elements. Bind it to the SAME key as
--- NL's Aimbot/Ragebot/Main/Peek Assist so both fire together = 2-in-1 peek.
-local mv_aipeek_k    = g_move:hotkey("AI Peek (hold — strafe out)")
-local mv_aipeek_dir  = g_move:combo("AI Peek direction", {"Right", "Left", "Alternate"}, 1)
+-- V2.5: AI Peek = tap-style auto-cycle. Tap hotkey -> script strafes out, holds
+-- briefly so ragebot can fire, then strafes back. Pure cmd.sidemove. No entity
+-- reads, no NL :override on Peek Assist (that crashed in v2.0). Bind to SAME
+-- key as NL Peek Assist for 2-in-1.
+local mv_aipeek_k     = g_move:hotkey("AI Peek (tap — auto peek+return)")
+local mv_aipeek_dir   = g_move:combo("AI Peek direction", {"Right", "Left", "Alternate"}, 1)
+local mv_aipeek_out   = g_move:slider("Peek-out duration (ms)", 100, 500, 200)
+local mv_aipeek_hold  = g_move:slider("Hold for shot (ms)",     50, 400, 100)
+local mv_aipeek_back  = g_move:slider("Peek-back duration (ms)",100, 500, 250)
 g_move:label(" ")
 g_move:label(accent .. "  Bind this + NL Peek Assist to SAME key for 2-in-1")
 g_move:label(accent .. "  Slow-walk / Fake-duck: NL Aimbot/Anti Aim/Misc tab")
@@ -506,30 +509,63 @@ local function register_first(handler, ...)
 end
 
 -- ══════════════════════════════════════════════════════════════════════════
--- MOVEMENT — V2.4: AI Peek strafe-out (writes ONLY cmd.sidemove while hotkey held).
--- No entity reads, no NL :override on hotkey elements (those crashed in v2.0).
--- Pure user-command modification. Pcall'd outer + alive-check.
+-- MOVEMENT — V2.5: AI Peek tap-style 3-phase auto-cycle.
+-- Tap hotkey -> phase OUT (strafe sidemove=+/-450) for peek-out ms
+--             -> phase HOLD (sidemove=0, user/ragebot can fire) for hold ms
+--             -> phase BACK (strafe -sidemove) for peek-back ms
+--             -> idle (no force on sidemove, user input passes through)
+-- No entity reads. No NL :override on hotkey refs.
 -- ══════════════════════════════════════════════════════════════════════════
-local _aipeek_alt = 1
+local _peek = { phase = nil, started = 0, sign = 1, last_pressed = false, alt = 1 }
+
 local function createmove_handler(cmd)
     if not (enable_master:get() and cmd) then return end
     pcall(function()
-        local pressed = mv_aipeek_k and mv_aipeek_k:get()
-        if not pressed then return end
         local lp = entity.get_local_player()
         if not lp then return end
         local alive = false
         pcall(function() alive = lp:is_alive() end)
-        if not alive then return end
-        local dir = mv_aipeek_dir:get()
-        local sign = 1
-        if dir == "Left" then sign = -1
-        elseif dir == "Alternate" then
-            -- flip every 32 ticks (~0.5s) while held
-            if (globals.tickcount or 0) % 32 == 0 then _aipeek_alt = -_aipeek_alt end
-            sign = _aipeek_alt
+        if not alive then _peek.phase = nil; return end
+
+        local now     = globals.realtime or 0
+        local pressed = mv_aipeek_k and mv_aipeek_k:get()
+
+        -- Rising edge: tap -> start cycle (only if not already cycling)
+        if pressed and not _peek.last_pressed and _peek.phase == nil then
+            _peek.phase   = "out"
+            _peek.started = now
+            local dir = mv_aipeek_dir:get()
+            if dir == "Left" then
+                _peek.sign = -1
+            elseif dir == "Alternate" then
+                _peek.alt = -_peek.alt
+                _peek.sign = _peek.alt
+            else
+                _peek.sign = 1   -- Right
+            end
         end
-        cmd.sidemove = 450 * sign
+        _peek.last_pressed = pressed
+
+        if _peek.phase == nil then return end
+
+        local elapsed_ms = (now - _peek.started) * 1000
+        if _peek.phase == "out" then
+            cmd.sidemove = 450 * _peek.sign
+            if elapsed_ms >= (mv_aipeek_out:get() or 200) then
+                _peek.phase = "hold"; _peek.started = now
+            end
+        elseif _peek.phase == "hold" then
+            -- sidemove = 0 so user/ragebot can hit the target
+            cmd.sidemove = 0
+            if elapsed_ms >= (mv_aipeek_hold:get() or 100) then
+                _peek.phase = "back"; _peek.started = now
+            end
+        elseif _peek.phase == "back" then
+            cmd.sidemove = -450 * _peek.sign
+            if elapsed_ms >= (mv_aipeek_back:get() or 250) then
+                _peek.phase = nil
+            end
+        end
     end)
 end
 
@@ -979,10 +1015,10 @@ pcall(function()
         -- ── KEYBINDS PANEL (right-middle, active hotkeys list) ──
         if vis_keybinds:get() then
             local active = {}
-            -- V2.4: show AI Peek state when hotkey held
-            pcall(function()
-                if mv_aipeek_k and mv_aipeek_k:get() then table.insert(active, "AI Peek") end
-            end)
+            -- V2.5: show AI Peek phase while cycling
+            if _peek and _peek.phase then
+                table.insert(active, "AI Peek: " .. tostring(_peek.phase))
+            end
             -- NL manual binds + double-tap if enabled show as fallback
             if #active > 0 then
                 local lh = 14
@@ -1119,7 +1155,7 @@ end)
 -- LOAD BANNER
 -- ══════════════════════════════════════════════════════════════════════════
 cs_log_color("══════════════════════════════════════════")
-cs_log_color("Sel01-Config v" .. SEL01_CFG_VERSION .. " loaded (CSGO HvH — AI Peek strafe-out added)")
+cs_log_color("Sel01-Config v" .. SEL01_CFG_VERSION .. " loaded (CSGO HvH — AI Peek tap-cycle: out + hold + back)")
 cs_log(string.format("  hooks  createmove=%s  aim_fire=%s",
     tostring(_hooks_status.createmove or "MISSING"),
     tostring(_hooks_status.aim_fire or "MISSING")))
