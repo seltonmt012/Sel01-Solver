@@ -4,40 +4,62 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-Single-file Neverlose CS2 Lua script (`resolverv2_35544.lua`, ~3700 lines, author seltonmt01) — custom anti-aim resolver "Sel01-Solver" with persistent cross-match learning, JSON export, HUD/ESP overlay, FFI clipboard copy-logs, and Sel01-Roast chat-spam. Runs inside Neverlose CS2 client via their Lua sandbox. No build system, no tests, no package manager.
+Two Neverlose **CSGO** (legacy build, NOT CS2) Lua scripts for HvH / rage play. Both run together inside the same NL client sandbox; they communicate only via NL's own events/UI, never directly.
 
-**Current version: 9.6** — bumped via `local SEL01_VERSION = "9.6"` constant at top of file. Displayed in 3 places (load-banner, UI label, HUD corner). Always bump constant AND file-header `@version` comment together — user reads any of the 3 to confirm fresh copy loaded vs stale NL copy.
+| Script | Role | Working copy | NL load path |
+|---|---|---|---|
+| **Sel01-Solver** (`resolverv2_35544.lua`, ~3700 lines, v9.x) | Resolver: per-player AA learning, JSON export, HUD/ESP overlay, FFI clipboard copy-logs, Sel01-Roast chat-spam | `C:\Users\Seltonmt\Desktop\sazz\aron\ownlua\resolverv2_35544.lua` | `E:\SteamLibrary\steamapps\common\Counter-Strike Global Offensive\nl\scripts\Sel01-Solver_59853.lua` |
+| **Sel01-Config** (`sel01_config.lua`, ~1200 lines, v1.x) | Companion: AA presets, anti-bruteforce jitter, on-shot/air-desync overrides, fake-duck assist on hostile-fire, watermark + indicators + skeet hit-log + damage popups + rotating AA arrow | `C:\Users\Seltonmt\Desktop\sazz\aron\ownlua\sel01_config.lua` | `E:\SteamLibrary\steamapps\common\Counter-Strike Global Offensive\nl\scripts\sel01_config_59908.lua` |
 
-Full architecture + bug history + UI doc lives in `README.md`. NL API docs at `https://docs-csgo.neverlose.cc/readme.md?ask=<keywords>` — consult before guessing API names.
+**Dual-copy rule (MANDATORY).** After every Edit/Write to either working copy, immediately overwrite the matching NL file (same path, no new files, no renames). PowerShell one-liner: `Copy-Item -Force -LiteralPath '<working>' -Destination '<nl-path>'`. The git repo only tracks working copies — the NL copies need the mirror so reload in NL picks up the change.
 
-**Paths:**
-- Working copy: `C:\Users\Seltonmt\Desktop\sazz\aron\ownlua\resolverv2_35544.lua`
-- NL load copy (user copies manually): `E:\SteamLibrary\steamapps\common\Counter-Strike Global Offensive\nl\scripts\Sel01-Solver_59853.lua`
+**Version constants — keep all touchpoints in sync per script:**
+- Sel01-Solver: `local SEL01_VERSION = "X.Y"` + file-header `@version X.Y` + 3 visible mentions (load-banner, UI label, HUD corner)
+- Sel01-Config: `local SEL01_CFG_VERSION = "X.Y"` + file-header `@version X.Y` (no HUD mention; load banner reads constant directly)
+
+Solver runtime data (private, gitignored):
 - Persistent learning (Lua-table fast-load): `nl/Sel01-Solver/learned.lua`
 - JSON backup + human-readable: `nl/Sel01-Solver/learned.json`
 - Copy-logs file fallback: `nl/Sel01-Solver/last_logs.txt`
 
-**Git repo initialized** (V9.6). `.gitignore` excludes `learned.lua/json/last_logs.txt/logo.png` (private per-user data).
+Solver architecture + bug history + UI doc lives in `README.md`. NL API docs at `https://docs-csgo.neverlose.cc/readme.md?ask=<keywords>` — consult before guessing API names. Config script has no separate README; this file is canonical.
+
+**Git repo.** Remote: `origin https://github.com/seltonmt012/ownlua.git` (branch `master`). `.gitignore` excludes private data + `.claude/` + `.vscode/`. Auto-commit + push on version bumps per project policy.
 
 ## Verify changes
 
 ```powershell
-luac -p resolverv2_35544.lua
+luac -p resolverv2_35544.lua    # resolver
+luac -p sel01_config.lua        # config
 ```
 
-`luac` from scoop (`C:\Users\Seltonmt\scoop\apps\lua\current\bin\luac.exe`). Must exit clean. No test infrastructure — runtime errors only surface when user reloads script in NL and reports.
+`luac` from scoop (`C:\Users\Seltonmt\scoop\apps\lua\current\bin\luac.exe`). Must exit clean. No test infrastructure — runtime errors only surface when user reloads in NL and reports. After luac passes, **dual-copy to NL** (see paths table above) so the next NL reload sees the change.
 
-**Local limit warning** (V9.3 hit-point): Lua 5.1 main-chunk limit = 200 locals. File is close to that. New top-level locals should be wrapped in `do...end` blocks to scope them out. Both clipboard FFI + log_buffer ring use this pattern.
+**Local limit warning** (V9.3 hit-point): Lua 5.1 main-chunk limit = 200 locals. Solver is close to that. New top-level locals should be wrapped in `do...end` blocks to scope them out. Both clipboard FFI + log_buffer ring use this pattern.
 
 ## Critical patterns (each has bitten before)
 
 **Forward-references kill closures.** NL UI callbacks (button bodies, `:set_callback`, `events.ragebot_target`, `events.render`) capture upvalues at parse-time. If referenced local is declared LATER, closure binds to GLOBAL (nil at call time). **Forward-decl block must be BEFORE any UI element referencing those names.** Currently at top (line ~135): `SteamMemory`, `LearnedModel`, `mode_stats`, `PlayerState`, `tick_cache`, `NormalizeAngle`, `mode_stats_update/dump`, `confidence`, `session_stats`, `record_player_shot`. Pattern: `local X = {}` at top, then `setmetatable(X, ...)` later. NEVER `local X = setmetatable({}, ...)` later (creates a new shadowing local).
 
-**Combo `:get()` returns STRING, not index.** Use string compares or `combo_str()` / `mode_str()` / `baim_hb_id()` helpers. Never arithmetic on combo value.
+**Combo `:get()` returns STRING, not index.** Use string compares or `combo_str()` / `mode_str()` / `baim_hb_id()` helpers. Never arithmetic on combo value. **Combo `:set()` also takes STRING** (the option label), not an index — passing an int silently fails or freezes the menu callback.
 
 **Slider 5th arg is NOT step.** `:slider(name, min, max, default)` only. 5th arg breaks display.
 
 **Neverlose sandbox lacks `os`.** Use `globals.realtime` + `globals.tickcount`. NL also lacks JSON lib — V8.3 ships own encoder.
+
+**Lua 5.1 sandbox restrictions:** no `goto`, no integer-division operator `//` (use `math.floor(a / b)`), no `table.unpack` (use `unpack`), no bitwise operators (use `bit.band` / `bit.bor` / `bit.bnot`).
+
+**`ui.find` path resolution.** Prefer `pui.find(...)` (from `neverlose/pui`) — it returns `nil` on missing paths silently. `ui.find` raises a popup-error dialog on missing paths that pcall does NOT suppress (the popup is a GUI side-effect that fires before the error propagates). Sel01-Config uses `nl_find_safe` which tries pui.find first and falls back to ui.find inside pcall. The full list of verified NL ui.find paths lives in user memory at `reference_nl_ui_paths.md` — consult before writing new path strings.
+
+**`ref:override(value)` is non-destructive; `ui.set(ref, value)` is destructive.** `:override` reverts to the user's manual UI state when the script unloads or `:override()` is called with no args. `ui.set` permanently mutates the user's config. Always prefer `:override` for runtime writes that wrap user-owned NL elements.
+
+**NEVER write fields to `events.antiaim` `cmd` userdata** (Sel01-Config v1.6 bug). No other NL script writes `cmd.pitch / cmd.yaw_base / cmd.desync_range / cmd.desync_side` — JAG0YAW, bloodwings, gingersense, bettervisal, nyanza all drive AA through `ui.find(...):override(...)` on NL's own Anti Aim panel. Writing to undefined fields on cmd causes a C++ panic that bypasses Lua pcall and crashes CSGO a few seconds after team-select. Sel01-Config v1.8 deleted `aa_handler` and replaced it with a periodic sync that only writes to `nl_refs.aa_bodyyaw_l/r/freestand` via `:override`.
+
+**NL events: assume per-script isolation.** Multiple installed scripts (resolver, config, bloodwings, etc.) each register their own `events.weapon_fire` / `events.aim_ack` handlers without stepping on each other. Empirically this works — both Sel01 scripts hook `events.weapon_fire` simultaneously and both detection paths fire. If a handler stops firing, suspect this assumption.
+
+**Event-name aliases vary by NL build.** Use `register_first(handler, name1, name2, ...)` (Sel01-Config v1.7 helper): walks aliases, `:set` on the first one that exists, returns its name for status logging. Triple-registering all aliases is dead code — the second `:set` overwrites the first.
+
+**Defer menu-callback work to next tick.** Button callbacks that synchronously call `:set` on combo / slider elements during the menu render lifecycle freeze the menu (Sel01-Config v1.5 fix). Set a `pending_X = name` flag in the button callback and drain it from the next `events.createmove` tick.
 
 **Per-tick functions mutate state → oscillation.** `pick_bruteforce_angle` runs 64×/sec. Four caching layers prevent state-thrash:
 - `bf_cached_missed/angle/mode/eye` — BF only recomputes when `missed` count changes OR eye drifts >20°
@@ -196,14 +218,17 @@ All `render.*` pcall-wrapped. Border via 4 thin rects (avoid uncertain `render.r
 
 **Remote**: `origin → https://github.com/seltonmt012/ownlua.git` (branch: `master`). Auto-pushed since V9.6.
 
-**Auto-commit + push policy** (user-explicit V9.6): every `SEL01_VERSION` bump triggers commit + push. No manual approval needed for these. Commit format:
+**Auto-commit + push policy** (user-explicit V9.6): every version constant bump triggers commit + push. No manual approval needed for these. Each script commits independently. Commit format:
 ```
-Sel01-Solver vX.Y — <short summary>
+Sel01-Solver vX.Y — <short summary>      (for resolver bumps)
+Sel01-Config vX.Y — <short summary>      (for config bumps)
 
-<bullet list of changes per V-section>
+<bullet list of changes>
 
 Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
 ```
+
+**Dual-copy reminder.** Every edit to `resolverv2_35544.lua` OR `sel01_config.lua` must also overwrite the matching NL file. NEVER create new files in the NL folder — only `Copy-Item -Force` over the existing ones. Working copy is the source of truth tracked by git; NL copy is the one NL reloads from.
 
 `.gitignore` excludes private data (`learned.lua/json/last_logs.txt/logo.png`, `.claude/`, `.vscode/`).
 
@@ -213,6 +238,50 @@ git push origin master
 ```
 
 If hook failure on commit: investigate root cause, fix, create NEW commit (don't amend — pre-commit hooks fail means commit didn't happen, amend would modify previous one).
+
+## Sel01-Config layout (`sel01_config.lua`, v1.8, ~1200 lines)
+
+| Section | Purpose |
+|---|---|
+| 1–30 | Version constant `SEL01_CFG_VERSION`, `pui` + `ffi` requires, optional `neverlose/gradient`, `cs_log` / `cs_log_color`, `accent`, `TAB = "Sel01-Config"` |
+| 30–60 | UI groups (6 tabs: Main / Anti-Aim / Movement / Visuals / Quality of Life / Info), preset buttons forward-decl `apply_preset_fwd` |
+| 60–120 | Anti-Aim UI: enable, pitch combo, yaw base, yaw add, yaw modifier, desync slider + side, freestanding, at-targets, plus HvH extras (on-shot, air-desync, anti-BF variance, fake-duck assist) |
+| 120–155 | Movement (auto-peek + quick-stop hotkeys, strafe nudge, no-fall, fast-ladder), Visuals switches, QoL toggles, Info buttons |
+| 155–230 | `nl_find_safe` (pui.find → ui.find fallback), `nl_override` + `nl_clear`, **verified NL ui.find ref dict** (all paths from JAG0YAW/bettervisal/bloodwings analysis) inside outer pcall |
+| 230–390 | `_do_apply_preset` (4 presets: Aggressive / Dynamic / Defensive / Spin) — all writes go through `safe_set` or `nl_override`. Public `apply_preset` only queues `pending_preset = name` so the menu callback returns instantly |
+| 390–460 | `aa_state` table (on_shot_until, fakeduck_until, last_fire_time), `aa_periodic_sync` — drives `nl_refs.aa_bodyyaw_l/r/freestand` every tick. No cmd-writes (v1.8 fix) |
+| 460–550 | `createmove_handler` (auto-peek, quick-stop, strafe nudge, no-fall, fast-ladder), `createmove_unified` (drains pending_preset, runs movement, runs aa_periodic_sync, syncs NL visuals overrides + fake-duck) |
+| 550–700 | Event hooks: `on_local_fire` → aim_fire / ragebot_fire (sets on_shot timer), `events.weapon_fire` (hostile-fire detection → fake-duck assist), `events.aim_ack` (hit-marker + skeet hit-log push), `events.player_hurt` (damage popups with hitgroup) |
+| 700–1100 | `events.render` — single handler. Order: hit-marker → rotating AA indicator → damage popups → animated-gradient watermark (sine-wave RGB) → bottom HvH indicators (DT / HS / ON-SHOT pulse / FD-ASSIST pulse / AA / MANUAL L/R / AIR / ANTI-BF / FREE / SW / FD) → velocity warning → skeet hit-log → keybinds panel → clantag updater → spectator overlay |
+| 1100–1220 | QoL: animated clantag (3 styles), kill-say themes, auto-accept, Status/Reset Info buttons, `clear_all_nl_overrides`, master-disable + shutdown handlers, load banner with hook-status report |
+
+### Sel01-Config flow (one tick)
+
+`events.createmove` → `createmove_unified(cmd)` → drain `pending_preset` (if any) via `pcall(_do_apply_preset, name)` → `createmove_handler(cmd)` (movement helpers, pcall'd) → `aa_periodic_sync()` (compute Body Yaw L/R from base desync + air override + on-shot reduction + anti-BF variance; clamp [0,58]; nl_override on body-yaw + freestand refs) → if master enabled, sync NL visuals overrides (hit-marker sound, thirdperson, scope overlay) + fake-duck during `fakeduck_until` window.
+
+### Sel01-Config presets (v1.8)
+
+| Toggle | Aggressive | Dynamic | Defensive | Spin |
+|---|---|---|---|---|
+| desync | 58 | 45 | 35 | 58 |
+| jitter mag | 45 | 28 | 15 | 58 |
+| jitter interval (ticks) | 2 | 3 | 4 | 1 |
+| freestanding | ON | ON | ON | **OFF** |
+| at-targets | OFF | ON | OFF | OFF |
+| on-shot AA | ON | ON | ON | OFF |
+| air desync | ON | ON | ON | ON |
+| anti-BF | ON | ON | **OFF** | ON (25°) |
+| fake-duck assist | ON | ON | ON | ON |
+| NL fake-lag limit | 7 | 5 | 3 | (varies) |
+
+### Common Sel01-Config gotchas (each has bitten)
+
+- **`events.antiaim` cmd-writes crash CSGO** (v1.6 incident). No other NL script does this. Always drive AA through `nl_refs.aa_bodyyaw_l/r:override(...)`.
+- **Combo `:set(int)` freezes menu** (v1.4 incident). Pass the option string. Better: skip combo `:set` in button callbacks entirely (decorative-only).
+- **Preset button callbacks must not synchronously mutate UI** (v1.5 incident). Set `pending_preset = name`; drain from createmove.
+- **`ui.find` raises popup-dialog on missing paths** (v1.3 incident). Use `pui.find` as primary.
+- **Single `events.render:set`** — registering twice overwrites the first hook. Everything that needs render lives inside the one handler.
+- **Forward-decl `update_clantag`** as `local update_clantag = function() end` BEFORE the render closure, then reassign later. Closures capture the upvalue, not the global.
 
 ## Common mistakes to avoid
 
