@@ -1,15 +1,16 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Config — Neverlose CSGO HvH config        ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 2.3                                    ║
+-- ║  Version: 2.4                                    ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Config
 -- @author seltonmt01
--- @version 2.3
--- @description Air-AA improvements (HvH-grade): rapid inverter flip, max-jitter boost, optional
---              fake-duck, 1.5x anti-BF variance airborne. Transition handling clears overrides on land.
+-- @version 2.4
+-- @description Add AI Peek strafe-out hotkey (bindable alongside NL Peek Assist for 2-in-1).
+--              While held, cmd.sidemove forces strafe in chosen direction. No origin tracking,
+--              no entity reads on enemies. Grounded-only.
 
-local SEL01_CFG_VERSION = "2.3"
+local SEL01_CFG_VERSION = "2.4"
 
 -- DEBUG: print to CSGO console at major load checkpoints. Plain print() bypasses
 -- NL chat (which may not flush before crash) and writes directly to CSGO console.
@@ -97,12 +98,14 @@ local aa_fd_duration = g_aa:slider("Fake-duck duration (ms)", 200, 2000, 800)
 -- MOVEMENT UI
 -- ══════════════════════════════════════════════════════════════════════════
 g_move:label(accent .. ui.get_icon"running" .. accent .. "  Movement helpers")
--- AI Peek removed — NL Peek Assist is a HOTKEY element; our :override on a
--- hotkey userdata crashed CSGO. There is no Lua API to programmatically trigger
--- NL hotkeys from a script. The only reliable peek is NL's own.
-g_move:label(accent .. "  AI Peek: assign NL Aimbot/Ragebot/Main/Peek Assist hotkey")
+-- V2.4: Sel01 AI Peek — basic strafe-out hotkey. Pure cmd.sidemove write, no
+-- entity reads, no NL :override on hotkey elements. Bind it to the SAME key as
+-- NL's Aimbot/Ragebot/Main/Peek Assist so both fire together = 2-in-1 peek.
+local mv_aipeek_k    = g_move:hotkey("AI Peek (hold — strafe out)")
+local mv_aipeek_dir  = g_move:combo("AI Peek direction", {"Right", "Left", "Alternate"}, 1)
+g_move:label(" ")
+g_move:label(accent .. "  Bind this + NL Peek Assist to SAME key for 2-in-1")
 g_move:label(accent .. "  Slow-walk / Fake-duck: NL Aimbot/Anti Aim/Misc tab")
-g_move:label(accent .. "  (NL has these built-in — no need to duplicate here)")
 
 -- ══════════════════════════════════════════════════════════════════════════
 -- VISUALS UI
@@ -503,11 +506,32 @@ local function register_first(handler, ...)
 end
 
 -- ══════════════════════════════════════════════════════════════════════════
--- MOVEMENT — V2.1: createmove_handler now a NO-OP. AI Peek per-tick override on
--- the Peek Assist hotkey element was the v2.0 spawn-crash cause. Use NL's
--- built-in hotkeys directly.
+-- MOVEMENT — V2.4: AI Peek strafe-out (writes ONLY cmd.sidemove while hotkey held).
+-- No entity reads, no NL :override on hotkey elements (those crashed in v2.0).
+-- Pure user-command modification. Pcall'd outer + alive-check.
 -- ══════════════════════════════════════════════════════════════════════════
-local function createmove_handler(cmd) end
+local _aipeek_alt = 1
+local function createmove_handler(cmd)
+    if not (enable_master:get() and cmd) then return end
+    pcall(function()
+        local pressed = mv_aipeek_k and mv_aipeek_k:get()
+        if not pressed then return end
+        local lp = entity.get_local_player()
+        if not lp then return end
+        local alive = false
+        pcall(function() alive = lp:is_alive() end)
+        if not alive then return end
+        local dir = mv_aipeek_dir:get()
+        local sign = 1
+        if dir == "Left" then sign = -1
+        elseif dir == "Alternate" then
+            -- flip every 32 ticks (~0.5s) while held
+            if (globals.tickcount or 0) % 32 == 0 then _aipeek_alt = -_aipeek_alt end
+            sign = _aipeek_alt
+        end
+        cmd.sidemove = 450 * sign
+    end)
+end
 
 -- Single createmove handler that runs movement + NL-visual override sync.
 -- V1.5: also drains pending_preset so preset writes happen OUTSIDE menu callback.
@@ -955,7 +979,10 @@ pcall(function()
         -- ── KEYBINDS PANEL (right-middle, active hotkeys list) ──
         if vis_keybinds:get() then
             local active = {}
-            -- V2.1: AI Peek dropped — keybinds panel only shows NL active states
+            -- V2.4: show AI Peek state when hotkey held
+            pcall(function()
+                if mv_aipeek_k and mv_aipeek_k:get() then table.insert(active, "AI Peek") end
+            end)
             -- NL manual binds + double-tap if enabled show as fallback
             if #active > 0 then
                 local lh = 14
@@ -1092,7 +1119,7 @@ end)
 -- LOAD BANNER
 -- ══════════════════════════════════════════════════════════════════════════
 cs_log_color("══════════════════════════════════════════")
-cs_log_color("Sel01-Config v" .. SEL01_CFG_VERSION .. " loaded (CSGO HvH — air-AA improvements: flip + boost + fakeduck)")
+cs_log_color("Sel01-Config v" .. SEL01_CFG_VERSION .. " loaded (CSGO HvH — AI Peek strafe-out added)")
 cs_log(string.format("  hooks  createmove=%s  aim_fire=%s",
     tostring(_hooks_status.createmove or "MISSING"),
     tostring(_hooks_status.aim_fire or "MISSING")))
