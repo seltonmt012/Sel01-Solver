@@ -1,20 +1,26 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Config — Neverlose CSGO HvH config        ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 1.10                                   ║
+-- ║  Version: 1.11                                   ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Config
 -- @author seltonmt01
--- @version 1.10
--- @description Spectator-crash fix: aa_periodic_sync bails if not alive, visuals overrides dirty-tracked,
---              preset apply step-logged + per-line pcall.
+-- @version 1.11
+-- @description Diagnostic build: 15 debug marks via print() across module load.
+--              Find the last "[DBG] M<N>" line in CSGO console before crash to bisect.
 
-local SEL01_CFG_VERSION = "1.10"
+local SEL01_CFG_VERSION = "1.11"
+
+-- DEBUG: print to CSGO console at major load checkpoints. Plain print() bypasses
+-- NL chat (which may not flush before crash) and writes directly to CSGO console.
+local function _dbg(n, label) pcall(function() print("[Sel01-Config DBG] M" .. n .. " " .. (label or "")) end) end
+_dbg(1, "top of file, requires ahead")
 
 local pui      = require("neverlose/pui");
 local ffi      = require("ffi");
 local gradient = nil
 pcall(function() gradient = require("neverlose/gradient") end)
+_dbg(2, "requires done")
 
 local CS_PREFIX = "[Sel01-Config]"
 local function cs_log(msg)
@@ -150,6 +156,7 @@ end
 -- pui.find (require'd from neverlose/pui above) is the safer variant used by JAG0YAW
 -- and nyanza snapshot. We prefer it. Fallback to ui.find as last resort.
 -- pcall(fn, ...) avoids closure-capture issues.
+_dbg(3, "UI elements registered, defining nl_find_safe next")
 local function nl_find_safe(...)
     if pui and pui.find then
         local ok, ref = pcall(pui.find, ...)
@@ -177,6 +184,7 @@ end
 -- NL UI REFERENCES — verified paths from JAG0YAW/bettervisal/bloodwings/nyanza
 -- All pcall-wrapped; if a path is gone in a future NL update, write fails silently.
 -- ══════════════════════════════════════════════════════════════════════════
+_dbg(4, "starting nl_refs build (ui.find calls)")
 local nl_refs = {}
 -- Outer pcall: even if pui.find / ui.find pops the NL "couldn't find menu item" dialog
 -- for some path that is gone in this NL build, the remaining lookups still run and
@@ -233,6 +241,7 @@ pcall(function()
     nl_refs.vis_self_chams   = nl_find_safe("Visuals", "Players", "Self", "Chams", "Weapon")
     nl_refs.vis_self_glow    = nl_find_safe("Visuals", "Players", "Self", "Chams", "Glow")
 end)  -- outer pcall
+_dbg(5, "nl_refs build done")
 
 -- ══════════════════════════════════════════════════════════════════════════
 -- PRESETS
@@ -256,6 +265,7 @@ local function _safe_step(label, fn)
         cs_log("[STEP-FAIL] " .. label .. " — " .. tostring(err))
     end
 end
+_dbg(6, "preset functions defining")
 local function _do_apply_preset(name)
     cs_log("[apply] start " .. tostring(name))
     if name == "aggressive" then
@@ -424,6 +434,7 @@ local aa_state = {
 -- "applied" never printing crash — NL UI state is in transition and constant
 -- writes from a spectating script can crash CSGO.
 local aa_periodic_last_tick = 0
+_dbg(7, "aa_periodic_sync defining")
 local function aa_periodic_sync()
     if not (enable_master:get() and aa_enable:get()) then return end
     -- bail if not in an alive match state
@@ -580,6 +591,7 @@ end
 -- V1.5: also drains pending_preset so preset writes happen OUTSIDE menu callback.
 -- V1.10: dirty-tracking for NL visual overrides (only write on toggle change)
 local _vis_last = { hitsnd = nil, tp = nil, sc = nil, fd = nil }
+_dbg(8, "createmove_unified defining")
 local function createmove_unified(cmd)
     -- Drain queued preset apply (set by Aggressive/Dynamic/Defensive/Legit buttons)
     if pending_preset then
@@ -611,7 +623,9 @@ local function createmove_unified(cmd)
     end
 end
 -- V1.7: pick the first available createmove name (createmove preferred)
+_dbg(9, "registering createmove hook")
 _hooks_status.createmove = register_first(createmove_unified, "createmove", "setup_command")
+_dbg(10, "createmove hook done")
 
 -- ══════════════════════════════════════════════════════════════════════════
 -- VISUALS — hit-marker + damage indicator + perf HUD + spectator overlay
@@ -636,7 +650,9 @@ local function on_local_fire(event)
     aa_state.last_fire_time = globals.realtime or 0
 end
 -- V1.7: aim_fire preferred over ragebot_fire (more reliable timing)
+_dbg(11, "registering aim_fire hook")
 _hooks_status.aim_fire = register_first(on_local_fire, "aim_fire", "ragebot_fire")
+_dbg(12, "aim_fire hook done, registering weapon_fire next")
 
 -- V1.6 H + V1.9 hardening: weapon_fire fires for audio + grenade + AI events at
 -- round-start. Entity.get on those non-player userids + method calls like
@@ -682,6 +698,7 @@ pcall(function()
     end)
 end)
 
+_dbg(13, "weapon_fire registered, aim_ack next")
 -- Aim_ack — hit-marker trigger
 pcall(function()
     events.aim_ack:set(function(event)
@@ -816,6 +833,7 @@ local function pulse_alpha(hz)
     return math.floor(127 + 127 * math.sin((globals.realtime or 0) * math.pi * 2 * hz))
 end
 
+_dbg(14, "aim_ack + player_hurt done, registering render next (BIGGEST risk)")
 -- Render loop
 pcall(function()
     events.render:set(function()
@@ -1264,6 +1282,7 @@ enable_master:set_callback(function(r)
         cs_log_color("Master DISABLED — overrides + clantag cleared")
     end
 end)
+_dbg(15, "all hooks + callbacks registered, banner next")
 
 -- ══════════════════════════════════════════════════════════════════════════
 -- LOAD BANNER
