@@ -1,26 +1,25 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Config — Neverlose CSGO HvH config        ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 1.11                                   ║
+-- ║  Version: 1.12                                   ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Config
 -- @author seltonmt01
--- @version 1.11
--- @description Diagnostic build: 15 debug marks via print() across module load.
---              Find the last "[DBG] M<N>" line in CSGO console before crash to bisect.
+-- @version 1.12
+-- @description Match-crash fix: weapon_fire + player_hurt handlers no longer read enemy entity
+--              properties. FD-assist triggers on any enemy fire (no distance/aim check).
+--              Damage popup stacks at screen edge (no world position read). Debug marks removed.
 
-local SEL01_CFG_VERSION = "1.11"
+local SEL01_CFG_VERSION = "1.12"
 
 -- DEBUG: print to CSGO console at major load checkpoints. Plain print() bypasses
 -- NL chat (which may not flush before crash) and writes directly to CSGO console.
 local function _dbg(n, label) pcall(function() print("[Sel01-Config DBG] M" .. n .. " " .. (label or "")) end) end
-_dbg(1, "top of file, requires ahead")
 
 local pui      = require("neverlose/pui");
 local ffi      = require("ffi");
 local gradient = nil
 pcall(function() gradient = require("neverlose/gradient") end)
-_dbg(2, "requires done")
 
 local CS_PREFIX = "[Sel01-Config]"
 local function cs_log(msg)
@@ -156,7 +155,6 @@ end
 -- pui.find (require'd from neverlose/pui above) is the safer variant used by JAG0YAW
 -- and nyanza snapshot. We prefer it. Fallback to ui.find as last resort.
 -- pcall(fn, ...) avoids closure-capture issues.
-_dbg(3, "UI elements registered, defining nl_find_safe next")
 local function nl_find_safe(...)
     if pui and pui.find then
         local ok, ref = pcall(pui.find, ...)
@@ -184,7 +182,6 @@ end
 -- NL UI REFERENCES — verified paths from JAG0YAW/bettervisal/bloodwings/nyanza
 -- All pcall-wrapped; if a path is gone in a future NL update, write fails silently.
 -- ══════════════════════════════════════════════════════════════════════════
-_dbg(4, "starting nl_refs build (ui.find calls)")
 local nl_refs = {}
 -- Outer pcall: even if pui.find / ui.find pops the NL "couldn't find menu item" dialog
 -- for some path that is gone in this NL build, the remaining lookups still run and
@@ -241,7 +238,6 @@ pcall(function()
     nl_refs.vis_self_chams   = nl_find_safe("Visuals", "Players", "Self", "Chams", "Weapon")
     nl_refs.vis_self_glow    = nl_find_safe("Visuals", "Players", "Self", "Chams", "Glow")
 end)  -- outer pcall
-_dbg(5, "nl_refs build done")
 
 -- ══════════════════════════════════════════════════════════════════════════
 -- PRESETS
@@ -265,7 +261,6 @@ local function _safe_step(label, fn)
         cs_log("[STEP-FAIL] " .. label .. " — " .. tostring(err))
     end
 end
-_dbg(6, "preset functions defining")
 local function _do_apply_preset(name)
     cs_log("[apply] start " .. tostring(name))
     if name == "aggressive" then
@@ -434,7 +429,6 @@ local aa_state = {
 -- "applied" never printing crash — NL UI state is in transition and constant
 -- writes from a spectating script can crash CSGO.
 local aa_periodic_last_tick = 0
-_dbg(7, "aa_periodic_sync defining")
 local function aa_periodic_sync()
     if not (enable_master:get() and aa_enable:get()) then return end
     -- bail if not in an alive match state
@@ -591,7 +585,6 @@ end
 -- V1.5: also drains pending_preset so preset writes happen OUTSIDE menu callback.
 -- V1.10: dirty-tracking for NL visual overrides (only write on toggle change)
 local _vis_last = { hitsnd = nil, tp = nil, sc = nil, fd = nil }
-_dbg(8, "createmove_unified defining")
 local function createmove_unified(cmd)
     -- Drain queued preset apply (set by Aggressive/Dynamic/Defensive/Legit buttons)
     if pending_preset then
@@ -623,9 +616,7 @@ local function createmove_unified(cmd)
     end
 end
 -- V1.7: pick the first available createmove name (createmove preferred)
-_dbg(9, "registering createmove hook")
 _hooks_status.createmove = register_first(createmove_unified, "createmove", "setup_command")
-_dbg(10, "createmove hook done")
 
 -- ══════════════════════════════════════════════════════════════════════════
 -- VISUALS — hit-marker + damage indicator + perf HUD + spectator overlay
@@ -650,55 +641,35 @@ local function on_local_fire(event)
     aa_state.last_fire_time = globals.realtime or 0
 end
 -- V1.7: aim_fire preferred over ragebot_fire (more reliable timing)
-_dbg(11, "registering aim_fire hook")
 _hooks_status.aim_fire = register_first(on_local_fire, "aim_fire", "ragebot_fire")
-_dbg(12, "aim_fire hook done, registering weapon_fire next")
 
--- V1.6 H + V1.9 hardening: weapon_fire fires for audio + grenade + AI events at
--- round-start. Entity.get on those non-player userids + method calls like
--- :is_enemy() / :is_alive() on weapon entities crashed CSGO on spawn. The whole
--- body is now wrapped in an outer pcall and every method call has its own pcall.
+-- V1.12: weapon_fire reads ZERO entity properties on the shooter. v1.6-1.11 all
+-- did entity.get + shooter.m_vecOrigin / m_angEyeAngles property reads. User
+-- reported repeated CSGO CTDs once in-match. CSGO returns invalid memory for
+-- entity properties on players in transition (just-respawned, dying, weapon-
+-- switching) and pcall does NOT catch C++ segfault. Trimmed handler trades
+-- hostile-aim precision for stability: ANY enemy fire opens the fake-duck window.
 pcall(function()
     events.weapon_fire:set(function(event)
         pcall(function()
             if not (enable_master:get() and aa_fd_assist:get()) then return end
             if not event or not event.userid then return end
             local lp = entity.get_local_player()
-            if not lp or not lp:is_alive() then return end
-            local shooter
-            pcall(function() shooter = entity.get(event.userid, true) end)
-            if not shooter or shooter == lp then return end
-            local is_enemy, is_alive = false, false
-            pcall(function() is_enemy = shooter:is_enemy() end)
-            pcall(function() is_alive = shooter:is_alive() end)
-            if not (is_enemy and is_alive) then return end
-            local sx, sy_o, sz, lx, ly, lz = 0, 0, 0, 0, 0, 0
-            local ok = pcall(function()
-                sx, sy_o, sz = shooter.m_vecOrigin.x, shooter.m_vecOrigin.y, shooter.m_vecOrigin.z
-                lx, ly, lz   = lp.m_vecOrigin.x,      lp.m_vecOrigin.y,      lp.m_vecOrigin.z
-            end)
-            if not ok then return end
-            local dx, dy, dz = lx - sx, ly - sy_o, lz - sz
-            local dist = math.sqrt(dx*dx + dy*dy + dz*dz)
-            if dist > 3500 then return end
-            local aimed = false
-            pcall(function()
-                local ang = shooter.m_angEyeAngles
-                local their = ang and (ang.y or ang[2])
-                if their then
-                    local desired = math.deg(math.atan2(dy, dx))
-                    local diff = math.abs(((their - desired + 180) % 360) - 180)
-                    if diff < 35 then aimed = true end
-                end
-            end)
-            if aimed then
-                aa_state.fakeduck_until = (globals.realtime or 0) + ((aa_fd_duration:get() or 800) / 1000)
-            end
+            if not lp then return end
+            local alive = false
+            pcall(function() alive = lp:is_alive() end)
+            if not alive then return end
+            -- Skip if shooter is local player (don't fd-assist our own shots).
+            -- lp:get_user_id() is a Lua method call on the lp object we already
+            -- verified, so no entity.get(event.userid) lookup needed.
+            local lp_uid
+            pcall(function() lp_uid = lp:get_user_id() end)
+            if lp_uid and event.userid == lp_uid then return end
+            aa_state.fakeduck_until = (globals.realtime or 0) + ((aa_fd_duration:get() or 800) / 1000)
         end)
     end)
 end)
 
-_dbg(13, "weapon_fire registered, aim_ack next")
 -- Aim_ack — hit-marker trigger
 pcall(function()
     events.aim_ack:set(function(event)
@@ -747,28 +718,21 @@ pcall(function()
             if not event then return end
             local lp = entity.get_local_player()
             if not lp then return end
-            local attacker, victim
-            pcall(function() attacker = entity.get(event.attacker, true) end)
-            pcall(function() victim   = entity.get(event.userid,   true) end)
-            if not attacker or attacker ~= lp then return end
-            if not victim or victim == lp then return end
-        local ox, oy, oz = 0, 0, 0
-        pcall(function()
-            ox = victim.m_vecOrigin.x
-            oy = victim.m_vecOrigin.y
-            oz = victim.m_vecOrigin.z + 70
-        end)
-        -- V1.6 L: store hitbox group for color-coding
-        local hb = -1
-        pcall(function() hb = event.hitgroup or -1 end)
-        table.insert(damage_pops, {
-            time = globals.realtime or 0,
-            dmg  = event.dmg_health or event.damage or 0,
-            x = ox, y = oy, z = oz,
-            hp_left = event.health or 0,
-            hitbox_id = hb,
-        })
-            -- prune to last 16 entries
+            -- V1.12: skip entity.get(victim, ...) — only check that attacker is us
+            -- via userid comparison. No victim.m_vecOrigin read; popup stacks at
+            -- screen edge instead of anchoring to the enemy's 3D position.
+            local lp_uid
+            pcall(function() lp_uid = lp:get_user_id() end)
+            if not lp_uid or event.attacker ~= lp_uid then return end
+            if event.userid == lp_uid then return end  -- not self-damage
+            local hb = -1
+            pcall(function() hb = event.hitgroup or -1 end)
+            table.insert(damage_pops, {
+                time = globals.realtime or 0,
+                dmg  = event.dmg_health or event.damage or 0,
+                hp_left = event.health or 0,
+                hitbox_id = hb,
+            })
             while #damage_pops > 16 do table.remove(damage_pops, 1) end
         end)
     end)
@@ -833,7 +797,6 @@ local function pulse_alpha(hz)
     return math.floor(127 + 127 * math.sin((globals.realtime or 0) * math.pi * 2 * hz))
 end
 
-_dbg(14, "aim_ack + player_hurt done, registering render next (BIGGEST risk)")
 -- Render loop
 pcall(function()
     events.render:set(function()
@@ -890,8 +853,12 @@ pcall(function()
             end
         end
 
-        -- ── V1.6 L: COLOR-CODED DAMAGE POPUPS (head=red / chest=green / stomach=yellow / leg=blue) ──
+        -- ── V1.12: DAMAGE POPUPS — screen-edge stack (no world_to_screen, no victim entity read) ──
+        -- Color by hitbox: head=red / chest=green / stomach=yellow / leg=blue.
         if vis_dmgind:get() then
+            local stack_x = cx + 60   -- right of crosshair
+            local stack_y_base = cy + 30
+            local row = 0
             for i = #damage_pops, 1, -1 do
                 local pop = damage_pops[i]
                 local age = now - pop.time
@@ -899,28 +866,25 @@ pcall(function()
                     table.remove(damage_pops, i)
                 else
                     local alpha = math.floor(255 * (1 - age / DMGPOP_DURATION_S))
-                    local yoff  = age * 30
-                    -- color by hitbox: 0=head, 3=chest, 4=stomach, 6/7=legs
                     local r, g, b = 255, 200, 80
                     local hb = pop.hitbox_id
-                    if hb == 0 then r, g, b = 255, 80, 80         -- head: red
-                    elseif hb == 3 then r, g, b = 120, 220, 120   -- chest: green
-                    elseif hb == 4 then r, g, b = 255, 220, 80    -- stomach: yellow
-                    elseif hb == 6 or hb == 7 then r, g, b = 120, 180, 255  -- legs: blue
+                    if hb == 0 then r, g, b = 255, 80, 80
+                    elseif hb == 3 then r, g, b = 120, 220, 120
+                    elseif hb == 4 then r, g, b = 255, 220, 80
+                    elseif hb == 6 or hb == 7 then r, g, b = 120, 180, 255
                     end
+                    local y = stack_y_base + row * 16
                     pcall(function()
-                        local p2d = render.world_to_screen(vector(pop.x, pop.y, pop.z))
-                        if p2d and p2d.x and p2d.x > 0 and p2d.y > 0 then
-                            render.text(4, vector(p2d.x + 6, p2d.y - yoff),
-                                        color(r, g, b, alpha), nil,
-                                        string.format("-%d HP", pop.dmg))
-                            if pop.hp_left > 0 then
-                                render.text(3, vector(p2d.x + 6, p2d.y - yoff + 14),
-                                            color(180, 180, 180, alpha), nil,
-                                            string.format("(%d hp)", pop.hp_left))
-                            end
+                        render.text(4, vector(stack_x, y),
+                                    color(r, g, b, alpha), nil,
+                                    string.format("-%d HP", pop.dmg))
+                        if pop.hp_left > 0 then
+                            render.text(3, vector(stack_x + 60, y + 2),
+                                        color(180, 180, 180, alpha), nil,
+                                        string.format("(%d hp)", pop.hp_left))
                         end
                     end)
+                    row = row + 1
                 end
             end
         end
@@ -1282,7 +1246,6 @@ enable_master:set_callback(function(r)
         cs_log_color("Master DISABLED — overrides + clantag cleared")
     end
 end)
-_dbg(15, "all hooks + callbacks registered, banner next")
 
 -- ══════════════════════════════════════════════════════════════════════════
 -- LOAD BANNER
