@@ -1,15 +1,16 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Config — Neverlose CSGO HvH config        ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 2.6                                    ║
+-- ║  Version: 2.7                                    ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Config
 -- @author seltonmt01
--- @version 2.6
--- @description Debug stats accumulator (shots, hits, miss-rate, HS-rate, hitbox breakdown,
---              damage dealt, session time) + dump button. Same idea as resolver's copy-logs.
+-- @version 2.7
+-- @description Peek Boost — gingersense pattern. READ NL Peek Assist state (no :override on hotkey),
+--              while active force ragebot hitchance + mindmg to permissive so first-bullet fires
+--              immediately during peek window. Drops custom sidemove writes.
 
-local SEL01_CFG_VERSION = "2.6"
+local SEL01_CFG_VERSION = "2.7"
 
 -- DEBUG: print to CSGO console at major load checkpoints. Plain print() bypasses
 -- NL chat (which may not flush before crash) and writes directly to CSGO console.
@@ -97,17 +98,15 @@ local aa_fd_duration = g_aa:slider("Fake-duck duration (ms)", 200, 2000, 800)
 -- MOVEMENT UI
 -- ══════════════════════════════════════════════════════════════════════════
 g_move:label(accent .. ui.get_icon"running" .. accent .. "  Movement helpers")
--- V2.5: AI Peek = tap-style auto-cycle. Tap hotkey -> script strafes out, holds
--- briefly so ragebot can fire, then strafes back. Pure cmd.sidemove. No entity
--- reads, no NL :override on Peek Assist (that crashed in v2.0). Bind to SAME
--- key as NL Peek Assist for 2-in-1.
-local mv_aipeek_k     = g_move:hotkey("AI Peek (tap — auto peek+return)")
-local mv_aipeek_dir   = g_move:combo("AI Peek direction", {"Right", "Left", "Alternate"}, 1)
-local mv_aipeek_out   = g_move:slider("Peek-out duration (ms)", 100, 500, 200)
-local mv_aipeek_hold  = g_move:slider("Hold for shot (ms)",     50, 400, 100)
-local mv_aipeek_back  = g_move:slider("Peek-back duration (ms)",100, 500, 250)
+-- V2.7: Peek Boost — gingersense pattern. Read NL Peek Assist state via :get()
+-- (NEVER override hotkey elements, that crashed in v2.0). While user is peeking,
+-- force ragebot hitchance + min-damage to permissive values so the first bullet
+-- fires immediately during the small visible window. No sidemove writes from us.
+local mv_peek_boost   = g_move:switch("Peek Boost (lower HC + mindmg during NL Peek Assist)", true)
+local mv_peek_hc      = g_move:slider("Peek-window Hit Chance", 10, 80, 30)
+local mv_peek_mindmg  = g_move:slider("Peek-window Min Damage", 1, 100, 1)
 g_move:label(" ")
-g_move:label(accent .. "  Bind this + NL Peek Assist to SAME key for 2-in-1")
+g_move:label(accent .. "  Assign NL Peek Assist hotkey: Aimbot/Ragebot/Main/Peek Assist")
 g_move:label(accent .. "  Slow-walk / Fake-duck: NL Aimbot/Anti Aim/Misc tab")
 
 -- ══════════════════════════════════════════════════════════════════════════
@@ -227,7 +226,9 @@ pcall(function()
     nl_refs.rage_dt          = nl_find_safe("Aimbot", "Ragebot", "Main", "Double Tap")
     nl_refs.rage_peek        = nl_find_safe("Aimbot", "Ragebot", "Main", "Peek Assist")
     nl_refs.rage_dormant     = nl_find_safe("Aimbot", "Ragebot", "Main", "Enabled", "Dormant Aimbot")
-    -- V2.1: rage_peek_assist ref dropped — never override hotkey elements per tick.
+    -- V2.7: rage_peek_assist ref RE-ADDED but we only :get() it (gingersense
+    -- pattern), never :override. Reading a hotkey state is safe; writing crashes.
+    nl_refs.rage_peek_assist = nl_find_safe("Aimbot", "Ragebot", "Main", "Peek Assist")
     nl_refs.rage_hc          = nl_find_safe("Aimbot", "Ragebot", "Selection", "Hit Chance")
     nl_refs.rage_mindmg      = nl_find_safe("Aimbot", "Ragebot", "Selection", "Min. Damage")
     nl_refs.rage_autowall    = nl_find_safe("Aimbot", "Ragebot", "Selection", "Penetrate Walls")
@@ -511,14 +512,11 @@ local function register_first(handler, ...)
 end
 
 -- ══════════════════════════════════════════════════════════════════════════
--- MOVEMENT — V2.5: AI Peek tap-style 3-phase auto-cycle.
--- Tap hotkey -> phase OUT (strafe sidemove=+/-450) for peek-out ms
---             -> phase HOLD (sidemove=0, user/ragebot can fire) for hold ms
---             -> phase BACK (strafe -sidemove) for peek-back ms
---             -> idle (no force on sidemove, user input passes through)
--- No entity reads. No NL :override on hotkey refs.
+-- MOVEMENT — V2.7: Peek Boost. Pure NL hitchance/mindmg override during the
+-- window where NL Peek Assist is held by the user (gingersense pattern: READ
+-- NL ref state, never :override the hotkey itself).
 -- ══════════════════════════════════════════════════════════════════════════
-local _peek = { phase = nil, started = 0, sign = 1, last_pressed = false, alt = 1 }
+local _peek_boost_active = false  -- dirty-track to only :override on transitions
 
 local function createmove_handler(cmd)
     if not (enable_master:get() and cmd) then return end
@@ -527,46 +525,36 @@ local function createmove_handler(cmd)
         if not lp then return end
         local alive = false
         pcall(function() alive = lp:is_alive() end)
-        if not alive then _peek.phase = nil; return end
+        if not alive then return end
 
-        local now     = globals.realtime or 0
-        local pressed = mv_aipeek_k and mv_aipeek_k:get()
-
-        -- Rising edge: tap -> start cycle (only if not already cycling)
-        if pressed and not _peek.last_pressed and _peek.phase == nil then
-            _peek.phase   = "out"
-            _peek.started = now
-            local dir = mv_aipeek_dir:get()
-            if dir == "Left" then
-                _peek.sign = -1
-            elseif dir == "Alternate" then
-                _peek.alt = -_peek.alt
-                _peek.sign = _peek.alt
-            else
-                _peek.sign = 1   -- Right
+        -- read NL Peek Assist hotkey state (safe — :get on hotkey is allowed)
+        local peeking = false
+        pcall(function()
+            if nl_refs.rage_peek_assist then
+                peeking = nl_refs.rage_peek_assist:get() == true
             end
+        end)
+
+        if not (mv_peek_boost and mv_peek_boost:get()) then
+            -- toggle just disabled — clear any leftover override and bail
+            if _peek_boost_active then
+                pcall(function() if nl_refs.rage_hc     then nl_refs.rage_hc:override()     end end)
+                pcall(function() if nl_refs.rage_mindmg then nl_refs.rage_mindmg:override() end end)
+                _peek_boost_active = false
+            end
+            return
         end
-        _peek.last_pressed = pressed
 
-        if _peek.phase == nil then return end
-
-        local elapsed_ms = (now - _peek.started) * 1000
-        if _peek.phase == "out" then
-            cmd.sidemove = 450 * _peek.sign
-            if elapsed_ms >= (mv_aipeek_out:get() or 200) then
-                _peek.phase = "hold"; _peek.started = now
-            end
-        elseif _peek.phase == "hold" then
-            -- sidemove = 0 so user/ragebot can hit the target
-            cmd.sidemove = 0
-            if elapsed_ms >= (mv_aipeek_hold:get() or 100) then
-                _peek.phase = "back"; _peek.started = now
-            end
-        elseif _peek.phase == "back" then
-            cmd.sidemove = -450 * _peek.sign
-            if elapsed_ms >= (mv_aipeek_back:get() or 250) then
-                _peek.phase = nil
-            end
+        if peeking and not _peek_boost_active then
+            -- peek window opened — drop hitchance + mindmg to permissive values
+            nl_override(nl_refs.rage_hc,     mv_peek_hc:get())
+            nl_override(nl_refs.rage_mindmg, mv_peek_mindmg:get())
+            _peek_boost_active = true
+        elseif (not peeking) and _peek_boost_active then
+            -- peek window closed — clear overrides, NL returns to user manual values
+            pcall(function() if nl_refs.rage_hc     then nl_refs.rage_hc:override()     end end)
+            pcall(function() if nl_refs.rage_mindmg then nl_refs.rage_mindmg:override() end end)
+            _peek_boost_active = false
         end
     end)
 end
@@ -1075,9 +1063,9 @@ pcall(function()
         -- ── KEYBINDS PANEL (right-middle, active hotkeys list) ──
         if vis_keybinds:get() then
             local active = {}
-            -- V2.5: show AI Peek phase while cycling
-            if _peek and _peek.phase then
-                table.insert(active, "AI Peek: " .. tostring(_peek.phase))
+            -- V2.7: show Peek Boost active state
+            if _peek_boost_active then
+                table.insert(active, "Peek Boost: ACTIVE")
             end
             -- NL manual binds + double-tap if enabled show as fallback
             if #active > 0 then
@@ -1245,7 +1233,7 @@ end)
 -- LOAD BANNER
 -- ══════════════════════════════════════════════════════════════════════════
 cs_log_color("══════════════════════════════════════════")
-cs_log_color("Sel01-Config v" .. SEL01_CFG_VERSION .. " loaded (CSGO HvH — Debug stats + AI Peek tap-cycle)")
+cs_log_color("Sel01-Config v" .. SEL01_CFG_VERSION .. " loaded (CSGO HvH — Peek Boost via NL Peek Assist read)")
 cs_log(string.format("  hooks  createmove=%s  aim_fire=%s",
     tostring(_hooks_status.createmove or "MISSING"),
     tostring(_hooks_status.aim_fire or "MISSING")))
