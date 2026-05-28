@@ -1,16 +1,15 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Config — Neverlose CSGO HvH config        ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 2.0                                    ║
+-- ║  Version: 2.1                                    ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Config
 -- @author seltonmt01
--- @version 2.0
--- @description Stable rebuild. NL :overrides + aa_periodic_sync + visual dirty-track restored
---              (v1.13 BISECT confirmed crashes were in event handlers). Broken movement helpers
---              dropped. AI Peek hotkey replaces quick-stop + auto-peek. weapon_fire stays off.
+-- @version 2.1
+-- @description Drop AI Peek wrapper (Peek Assist is hotkey element, :override(int) per-tick = crash).
+--              Switch player_hurt to JAG0YAW entity-compare pattern (drops lp:get_user_id risk).
 
-local SEL01_CFG_VERSION = "2.0"
+local SEL01_CFG_VERSION = "2.1"
 
 -- DEBUG: print to CSGO console at major load checkpoints. Plain print() bypasses
 -- NL chat (which may not flush before crash) and writes directly to CSGO console.
@@ -95,13 +94,13 @@ local aa_fd_duration = g_aa:slider("Fake-duck duration (ms)", 200, 2000, 800)
 -- MOVEMENT UI
 -- ══════════════════════════════════════════════════════════════════════════
 g_move:label(accent .. ui.get_icon"running" .. accent .. "  Movement helpers")
--- V2.0: dropped strafe-nudge / no-fall / fast-ladder (broken in air per user feedback).
--- Dropped quick-stop + auto-peek hotkeys (createmove-injection caused weird movement).
--- New: AI Peek wrapper around NL's Aimbot/Ragebot/Main/Peek Assist.
-local mv_aipeek_k    = g_move:hotkey("AI Peek (hold — uses NL Peek Assist)")
-local mv_aipeek_dur  = g_move:slider("AI Peek hold duration (ms)", 200, 2000, 600)
-g_move:label(" ")
-g_move:label(accent .. "  Other movement: use NL Misc tab (it has slow-walk / fake-duck / etc)")
+-- V2.1: ALL movement helpers dropped. v1.13 BISECT showed createmove movement
+-- is stable; v2.0 added AI Peek which writes :override(int) every tick on the
+-- NL Peek Assist element — Peek Assist is a HOTKEY element and JAG0YAW only
+-- STORES the ref, never overrides it. The per-tick override caused the spawn CTD.
+-- Use NL's built-in hotkey bindings for Peek Assist + slow-walk + fake-duck directly.
+g_move:label(accent .. "  Use NL Aimbot/Ragebot/Main/Peek Assist directly (assign hotkey there)")
+g_move:label(accent .. "  Slow-walk / Fake-duck: NL Aimbot/Anti Aim/Misc tab")
 
 -- ══════════════════════════════════════════════════════════════════════════
 -- VISUALS UI
@@ -220,7 +219,7 @@ pcall(function()
     nl_refs.rage_dt          = nl_find_safe("Aimbot", "Ragebot", "Main", "Double Tap")
     nl_refs.rage_peek        = nl_find_safe("Aimbot", "Ragebot", "Main", "Peek Assist")
     nl_refs.rage_dormant     = nl_find_safe("Aimbot", "Ragebot", "Main", "Enabled", "Dormant Aimbot")
-    nl_refs.rage_peek_assist = nl_find_safe("Aimbot", "Ragebot", "Main", "Peek Assist")
+    -- V2.1: rage_peek_assist ref dropped — never override hotkey elements per tick.
     nl_refs.rage_hc          = nl_find_safe("Aimbot", "Ragebot", "Selection", "Hit Chance")
     nl_refs.rage_mindmg      = nl_find_safe("Aimbot", "Ragebot", "Selection", "Min. Damage")
     nl_refs.rage_autowall    = nl_find_safe("Aimbot", "Ragebot", "Selection", "Penetrate Walls")
@@ -475,28 +474,11 @@ local function register_first(handler, ...)
 end
 
 -- ══════════════════════════════════════════════════════════════════════════
--- MOVEMENT — V2.0: createmove no longer mutates lp movement (strafe nudge / no-fall
--- / fast-ladder / quick-stop / auto-peek all dropped — user reported broken air
--- movement). New AI Peek: hotkey-driven, just toggles NL's built-in Peek Assist
--- via :override (no cmd.forwardmove / cmd.sidemove writes from us at all).
+-- MOVEMENT — V2.1: createmove_handler now a NO-OP. AI Peek per-tick override on
+-- the Peek Assist hotkey element was the v2.0 spawn-crash cause. Use NL's
+-- built-in hotkeys directly.
 -- ══════════════════════════════════════════════════════════════════════════
-local aipeek_state = { last_pressed = false, expires_at = 0 }
-
-local function createmove_handler(cmd)
-    if not (enable_master:get() and cmd) then return end
-    pcall(function()
-        local now = globals.realtime or 0
-        local pressed = mv_aipeek_k and mv_aipeek_k:get()
-        if pressed and not aipeek_state.last_pressed then
-            -- rising edge — open peek window
-            aipeek_state.expires_at = now + ((mv_aipeek_dur:get() or 600) / 1000)
-        end
-        aipeek_state.last_pressed = pressed
-        -- drive NL Peek Assist via :override while pressed OR window is open
-        local window_open = pressed or (now < aipeek_state.expires_at)
-        nl_override(nl_refs.rage_peek_assist, window_open and 1 or 0)
-    end)
-end
+local function createmove_handler(cmd) end
 
 -- Single createmove handler that runs movement + NL-visual override sync.
 -- V1.5: also drains pending_preset so preset writes happen OUTSIDE menu callback.
@@ -579,18 +561,21 @@ pcall(function()
     end)
 end)
 
--- V2.0: player_hurt restored (v1.12 already had zero entity reads).
+-- V2.1: player_hurt switched to JAG0YAW pattern (entity object compare instead
+-- of lp:get_user_id()). JAG0YAW's hitmarker.on_player_hurt does:
+--   if entity.get(event.attacker, true) == entity.get_local_player() then ...
+-- No method call on lp object, no get_user_id call that may not exist in user's
+-- NL build. Pure object identity comparison.
 pcall(function()
     events.player_hurt:set(function(event)
         pcall(function()
             if not (enable_master:get() and vis_dmgind:get()) then return end
             if not event then return end
+            local attacker = entity.get(event.attacker, true)
             local lp = entity.get_local_player()
-            if not lp then return end
-            local lp_uid
-            pcall(function() lp_uid = lp:get_user_id() end)
-            if not lp_uid or event.attacker ~= lp_uid then return end
-            if event.userid == lp_uid then return end
+            if attacker ~= lp then return end
+            local victim = entity.get(event.userid, true)
+            if not victim or victim == lp then return end
             local hb = -1
             pcall(function() hb = event.hitgroup or -1 end)
             table.insert(damage_pops, {
@@ -937,9 +922,7 @@ pcall(function()
         -- ── KEYBINDS PANEL (right-middle, active hotkeys list) ──
         if vis_keybinds:get() then
             local active = {}
-            pcall(function()
-                if mv_aipeek_k and mv_aipeek_k:get() then table.insert(active, "AI Peek") end
-            end)
+            -- V2.1: AI Peek dropped — keybinds panel only shows NL active states
             -- NL manual binds + double-tap if enabled show as fallback
             if #active > 0 then
                 local lh = 14
@@ -1076,7 +1059,7 @@ end)
 -- LOAD BANNER
 -- ══════════════════════════════════════════════════════════════════════════
 cs_log_color("══════════════════════════════════════════")
-cs_log_color("Sel01-Config v" .. SEL01_CFG_VERSION .. " loaded (CSGO HvH — NL writes restored, weapon_fire still off)")
+cs_log_color("Sel01-Config v" .. SEL01_CFG_VERSION .. " loaded (CSGO HvH — AI Peek removed, JAG0YAW player_hurt pattern)")
 cs_log(string.format("  hooks  createmove=%s  aim_fire=%s",
     tostring(_hooks_status.createmove or "MISSING"),
     tostring(_hooks_status.aim_fire or "MISSING")))
