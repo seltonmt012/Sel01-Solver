@@ -1,16 +1,15 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Config — Neverlose CSGO HvH config        ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 2.7                                    ║
+-- ║  Version: 2.8                                    ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Config
 -- @author seltonmt01
--- @version 2.7
--- @description Peek Boost — gingersense pattern. READ NL Peek Assist state (no :override on hotkey),
---              while active force ragebot hitchance + mindmg to permissive so first-bullet fires
---              immediately during peek window. Drops custom sidemove writes.
+-- @version 2.8
+-- @description Peek Boost = hotkey (hold). Hits-taken log: snapshot our AA state when we get
+--              shot so we can analyze why. Extended dump_stats with hits-taken section.
 
-local SEL01_CFG_VERSION = "2.7"
+local SEL01_CFG_VERSION = "2.8"
 
 -- DEBUG: print to CSGO console at major load checkpoints. Plain print() bypasses
 -- NL chat (which may not flush before crash) and writes directly to CSGO console.
@@ -98,15 +97,14 @@ local aa_fd_duration = g_aa:slider("Fake-duck duration (ms)", 200, 2000, 800)
 -- MOVEMENT UI
 -- ══════════════════════════════════════════════════════════════════════════
 g_move:label(accent .. ui.get_icon"running" .. accent .. "  Movement helpers")
--- V2.7: Peek Boost — gingersense pattern. Read NL Peek Assist state via :get()
--- (NEVER override hotkey elements, that crashed in v2.0). While user is peeking,
--- force ragebot hitchance + min-damage to permissive values so the first bullet
--- fires immediately during the small visible window. No sidemove writes from us.
-local mv_peek_boost   = g_move:switch("Peek Boost (lower HC + mindmg during NL Peek Assist)", true)
+-- V2.8: Peek Boost is now a HOLD HOTKEY. While held, lowers ragebot HC + mindmg
+-- so first-bullet fires instantly. Independent of NL Peek Assist hotkey — user
+-- can bind to same key as NL Peek Assist (2-in-1) or to a separate key.
+local mv_peek_boost_k = g_move:hotkey("Peek Boost (hold — lowers HC + mindmg)")
 local mv_peek_hc      = g_move:slider("Peek-window Hit Chance", 10, 80, 30)
 local mv_peek_mindmg  = g_move:slider("Peek-window Min Damage", 1, 100, 1)
 g_move:label(" ")
-g_move:label(accent .. "  Assign NL Peek Assist hotkey: Aimbot/Ragebot/Main/Peek Assist")
+g_move:label(accent .. "  Bind same key as NL Aimbot/Ragebot/Main/Peek Assist for 2-in-1")
 g_move:label(accent .. "  Slow-walk / Fake-duck: NL Aimbot/Anti Aim/Misc tab")
 
 -- ══════════════════════════════════════════════════════════════════════════
@@ -512,11 +510,10 @@ local function register_first(handler, ...)
 end
 
 -- ══════════════════════════════════════════════════════════════════════════
--- MOVEMENT — V2.7: Peek Boost. Pure NL hitchance/mindmg override during the
--- window where NL Peek Assist is held by the user (gingersense pattern: READ
--- NL ref state, never :override the hotkey itself).
+-- MOVEMENT — V2.8: Peek Boost via our own HOLD hotkey. Dirty-tracked NL
+-- hitchance / mindmg :override on rising + falling edge.
 -- ══════════════════════════════════════════════════════════════════════════
-local _peek_boost_active = false  -- dirty-track to only :override on transitions
+local _peek_boost_active = false
 
 local function createmove_handler(cmd)
     if not (enable_master:get() and cmd) then return end
@@ -525,18 +522,7 @@ local function createmove_handler(cmd)
         if not lp then return end
         local alive = false
         pcall(function() alive = lp:is_alive() end)
-        if not alive then return end
-
-        -- read NL Peek Assist hotkey state (safe — :get on hotkey is allowed)
-        local peeking = false
-        pcall(function()
-            if nl_refs.rage_peek_assist then
-                peeking = nl_refs.rage_peek_assist:get() == true
-            end
-        end)
-
-        if not (mv_peek_boost and mv_peek_boost:get()) then
-            -- toggle just disabled — clear any leftover override and bail
+        if not alive then
             if _peek_boost_active then
                 pcall(function() if nl_refs.rage_hc     then nl_refs.rage_hc:override()     end end)
                 pcall(function() if nl_refs.rage_mindmg then nl_refs.rage_mindmg:override() end end)
@@ -545,13 +531,13 @@ local function createmove_handler(cmd)
             return
         end
 
-        if peeking and not _peek_boost_active then
-            -- peek window opened — drop hitchance + mindmg to permissive values
+        local held = mv_peek_boost_k and mv_peek_boost_k:get()
+
+        if held and not _peek_boost_active then
             nl_override(nl_refs.rage_hc,     mv_peek_hc:get())
             nl_override(nl_refs.rage_mindmg, mv_peek_mindmg:get())
             _peek_boost_active = true
-        elseif (not peeking) and _peek_boost_active then
-            -- peek window closed — clear overrides, NL returns to user manual values
+        elseif (not held) and _peek_boost_active then
             pcall(function() if nl_refs.rage_hc     then nl_refs.rage_hc:override()     end end)
             pcall(function() if nl_refs.rage_mindmg then nl_refs.rage_mindmg:override() end end)
             _peek_boost_active = false
@@ -602,6 +588,47 @@ _hooks_status.aim_fire = nil   -- not registered in v1.13
 -- V1.13 BISECT: weapon_fire handler DISABLED (no registration). If config is
 -- stable with this off, FD-assist or weapon_fire-related code is the crash.
 
+-- V2.8: hits-taken log — when WE get shot, snapshot AA state + context so we can
+-- analyze "why did this hit me". Ring buffer of last 10 incidents.
+local hits_taken_log = {}
+local HITS_TAKEN_MAX = 10
+
+local function _hb_name(hb)
+    local map = { [0]="head", [3]="chest", [4]="stomach", [6]="leg", [7]="leg" }
+    return map[hb] or tostring(hb or "?")
+end
+
+-- V2.8: capture our AA state at the moment we get hit
+local function _snapshot_aa_state()
+    local lp = entity.get_local_player()
+    local airborne = false
+    local velocity = 0
+    if lp then
+        pcall(function()
+            local f = lp.m_fFlags or 0
+            airborne = bit.band(f, 1) == 0
+            local v = lp.m_vecVelocity
+            velocity = math.sqrt((v.x or 0)^2 + (v.y or 0)^2)
+        end)
+    end
+    return {
+        aa_enable     = aa_enable:get(),
+        desync        = aa_desync:get(),
+        air_set       = aa_air_set:get(),
+        air_mag       = aa_air_mag:get(),
+        anti_bf       = aa_anti_bf:get(),
+        on_shot       = aa_onshot:get() and (globals.realtime or 0) < (aa_state.on_shot_until or 0),
+        fd_assist     = aa_fd_assist:get(),
+        freestanding  = aa_freestanding:get(),
+        airborne      = airborne,
+        velocity      = math.floor(velocity),
+        peek_boost    = _peek_boost_active,
+        jitter_dir    = aa_jitter_dir,
+        body_yaw_l    = aa_periodic_last_lim_l or nil,  -- if we track this
+        body_yaw_r    = aa_periodic_last_lim_r or nil,
+    }
+end
+
 -- V2.6: debug stats accumulator. Same idea as resolver's session_stats — track
 -- shot counts + hit/miss + hitbox breakdown + total damage so the user can dump
 -- a session summary and tune presets accordingly.
@@ -618,6 +645,8 @@ local stats = {
     total_dmg      = 0,
     biggest_hit    = 0,
     one_taps       = 0,    -- >= 100 dmg single hit
+    hits_taken     = 0,    -- V2.8: we got shot
+    dmg_taken      = 0,
 }
 
 local function _stats_clear()
@@ -633,6 +662,9 @@ local function _stats_clear()
     stats.total_dmg      = 0
     stats.biggest_hit    = 0
     stats.one_taps       = 0
+    stats.hits_taken     = 0
+    stats.dmg_taken      = 0
+    hits_taken_log       = {}  -- clear hits-taken log too
 end
 
 -- V2.0: aim_ack restored, ZERO entity.get calls. Target name comes from event
@@ -694,20 +726,42 @@ pcall(function()
         pcall(function()
             if not enable_master:get() then return end
             if not event then return end
-            local attacker = entity.get(event.attacker, true)
             local lp = entity.get_local_player()
+            if not lp then return end
+            local attacker = entity.get(event.attacker, true)
+            local victim   = entity.get(event.userid,   true)
+
+            -- V2.8: WE got hit (victim == lp, attacker is someone else)
+            if victim == lp and attacker and attacker ~= lp then
+                stats.hits_taken = (stats.hits_taken or 0) + 1
+                local dmg_in = event.dmg_health or event.damage or 0
+                stats.dmg_taken = (stats.dmg_taken or 0) + dmg_in
+                local atk_name = "?"
+                pcall(function() if attacker.get_name then atk_name = attacker:get_name() end end)
+                local hb_in = event.hitgroup or -1
+                table.insert(hits_taken_log, {
+                    time     = globals.realtime or 0,
+                    atk_name = atk_name,
+                    dmg      = dmg_in,
+                    hp_left  = event.health or 0,
+                    hitbox   = _hb_name(hb_in),
+                    hb_id    = hb_in,
+                    snapshot = _snapshot_aa_state(),
+                })
+                while #hits_taken_log > HITS_TAKEN_MAX do table.remove(hits_taken_log, 1) end
+                return  -- don't run damage-given accumulator for received hits
+            end
+
+            -- WE dealt damage (attacker == lp, victim is enemy)
             if attacker ~= lp then return end
-            local victim = entity.get(event.userid, true)
             if not victim or victim == lp then return end
             local hb  = -1
             local dmg = 0
             pcall(function() hb  = event.hitgroup or -1 end)
             pcall(function() dmg = event.dmg_health or event.damage or 0 end)
-            -- V2.6: damage stats accumulator
             stats.total_dmg = stats.total_dmg + dmg
             if dmg > stats.biggest_hit then stats.biggest_hit = dmg end
             if dmg >= 100 then stats.one_taps = stats.one_taps + 1 end
-            -- visual gate (popup render)
             if not vis_dmgind:get() then return end
             table.insert(damage_pops, {
                 time      = globals.realtime or 0,
@@ -1174,7 +1228,7 @@ end
 pcall(function() btn_status:set_callback(function() dump_status() end) end)
 pcall(function() btn_reset:set_callback(function() apply_preset("dynamic") end) end)
 
--- V2.6: debug stats dump (mirrors resolver's session_stats / mode-stats style)
+-- V2.6 + V2.8: debug stats dump
 local function dump_stats()
     local now      = globals.realtime or 0
     local elapsed  = now - (stats.session_start or now)
@@ -1186,16 +1240,38 @@ local function dump_stats()
     cs_log_color("══ Sel01-Config v" .. SEL01_CFG_VERSION .. " DEBUG STATS ══")
     cs_log(string.format("Session: %.1f min  |  Master=%s  AA=%s",
         elapsed / 60, tostring(enable_master:get()), tostring(aa_enable:get())))
-    cs_log(string.format("Shots: %d fired  %d hit  %d miss  -> %.1f%% hit-rate",
+    cs_log(string.format("DEALT: %d fired  %d hit  %d miss  -> %.1f%% hit-rate",
         fired, hits, misses, hit_rate))
-    cs_log(string.format("Hitbox: head=%d chest=%d stomach=%d leg=%d other=%d  -> HS-rate %.1f%%",
+    cs_log(string.format("  Hitbox: head=%d chest=%d stomach=%d leg=%d other=%d  -> HS-rate %.1f%%",
         stats.hits_head, stats.hits_chest, stats.hits_stomach, stats.hits_leg,
         stats.hits_other, hs_rate))
-    cs_log(string.format("Damage: total=%d  biggest-hit=%d  1-taps(>=100)=%d",
+    cs_log(string.format("  Damage: total=%d  biggest=%d  1-taps(>=100)=%d",
         stats.total_dmg, stats.biggest_hit, stats.one_taps))
-    cs_log(string.format("Per-shot avg: %.1f dmg  |  per-hit avg: %.1f dmg",
+    cs_log(string.format("  Avg: %.1f/shot  |  %.1f/hit",
         fired > 0 and (stats.total_dmg / fired) or 0,
         hits  > 0 and (stats.total_dmg / hits)  or 0))
+    cs_log_color("── HITS TAKEN ──")
+    cs_log(string.format("TAKEN: %d hits  %d dmg total  |  K/D-ish: %.2f",
+        stats.hits_taken, stats.dmg_taken,
+        stats.hits_taken > 0 and (hits / stats.hits_taken) or hits))
+    if #hits_taken_log > 0 then
+        cs_log_color("Last incidents (newest first):")
+        for i = #hits_taken_log, math.max(1, #hits_taken_log - 4), -1 do
+            local e = hits_taken_log[i]
+            local s = e.snapshot or {}
+            cs_log(string.format(
+                "  [%.1fs ago] %s hit %s for %d (hp_left=%d)",
+                now - e.time, e.atk_name, e.hitbox, e.dmg, e.hp_left))
+            cs_log(string.format(
+                "    AA=%s desync=%d air=%s(%d) anti_bf=%s onshot=%s fd=%s free=%s air=%s vel=%d peek=%s",
+                tostring(s.aa_enable), s.desync or 0,
+                tostring(s.air_set),   s.air_mag or 0,
+                tostring(s.anti_bf),   tostring(s.on_shot),
+                tostring(s.fd_assist), tostring(s.freestanding),
+                tostring(s.airborne),  s.velocity or 0,
+                tostring(s.peek_boost)))
+        end
+    end
     cs_log_color("══ END STATS ══")
 end
 pcall(function() btn_stats:set_callback(function() dump_stats() end) end)
@@ -1233,7 +1309,7 @@ end)
 -- LOAD BANNER
 -- ══════════════════════════════════════════════════════════════════════════
 cs_log_color("══════════════════════════════════════════")
-cs_log_color("Sel01-Config v" .. SEL01_CFG_VERSION .. " loaded (CSGO HvH — Peek Boost via NL Peek Assist read)")
+cs_log_color("Sel01-Config v" .. SEL01_CFG_VERSION .. " loaded (CSGO HvH — Peek Boost hold-hotkey + Hits-taken log)")
 cs_log(string.format("  hooks  createmove=%s  aim_fire=%s",
     tostring(_hooks_status.createmove or "MISSING"),
     tostring(_hooks_status.aim_fire or "MISSING")))
