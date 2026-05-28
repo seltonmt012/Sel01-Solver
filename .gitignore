@@ -1,0 +1,27 @@
+# Lua compiled
+*.luac
+*.luaclient
+
+# OS junk
+Thumbs.db
+.DS_Store
+desktop.ini
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*~
+
+# Local runtime data (don't share personal learning history)
+nl/Sel01-Solver/learned.lua
+nl/Sel01-Solver/learned.json
+nl/Sel01-Solver/last_logs.txt
+nl/Sel01-Solver/logo.png
+
+# Local notes/scratch
+notes.txt
+TODO.local.md
+
+# Claude memory (per-user)
+.claude/
