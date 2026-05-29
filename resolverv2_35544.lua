@@ -1,22 +1,24 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 9.24                                   ║
+-- ║  Version: 9.25                                   ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 9.24
--- @description Two log-driven fixes:
---   * effective_desync samples gate 2 → 1. One measured sample beats blind 58°.
---     Observed: BF:opposite shot 57° at enemy with measured 24.2° because the
---     2-sample threshold fell through to max_desync. Now 24.2° applies after
---     the first hit confirms it. Same applies to Networked-Meas path.
---   * LBY-Snap-Guess miss flip-on-mismatch-only. Earlier code flipped on every
---     miss; logs showed misses where our delta MATCHED measDesync exactly
---     (server-side backtrack fail, not our side error). Flipping then oscillated.
---     Now we flip only when |our_delta - measured| > 5°.
+-- @version 9.25
+-- @description User-friendly polish + console-events fix:
+--   * cs_event_* now uses 3-fallback console writers (client.color_log →
+--     client.log → print) so HIT/MISS/KILL show in the in-game console even
+--     on NL builds where color_log isn't exposed. Each event is also pushed to
+--     log_buffer (📋 Copy captures them).
+--   * AA Advisor recommendations rewritten for clarity: plain English,
+--     concrete slider/toggle names + values, color-coded lines (green=DO,
+--     grey=why, orange=warn, cyan=good). Header now says "Their AA: SWITCH |
+--     prefers RIGHT side | desync ≈ 36°" instead of cryptic stats.
+--   * Stats lines simplified to "Our data: 5 hits | L=2 R=5 | miss-rate 17%".
+--   * v9.24 fixes carry (effective_desync 2→1, LBY-Snap flip on mismatch).
 
-local SEL01_VERSION = "9.24"
+local SEL01_VERSION = "9.25"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -483,65 +485,112 @@ end
 
 function advisor_show()
     if #advisor_state.list == 0 then
-        cs_log_color("[Advisor] empty list — click 🔁 Refresh first")
+        cs_log_color("[Advisor] No tracked players yet. Play 1-2 rounds, then click 🔁 Refresh.")
         return
     end
     local e = advisor_state.list[advisor_state.idx]
     if not e then return end
-    cs_log_color(string.format("══ AA Advisor: %s (#%d/%d) ══",
+    cs_log_color("══════════════════════════════════════════")
+    cs_log_color(string.format("  AA Advisor:  %s   (#%d / %d)",
         e.name, advisor_state.idx, #advisor_state.list))
-    cs_log_color(string.format("  AA-type=%s | dom=%s | mag=%.1f° | hits=%d miss=%d | last-mode=%s",
-        e.aa_type:upper(), advisor_dom_label(e.dom), e.mag, e.hits, e.miss, e.last_mode))
-    cs_log_color(string.format("  L=%d/%.1f° R=%d/%.1f° passive-obs=%d miss-rate=%d%%",
-        e.samples_l, e.measured_l, e.samples_r, e.measured_r, e.passive, e.miss_rate))
-    cs_log_color("── Config-side AA recommendations vs this enemy ──")
-    if e.aa_type == "static" then
-        cs_log_color("  → They use STATIC AA. Their resolver of you likely expects static/dom-side too.")
-        cs_log_color("    SET: Yaw Modifier=Jitter int 1-2 ticks, Anti-BF ON, YAW-ROT ON")
-        cs_log_color("    AVOID: fixed Manual L/R preset")
-    elseif e.aa_type == "switch" then
-        cs_log_color("  → They SWITCH-AA. Resolver-of-you likely runs alt-track.")
-        cs_log_color("    SET: Desync 58 + Side-streak limit thresh=2, YAW-ROT ON, DEF-on-dmg ON")
-        cs_log_color("    AVOID: regular L↔R alternation in your preset")
-    elseif e.aa_type == "jitter" then
-        cs_log_color("  → They JITTER. Resolver-of-you likely jitter-period sync.")
-        cs_log_color("    SET: Desync 35-45, Slow-walk boost ON, jitter-interval ODD value (3 or 5)")
-        cs_log_color("    AVOID: matching their interval (2 or 4)")
-    elseif e.aa_type == "spinner" then
-        cs_log_color("  → They SPINNER. Continuous rotation — uncommon. Resolver of you usually weak.")
-        cs_log_color("    SET: YAW-ROT ON + Side-streak 2 + Anti-BF max variance")
-    else
-        cs_log_color("  → AA-type still unknown (need more samples). Generic defense:")
-        cs_log_color("    SET: DEF-on-dmg ON, Side-streak thresh=3, Anti-BF ON")
+    cs_log_color("══════════════════════════════════════════")
+    cs_log_color(string.format("  Their AA:  %s  |  prefers %s side  |  desync ≈ %.0f°",
+        tostring(e.aa_type):upper(), advisor_dom_label(e.dom), e.mag))
+    cs_log_color(string.format("  Our data:  %d hits  |  L=%d  R=%d  |  miss-rate %d%%",
+        e.hits, e.samples_l, e.samples_r, e.miss_rate))
+    cs_log_color("  ── Recommendations ─────────────────────")
+    for _, line in ipairs(advisor_build_recs(e)) do
+        cs_log_color("  " .. line)
     end
-    if e.mag >= 35 then
-        cs_log_color(string.format("  → High-mag enemy (%.0f°). Their resolver trained on big desync.", e.mag))
-        cs_log_color("    SET: your desync 20-30 OR full 58 (mismatch training data, avoid 35-45 middle)")
-    elseif e.mag > 0 and e.mag <= 22 then
-        cs_log_color(string.format("  → Low-mag enemy (~%.0f°). Their resolver under-shoots.", e.mag))
-        cs_log_color("    SET: your desync 58 fixed (NL anti-BF OFF maximizes the gap)")
-    end
-    if e.dom ~= 0 and (e.samples_l + e.samples_r) >= 4 then
-        local their = e.dom > 0 and "RIGHT" or "LEFT"
-        local opp   = e.dom > 0 and "LEFT"  or "RIGHT"
-        cs_log_color(string.format("  → They strongly dom-%s their fake. Resolver-of-you probably assumes you too.", their))
-        cs_log_color(string.format("    SET: prefer Manual %s side OR side-streak thresh=2 (force flip earlier)", opp))
-    end
-    if e.miss_rate >= 30 then
-        cs_log_color(string.format("  → Recent miss-rate HIGH (%d%%). Resolver less sure about THEM too.", e.miss_rate))
-        cs_log_color("    Consider Smart Strategy → predict=Conservative for this match")
-    end
-    cs_log_color("══")
+    cs_log_color("══════════════════════════════════════════")
 end
 
--- V9.23: panel-update helper. Refreshes the pre-created labels via :name().
+-- V9.25: advisor recommendations rewritten for clarity. Each rec now says
+-- WHAT to do (concrete slider/toggle name + value) and WHY in plain language.
+-- Builder returns a list of {"label", color_prefix_or_nil} tuples so we can
+-- highlight DO-THIS lines green and explanation lines white.
+function advisor_build_recs(e)
+    local r = {}
+    local function push(text, kind)
+        -- kind: "do" green / "why" white / "warn" orange / "good" cyan / nil plain
+        local prefix = ""
+        if     kind == "do"   then prefix = "\aB4F082FF"   -- green
+        elseif kind == "why"  then prefix = "\aC8C8C8FF"   -- light grey
+        elseif kind == "warn" then prefix = "\aFFB46EFF"   -- orange
+        elseif kind == "good" then prefix = "\a8CE0FFFF"   -- cyan
+        else                       prefix = "\aFFFFFFFF"
+        end
+        r[#r+1] = prefix .. text
+    end
+
+    -- 1) headline: what type of enemy + how much we know
+    if e.aa_type == "static" then
+        push("→ Enemy uses STATIC anti-aim (fixed side)", nil)
+        push("   Their resolver expects you to use static too — break it",  "why")
+        push("   DO: Sel01-Config → Yaw Modifier = Jitter, interval 1-2 ticks", "do")
+        push("   DO: Anti-BF jitter ON, YAW base rotation ON",                 "do")
+    elseif e.aa_type == "switch" then
+        push("→ Enemy uses SWITCH anti-aim (alternates L/R)", nil)
+        push("   Their resolver tracks your streak — flip earlier than they expect", "why")
+        push("   DO: Sel01-Config → Desync = 58 (max)", "do")
+        push("   DO: Side-streak limit ON, threshold 2 shots",                "do")
+        push("   DO: YAW rotation ON, Defensive-on-dmg ON",                   "do")
+    elseif e.aa_type == "jitter" then
+        push("→ Enemy uses JITTER anti-aim (small fast flips)", nil)
+        push("   Their resolver syncs to a clock — desync it",            "why")
+        push("   DO: Sel01-Config → Desync 35-45 (NOT max)",              "do")
+        push("   DO: Jitter interval = 3 or 5 (avoid 2/4)",               "do")
+        push("   DO: Slow-walk AA boost ON for peeks",                    "do")
+    elseif e.aa_type == "spinner" then
+        push("→ Enemy SPINNER (continuously rotating)", nil)
+        push("   Rare config — most resolvers fail. Use chaos",           "why")
+        push("   DO: YAW rotation ON + Side-streak 2 + Anti-BF max var",  "do")
+    else
+        push("→ Enemy AA type still unknown", nil)
+        push("   Need 2-3 more hits to classify — generic defense:",      "why")
+        push("   DO: Defensive-on-dmg ON, Side-streak 3, Anti-BF ON",     "do")
+    end
+
+    -- 2) magnitude advice
+    if e.mag >= 35 then
+        push(string.format("→ Their desync is BIG (%.0f°). Their resolver trains on big numbers.", e.mag), nil)
+        push("   DO: Your desync 20-30 OR full 58 (avoid 35-45 middle)",  "do")
+    elseif e.mag > 0 and e.mag <= 22 then
+        push(string.format("→ Their desync is SMALL (%.0f°). Their resolver under-shoots big.", e.mag), nil)
+        push("   DO: Your desync 58 fixed wins reliably",                  "do")
+    end
+
+    -- 3) dominance advice (only when enough samples)
+    if e.dom ~= 0 and (e.samples_l + e.samples_r) >= 4 then
+        local their_word = e.dom > 0 and "RIGHT" or "LEFT"
+        local your_word  = e.dom > 0 and "LEFT"  or "RIGHT"
+        push(string.format("→ They strongly favor %s side", their_word), nil)
+        push(string.format("   DO: NL Anti Aim → Body Yaw Inverter = %s manual", your_word), "do")
+        push("   OR: Side-streak threshold 2 (force flip after 2 shots)",       "do")
+    end
+
+    -- 4) miss-rate warning
+    if e.miss_rate >= 30 then
+        push(string.format("⚠ Resolver miss-rate is high on this one (%d%%)", e.miss_rate), "warn")
+        push("   DO: Smart Strategy → Predict = Conservative for this match",    "warn")
+    end
+
+    -- 5) good-status notes
+    if e.hits >= 5 and e.miss_rate <= 15 then
+        push(string.format("✓ Solid lock (%d hits, %d%% miss). Keep current preset.", e.hits, e.miss_rate), "good")
+    end
+
+    return r
+end
+
+-- V9.23+25: panel-update helper. Refreshes the pre-created labels via :name().
 function advisor_panel_update()
     local function setn(lbl, text)
         if lbl and lbl.name then pcall(function() lbl:name(text or " ") end) end
     end
     if #advisor_state.list == 0 then
         setn(advisor_lbl_header, "  (empty — click 🔁 Refresh)")
-        setn(advisor_lbl_stats1, " ")
+        setn(advisor_lbl_stats1, "  Play 1-2 rounds first, then click 🔁")
         setn(advisor_lbl_stats2, " ")
         setn(advisor_lbl_rec1,   " ")
         setn(advisor_lbl_rec2,   " ")
@@ -555,58 +604,29 @@ function advisor_panel_update()
     end
     local e = advisor_state.list[advisor_state.idx]
     if not e then return end
+    -- header line: enemy + position in list
     setn(advisor_lbl_header,
         string.format("  \aFFD8AAFF#%d/%d  \aFFFFFFFF%s",
             advisor_state.idx, #advisor_state.list, e.name))
+    -- stats line 1: enemy AA profile (their style)
     setn(advisor_lbl_stats1,
-        string.format("  aa=%s  dom=%s  mag=%.0f°  hits=%d  miss=%d",
-            tostring(e.aa_type):upper(), advisor_dom_label(e.dom),
-            e.mag, e.hits, e.miss))
+        string.format("  Their AA: %s  |  prefers %s side  |  desync ≈ %.0f°",
+            tostring(e.aa_type):upper(), advisor_dom_label(e.dom), e.mag))
+    -- stats line 2: how much data we have on them
     setn(advisor_lbl_stats2,
-        string.format("  L=%d/%.0f°  R=%d/%.0f°  passive=%d  miss-rate=%d%%",
-            e.samples_l, e.measured_l, e.samples_r, e.measured_r,
-            e.passive, e.miss_rate))
+        string.format("  Data: %d hits  |  L=%d  R=%d  |  miss-rate %d%%",
+            e.hits, e.samples_l, e.samples_r, e.miss_rate))
     -- recommendations
-    local recs = {}
-    if e.aa_type == "static" then
-        recs[#recs+1] = "  → Static AA. Counter-side resolver expected."
-        recs[#recs+1] = "    Yaw Modifier=Jitter int 1-2 + Anti-BF ON + YAW-ROT ON"
-    elseif e.aa_type == "switch" then
-        recs[#recs+1] = "  → Switch AA. Alt-track resolver."
-        recs[#recs+1] = "    Desync 58 + Side-streak thresh=2 + YAW-ROT ON + DEF-on-dmg ON"
-    elseif e.aa_type == "jitter" then
-        recs[#recs+1] = "  → Jitter AA. Period sync."
-        recs[#recs+1] = "    Desync 35-45 + Slow-walk boost ON + int ODD (3/5)"
-    elseif e.aa_type == "spinner" then
-        recs[#recs+1] = "  → Spinner. Continuous rotation."
-        recs[#recs+1] = "    YAW-ROT ON + Side-streak 2 + Anti-BF max"
-    else
-        recs[#recs+1] = "  → AA-type unknown (need more samples)."
-        recs[#recs+1] = "    Generic: DEF-on-dmg ON + Side-streak 3 + Anti-BF ON"
-    end
-    if e.mag >= 35 then
-        recs[#recs+1] = string.format("  → High-mag (%.0f°). Your desync 20-30 OR full 58.", e.mag)
-    elseif e.mag > 0 and e.mag <= 22 then
-        recs[#recs+1] = string.format("  → Low-mag (%.0f°). Desync 58 fixed wins.", e.mag)
-    end
-    if e.dom ~= 0 and (e.samples_l + e.samples_r) >= 4 then
-        local their = e.dom > 0 and "RIGHT" or "LEFT"
-        local opp   = e.dom > 0 and "LEFT"  or "RIGHT"
-        recs[#recs+1] = string.format("  → They dom-%s. Manual %s side OR streak thresh=2.", their, opp)
-    end
-    if e.miss_rate >= 30 then
-        recs[#recs+1] = string.format("  → High recent miss-rate %d%%. Predict=Conservative.", e.miss_rate)
-    end
-    -- pad recs to 8 slots
+    local recs = advisor_build_recs(e)
     while #recs < 8 do recs[#recs+1] = " " end
-    setn(advisor_lbl_rec1, recs[1])
-    setn(advisor_lbl_rec2, recs[2])
-    setn(advisor_lbl_rec3, recs[3])
-    setn(advisor_lbl_rec4, recs[4])
-    setn(advisor_lbl_rec5, recs[5])
-    setn(advisor_lbl_rec6, recs[6])
-    setn(advisor_lbl_rec7, recs[7])
-    setn(advisor_lbl_rec8, recs[8])
+    setn(advisor_lbl_rec1, "  " .. recs[1])
+    setn(advisor_lbl_rec2, "  " .. recs[2])
+    setn(advisor_lbl_rec3, "  " .. recs[3])
+    setn(advisor_lbl_rec4, "  " .. recs[4])
+    setn(advisor_lbl_rec5, "  " .. recs[5])
+    setn(advisor_lbl_rec6, "  " .. recs[6])
+    setn(advisor_lbl_rec7, "  " .. recs[7])
+    setn(advisor_lbl_rec8, "  " .. recs[8])
 end
 
 advisor_btn_refresh = g_advisor:button("🔁 Refresh player list", function()
@@ -678,25 +698,39 @@ function event_ticker_push(text, r, g, b)
     }
     if t.count < t.cap then t.count = t.count + 1 end
 end
+-- V9.25: console-print with multi-fallback. User reported events showed on
+-- ticker but not in NL console. Now we try three writers in order: NL's
+-- color_log (if exposed by build), client.log (NL standard), then plain print
+-- (CSGO game console). Also push the brief line to log_buffer so 📋 Copy
+-- captures it for sharing.
+function cs_event_console(text, r, g, b)
+    local line = "[Sel01] " .. tostring(text)
+    local ok = pcall(function() client.color_log(r or 220, g or 220, b or 220, line) end)
+    if not ok then
+        ok = pcall(function() client.log(line) end)
+        if not ok then pcall(function() print(line) end) end
+    end
+    pcall(function() log_buffer_push(line) end)
+end
 function cs_event_hit(idx, mode)
     local txt = string.format("✓ HIT #%d  %s", idx or 0, tostring(mode or "?"))
     event_ticker_push(txt, 110, 240, 130)
-    pcall(function() client.color_log(110, 240, 130, "[Sel01] " .. txt) end)
+    cs_event_console(txt, 110, 240, 130)
 end
 function cs_event_miss(idx, reason, mode)
     local txt = string.format("✗ MISS #%d  %s  (%s)",
         idx or 0, tostring(reason or "?"), tostring(mode or "?"))
     event_ticker_push(txt, 240, 110, 110)
-    pcall(function() client.color_log(240, 110, 110, "[Sel01] " .. txt) end)
+    cs_event_console(txt, 240, 110, 110)
 end
 function cs_event_kill(name)
     local txt = string.format("☠ KILL  %s", tostring(name or "?"))
     event_ticker_push(txt, 200, 180, 255)
-    pcall(function() client.color_log(200, 180, 255, "[Sel01] " .. txt) end)
+    cs_event_console(txt, 200, 180, 255)
 end
 function cs_event_info(text, r, g, b)
     event_ticker_push(text, r or 200, g or 220, b or 255)
-    pcall(function() client.color_log(r or 200, g or 220, b or 255, "[Sel01] " .. tostring(text)) end)
+    cs_event_console(text, r or 200, g or 220, b or 255)
 end
 
 -- Performance info (labels — settings hardcoded ON)
@@ -4466,5 +4500,6 @@ _cs_log_color_raw("V9.21: Event ticker top-right (HIT/MISS/KILL always visible) 
 _cs_log_color_raw("V9.22: Predicted-Alt/Streak mag-fix — uses per-side measured (was preset 58° × 0.85). Dom-R 36° enemy: 49° → 36° (no over-shoot).")
 _cs_log_color_raw("V9.23: Advisor panel moved INSIDE NL menu (label :name() updates) — no on-screen overlay. Event ticker stays top-right.")
 _cs_log_color_raw("V9.24: effective_desync 2→1 sample gate (one hit beats blind 58°) + LBY-Snap miss flips only on |delta-measured|>5° (no flip-flop on backtrack fails).")
+_cs_log_color_raw("V9.25: cs_event_* console fallback (HIT/MISS/KILL now print to in-game console too) + AA Advisor wording rewritten plain-English with color-coded DO/why/warn/good lines.")
 _cs_log_color_raw("Logging: " .. (log_enabled:get() and ("ON" .. (log_verbose:get() and " (verbose)" or ""))  or "OFF"))
 _cs_log_color_raw("=========================================")
