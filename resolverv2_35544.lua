@@ -1,21 +1,23 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 9.29                                   ║
+-- ║  Version: 9.30                                   ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 9.29
--- @description Coach-chat variety + data-driven + bimodal detection:
---   * 3 wording variants per category (diagnosis / fix / dom / mag) — picked
---     deterministically from enemy-name hash so the same enemy keeps one
---     flavour across calls but different enemies vary.
---   * Diagnosis now cites REAL stats (switch streak counts, dom counts, etc).
---   * BIMODAL enemy detection (per-side mag diff > 10°) gets its own special
---     line — calls out the L=X° R=Y° leak.
---   * v9.26 EMA drift-bump carries. Resolver math unchanged.
+-- @version 9.30
+-- @description AA-switch detection + hard-reset on big changes:
+--   * On every hit, if |actual - stored_EMA| > 10° AND we already have >=3
+--     samples, treat as the enemy SWITCHING their AA preset (not drift).
+--   * Replace EMA with the new actual value directly (no smoothing).
+--   * Decimate sample count to 40% so confidence drops temporarily and the
+--     resolver re-confirms over the next 2 hits instead of dragging on the
+--     old EMA for 4-5 misses.
+--   * Applied to global measured_desync AND per-side EMAs independently.
+--   * v9.26 drift-bump (alpha 0.55 on 5-10° diff) still handles small shifts.
+--   * v9.29 coach variants carry.
 
-local SEL01_VERSION = "9.29"
+local SEL01_VERSION = "9.30"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -2535,19 +2537,26 @@ events.aim_ack:set(function(event)
             if actual >= 1 and actual <= 65 then
                 -- V9.26: drift-bump. Default alpha 0.30 (slow EMA, anti-noise).
                 -- When the latest hit's actual differs from the current EMA by
-                -- > 5°, the enemy probably changed their desync magnitude
-                -- (cycled to a new setting / preset switched). Use alpha 0.55
-                -- so the EMA catches up in 2-3 hits instead of 6-8. Observed
-                -- in v9.25 logs: enemy with stored 25° suddenly hit at 28°
-                -- twice → BF tried 29° (close but off by 1). Faster EMA fix.
+                -- > 5°, the enemy probably changed their desync magnitude.
+                -- V9.30: HARD-RESET on big switch. If diff > 10° AND we have
+                -- prior samples, the enemy CHANGED their AA preset (not just
+                -- drift). EMA bump still takes 3-4 hits to converge; hard reset
+                -- catches up in 1 hit by dropping the stored EMA to the new
+                -- actual value and decimating sample-count so confidence drops
+                -- temporarily. Without this, locked targets (high conf) stay
+                -- using the old EMA after the enemy switches → 2-3 sure misses.
+                local prev_emag = s.measured_desync or 0
+                local diff = math.abs(actual - prev_emag)
                 local alpha = 0.30
-                if s.desync_samples > 0
-                   and math.abs(actual - (s.measured_desync or 0)) > 5 then
-                    alpha = 0.55
-                end
-                -- global EMA (legacy fallback)
+                if s.desync_samples > 0 and diff > 5 then alpha = 0.55 end
                 if s.desync_samples == 0 then
                     s.measured_desync = actual
+                elseif s.desync_samples >= 3 and diff > 10 then
+                    -- V9.30 SWITCH-RESET: take the new value as-is, decay samples
+                    s.measured_desync = actual
+                    s.desync_samples = math.max(2, math.floor(s.desync_samples * 0.4))
+                    cs_log_verbose("AA-switch hard-reset idx=%d global EMA %.1f → %.1f (diff=%.1f, samples↓)",
+                                   Ent:get_index(), prev_emag, actual, diff)
                 else
                     s.measured_desync = s.measured_desync * (1 - alpha) + actual * alpha
                 end
@@ -2556,23 +2565,38 @@ events.aim_ack:set(function(event)
                 -- so adaptive_guess_mag() reflects current lobby AA magnitudes.
                 session_push_desync(actual)
                 -- per-side EMA (V9.26: own drift-bump per side too)
+                -- V9.30: per-side hard-reset on big switch >10° too.
                 if exp_perside_desync and exp_perside_desync:get() then
                     if hit_side > 0 then
+                        local prev = s.measured_right or 0
+                        local diff_r = math.abs(actual - prev)
                         if s.samples_right == 0 then
                             s.measured_right = actual
+                        elseif s.samples_right >= 3 and diff_r > 10 then
+                            s.measured_right = actual
+                            s.samples_right = math.max(2, math.floor(s.samples_right * 0.4))
+                            cs_log_verbose("AA-switch hard-reset idx=%d R-side %.1f → %.1f (diff=%.1f)",
+                                           Ent:get_index(), prev, actual, diff_r)
                         else
                             local a_r = 0.30
-                            if math.abs(actual - (s.measured_right or 0)) > 5 then a_r = 0.55 end
+                            if diff_r > 5 then a_r = 0.55 end
                             s.measured_right = s.measured_right * (1 - a_r) + actual * a_r
                         end
                         s.samples_right = math.min(s.samples_right + 1, 99)
                         s.real_right = math.min((s.real_right or 0) + 1, 99)  -- V9.1
                     elseif hit_side < 0 then
+                        local prev = s.measured_left or 0
+                        local diff_l = math.abs(actual - prev)
                         if s.samples_left == 0 then
                             s.measured_left = actual
+                        elseif s.samples_left >= 3 and diff_l > 10 then
+                            s.measured_left = actual
+                            s.samples_left = math.max(2, math.floor(s.samples_left * 0.4))
+                            cs_log_verbose("AA-switch hard-reset idx=%d L-side %.1f → %.1f (diff=%.1f)",
+                                           Ent:get_index(), prev, actual, diff_l)
                         else
                             local a_l = 0.30
-                            if math.abs(actual - (s.measured_left or 0)) > 5 then a_l = 0.55 end
+                            if diff_l > 5 then a_l = 0.55 end
                             s.measured_left = s.measured_left * (1 - a_l) + actual * a_l
                         end
                         s.samples_left = math.min(s.samples_left + 1, 99)
@@ -4702,5 +4726,6 @@ _cs_log_color_raw("V9.26: 📨 Send tips to CSGO chat button (Advisor) + EMA dri
 _cs_log_color_raw("V9.27: Coach-chat lines now address @enemy by name + up to 4 concrete tips per send (type + dom + magnitude). No more bare 'hey'.")
 _cs_log_color_raw("V9.28: Coach-chat each line explains WHY enemy AA is exploitable + HOW to fix (was only stating facts). 4 lines: problem/fix/dom/mag.")
 _cs_log_color_raw("V9.29: Coach-chat 3 wording variants per category (name-hash deterministic) + data-driven WHY (real streak/dom counts) + BIMODAL detection.")
+_cs_log_color_raw("V9.30: AA-switch hard-reset — when |actual - EMA| > 10° on samples>=3, replace EMA with actual + decay samples to 40% (catches preset changes in 1 hit).")
 _cs_log_color_raw("Logging: " .. (log_enabled:get() and ("ON" .. (log_verbose:get() and " (verbose)" or ""))  or "OFF"))
 _cs_log_color_raw("=========================================")
