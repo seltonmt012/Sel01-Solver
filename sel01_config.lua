@@ -1,15 +1,15 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Config — Neverlose CSGO HvH config        ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 3.1                                    ║
+-- ║  Version: 3.2                                    ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Config
 -- @author seltonmt01
--- @version 3.1
--- @description UI overflow fix (Peek Boost label shorter). New "Print Recommendations" button.
---              Anti-HS Bundle quick-toggle.
+-- @version 3.2
+-- @description Move-AA extras (when running on ground): desync override, rapid inverter flip,
+--              max jitter boost — analog to Air-extras. Aggressive preset enables anti-HS + move-AA defaults.
 
-local SEL01_CFG_VERSION = "3.1"
+local SEL01_CFG_VERSION = "3.2"
 
 -- DEBUG: print to CSGO console at major load checkpoints. Plain print() bypasses
 -- NL chat (which may not flush before crash) and writes directly to CSGO console.
@@ -85,6 +85,12 @@ local aa_air_mag      = g_aa:slider("Air desync magnitude (deg)", 10, 58, 35)
 local aa_air_flip     = g_aa:switch("  └ Air rapid inverter flip (LBY break)", true)
 local aa_air_boost    = g_aa:switch("  └ Air max jitter boost (yaw mod offset = 58)", true)
 local aa_air_fakeduck = g_aa:switch("  └ Air force fake-duck (LBY break alt)", false)
+-- V3.2 F-MOVE: Move desync override (running on ground)
+local aa_move_set     = g_aa:switch("Move desync override (running ground)", false)
+local aa_move_mag     = g_aa:slider("Move desync magnitude (deg)", 10, 58, 45)
+local aa_move_thresh  = g_aa:slider("Move velocity threshold (u/s)", 50, 250, 100)
+local aa_move_flip    = g_aa:switch("  └ Move rapid inverter flip", false)
+local aa_move_boost   = g_aa:switch("  └ Move max jitter boost", false)
 -- G: Anti-bruteforce jitter variance
 local aa_anti_bf     = g_aa:switch("Anti-bruteforce jitter (random mag variance)", true)
 local aa_anti_bf_var = g_aa:slider("Anti-BF variance (deg)", 5, 25, 15)
@@ -285,9 +291,18 @@ local function _do_apply_preset(name)
         safe_set(aa_onshot, true)
         safe_set(aa_air_set, true)
         safe_set(aa_air_mag, 35)
-        safe_set(aa_air_flip, true)      -- V2.3: rapid inverter flip in air
-        safe_set(aa_air_boost, true)     -- V2.3: max jitter offset in air
-        safe_set(aa_air_fakeduck, false) -- V2.3: optional LBY break (noisy on ground sync, skip)
+        safe_set(aa_air_flip, true)
+        safe_set(aa_air_boost, true)
+        safe_set(aa_air_fakeduck, false)
+        -- V3.2: Move-AA + Anti-HS enabled by default in Aggressive
+        safe_set(aa_move_set, true)
+        safe_set(aa_move_mag, 45)
+        safe_set(aa_move_thresh, 100)
+        safe_set(aa_move_flip, true)
+        safe_set(aa_move_boost, true)
+        safe_set(aa_pitch_jitter, true)
+        safe_set(aa_move_fakeduck, true)
+        safe_set(aa_move_fd_thresh, 100)
         safe_set(aa_anti_bf, true)
         safe_set(aa_anti_bf_var, 15)
         safe_set(aa_fd_assist, true)
@@ -474,12 +489,24 @@ local function aa_periodic_sync()
     local on_shot_active = aa_onshot:get() and now < aa_state.on_shot_until
     local anti_bf_active = aa_anti_bf:get()
     local air_set_active = aa_air_set:get() and airborne
+    -- V3.2: Move override active when running on ground over threshold velocity
+    local move_set_active = false
+    local _vel_cache = 0
+    if aa_move_set:get() and not airborne then
+        pcall(function()
+            local v = lp.m_vecVelocity
+            _vel_cache = math.sqrt((v.x or 0)^2 + (v.y or 0)^2)
+        end)
+        if _vel_cache > (aa_move_thresh:get() or 100) then move_set_active = true end
+    end
 
-    if not (air_set_active or on_shot_active or anti_bf_active) then return end
+    if not (air_set_active or on_shot_active or anti_bf_active or move_set_active) then return end
 
-    -- desync magnitude: air > on-shot > base
-    local lim = air_set_active and aa_air_mag:get() or aa_desync:get()
-    if on_shot_active then lim = math.max(15, math.floor(lim * 0.5)) end
+    -- V3.2: desync magnitude priority: air > move > on-shot reduction > base
+    local lim = aa_desync:get()
+    if move_set_active then lim = aa_move_mag:get() end
+    if air_set_active  then lim = aa_air_mag:get() end
+    if on_shot_active  then lim = math.max(15, math.floor(lim * 0.5)) end
 
     local l_lim, r_lim = lim, lim
     if anti_bf_active then
@@ -496,18 +523,24 @@ local function aa_periodic_sync()
 
     -- V2.3 AIR EXTRAS — only when airborne
     if air_set_active then
-        -- rapid inverter flip every periodic tick (~16Hz) — LBY break in air
         if aa_air_flip:get() then
-            local flip_state = (aa_yaw_jitter_counter % 2 == 0)
-            nl_override(nl_refs.aa_bodyyaw_inv, flip_state)
+            nl_override(nl_refs.aa_bodyyaw_inv, (aa_yaw_jitter_counter % 2 == 0))
         end
-        -- boost yaw modifier offset to 58 (max jitter angle) for max desync chaos
         if aa_air_boost:get() then
             nl_override(nl_refs.aa_yawmod_offset, 58)
         end
-        -- force fake-duck in air — alt LBY break, ragebot harder to hit ducked target
         if aa_air_fakeduck:get() then
             nl_override(nl_refs.aa_fakeduck, true)
+        end
+    end
+
+    -- V3.2 MOVE EXTRAS — only when running on ground above threshold
+    if move_set_active then
+        if aa_move_flip:get() then
+            nl_override(nl_refs.aa_bodyyaw_inv, (aa_yaw_jitter_counter % 2 == 0))
+        end
+        if aa_move_boost:get() then
+            nl_override(nl_refs.aa_yawmod_offset, 58)
         end
     end
 
@@ -1448,7 +1481,7 @@ end)
 -- LOAD BANNER
 -- ══════════════════════════════════════════════════════════════════════════
 cs_log_color("══════════════════════════════════════════")
-cs_log_color("Sel01-Config v" .. SEL01_CFG_VERSION .. " loaded (CSGO HvH — Recommendations + Anti-HS Bundle button)")
+cs_log_color("Sel01-Config v" .. SEL01_CFG_VERSION .. " loaded (CSGO HvH — Move-AA extras + Aggressive auto-enables anti-HS)")
 cs_log(string.format("  hooks  createmove=%s  aim_fire=%s",
     tostring(_hooks_status.createmove or "MISSING"),
     tostring(_hooks_status.aim_fire or "MISSING")))
