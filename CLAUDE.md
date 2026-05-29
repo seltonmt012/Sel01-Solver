@@ -8,8 +8,8 @@ Two Neverlose **CSGO** (legacy build, NOT CS2) Lua scripts for HvH / rage play. 
 
 | Script | Role | Working copy | NL load path |
 |---|---|---|---|
-| **Sel01-Solver** (`resolverv2_35544.lua`, ~3700 lines, v9.x) | Resolver: per-player AA learning, JSON export, HUD/ESP overlay, FFI clipboard copy-logs, Sel01-Roast chat-spam | `C:\Users\Seltonmt\Desktop\sazz\aron\ownlua\resolverv2_35544.lua` | `E:\SteamLibrary\steamapps\common\Counter-Strike Global Offensive\nl\scripts\Sel01-Solver_59853.lua` |
-| **Sel01-Config** (`sel01_config.lua`, ~1400 lines, v3.x) | Companion: AA presets (Aggressive/Dynamic/Defensive/Spin), anti-bruteforce jitter, air-desync + move-desync overrides, anti-HS extras (pitch jitter, move-fakeduck), peek-boost hotkey, hits-taken log with AA-state snapshots, kill/miss/hit event log top-left, debug stats, watermark + indicators + rotating AA arrow | `C:\Users\Seltonmt\Desktop\sazz\aron\ownlua\sel01_config.lua` | `E:\SteamLibrary\steamapps\common\Counter-Strike Global Offensive\nl\scripts\sel01_config_59908.lua` |
+| **Sel01-Solver** (`resolverv2_35544.lua`, ~4200 lines, v9.30) | Resolver: per-player AA learning, JSON export, HUD/ESP overlay + top-right event ticker, FFI clipboard copy-logs, Sel01-Roast chat-spam, AA Advisor (in-menu panel + Coach-chat to CSGO say) | `C:\Users\Seltonmt\Desktop\sazz\aron\ownlua\resolverv2_35544.lua` | `E:\SteamLibrary\steamapps\common\Counter-Strike Global Offensive\nl\scripts\Sel01-Solver_59853.lua` |
+| **Sel01-Config** (`sel01_config.lua`, ~1600 lines, v3.9) | Companion: AA presets (Aggressive/Dynamic/Defensive/Spin), anti-resolver bundle (defensive on hit-taken, slow-walk boost, fake-lag variance, yaw base rotation, side-streak limit, magnitude jitter), anti-HS extras (pitch jitter, move-fakeduck), peek-boost hotkey, comprehensive Dump Debug Stats, hits-taken log with AA-state snapshots, kill/miss/hit event log top-left, watermark + indicators + rotating AA arrow | `C:\Users\Seltonmt\Desktop\sazz\aron\ownlua\sel01_config.lua` | `E:\SteamLibrary\steamapps\common\Counter-Strike Global Offensive\nl\scripts\sel01_config_59908.lua` |
 
 **Dual-copy rule (MANDATORY).** After every Edit/Write to either working copy, immediately overwrite the matching NL file (same path, no new files, no renames). PowerShell one-liner: `Copy-Item -Force -LiteralPath '<working>' -Destination '<nl-path>'`. The git repo only tracks working copies — the NL copies need the mirror so reload in NL picks up the change.
 
@@ -35,7 +35,7 @@ luac -p sel01_config.lua        # config
 
 `luac` from scoop (`C:\Users\Seltonmt\scoop\apps\lua\current\bin\luac.exe`). Must exit clean. No test infrastructure — runtime errors only surface when user reloads in NL and reports. After luac passes, **dual-copy to NL** (see paths table above) so the next NL reload sees the change.
 
-**Local limit warning** (V9.3 hit-point): Lua 5.1 main-chunk limit = 200 locals. Solver is close to that. New top-level locals should be wrapped in `do...end` blocks to scope them out. Both clipboard FFI + log_buffer ring use this pattern.
+**Local limit warning** (V9.3 hit-point, V9.19 + V9.20 + V9.21 escalation): Lua 5.1 main-chunk limit = 200 locals. Solver is AT THE CAP. Since v9.19 new helpers + UI groups + buttons + state tables are declared as MODULE GLOBALS (no `local` keyword) instead of locals — captures from local scope still work (lexical) because the function is defined after the local is declared. Globals affected: `sel01_session_desyncs`, `session_push_desync`, `adaptive_guess_mag`, `alt_side_pick`, `g_advisor`, `advisor_state`, `advisor_*` helpers + buttons, `event_ticker`, `cs_event_*`, `esp_event_ticker`, `advisor_lbl_*`, `render_event_ticker`. The clipboard FFI + log_buffer ring still use the `do...end` pattern from earlier days. Pick globals for ANYTHING new that needs to be callable across the file — `do...end` is only useful for purely local helpers that ALL their call sites can fit inside one block.
 
 ## Critical patterns (each has bitten before)
 
@@ -97,33 +97,55 @@ luac -p sel01_config.lua        # config
 
 **Mode-name suffix chain explosion** (V8.9 bug). Known-player fast-path appended `-Recall` each engagement → `Static-Meas-Recall-Recall-Recall-Recall`. Fix: strip existing suffix before appending. `learning_update_hit` + `mode_stats_update` + `learning_load` migration all clean `+Pred / -DefInv / -Recall / BF: / *-Guess` from stored values.
 
-## File layout (resolverv2_35544.lua, ~3700 lines)
+**Never lua-override NL ragebot Hit Chance / Min Damage / Hitboxes / Safe Points / Body Aim from auto-paths** (V9.18 hard lesson). User manually tunes NL Selection (HC 72 / MinDmg 100 / multi-hitbox Head+Chest+Stomach / Safepoints Prefer / Hitbox Safety Arms+Legs+Feet) and the lua MUST respect that everywhere except a tight whitelist of emergency paths. v9.4-v9.17 stacked "smart" downgrades (HEAD-FOCUS hc=40 mindmg=25, per-weapon sniper hc=50 mindmg=80 head-only, counter-fire mindmg=1, close-miss followup mindmg=1, jump-shot mindmg=35) — each looked reasonable but stacked into firing at half the intended confidence + accepting 3-6 dmg body taps. v9.18 deleted ALL of them. Hit rate jumped from ~50% to 85.7% in the next session. `ctx:override_min_damage(...)` is now banned globally. Allowed overrides: counter-fire (hc 15 + force head + safepoint off + multipoint; NEVER touch mindmg), close-priority point-blank (tiered hc 5-20 distance), close-miss followup (hc 10 + head + safepoint off), force-baim (user-explicit slider — hitbox + hc decay), jump-shot (head + low hc when airborne), NoSpread / Head-Strict (user-explicit toggles). Any new feature that touches `ctx:override_hitchance / override_hitbox / override_safe_point` is suspect — justify why NL can't do it naturally before adding.
 
-| Lines (approx) | Purpose |
+**EMA drift-bump + AA-switch hard-reset** (V9.26 + V9.30 measurement layers). The per-player `measured_desync` EMA defaults to alpha 0.30 (slow / anti-noise). Two acceleration layers stacked on top: (1) drift-bump — when `|actual - EMA| > 5°` and `samples >= 1`, alpha temporarily jumps to 0.55 so a drifting enemy converges in 2-3 hits instead of 6-8. (2) hard-reset — when `|actual - EMA| > 10°` and `samples >= 3`, the EMA is REPLACED with the new actual value verbatim and `desync_samples` is decimated to `floor(samples * 0.4)`. This catches enemies that explicitly switch their AA preset mid-round (locked targets with high conf were dragging the old EMA for 3-4 misses before drift-bump caught up). Per-side EMAs (`measured_left`, `measured_right`) each run the same two-layer logic independently — a side-only preset change resets only that side. Verbose logs print "AA-switch hard-reset idx=N L/R/global EMA X→Y (diff=Z)".
+
+**Alt-mode dom-bias** (V9.19). `Predicted-Alt`, `Air-Alt`, `Slow-Alt`, `Still-Alt` previously did blind `-last_hit_side` flip. On a `streak{L=9 R=0}` enemy that = miss every time. `alt_side_pick(s)` returns the dom side when one side leads by 2+ samples, else 0 (blind alt). Callers fall back to `-last_hit_side` only when the helper returns 0.
+
+**Adaptive guess magnitude** (V9.19). Hardcoded `±29°` fallback in `Static-Guess / Networked-Guess / LBY-Snap-Guess / Air-Guess` paths was systematically under-shooting lobbies with ~37-38° modal desync. Replaced with `adaptive_guess_mag()` returning the running median of the last 20 hit-derived measurements across the whole session (clamped 20-58). Pushed from `aim_ack` HIT path via `session_push_desync(actual)`. `LBY-Snap-Guess` cycle anchors on this value too: `{base, min(58, base+16), 58}` instead of `{29, 45, 58}`.
+
+**LBY-Snap-Guess flip only on mismatch** (V9.24). Previously every LBY-Snap miss flipped `last_hit_side`. But misses with `delta = measDesync` exactly are server-side backtrack failures (NL netcode), not our side error — flipping then = next attempt picks wrong side = oscillation. Now we compute `angle_err = |our_delta - measured|` and flip only when `> 5°`. When ≤ 5°, log "server-side fail, no flip".
+
+**Predicted-Alt / Predicted-Streak per-side magnitude** (V9.22 fix, was the biggest single-bug regression in the v9.19-v9.21 era). `_pick_first_shot_impl` computes `desync` at the top using `guess_side = last_hit_side` and the result feeds `eye_yaw + desync * side * mult` at the end. When Alt-mode picks the OPPOSITE side via dom-bias, that cached `desync` is for the WRONG side. Fix: when `used_measured = true` (Predicted-Alt or Predicted-Streak path picked the side from learned data), re-call `effective_desync(s, max_desync, chosen_side)` to fetch the per-side value, AND drop the `0.85 mult` (an already-correct measured magnitude does not want undershooting). `effective_desync` itself was loosened in V9.24 (sample threshold `2 → 1`) so a single hit beats blindly shooting at `max_desync`.
+
+**NL `:name(string)` updates label / button text at runtime** (verified pattern from `bloodwings_33877.lua:958`, `grenade_helper_33880.lua:1259`, `frostlive_33878.lua:4407-4429`). Combo OPTIONS cannot be dynamically replaced (no `:set_items`), but a label's displayed text can. The AA Advisor panel (v9.23) pre-creates 11 label slots in `g_advisor` and calls `advisor_panel_update()` to rewrite them all via `:name()` on each Refresh / Next button. Lets the panel act like a dynamic content area inside the NL menu without an on-screen overlay.
+
+**Console multi-fallback writer** (V9.25). `cs_event_console(text, r, g, b)` writes a line via `client.color_log` → `client.log` → `print` in order, pcall'd. NL builds vary on which writer is exposed. Use this whenever you want a HIT/MISS/KILL to land in the in-game console regardless of `log_enabled` toggles. Each call also pushes to `log_buffer` so the 📋 Copy button captures the history.
+
+**`utils.console_exec("say <text>")`** is the working pattern for sending CSGO chat messages from Lua (Sel01-Roast since v8, Coach-chat send-to-chat since v9.26). Length limit ~127 chars per say. Strip embedded `"` defensively. `engine.execute_client_cmd` is the fallback when `utils.console_exec` isn't exposed.
+
+## File layout (resolverv2_35544.lua, ~4200 lines)
+
+Line numbers are approximate — they drift as features are added. Use `Grep` to find a specific function. The shape of the file is:
+
+| Region | Purpose |
 |---|---|
-| 1–35 | Version constant, requires, `cs_log` helpers + raw refs |
-| 35–80 | **V8.7 FFI clipboard helper** (wrapped in `do...end` for local-budget) |
-| 82–175 | Loading screen FFI URL download, sidebar gradient |
-| 130–175 | **EARLY FORWARD-DECL BLOCK** (V7.3 fix) + `record_player_shot` definition |
-| 180–355 | UI: tab `Sel01-Solver`, 10 groups, **6 preset buttons**, 4 Smart Strategy combos, ~18 experimental toggles (incl V7.9 `exp_head_strict`) |
-| 360–620 | Logging buttons (📋 copy-logs via FFI clipboard + file, 🗑 reset learning, 🗑 reset session, dump, status) |
-| 625–700 | V5 mode-stats audit (V8.9 normalize -Recall) + V5+V9.1 confidence (real-vs-seeded weighting) |
-| 705–840 | V4 persistent learning + V8.3 JSON encoder + `learning_export_json` + V8.9 migration + V8.6 6-pattern sid + manual reset/export buttons |
-| 845–900 | V4 prediction helpers (`predict_yaw_ahead`, `predict_position`) |
-| 905–1180 | Helper funcs (mode_str, baim_hb_id) + `safe_set` + `apply_preset()` — **6 presets** (aggressive/dynamic/defensive/nospread/ssg_pro/head_only) |
-| 1185–1280 | Logging gates (cs_log/verbose/debug) + log_buffer ring push + V8.8 buffer-from-verbose expansion |
-| 1285–1450 | FFI cdef `AnimatingStateInfo`, `GetAnimState`, `GetMaxDesync`, math helpers, `RebuildServerYaw` |
-| 1455–1560 | `PlayerState` setmetatable on forward-decl'd table — all V3-V9 fields incl `real_left/right`, `def_delta`, `still_ticks`, `yaw_rate_buf` |
-| 1565–1900 | `events.aim_ack` — snapshot match, per-side EMA, **real_samples increment**, V8.2 correction-flip, V9.6 LBY auto-flip, V9.3 def-AA fingerprint, non-resolver-miss skip, **Init-mode log filter** |
-| 1905–2050 | `update_jitter` (V9.0 yaw_rate clamp + V8.0 consistency buf), `classify_aa` (V9.5 spinner-shortcut), Steam-mem |
-| 2055–2410 | `_pick_first_shot_impl` + **all resolver modes**: known-player fast-path, V8.4 Still-Server/Meas/BFGuess, V7.8 slow-walker, V9.2 Slow-Alt switch-alt, AA-classify shortcuts (V9.3 Spinner-Rot), LBY-Snap, jitter-lock, Predicted-Alt/Streak, Networked variants, ±29 guess fallback |
-| 2415–2550 | `pick_first_shot_angle` FS-cache wrapper, `pick_bruteforce_angle` (V9.5 def_delta cycle, V7.8 finer cycle for static/slow) |
-| 2555–2720 | per-tick caches, `resolve_player`: dormancy reset + V9.2 decay measured + V4 learning boot + air-branch (V8.2 Air-Alt + V8.2 Air-CorrFlip + V9.6 Air-Guess), slow-walker + V8.4 stationary detect, AA-classify (V9.0 stronger hysteresis), V4+V9.3 extrapolation (V8.1 4 gates + V9.2 dist-scale + V9.3 per-weapon + ping-aware), passive seed + V8.6 persist passive |
-| 2725–2825 | `should_force_baim`, weapon_fire (LBY snap), aim_fire snapshot push + V7.8 last_shot_side, createmove (V8.4 periodic auto-save 10s) |
-| 2830–3050 | `events.ragebot_target` — **10-stage override stack** incl V9.4 SSG-respect close-priority floor + safe-points respect + V9.6 fast-fire + V8.5 jump-shot V9.4 SSG-respect variant + V7.9 head-strict + V8.4 baim hc-drop |
-| 3055–3300 | ESP overlay + HUD-corner overlay (V8.0 throttled compute / per-frame draw from cache) + V7+V8 learning indicators (`👁/·/★/🔒`) |
-| 3305–3525 | Sel01-Roast chat spam, player_death, shutdown handler (V8.6 force-save) |
-| 3530–3700 | Load banner with full diagnostics + V4 `learning_load` + V8.9 migration call + V6 cleanup |
+| Header (top) | Version constant + `@version` header + `require`s + `cs_log` helpers + raw refs |
+| FFI clipboard helper | Wrapped in a `do...end` block to keep its 2 locals out of the main-chunk budget |
+| Loading-screen overlay | FFI URL download + sidebar gradient; calls into `events.render` |
+| **EARLY FORWARD-DECL BLOCK** (~line 165) | `SteamMemory`, `LearnedModel`, `mode_stats`, `PlayerState`, `tick_cache`, `NormalizeAngle`, `mode_stats_update/dump`, `confidence`, `session_stats`, `record_player_shot`. MUST come before any UI element with a callback that references these. |
+| UI build | Tab `Sel01-Solver`, ~11 groups, 6 preset buttons, 4 Smart Strategy combos, ~20 experimental toggles, V9.20 **🎯 AA Advisor group** (Refresh / Next / Show / Show-ALL / 📨 Send-tips-to-chat buttons + 11 dynamic label slots), V9.21 **Event Ticker** ESP/HUD toggle |
+| V9.19+ globals block | `sel01_session_desyncs` ring + `session_push_desync` + `adaptive_guess_mag` + `alt_side_pick`. Declared as MODULE GLOBALS (no `local`) — at the 200-local ceiling. |
+| V9.20+ AA Advisor block | `advisor_state` + `advisor_rebuild` + `advisor_show` + `advisor_panel_update` + `advisor_chat_send` (all globals) + `advisor_build_recs` (chat + panel shared formatter). |
+| V9.21+ event-ticker block | `event_ticker` ring + `event_ticker_push` + `cs_event_hit/miss/kill/info/console` (all globals, multi-fallback console writer). |
+| Logging buttons | 📋 copy-logs (FFI clipboard + file), 🗑 reset learning / session, dump, status |
+| Stats + confidence | V5 mode-stats audit (V8.9 normalize `-Recall`) + V5+V9.1 confidence (real-vs-seeded weighting) |
+| Persistent learning | V4 + V8.3 JSON encoder + V8.9 migration + V8.6 6-pattern sid + manual reset/export buttons |
+| Helpers + presets | mode_str / baim_hb_id / safe_set / apply_preset — 6 presets (aggressive / dynamic / defensive / nospread / ssg_pro / head_only) |
+| Log gates | cs_log / verbose / debug + `log_buffer` ring (cap=200) push + V8.8 buffer-from-verbose expansion |
+| FFI + math | `AnimatingStateInfo`, `GetAnimState`, `GetMaxDesync`, `RebuildServerYaw` |
+| PlayerState meta | `setmetatable` on the forward-decl'd table — fields for V3-V9.30 incl `real_left/right`, `def_delta`, `still_ticks`, `yaw_rate_buf`, `bt_fail_count` |
+| `events.aim_ack` | Snapshot match, per-side EMA with V9.26 drift-bump + V9.30 hard-reset, V8.2 correction-flip, V9.6+V9.24 LBY-Snap flip-on-mismatch, V9.3 def-AA fingerprint, non-resolver-miss skip, Init-mode log filter, V9.21 `cs_event_hit/miss` calls |
+| `update_jitter` + `classify_aa` | V9.0 yaw_rate clamp 720°/s + V8.0 consistency buf + V9.5 spinner-shortcut + V9.10 7-tick hysteresis + 2s lockout |
+| `_pick_first_shot_impl` | All resolver modes: known-player fast-path, V8.4 Still-Server/Meas/BFGuess, V7.8 slow-walker, V9.2 Slow-Alt, AA-classify shortcuts (V9.3 Spinner-Rot), LBY-Snap, jitter-lock, V9.22 Predicted-Alt/Streak per-side mag + V9.19 dom-bias, Networked variants, V9.19 adaptive guess fallback |
+| BF + per-tick caches | `pick_bruteforce_angle` (V9.5 def_delta cycle, V7.8 finer cycle for static/slow) |
+| `resolve_player` | Dormancy reset + V9.2 decay measured + V4 learning boot + V8.2/V9.6/V9.19 air-branch + slow + V8.4 stationary detect + V9.0 AA-classify + V4+V9.3 extrapolation (4 gates + dist + per-weapon + ping) + V7.1/V8.6 passive seed |
+| createmove + weapon_fire + aim_fire | V8.4 periodic auto-save 10s + LBY snap + V7.8 last_shot_side + V9.21 fake-lag variance / yaw rotation / side-streak tick |
+| `events.ragebot_target` | 10-stage override stack (V5 shot-cooldown → V9.4 close-priority → V6 air-block → V9.11 counter-fire → cancel-conf → per-weapon (V9.18 sniper-only respect) → V9.6 fast-fire → NoSpread → V7.9 head-strict → V9.12 close-miss followup → V8.5 jump-shot → V8.4 force-baim). V9.18 deleted HEAD-FOCUS + per-weapon downgrades; all `override_min_damage` calls stripped. |
+| ESP + HUD-corner | V8.0 throttled compute / per-frame draw from cache + V7+V8 learning indicators (`👁/·/★/🔒`). V9.21 `render_event_ticker` (top-right HUD log) — `render_advisor_panel` was removed in V9.23, advisor moved into NL menu |
+| Roast + death + shutdown | Sel01-Roast chat spam + `player_death` (V9.21 also fires `cs_event_kill`) + V8.6 force-save shutdown handler |
+| Load banner | Full diagnostics + V4 `learning_load` + V8.9 migration call + V6 cleanup + V9.x change log lines |
 
 ## Resolver mode flow (one resolve call)
 
@@ -176,7 +198,9 @@ User can't easily share NL state. Tools:
 6. **Print Status button**, **Dump All Player States button**
 7. **In-game HUD-corner overlay** (when ESP-toggle on) → tracked/learned/conf/top-mode/last-event/current-target intel + session-trend
 8. **Per-enemy ESP** — arrow + ⚡(if +Pred) + measured° + learning-progress indicator
-9. **`log_buffer`** — V9.3 ring-buffer (cap=80, O(1) push). Captures HIT/MISS-FULL, UNKNOWN states, close-priority/cancel-conf/snapshot/aa-commit/correction-flip/jump events. V8.8 also feeds key verbose events regardless of verbose-toggle.
+9. **`log_buffer`** — V9.3 ring-buffer (V9.10 cap raised 80 → 200, O(1) push). Captures HIT/MISS-FULL, UNKNOWN states, close-priority/cancel-conf/snapshot/aa-commit/correction-flip/jump events. V8.8 also feeds key verbose events regardless of verbose-toggle.
+10. **Event ticker** (V9.21, top-right of screen, toggle in ESP/HUD) — last 12 HIT/MISS/KILL events color-coded with 5s fade. Driven by `cs_event_hit/miss/kill` calls at the `aim_ack` and `player_death` sites. Console-mirror via multi-fallback writer (`client.color_log` → `client.log` → `print`) so events appear without any toggle.
+11. **AA Advisor** (V9.20-V9.29, group `🎯 AA Advisor` in Sel01-Solver tab). Buttons: 🔁 Refresh (snapshots tracked PlayerState entries by hits desc), ▶ Next (cycle selected), 💡 Refresh recommendations, 📜 Dump recs for ALL to console, 📨 Send tips to CSGO chat (selected) — Coach-chat fires 2-4 `say` lines via `utils.console_exec`, each addressing the enemy by name with diagnosis + WHY + fix. V9.29 has 3 wording variants per category picked deterministically from the enemy name hash; V9.30 doesn't change Advisor wording. Recommendations are personalised with real stats (streak counts / dom counts / per-side magnitudes); BIMODAL detection (per-side mag diff > 10°) gets its own line. The panel itself renders INSIDE the NL menu via 11 pre-created label slots updated through the `:name(string)` method (V9.23 — confirmed pattern from bloodwings / frostlive / grenade_helper).
 
 ## ESP learning-progress indicators (per-enemy label)
 
@@ -214,7 +238,21 @@ Always-on features (no toggle):
 - **V6**: close-priority tiered (V9.4 sniper hc-floor), per-AA best-mode tracking (V9.0 filter BF/Guess), intel-aware cancel-conf, BF eye-drift invalidate, FS-cache result validation, guess-side per-engagement, learning-cleanup (7d/200-entry)
 - **V7**: lock-on visual indicators, session-trend tracker, V7.1 passive learning, V7.7 6-pattern sid fallback + known-player fast-path
 - **V8**: V8.0 miss-rate-aware confidence + yaw_rate consistency, V8.2 correction-flip + switch-AA alternating, V8.3 JSON export, V8.4 stationary detect + baim hc-drop + jump-shot + auto-save 10s, V8.5 jump-scout extended range, V8.6 robust persistence (every hit + passive persist + force-save), V8.7 FFI clipboard, V8.8 backtrack-failure handle + comprehensive copy
-- **V9**: V9.0 yaw_rate clamp 720°/s + AA-stability + BF filter, V9.1 real-vs-seeded sample tracking + Init log filter, V9.2 decay measured + dist-scale + Slow-Alt, V9.3 Spinner-Rot + ping-aware extrap + per-weapon predict + def-AA delta fingerprint + log_buffer ring, V9.4 SSG-Pro tuned, V9.5 BF def_delta cycle + tighter spinner detect, V9.6 fast-fire + Air-Guess + LBY auto-flip, V9.7 Still-Alt + still/slow hard-reset on yaw spike, V9.8 counter-fire (events.weapon_fire hostile detect → bypass cancel-conf), V9.9 bulk easy-wins (dominant-side conf-boost / 2-miss mode-blacklist / crouch-aware hitbox / hostile-fire HUD / per-tick lp+wc cache / symmetric-data low-conf / backtrack-fail penalty / yaw-consistency extrap-boost), V9.10 log_buffer cap 80→200 + AA-type hysteresis tightened (7-consecutive + 2s lockout + anti-flap 5s freeze if >3 commits in 10s), V9.11 enhanced counter-fire (force head + safepoint-off + HC 15 + multipoint) + fast-fire tier system (conf 50/70/85 thresholds), V9.12 close-range first-miss follow-up (Aggressive + missed≥1 + dist<1000 → HC 10 + force head + safepoint-off)
+- **V9 (early)**: V9.0 yaw_rate clamp 720°/s + AA-stability + BF filter, V9.1 real-vs-seeded sample tracking + Init log filter, V9.2 decay measured + dist-scale + Slow-Alt, V9.3 Spinner-Rot + ping-aware extrap + per-weapon predict + def-AA delta fingerprint + log_buffer ring, V9.4 SSG-Pro tuned, V9.5 BF def_delta cycle + tighter spinner detect, V9.6 fast-fire + Air-Guess + LBY auto-flip, V9.7 Still-Alt + still/slow hard-reset on yaw spike, V9.8 counter-fire (events.weapon_fire hostile detect → bypass cancel-conf), V9.9 bulk easy-wins (dominant-side conf-boost / 2-miss mode-blacklist / crouch-aware hitbox / hostile-fire HUD / per-tick lp+wc cache / symmetric-data low-conf / backtrack-fail penalty / yaw-consistency extrap-boost), V9.10 log_buffer cap 80→200 + AA-type hysteresis tightened (7-consecutive + 2s lockout + anti-flap 5s freeze if >3 commits in 10s), V9.11 enhanced counter-fire (force head + safepoint-off + HC 15 + multipoint) + fast-fire tier system (conf 50/70/85 thresholds), V9.12 close-range first-miss follow-up (Aggressive + missed≥1 + dist<1000 → HC 10 + force head + safepoint-off)
+- **V9.13-V9.30 (recent)**:
+  - **V9.18 (major)** — stripped ALL `ctx:override_min_damage` calls + deleted HEAD-FOCUS block + sniper always-respect + auto-rifle/heavy-pistol overrides removed. User's NL Selection (HC 72 / MinDmg 100 / multi-hitbox / SafePoints Prefer) is now the source of truth globally. Hit rate ~50% → 85.7% in one session. ([memory: feedback_never_override_nl_config.md](file:../.claude/projects/C--Users-Seltonmt-Desktop-sazz-aron-ownlua/memory/feedback_never_override_nl_config.md))
+  - **V9.19** — `sel01_session_desyncs` ring (cap 20) + `adaptive_guess_mag()` median replaces hardcoded ±29° in all `*-Guess` fallback paths + `alt_side_pick(s)` dom-bias for Predicted-Alt / Air-Alt / Slow-Alt / Still-Alt
+  - **V9.20** — AA Advisor tab (Refresh / Next / Show / Show-ALL buttons, advisor_rebuild + advisor_show, recommendations based on aa_type + dom + mag + miss-rate)
+  - **V9.21** — Event ticker (top-right toggle in ESP/HUD) + `cs_event_*` helpers with 3-fallback console writer
+  - **V9.22** — Predicted-Alt / Predicted-Streak magnitude fix (recompute `effective_desync` with chosen side, drop 0.85 mult on measured paths)
+  - **V9.23** — Advisor panel moved INSIDE NL menu via 11 label slots + `:name()` runtime text updates; on-screen overlay removed
+  - **V9.24** — `effective_desync` sample threshold 2 → 1 (one hit beats blind 58°) + LBY-Snap-Guess flip only when `|delta - measured| > 5°`
+  - **V9.25** — `cs_event_*` console multi-fallback (HIT/MISS/KILL print to in-game console without any toggle) + Advisor wording rewritten in plain English with color-coded DO/why/warn/good
+  - **V9.26** — 📨 Send tips to CSGO chat button (Advisor → utils.console_exec say lines) + EMA drift-bump (alpha 0.30 → 0.55 on |actual - EMA| > 5°)
+  - **V9.27** — Coach-chat addresses `@enemy_name` (name trimmed to 18-22 chars to fit 127-char say limit) + up to 4 concrete tips per send
+  - **V9.28** — Coach-chat each line explains WHY enemy's AA is exploitable + HOW to fix (was just stating facts)
+  - **V9.29** — Coach-chat 3 wording variants per category (deterministic by enemy-name hash) + data-driven WHY (real streak / dom counts) + BIMODAL detection (per-side mag diff > 10°)
+  - **V9.30** — AA-switch hard-reset: when `|actual - EMA| > 10°` and `samples >= 3`, EMA is REPLACED with actual + `samples` decimated to 40% (catches locked-target preset switches in 1 hit instead of 3-4)
 
 ## HUD-overlay anatomy
 
@@ -249,7 +287,7 @@ git push origin master
 
 If hook failure on commit: investigate root cause, fix, create NEW commit (don't amend — pre-commit hooks fail means commit didn't happen, amend would modify previous one).
 
-## Sel01-Config layout (`sel01_config.lua`, v3.x, ~1400 lines)
+## Sel01-Config layout (`sel01_config.lua`, v3.9, ~1600 lines)
 
 | Section | Purpose |
 |---|---|
@@ -287,18 +325,39 @@ If hook failure on commit: investigate root cause, fix, create NEW commit (don't
 | move-fakeduck (v3.0/3.2) | **ON** | OFF | OFF | OFF |
 | NL fake-lag limit | 7 | 5 | 3 | (varies) |
 
+### Anti-resolver bundle (v3.6 - v3.9, separate from presets — opt-in toggles)
+
+| Toggle | Default | Effect |
+|---|---|---|
+| **Defensive AA on hit-taken** (v3.6, bullet-only since v3.7) | ON | `player_hurt` with `hitgroup 1-7` (skip nade / world / fall) → for `aa_def_duration` ms: max desync 58 + 2× anti-BF variance + random body-yaw inverter every periodic tick. v3.7 dropped the force-fakeduck (was crouching mid-escape). |
+| **Slow-walk AA boost** (v3.6) | ON | When NL Slow Walk hotkey is held: same chaos package as defensive — slow walkers are easy targets, this hides the magnitude / side. |
+| **Fake-lag variance** (v3.6) | OFF | Periodically (every 1-3s) overrides NL Fake Lag Limit by ±2 ticks. Captures user's base value once on first activation so it doesn't drift away. Toggle-off clears. |
+| **Yaw base rotation** (v3.7) | OFF | Periodically (every 4-8s random) rotates NL Yaw Base through Forward / Backward / Left / Right via `:override(string)` — combo string override is safe; combo `:override(bool)` segfaults. |
+| **Side-streak limit** (v3.7) | ON, threshold 3 | aim_ack reads NL body-yaw inverter after every shot, counts consecutive same-side. When the streak crosses the threshold, queues a force-flip for the next periodic sync. |
+| **Magnitude jitter** (v3.9, per-tick) | OFF, range 35-58° | Randomizes the base desync magnitude inside [min, max] every periodic-sync tick. EMA-based resolvers (including Sel01-Solver v9.x) lock onto the AVERAGE, leaving the actual fake yaw 5-15° off that average every shot. |
+
+### Comprehensive Dump Debug Stats (v3.8)
+
+The `Dump Debug Stats` button now emits 9 sections to chat in one click: SESSION + DEALT (shots / hits / HS% / dmg / kills / KD-ish) + RECENT EVENTS (last 8 from `hit_log`) + HITS TAKEN (all 10 incidents w/ full AA snapshots) + AA CONFIG (every slider + switch) + ANTI-RESOLVER state (v3.6 / v3.7 toggles + live activity windows) + NL RAGEBOT live (reads user's NL HC / MinDmg / Penetrate / SafePoints / HitboxSafety / FakeLag / SlowWalk / FakeDuck via `nl_refs[...]:get()`) + PERF (FPS / ping / velocity / airborne).
+
 ### Sel01-Config V2-V3 feature timeline
 
 - **V2.0-2.1**: Re-enable subsystems after v1.13 BISECT confirmed stable baseline. Drop `nl_override` on Peek Assist hotkey (use gingersense pattern: `:get()` read). Switch player_hurt to JAG0YAW entity-compare.
 - **V2.2**: Drop visual NL :override calls (Scope Overlay etc are combo elements).
-- **V2.3**: Air-AA extras — rapid inverter flip + max jitter boost + optional fake-duck while airborne, 1.5× anti-BF variance, transition handling clears overrides on land. Arrow indicator follows `aa_jitter_dir` when our AA override on (was reading NL inverter, always pointed right).
+- **V2.3**: Air-AA extras — rapid inverter flip + max jitter boost + optional fake-duck while airborne, 1.5× anti-BF variance, transition handling clears overrides on land.
 - **V2.4-2.5**: AI Peek iteration (sidemove cycle) — later replaced by Peek Boost.
 - **V2.6**: Debug stats accumulator (shots fired/hit/miss + total dmg + biggest + 1-taps) + dump button.
-- **V2.7-2.8**: Peek Boost as hold hotkey — drives NL hitchance + mindmg :override on rising/falling edge of our own hotkey (NL Peek Assist hotkey unchanged, user binds same key for 2-in-1). Hits-Taken log (cap 10) with AA-state snapshot per incident: desync / air-override / anti-BF / on-shot / fd-assist / freestanding / airborne / velocity / peek-boost / jitter direction.
-- **V2.9**: aim_ack hit-detection fixed (nil = HIT, was MISS). Unified event log: HITS + MISSES (with reason) + KILLS (from `events.player_death`) — color-coded top-left, default ON in all presets.
-- **V3.0**: Hitbox stats moved from aim_ack to player_hurt (hitgroup-based). Two name maps factored out. Anti-headshot extras (pitch jitter via NL Pitch combo set to "Jitter Down/Up", auto-fakeduck while moving above velocity threshold). Both default OFF until opted in.
-- **V3.1**: Peek Boost UI label shortened (text overflow). Print Recommendations button (data-driven advice based on stats). Anti-HS Bundle quick-toggle.
-- **V3.2**: Move-AA extras (running on ground above velocity threshold) — own desync magnitude, rapid inverter flip, max jitter boost. Aggressive preset auto-enables full anti-HS bundle (pitch_jitter + move_fakeduck + move-AA extras).
+- **V2.7-2.8**: Peek Boost as hold hotkey — drives NL hitchance / mindmg `:override` on rising/falling edge of our own hotkey. Hits-Taken log (cap 10) with AA-state snapshot per incident.
+- **V2.9**: aim_ack hit-detection fixed (nil = HIT, was MISS). Unified event log: HITS + MISSES (with reason) + KILLS, color-coded top-left.
+- **V3.0**: Hitbox stats moved from aim_ack to player_hurt (hitgroup-based). Pitch jitter + auto-fakeduck while moving (both default OFF).
+- **V3.1**: Peek Boost UI label shortened. Print Recommendations button. Anti-HS Bundle quick-toggle.
+- **V3.2**: Move-AA extras (running on ground above velocity threshold). Aggressive preset auto-enables full anti-HS bundle.
+- **V3.3**: Sticky fake-duck bug fix — added falling-edge clear via `_move_fd_active` dirty-track. Without it, NL kept the fake-duck override true forever after movement stopped.
+- **V3.4 → V3.5**: Peek MinDmg default raised 1 → 50 (low-damage-during-peek hits) → then slider REMOVED entirely (Peek Boost no longer overrides NL min_dmg at all). Aligns with v9.18 "never override NL config" rule.
+- **V3.6**: Anti-resolver bundle (Defensive on-dmg / Slow-walk boost / Fake-lag variance) + DEF / SW-BOOST / FL-VAR indicators.
+- **V3.7**: Yaw base rotation + Side-streak limit + YAW-ROT indicator. Defensive AA filtered to bullet-only (hitgroup 1-7); force-fakeduck removed from defensive (was hindering escape during nade hits).
+- **V3.8**: Dump Debug Stats rewritten — 9 sections, includes live NL Ragebot values via `nl_refs[...]:get()`.
+- **V3.9**: Magnitude jitter (per-tick variance, anti-EMA-resolver) + MAG-JIT indicator. Default OFF; combines with anti-BF for full per-side chaos.
 
 ### Common Sel01-Config gotchas (each has bitten)
 
