@@ -1,19 +1,20 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 9.22                                   ║
+-- ║  Version: 9.23                                   ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 9.22
--- @description Predicted-Alt / Predicted-Streak magnitude fix.
---   * Was using preset.max_desync (58°) * 0.85 mult after side was picked from
---     per-side measured data. On dom-R enemy with sr=4/36° we shot at ~49° = miss
---     by 13°. Now recomputes effective_desync(s, max_desync, chosen_side) and
---     drops the 0.85 mult when measured side is used.
---   * v9.21 carries (event ticker + advisor panel + console-always HIT/MISS).
+-- @version 9.23
+-- @description Advisor panel moved INSIDE NL menu (was on-screen overlay).
+--   * Pre-create label slots in g_advisor. advisor_panel_update() rewrites their
+--     text via the `:name()` method (confirmed pattern from bloodwings /
+--     frostlive / grenade_helper). Refresh / Next / Show buttons drive updates.
+--   * On-screen render_advisor_panel + advisor_panel_show toggle removed.
+--   * Event ticker (top-right) stays — was the intended screen visual.
+--   * v9.22 Predicted-Alt mag fix carries.
 
-local SEL01_VERSION = "9.22"
+local SEL01_VERSION = "9.23"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -531,26 +532,98 @@ function advisor_show()
     cs_log_color("══")
 end
 
+-- V9.23: panel-update helper. Refreshes the pre-created labels via :name().
+function advisor_panel_update()
+    local function setn(lbl, text)
+        if lbl and lbl.name then pcall(function() lbl:name(text or " ") end) end
+    end
+    if #advisor_state.list == 0 then
+        setn(advisor_lbl_header, "  (empty — click 🔁 Refresh)")
+        setn(advisor_lbl_stats1, " ")
+        setn(advisor_lbl_stats2, " ")
+        setn(advisor_lbl_rec1,   " ")
+        setn(advisor_lbl_rec2,   " ")
+        setn(advisor_lbl_rec3,   " ")
+        setn(advisor_lbl_rec4,   " ")
+        setn(advisor_lbl_rec5,   " ")
+        setn(advisor_lbl_rec6,   " ")
+        setn(advisor_lbl_rec7,   " ")
+        setn(advisor_lbl_rec8,   " ")
+        return
+    end
+    local e = advisor_state.list[advisor_state.idx]
+    if not e then return end
+    setn(advisor_lbl_header,
+        string.format("  \aFFD8AAFF#%d/%d  \aFFFFFFFF%s",
+            advisor_state.idx, #advisor_state.list, e.name))
+    setn(advisor_lbl_stats1,
+        string.format("  aa=%s  dom=%s  mag=%.0f°  hits=%d  miss=%d",
+            tostring(e.aa_type):upper(), advisor_dom_label(e.dom),
+            e.mag, e.hits, e.miss))
+    setn(advisor_lbl_stats2,
+        string.format("  L=%d/%.0f°  R=%d/%.0f°  passive=%d  miss-rate=%d%%",
+            e.samples_l, e.measured_l, e.samples_r, e.measured_r,
+            e.passive, e.miss_rate))
+    -- recommendations
+    local recs = {}
+    if e.aa_type == "static" then
+        recs[#recs+1] = "  → Static AA. Counter-side resolver expected."
+        recs[#recs+1] = "    Yaw Modifier=Jitter int 1-2 + Anti-BF ON + YAW-ROT ON"
+    elseif e.aa_type == "switch" then
+        recs[#recs+1] = "  → Switch AA. Alt-track resolver."
+        recs[#recs+1] = "    Desync 58 + Side-streak thresh=2 + YAW-ROT ON + DEF-on-dmg ON"
+    elseif e.aa_type == "jitter" then
+        recs[#recs+1] = "  → Jitter AA. Period sync."
+        recs[#recs+1] = "    Desync 35-45 + Slow-walk boost ON + int ODD (3/5)"
+    elseif e.aa_type == "spinner" then
+        recs[#recs+1] = "  → Spinner. Continuous rotation."
+        recs[#recs+1] = "    YAW-ROT ON + Side-streak 2 + Anti-BF max"
+    else
+        recs[#recs+1] = "  → AA-type unknown (need more samples)."
+        recs[#recs+1] = "    Generic: DEF-on-dmg ON + Side-streak 3 + Anti-BF ON"
+    end
+    if e.mag >= 35 then
+        recs[#recs+1] = string.format("  → High-mag (%.0f°). Your desync 20-30 OR full 58.", e.mag)
+    elseif e.mag > 0 and e.mag <= 22 then
+        recs[#recs+1] = string.format("  → Low-mag (%.0f°). Desync 58 fixed wins.", e.mag)
+    end
+    if e.dom ~= 0 and (e.samples_l + e.samples_r) >= 4 then
+        local their = e.dom > 0 and "RIGHT" or "LEFT"
+        local opp   = e.dom > 0 and "LEFT"  or "RIGHT"
+        recs[#recs+1] = string.format("  → They dom-%s. Manual %s side OR streak thresh=2.", their, opp)
+    end
+    if e.miss_rate >= 30 then
+        recs[#recs+1] = string.format("  → High recent miss-rate %d%%. Predict=Conservative.", e.miss_rate)
+    end
+    -- pad recs to 8 slots
+    while #recs < 8 do recs[#recs+1] = " " end
+    setn(advisor_lbl_rec1, recs[1])
+    setn(advisor_lbl_rec2, recs[2])
+    setn(advisor_lbl_rec3, recs[3])
+    setn(advisor_lbl_rec4, recs[4])
+    setn(advisor_lbl_rec5, recs[5])
+    setn(advisor_lbl_rec6, recs[6])
+    setn(advisor_lbl_rec7, recs[7])
+    setn(advisor_lbl_rec8, recs[8])
+end
+
 advisor_btn_refresh = g_advisor:button("🔁 Refresh player list", function()
     pcall(advisor_rebuild)
-    cs_log_color(string.format("[Advisor] %d tracked players — use ▶ Next to cycle",
-        #advisor_state.list))
+    pcall(advisor_panel_update)
 end)
 advisor_btn_next = g_advisor:button("▶ Next player", function()
     if #advisor_state.list == 0 then
-        cs_log_color("[Advisor] empty list — click 🔁 Refresh first")
+        pcall(advisor_panel_update)
         return
     end
     advisor_state.idx = (advisor_state.idx % #advisor_state.list) + 1
-    local e = advisor_state.list[advisor_state.idx]
-    cs_log_color(string.format("[Advisor] selected #%d/%d: %s  (aa=%s mag=%.0f° dom=%s hits=%d)",
-        advisor_state.idx, #advisor_state.list, e.name, e.aa_type, e.mag,
-        advisor_dom_label(e.dom), e.hits))
+    pcall(advisor_panel_update)
 end)
-advisor_btn_show = g_advisor:button("💡 Show AA recommendations", function()
-    pcall(advisor_show)
+advisor_btn_show = g_advisor:button("💡 Refresh recommendations", function()
+    pcall(advisor_rebuild)
+    pcall(advisor_panel_update)
 end)
-advisor_btn_all = g_advisor:button("📜 Show recs for ALL learned", function()
+advisor_btn_all = g_advisor:button("📜 Dump recs for ALL to chat", function()
     pcall(advisor_rebuild)
     if #advisor_state.list == 0 then
         cs_log_color("[Advisor] no enemies tracked yet")
@@ -563,13 +636,24 @@ advisor_btn_all = g_advisor:button("📜 Show recs for ALL learned", function()
     end
     advisor_state.idx = save_idx
 end)
--- V9.21: also toggle Advisor on-screen panel (mid-left) so recs render
--- visually instead of dumping only to chat. Off by default — only pops up
--- when user wants to inspect. NL menu Refresh/Next buttons drive the panel.
-advisor_panel_show = g_advisor:switch("📺 Show Advisor panel on screen", false)
+-- V9.23: in-menu advisor panel. Pre-create label slots that get their text
+-- updated at runtime via the NL `:name(string)` method (confirmed pattern from
+-- bloodwings / frostlive / grenade_helper). No on-screen render — output stays
+-- inside the NL UI so the user can read it without opening console.
 g_advisor:label(" ")
-g_advisor:label("\a{Link Active}  Use 📺 toggle for on-screen panel (no chat needed).")
-g_advisor:label("\a{Link Active}  Recs reference Config v3.7 toggles (DEF/YAW-ROT/Side-streak).")
+g_advisor:label("\a{Link Active}══════ Selected Player ══════")
+advisor_lbl_header = g_advisor:label("  (click 🔁 Refresh to start)")
+advisor_lbl_stats1 = g_advisor:label(" ")
+advisor_lbl_stats2 = g_advisor:label(" ")
+g_advisor:label("\a{Link Active}── Config-side recs ──")
+advisor_lbl_rec1   = g_advisor:label(" ")
+advisor_lbl_rec2   = g_advisor:label(" ")
+advisor_lbl_rec3   = g_advisor:label(" ")
+advisor_lbl_rec4   = g_advisor:label(" ")
+advisor_lbl_rec5   = g_advisor:label(" ")
+advisor_lbl_rec6   = g_advisor:label(" ")
+advisor_lbl_rec7   = g_advisor:label(" ")
+advisor_lbl_rec8   = g_advisor:label(" ")
 
 -- ╔══════════════════════════════════════════════════╗
 -- ║ V9.21: EVENT TICKER (top-right on-screen log)    ║
@@ -4174,75 +4258,8 @@ function render_event_ticker()
     end
 end
 
-function render_advisor_panel()
-    if not (advisor_panel_show and advisor_panel_show:get()) then return end
-    if #advisor_state.list == 0 then
-        pcall(function()
-            render.text(3, vector(20, 220), color(220, 200, 100, 220), nil,
-                "▸ AA Advisor: empty — click 🔁 Refresh in menu")
-        end)
-        return
-    end
-    local e = advisor_state.list[advisor_state.idx]
-    if not e then return end
-    local x, y = 20, 220
-    local lines = {}
-    lines[#lines+1] = {string.format("🎯 AA Advisor #%d/%d", advisor_state.idx, #advisor_state.list),
-                       180, 220, 255}
-    lines[#lines+1] = {"  " .. e.name, 240, 240, 240}
-    lines[#lines+1] = {string.format("  aa=%s  dom=%s  mag=%.0f°  hits=%d  miss=%d",
-                       e.aa_type:upper(), advisor_dom_label(e.dom), e.mag, e.hits, e.miss),
-                       200, 220, 200}
-    lines[#lines+1] = {string.format("  L=%d/%.0f°  R=%d/%.0f°  passive=%d  miss-rate=%d%%",
-                       e.samples_l, e.measured_l, e.samples_r, e.measured_r, e.passive, e.miss_rate),
-                       180, 200, 180}
-    lines[#lines+1] = {"  ── Config recs ──", 255, 200, 100}
-    if e.aa_type == "static" then
-        lines[#lines+1] = {"  → Static AA. Counter-side resolver expected.", 220, 220, 220}
-        lines[#lines+1] = {"    Yaw Modifier=Jitter int 1-2  +  Anti-BF ON  +  YAW-ROT ON", 140, 220, 180}
-    elseif e.aa_type == "switch" then
-        lines[#lines+1] = {"  → Switch AA. Alt-track resolver expected.", 220, 220, 220}
-        lines[#lines+1] = {"    Desync 58  +  Side-streak thresh=2  +  YAW-ROT ON  +  DEF-on-dmg ON", 140, 220, 180}
-    elseif e.aa_type == "jitter" then
-        lines[#lines+1] = {"  → Jitter AA. Jitter-period sync.", 220, 220, 220}
-        lines[#lines+1] = {"    Desync 35-45  +  Slow-walk boost ON  +  jitter int ODD (3/5)", 140, 220, 180}
-    elseif e.aa_type == "spinner" then
-        lines[#lines+1] = {"  → Spinner. Continuous rotation.", 220, 220, 220}
-        lines[#lines+1] = {"    YAW-ROT ON  +  Side-streak 2  +  Anti-BF max", 140, 220, 180}
-    else
-        lines[#lines+1] = {"  → AA-type unknown (need more samples).", 220, 220, 220}
-        lines[#lines+1] = {"    Generic: DEF-on-dmg ON  +  Side-streak 3  +  Anti-BF ON", 140, 220, 180}
-    end
-    if e.mag >= 35 then
-        lines[#lines+1] = {string.format("  → High-mag (%.0f°). Your desync 20-30 OR full 58.", e.mag),
-                           255, 200, 140}
-    elseif e.mag > 0 and e.mag <= 22 then
-        lines[#lines+1] = {string.format("  → Low-mag (%.0f°). Desync 58 fixed wins.", e.mag),
-                           255, 200, 140}
-    end
-    if e.dom ~= 0 and (e.samples_l + e.samples_r) >= 4 then
-        local their = e.dom > 0 and "RIGHT" or "LEFT"
-        local opp   = e.dom > 0 and "LEFT"  or "RIGHT"
-        lines[#lines+1] = {string.format("  → They dom-%s. Manual %s side or streak thresh=2.", their, opp),
-                           255, 200, 140}
-    end
-    if e.miss_rate >= 30 then
-        lines[#lines+1] = {string.format("  → High recent miss-rate %d%%. Predict=Conservative.", e.miss_rate),
-                           255, 180, 120}
-    end
-    -- compute background height
-    local h = #lines * 14 + 12
-    pcall(function()
-        render.rect(vector(x - 6, y - 4), vector(x + 460, y + h),
-                    color(15, 15, 20, 210), 2, true)
-    end)
-    for _, ln in ipairs(lines) do
-        pcall(function()
-            render.text(3, vector(x, y), color(ln[2], ln[3], ln[4], 255), nil, ln[1])
-        end)
-        y = y + 14
-    end
-end
+-- V9.23: render_advisor_panel removed (on-screen). Advisor now lives entirely
+-- inside the NL menu — labels updated via :name() on the pre-created slots.
 
 -- NL docs: events.render is THE per-frame draw event. Wrap existing render-callback.
 pcall(function()
@@ -4251,7 +4268,6 @@ pcall(function()
         pcall(sidebar)
         pcall(esp_paint_handler)
         pcall(render_event_ticker)
-        pcall(render_advisor_panel)
     end)
     cs_log("ESP render hook installed (events.render)")
 end)
@@ -4429,5 +4445,6 @@ _cs_log_color_raw("V9.19: Adaptive guess magnitude (session median replaces 29°
 _cs_log_color_raw("V9.20: AA Advisor tab → per-enemy config recommendations (Refresh / Next / Show / Show-ALL buttons).")
 _cs_log_color_raw("V9.21: Event ticker top-right (HIT/MISS/KILL always visible) + Advisor on-screen panel toggle (📺) + console HIT/MISS always-on.")
 _cs_log_color_raw("V9.22: Predicted-Alt/Streak mag-fix — uses per-side measured (was preset 58° × 0.85). Dom-R 36° enemy: 49° → 36° (no over-shoot).")
+_cs_log_color_raw("V9.23: Advisor panel moved INSIDE NL menu (label :name() updates) — no on-screen overlay. Event ticker stays top-right.")
 _cs_log_color_raw("Logging: " .. (log_enabled:get() and ("ON" .. (log_verbose:get() and " (verbose)" or ""))  or "OFF"))
 _cs_log_color_raw("=========================================")
