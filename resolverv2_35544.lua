@@ -1,20 +1,20 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 9.20                                   ║
+-- ║  Version: 9.21                                   ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 9.20
--- @description AA Advisor (per-enemy config recommendations).
---   * New tab section "🎯 AA Advisor" — Refresh / Next / Show / Show-ALL buttons.
---   * Reads currently-tracked PlayerState entries, snapshots aa_type / dom / mag /
---     samples / passive-obs / miss-rate. Cycle through with ▶, hit 💡 to dump
---     config-side AA recommendations to chat (DEF / YAW-ROT / Side-streak /
---     desync magnitude / preferred side, all in Sel01-Config v3.7 terms).
---   * v9.19 changes carried (adaptive fallback magnitude + Alt-mode dom-bias).
+-- @version 9.21
+-- @description On-screen event ticker + advisor panel + console-always HIT/MISS.
+--   * Top-right Event Ticker (toggle in ESP/HUD) — last 12 HIT/MISS/KILL/INFO
+--     events color-coded with fade. No console toggle required.
+--   * AA Advisor on-screen panel toggle (📺 in Advisor group) — selected enemy's
+--     recommendations render mid-left of screen, driven by menu buttons.
+--   * cs_event_hit / cs_event_miss / cs_event_kill helpers print to console via
+--     client.color_log every event regardless of cs_log_enabled toggle.
 
-local SEL01_VERSION = "9.20"
+local SEL01_VERSION = "9.21"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -307,6 +307,9 @@ local esp_hud_pos      = g_esp:combo (accent .. ui.get_icon"clock"     .. accent
 local esp_throttle_hz  = g_esp:slider(accent .. ui.get_icon"bolt"      .. accent .. "  ESP Refresh Rate (Hz)", 5, 30, 10)
 local esp_label_color  = g_esp:color_picker(accent .. ui.get_icon"feather" .. accent .. "  Label Default Color", color(255, 255, 255, 255))
 g_esp:label(accent .. ui.get_icon"link-slash" .. accent .. "  Mode colors auto: green=Meas, yellow=Predict, red=BF, cyan=LBY")
+-- V9.21: live event ticker top-right of screen — HIT/MISS/KILL/INFO with fade.
+-- Global (no `local`) to dodge main-chunk 200-local limit.
+esp_event_ticker = g_esp:switch(accent .. ui.get_icon"bolt" .. accent .. "  Event Ticker (top-right HUD log)", true)
 
 -- ─── SMART STRATEGY COMBOS (batch-set individual toggles) ─────
 local strat_learning = g_smart:combo(accent .. ui.get_icon"user"      .. accent .. "  Learning Strategy",
@@ -561,9 +564,55 @@ advisor_btn_all = g_advisor:button("📜 Show recs for ALL learned", function()
     end
     advisor_state.idx = save_idx
 end)
+-- V9.21: also toggle Advisor on-screen panel (mid-left) so recs render
+-- visually instead of dumping only to chat. Off by default — only pops up
+-- when user wants to inspect. NL menu Refresh/Next buttons drive the panel.
+advisor_panel_show = g_advisor:switch("📺 Show Advisor panel on screen", false)
 g_advisor:label(" ")
-g_advisor:label("\a{Link Active}  Output goes to chat (in-game console).")
+g_advisor:label("\a{Link Active}  Use 📺 toggle for on-screen panel (no chat needed).")
 g_advisor:label("\a{Link Active}  Recs reference Config v3.7 toggles (DEF/YAW-ROT/Side-streak).")
+
+-- ╔══════════════════════════════════════════════════╗
+-- ║ V9.21: EVENT TICKER (top-right on-screen log)    ║
+-- ╠══════════════════════════════════════════════════╣
+-- ║ Dedicated ring of last N HIT/MISS/KILL/INFO      ║
+-- ║ events with timestamp + color. Rendered top-right║
+-- ║ of screen so user always sees what's happening — ║
+-- ║ no console toggle required, no menu open needed. ║
+-- ║ cs_event_* helpers also print to console via     ║
+-- ║ client.color_log (bypasses log_enabled gate).    ║
+-- ╚══════════════════════════════════════════════════╝
+event_ticker = { cap = 12, head = 0, count = 0 }
+function event_ticker_push(text, r, g, b)
+    local t = event_ticker
+    t.head = (t.head % t.cap) + 1
+    t[t.head] = {
+        txt = tostring(text or ""),
+        r   = r or 220, g = g or 220, b = b or 220,
+        t   = globals.realtime or 0,
+    }
+    if t.count < t.cap then t.count = t.count + 1 end
+end
+function cs_event_hit(idx, mode)
+    local txt = string.format("✓ HIT #%d  %s", idx or 0, tostring(mode or "?"))
+    event_ticker_push(txt, 110, 240, 130)
+    pcall(function() client.color_log(110, 240, 130, "[Sel01] " .. txt) end)
+end
+function cs_event_miss(idx, reason, mode)
+    local txt = string.format("✗ MISS #%d  %s  (%s)",
+        idx or 0, tostring(reason or "?"), tostring(mode or "?"))
+    event_ticker_push(txt, 240, 110, 110)
+    pcall(function() client.color_log(240, 110, 110, "[Sel01] " .. txt) end)
+end
+function cs_event_kill(name)
+    local txt = string.format("☠ KILL  %s", tostring(name or "?"))
+    event_ticker_push(txt, 200, 180, 255)
+    pcall(function() client.color_log(200, 180, 255, "[Sel01] " .. txt) end)
+end
+function cs_event_info(text, r, g, b)
+    event_ticker_push(text, r or 200, g or 220, b or 255)
+    pcall(function() client.color_log(r or 200, g or 220, b or 255, "[Sel01] " .. tostring(text)) end)
+end
 
 -- Performance info (labels — settings hardcoded ON)
 g_perf:label(accent .. ui.get_icon"bolt"     .. accent .. "  Anim-state cache: ON (per tick)")
@@ -2125,6 +2174,8 @@ events.aim_ack:set(function(event)
                 s.measured_desync, s.desync_samples,
                 s.hit_streak_left, s.hit_streak_right, tostring(s.defensive_aa)
             )
+            -- V9.21: also surface to event ticker + console (always-on)
+            pcall(cs_event_miss, Ent:get_index(), reason, s.mode)
         end
     else
         -- V9.9-B: clear mode-blacklist + miss-counter on HIT (mode proven working)
@@ -2228,6 +2279,8 @@ events.aim_ack:set(function(event)
                 s.measured_desync, s.desync_samples,
                 s.hit_streak_left, s.hit_streak_right
             )
+            -- V9.21: also surface to event ticker + console (always-on)
+            pcall(cs_event_hit, Ent:get_index(), s.mode)
         end
         s.missed = 0
         s.bf_cached_missed = nil  -- clear BF cache so next miss recomputes fresh
@@ -4073,12 +4126,121 @@ local esp_paint_handler = function()
     end)
 end
 
+-- V9.21: event ticker (top-right) + advisor panel (mid-left) renderer. Wired
+-- as a global so the events.render hook can call it without touching locals.
+function render_event_ticker()
+    if not (esp_event_ticker and esp_event_ticker:get()) then return end
+    if event_ticker.count == 0 then return end
+    local sx
+    pcall(function() sx = render.screen_size().x end)
+    if not sx then return end
+    local x = sx - 320
+    local y = 80
+    local now = globals.realtime or 0
+    -- header
+    pcall(function()
+        render.rect(vector(x - 6, y - 4), vector(x + 305, y + 16),
+                    color(15, 15, 20, 200), 2, true)
+        render.text(3, vector(x, y), color(180, 220, 255, 255), nil,
+                    string.format("▸ Sel01 Events (%d)", event_ticker.count))
+    end)
+    y = y + 18
+    -- draw last N in chronological order (oldest at top, newest at bottom)
+    for i = 1, event_ticker.count do
+        local idx = ((event_ticker.head - event_ticker.count + i - 1) % event_ticker.cap) + 1
+        local e = event_ticker[idx]
+        if e then
+            local age = now - (e.t or 0)
+            local alpha = 255
+            if age > 5 then alpha = math.max(40, 255 - math.floor((age - 5) * 35)) end
+            pcall(function()
+                render.text(3, vector(x, y),
+                            color(e.r or 220, e.g or 220, e.b or 220, alpha),
+                            nil, e.txt or "?")
+            end)
+            y = y + 14
+        end
+    end
+end
+
+function render_advisor_panel()
+    if not (advisor_panel_show and advisor_panel_show:get()) then return end
+    if #advisor_state.list == 0 then
+        pcall(function()
+            render.text(3, vector(20, 220), color(220, 200, 100, 220), nil,
+                "▸ AA Advisor: empty — click 🔁 Refresh in menu")
+        end)
+        return
+    end
+    local e = advisor_state.list[advisor_state.idx]
+    if not e then return end
+    local x, y = 20, 220
+    local lines = {}
+    lines[#lines+1] = {string.format("🎯 AA Advisor #%d/%d", advisor_state.idx, #advisor_state.list),
+                       180, 220, 255}
+    lines[#lines+1] = {"  " .. e.name, 240, 240, 240}
+    lines[#lines+1] = {string.format("  aa=%s  dom=%s  mag=%.0f°  hits=%d  miss=%d",
+                       e.aa_type:upper(), advisor_dom_label(e.dom), e.mag, e.hits, e.miss),
+                       200, 220, 200}
+    lines[#lines+1] = {string.format("  L=%d/%.0f°  R=%d/%.0f°  passive=%d  miss-rate=%d%%",
+                       e.samples_l, e.measured_l, e.samples_r, e.measured_r, e.passive, e.miss_rate),
+                       180, 200, 180}
+    lines[#lines+1] = {"  ── Config recs ──", 255, 200, 100}
+    if e.aa_type == "static" then
+        lines[#lines+1] = {"  → Static AA. Counter-side resolver expected.", 220, 220, 220}
+        lines[#lines+1] = {"    Yaw Modifier=Jitter int 1-2  +  Anti-BF ON  +  YAW-ROT ON", 140, 220, 180}
+    elseif e.aa_type == "switch" then
+        lines[#lines+1] = {"  → Switch AA. Alt-track resolver expected.", 220, 220, 220}
+        lines[#lines+1] = {"    Desync 58  +  Side-streak thresh=2  +  YAW-ROT ON  +  DEF-on-dmg ON", 140, 220, 180}
+    elseif e.aa_type == "jitter" then
+        lines[#lines+1] = {"  → Jitter AA. Jitter-period sync.", 220, 220, 220}
+        lines[#lines+1] = {"    Desync 35-45  +  Slow-walk boost ON  +  jitter int ODD (3/5)", 140, 220, 180}
+    elseif e.aa_type == "spinner" then
+        lines[#lines+1] = {"  → Spinner. Continuous rotation.", 220, 220, 220}
+        lines[#lines+1] = {"    YAW-ROT ON  +  Side-streak 2  +  Anti-BF max", 140, 220, 180}
+    else
+        lines[#lines+1] = {"  → AA-type unknown (need more samples).", 220, 220, 220}
+        lines[#lines+1] = {"    Generic: DEF-on-dmg ON  +  Side-streak 3  +  Anti-BF ON", 140, 220, 180}
+    end
+    if e.mag >= 35 then
+        lines[#lines+1] = {string.format("  → High-mag (%.0f°). Your desync 20-30 OR full 58.", e.mag),
+                           255, 200, 140}
+    elseif e.mag > 0 and e.mag <= 22 then
+        lines[#lines+1] = {string.format("  → Low-mag (%.0f°). Desync 58 fixed wins.", e.mag),
+                           255, 200, 140}
+    end
+    if e.dom ~= 0 and (e.samples_l + e.samples_r) >= 4 then
+        local their = e.dom > 0 and "RIGHT" or "LEFT"
+        local opp   = e.dom > 0 and "LEFT"  or "RIGHT"
+        lines[#lines+1] = {string.format("  → They dom-%s. Manual %s side or streak thresh=2.", their, opp),
+                           255, 200, 140}
+    end
+    if e.miss_rate >= 30 then
+        lines[#lines+1] = {string.format("  → High recent miss-rate %d%%. Predict=Conservative.", e.miss_rate),
+                           255, 180, 120}
+    end
+    -- compute background height
+    local h = #lines * 14 + 12
+    pcall(function()
+        render.rect(vector(x - 6, y - 4), vector(x + 460, y + h),
+                    color(15, 15, 20, 210), 2, true)
+    end)
+    for _, ln in ipairs(lines) do
+        pcall(function()
+            render.text(3, vector(x, y), color(ln[2], ln[3], ln[4], 255), nil, ln[1])
+        end)
+        y = y + 14
+    end
+end
+
 -- NL docs: events.render is THE per-frame draw event. Wrap existing render-callback.
 pcall(function()
     events.render:set(function()
         pcall(loading_render_callback)
         pcall(sidebar)
         pcall(esp_paint_handler)
+        pcall(render_event_ticker)
+        pcall(render_advisor_panel)
     end)
     cs_log("ESP render hook installed (events.render)")
 end)
@@ -4165,6 +4327,10 @@ events.player_death:set(function(e)
     local attacker = entity.get(e.attacker, true)
     local target = entity.get(e.userid, true)
     if me == attacker and target ~= me then
+        -- V9.21: feed event ticker on every kill we get
+        local nm = "?"
+        pcall(function() if target.get_name then nm = target:get_name() end end)
+        pcall(cs_event_kill, nm)
         if (type(isON) == "boolean" and type(trashtype) == "string") then
             local v1 = string.format("%s", isON)
             local v2 = string.format("%s", trashtype)
@@ -4250,5 +4416,6 @@ _cs_log_color_raw("Aggressive preset = first-shot velocity bias, opposite→58 b
 _cs_log_color_raw("V9.18: ALL min_damage overrides REMOVED — NL min_dmg is source of truth. HEAD-FOCUS hc=40 block DELETED (was downgrading NL hc).")
 _cs_log_color_raw("V9.19: Adaptive guess magnitude (session median replaces 29° fallback) + Alt-mode dom-bias (Predicted-Alt/Air-Alt/Slow-Alt/Still-Alt prefer dom-side over blind flip).")
 _cs_log_color_raw("V9.20: AA Advisor tab → per-enemy config recommendations (Refresh / Next / Show / Show-ALL buttons).")
+_cs_log_color_raw("V9.21: Event ticker top-right (HIT/MISS/KILL always visible) + Advisor on-screen panel toggle (📺) + console HIT/MISS always-on.")
 _cs_log_color_raw("Logging: " .. (log_enabled:get() and ("ON" .. (log_verbose:get() and " (verbose)" or ""))  or "OFF"))
 _cs_log_color_raw("=========================================")
