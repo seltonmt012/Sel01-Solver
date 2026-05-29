@@ -1,12 +1,21 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 9.30                                   ║
+-- ║  Version: 9.31                                   ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 9.30
--- @description AA-switch detection + hard-reset on big changes:
+-- @version 9.31
+-- @description Server-side-fail flip guard + locked-target head preference:
+--   * V9.31 correction-flip fix: a `correction` miss where our resolved delta
+--     == measured_desync means the SIDE was right and the server rejected the
+--     shot (fake-lag/backtrack). Old code flipped side anyway → oscillation +
+--     fed BF:opposite the wrong side. Now flip only when angle_err > 5°; a
+--     correct-angle reject KEEPS the side (generalizes the V9.24 LBY guard).
+--   * V9.31 body-only fix: on LOCKED targets (8+ samples, 60+ conf, not whiffing)
+--     relax NL safe-point + enable multipoint so the ragebot takes HEAD instead
+--     of the safe body point. Toggle, never touches mindmg/hitbox.
+-- @description-prev AA-switch detection + hard-reset on big changes:
 --   * On every hit, if |actual - stored_EMA| > 10° AND we already have >=3
 --     samples, treat as the enemy SWITCHING their AA preset (not drift).
 --   * Replace EMA with the new actual value directly (no smoothing).
@@ -17,7 +26,7 @@
 --   * v9.26 drift-bump (alpha 0.55 on 5-10° diff) still handles small shifts.
 --   * v9.29 coach variants carry.
 
-local SEL01_VERSION = "9.30"
+local SEL01_VERSION = "9.31"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -299,6 +308,11 @@ local exp_respect_man   = g_experimental:switch(accent .. ui.get_icon"crosshairs
 local exp_predict_ticks = g_experimental:slider(accent .. ui.get_icon"clock"      .. accent .. "  Prediction Ticks Ahead", 1, 6, 2)
 -- V7.9: strict head-only on normal (spread) servers
 local exp_head_strict   = g_experimental:switch(accent .. ui.get_icon"crosshairs" .. accent .. "  Headshot-Only Strict (spread server)", false)
+-- V9.31: relax NL safe-point on LOCKED targets so the ragebot takes HEAD instead
+-- of the safe BODY point on proven enemies. GLOBAL (main chunk is at the 200-local
+-- cap). Only toggles safepoint+multipoint (NEVER mindmg/hitbox) → respects the
+-- never-override-NL-config rule; baseline unchanged for un-learned enemies.
+exp_lock_headpref = g_experimental:switch(accent .. ui.get_icon"bullseye" .. accent .. "  Head-Pref on Locked Targets (less body)", true)
 
 -- ─── ESP / HUD dedicated group ─────────────────────────
 local esp_master       = g_esp:switch(accent .. ui.get_icon"bullseye"  .. accent .. "  ESP Master (on/off)", true)
@@ -954,23 +968,29 @@ end
 -- lobby. samples=0 fallback paths (Predicted-Guess, Networked-Guess, *-Guess)
 -- previously used hardcoded ±29°. User's lobby modal desync was ~37-38° so 29°
 -- under-shot constantly. Adaptive median catches up automatically.
-sel01_session_desyncs = { cap = 20, head = 0, count = 0 }
+sel01_session_desyncs = { cap = 20, head = 0, count = 0, dirty = true }
 function session_push_desync(v)
     if not v or v < 5 or v > 65 then return end
     local r = sel01_session_desyncs
     r.head = (r.head % r.cap) + 1
     r[r.head] = v
     if r.count < r.cap then r.count = r.count + 1 end
+    r.dirty = true  -- V9.31: invalidate adaptive_guess_mag memo
 end
 function adaptive_guess_mag()
     local r = sel01_session_desyncs
     if r.count == 0 then return 29 end
+    -- V9.31: memoize. Median only changes when session_push_desync runs (a HIT),
+    -- but this is called from 6 per-resolve *-Guess paths 64×/sec/enemy. Cache the
+    -- sorted-median; recompute only when the ring is dirty.
+    if not r.dirty and r.cached_mag then return r.cached_mag end
     local tmp = {}
     for i = 1, r.count do tmp[i] = r[i] end
     table.sort(tmp)
     local mid = tmp[math.ceil(r.count / 2)]
-    if mid < 20 then return 20 end
-    if mid > 58 then return 58 end
+    if mid < 20 then mid = 20 elseif mid > 58 then mid = 58 end
+    r.cached_mag = mid
+    r.dirty = false
     return mid
 end
 
@@ -1328,12 +1348,18 @@ confidence = function(s)
     local n = #s.recent_resolved
     local sd_score = 30
     if n >= 3 then
-        local sum = 0
-        for _, r in ipairs(s.recent_resolved) do sum = sum + r.a end
-        local mean = sum / n
+        -- V9.31: circular spread vs a reference angle. A plain arithmetic mean of
+        -- wrap-around yaws explodes near the ±180 seam (+179 & -179 are 2° apart
+        -- but average to ~0 → fake ~180° stddev → confidence wrongly tanked, which
+        -- silently suppresses extrapolation / fast-fire / lock-on for an enemy
+        -- whose facing straddles the seam). Deviate from a reference via NormalizeAngle.
+        local ref = s.recent_resolved[1].a
+        local sumd = 0
+        for _, r in ipairs(s.recent_resolved) do sumd = sumd + NormalizeAngle(r.a - ref) end
+        local mean_off = sumd / n
         local sq = 0
         for _, r in ipairs(s.recent_resolved) do
-            local d = NormalizeAngle(r.a - mean)
+            local d = NormalizeAngle(r.a - ref) - mean_off
             sq = sq + d * d
         end
         local sd = math.sqrt(sq / n)
@@ -2060,6 +2086,7 @@ pcall(function()
     exp_extrapolation:set_callback (function(r) cs_log("Extrapolation " .. (r:get() and "ON" or "OFF")) end)
     exp_respect_man:set_callback   (function(r) cs_log("Respect Manual SSG " .. (r:get() and "ON" or "OFF")) end)
     exp_head_strict:set_callback   (function(r) cs_log("Headshot-Only Strict " .. (r:get() and "ON" or "OFF")) end)
+    if exp_lock_headpref then exp_lock_headpref:set_callback(function(r) cs_log("Head-Pref Locked " .. (r:get() and "ON" or "OFF")) end) end
 end)
 pcall(ffi.cdef, [[
     typedef struct {
@@ -2369,6 +2396,12 @@ events.aim_ack:set(function(event)
     if not Ent then return end
     local s = get_state(Ent)
     local reason = event.state
+    -- V9.31: read the backtrack tick (confirmed real on this NL build — gazolina &
+    -- JAG0YAW both read event.backtrack). A high bt means NL replayed a STALE
+    -- record → the miss is netcode, not our side error → must NOT trigger a flip.
+    -- pcall: the field may be absent on some builds.
+    local bt = 0
+    pcall(function() bt = event.backtrack or 0 end)
     -- INVERTED: default to MISS, only count HIT when explicit known-hit
     local is_hit = (reason == nil) or HIT_STATES[reason]
     -- log unknown reasons in debug so we can learn what NL sends
@@ -2446,27 +2479,43 @@ events.aim_ack:set(function(event)
             end
         end
         -- V7.8 + V8.2: correction-miss → wrong side picked. Track + flip immediately.
+        -- V9.31: GENERALIZED SERVER-SIDE-FAIL GUARD (was LBY-Snap-only in V9.24).
+        -- Logs proved the dominant miss is `correction` where our resolved delta
+        -- == measured_desync (idx=5 missed Air 3x @ delta==meas==29; idx=10/idx=7
+        -- L<->R thrash). That means our SIDE was right and the server rejected the
+        -- shot (fake-lag / backtrack / lag-comp mismatch) — NOT our error. The old
+        -- code flipped unconditionally, sending the next shot to the WRONG side and
+        -- feeding BF:opposite garbage (25% rate). Now we only flip + decay streak +
+        -- bust the FS cache when the angle was actually wrong (err > 5°). A correct
+        -- angle that the server rejected KEEPS the side and just tallies a
+        -- server-fail streak (used downstream to recognise fake-laggers).
         if reason == "correction" and s.last_shot_side ~= 0 then
-            if s.last_shot_side > 0 then
-                s.correction_right = s.correction_right + 1
+            local our_delta = NormalizeAngle((s.last_resolved or 0) - (s.last_eye_yaw or 0))
+            local angle_err = math.abs(math.abs(our_delta) - (s.measured_desync or 0))
+            if angle_err > 5 and bt <= 8 then
+                if s.last_shot_side > 0 then
+                    s.correction_right = s.correction_right + 1
+                    s.hit_streak_right = math.max(0, (s.hit_streak_right or 0) - 2)
+                    s.last_hit_side = -1
+                else
+                    s.correction_left = s.correction_left + 1
+                    s.hit_streak_left = math.max(0, (s.hit_streak_left or 0) - 2)
+                    s.last_hit_side = 1
+                end
+                -- Invalidate first-shot cache so next engagement re-picks side
+                s.fs_cached_time   = nil
+                s.fs_cached_angle  = nil
+                s.guess_cached_side = nil
+                s.serverfail_streak = 0
+                cs_log_verbose("correction-miss idx=%d shot_side=%d FLIP→%d err=%.1f L=%d R=%d",
+                               Ent:get_index(), s.last_shot_side, s.last_hit_side, angle_err, s.correction_left, s.correction_right)
             else
-                s.correction_left = s.correction_left + 1
+                -- angle was correct, server rejected it → server-side / fake-lag fail.
+                -- KEEP the side. Repeated fails flag a hard fake-lagger.
+                s.serverfail_streak = (s.serverfail_streak or 0) + 1
+                cs_log_verbose("correction-miss idx=%d KEEP side=%d our=%.1f meas=%.1f err=%.1f bt=%d (server/backtrack fail #%d, no flip)",
+                               Ent:get_index(), s.last_shot_side, our_delta, s.measured_desync or 0, angle_err, bt, s.serverfail_streak)
             end
-            -- V8.2: immediate side-flip after correction (player switched their AA)
-            -- Decay streak on missed side, set last_hit_side to opposite
-            if s.last_shot_side > 0 then
-                s.hit_streak_right = math.max(0, (s.hit_streak_right or 0) - 2)
-                s.last_hit_side = -1
-            else
-                s.hit_streak_left = math.max(0, (s.hit_streak_left or 0) - 2)
-                s.last_hit_side = 1
-            end
-            -- Invalidate first-shot cache so next engagement re-picks side
-            s.fs_cached_time   = nil
-            s.fs_cached_angle  = nil
-            s.guess_cached_side = nil
-            cs_log_verbose("correction-miss idx=%d shot_side=%d FLIP→%d L=%d R=%d",
-                           Ent:get_index(), s.last_shot_side, s.last_hit_side, s.correction_left, s.correction_right)
         end
         cs_log_verbose("MISS [%s] target=%d count=%d mode=%s",
                        tostring(reason), Ent:get_index(), s.missed, tostring(s.mode))
@@ -2564,6 +2613,14 @@ events.aim_ack:set(function(event)
                 -- V9.19: push every hit-derived measurement into the session ring
                 -- so adaptive_guess_mag() reflects current lobby AA magnitudes.
                 session_push_desync(actual)
+                -- V9.31: count real (hit-derived) samples side-independently, OUTSIDE
+                -- the per-side guard, so confidence is not capped at 50 when the
+                -- per-side-desync toggle is OFF (real_left/right gate the conf cap).
+                if hit_side > 0 then
+                    s.real_right = math.min((s.real_right or 0) + 1, 99)
+                elseif hit_side < 0 then
+                    s.real_left  = math.min((s.real_left or 0) + 1, 99)
+                end
                 -- per-side EMA (V9.26: own drift-bump per side too)
                 -- V9.30: per-side hard-reset on big switch >10° too.
                 if exp_perside_desync and exp_perside_desync:get() then
@@ -2583,7 +2640,6 @@ events.aim_ack:set(function(event)
                             s.measured_right = s.measured_right * (1 - a_r) + actual * a_r
                         end
                         s.samples_right = math.min(s.samples_right + 1, 99)
-                        s.real_right = math.min((s.real_right or 0) + 1, 99)  -- V9.1
                     elseif hit_side < 0 then
                         local prev = s.measured_left or 0
                         local diff_l = math.abs(actual - prev)
@@ -2600,7 +2656,6 @@ events.aim_ack:set(function(event)
                             s.measured_left = s.measured_left * (1 - a_l) + actual * a_l
                         end
                         s.samples_left = math.min(s.samples_left + 1, 99)
-                        s.real_left = math.min((s.real_left or 0) + 1, 99)  -- V9.1
                     end
                 end
             end
@@ -2642,6 +2697,7 @@ events.aim_ack:set(function(event)
         s.guess_cached_side = nil
         s.lby_snap_attempts = 0  -- V9.16: reset LBY-Snap-Guess magnitude cycle on hit
         s.guess_cached_miss = nil
+        s.serverfail_streak = 0  -- V9.31: hit clears the server-side-fail tally
         -- V7.8: hit confirms current side — decay correction counters on opposite side
         if hit_side > 0 then
             s.correction_left = math.max(0, (s.correction_left or 0) - 1)
@@ -3314,9 +3370,10 @@ local function pick_bruteforce_angle(s, anim, eye_yaw, max_desync, p, preset)
 
     local result
     if kind == "opposite" then
-        local side = kind_side
-        s.last_hit_side = side
-        result = eye_yaw + desync * side
+        -- V9.31: do NOT write s.last_hit_side here — BF runs while GUESSING
+        -- (s.missed>0); no hit confirmed this side. Mutating the confirmed-hit
+        -- side memory corrupts every other path's side pick → L/R oscillation.
+        result = eye_yaw + desync * kind_side
     elseif kind == "desync"   then result = eye_yaw + desync
     elseif kind == "-desync"  then result = eye_yaw - desync
     elseif kind == "+58"      then result = eye_yaw + 58
@@ -3486,6 +3543,10 @@ local function resolve_player(p)
         end
         s.tmp_dist = math.sqrt(dist_sq)
         s.tmp_close = s.tmp_dist < close_range_dist:get()
+        -- V9.31: clear a stale hostile-fire mark for out-of-range enemies (the
+        -- weapon_fire handler no longer range-gates — it cannot read enemy origin
+        -- safely). Done here, where the distance is already computed safely.
+        if s.tmp_dist >= 3500 and (s.last_hostile_fire or 0) > 0 then s.last_hostile_fire = 0 end
 
         local to_yaw = math.deg(math.atan2(dy, dx))
         local fov = math.abs(NormalizeAngle(to_yaw - tick_cache.lp_yaw))
@@ -3734,38 +3795,18 @@ local lby_snap_handler = function(event)
     local s = get_state(shooter)
     s.lby_snap  = true
     s.last_shot = globals.curtime
-    -- V9.8: HOSTILE-FIRE DETECTION — mark when enemy fires within engagement range,
-    -- and (best-effort) check if their eye-yaw points toward us. Used by ragebot_target
-    -- counter-fire override to bypass cancel-low-conf during their fire-window.
-    if lp_e and lp_e:is_alive() then
-        local sx, sy_pos, sz, lx, ly, lz = 0, 0, 0, 0, 0, 0
-        local ok_pos = pcall(function()
-            sx, sy_pos, sz = shooter.m_vecOrigin.x, shooter.m_vecOrigin.y, shooter.m_vecOrigin.z
-            lx, ly, lz     = lp_e.m_vecOrigin.x,    lp_e.m_vecOrigin.y,    lp_e.m_vecOrigin.z
-        end)
-        if ok_pos then
-            local dx, dy, dz = lx - sx, ly - sy_pos, lz - sz
-            local dist = math.sqrt(dx*dx + dy*dy + dz*dz)
-            if dist < 3500 then
-                s.last_hostile_fire  = globals.tickcount or 0
-                s.hostile_fire_count = (s.hostile_fire_count or 0) + 1
-                local aimed_at_us = false
-                pcall(function()
-                    local ang = shooter.m_angEyeAngles
-                    local their = ang and (ang.y or ang[2])
-                    if their then
-                        local desired = math.deg(math.atan2(dy, dx))
-                        local diff = NormalizeAngle(their - desired)
-                        if math.abs(diff) < 35 then aimed_at_us = true end
-                    end
-                end)
-                s.last_hostile_aimed = aimed_at_us
-                cs_log_verbose("hostile-fire idx=%d dist=%.0f aimed=%s tick=%d",
-                               shooter:get_index(), dist, tostring(aimed_at_us),
-                               s.last_hostile_fire)
-            end
-        end
-    end
+    -- V9.8: HOSTILE-FIRE DETECTION — mark when an enemy fires, for the
+    -- ragebot_target counter-fire override (bypasses cancel-low-conf in their
+    -- fire-window). V9.31 HARD-CONSTRAINT-5 FIX: NEVER read enemy entity props
+    -- (m_vecOrigin / m_angEyeAngles) in a weapon_fire handler — transition-state
+    -- players (just-respawned / dying / weapon-switching) return invalid memory
+    -- that C++-panics PAST pcall and crashes CSGO. Stash ONLY the event-derived
+    -- tick. resolve_player clears the mark for out-of-range enemies (where the
+    -- distance is read safely), and the counter-fire consumer already re-gates by
+    -- ticks_since<=64 + conf>=10, so dropping the range/aim check here is safe.
+    s.last_hostile_fire  = globals.tickcount or 0
+    s.hostile_fire_count = (s.hostile_fire_count or 0) + 1
+    s.last_hostile_aimed = false
 end
 
 local lby_event_set = false
@@ -3896,11 +3937,14 @@ end
 local function resolve_stddev(s)
     local n = #s.recent_resolved
     if n < 3 then return 0 end
-    local sum, sq_sum = 0, 0
-    for _, r in ipairs(s.recent_resolved) do sum = sum + r.a end
-    local mean = sum / n
+    -- V9.31: circular spread vs reference (wrap-safe; see confidence()). Drives
+    -- cancel-conf — a fake-huge stddev here makes the ragebot REFUSE to fire.
+    local ref = s.recent_resolved[1].a
+    local sumd, sq_sum = 0, 0
+    for _, r in ipairs(s.recent_resolved) do sumd = sumd + NormalizeAngle(r.a - ref) end
+    local mean_off = sumd / n
     for _, r in ipairs(s.recent_resolved) do
-        local d = NormalizeAngle(r.a - mean)
+        local d = NormalizeAngle(r.a - ref) - mean_off
         sq_sum = sq_sum + d * d
     end
     return math.sqrt(sq_sum / n)
@@ -4066,6 +4110,25 @@ pcall(function()
                                    tostring(s.last_hostile_aimed), ticks_since)
                 end
             end
+        end
+
+        -- V9.31: LOCKED-TARGET HEAD PREFERENCE — the body-only-hits fix.
+        -- On a normal mid-range fight NO existing stage turns off NL's "Prefer"
+        -- safe-points, so NL picks the safe BODY point because head isn't 100%
+        -- guaranteed. But on a LOCKED target (8+ samples, 60+ conf, not currently
+        -- whiffing) the yaw resolve IS proven → head IS safe. Relax safe-point +
+        -- enable multipoint so the ragebot takes the head it was avoiding. Never
+        -- touches mindmg/hitbox (respects never-override-NL-config); fires ONLY on
+        -- locked targets so the baseline is identical for everyone else. Skip when
+        -- counter-fire already forced head, or on snipers honouring manual SSG.
+        if not counter_fire_active and exp_lock_headpref and exp_lock_headpref:get()
+           and intel and intel.samples >= 8 and intel.conf >= 60
+           and (not s or (s.missed or 0) == 0)
+           and not (wc == "sniper" and exp_respect_man and exp_respect_man:get()) then
+            pcall(function() ctx:override_safe_point(false) end)
+            pcall(function() ctx:override_multipoint(true) end)
+            cs_log_verbose("lock-headpref idx=%d conf=%d samples=%d → safepoint off (take head)",
+                           target:get_index(), intel.conf, intel.samples)
         end
 
         -- V3+V5+V6: CANCEL LOW-CONFIDENCE — intel-aware (known mode-match = trust)
@@ -4252,7 +4315,7 @@ pcall(function()
         end
 
         -- V8.5 + V9.4: JUMP-SHOT improvement — extended range + smart hitbox
-        if lp_airborne and not close_priority and target_dist < 4000 then
+        if lp_airborne and not close_priority and target_dist < 4000 and not should_force_baim(target) then  -- V9.31: don't let jump-shot clobber force-baim's body hitbox
             local respect_sniper = (wc == "sniper") and exp_respect_man and exp_respect_man:get()
             if respect_sniper then
                 -- V9.18: SSG-Pro respect mode — preserve NL hc + multi-hitbox entirely
@@ -4405,6 +4468,10 @@ local esp_paint_handler = function()
     if not (esp_show_hud and esp_show_hud:get()) then return end
     pcall(function()
         local screen = render.screen_size()
+        local now = globals.curtime or 0  -- V9.31: `now` was an undefined global (nil)
+                                          -- here → HUD silently died at the last-combat
+                                          -- line (nil arithmetic, swallowed by pcall).
+                                          -- Same clock as current_target.time.
         local panel_w, panel_h = 320, 150
         local pos = esp_hud_pos and tostring(esp_hud_pos:get()) or "Bottom-Left"
         local x0, y0
@@ -4727,5 +4794,6 @@ _cs_log_color_raw("V9.27: Coach-chat lines now address @enemy by name + up to 4 
 _cs_log_color_raw("V9.28: Coach-chat each line explains WHY enemy AA is exploitable + HOW to fix (was only stating facts). 4 lines: problem/fix/dom/mag.")
 _cs_log_color_raw("V9.29: Coach-chat 3 wording variants per category (name-hash deterministic) + data-driven WHY (real streak/dom counts) + BIMODAL detection.")
 _cs_log_color_raw("V9.30: AA-switch hard-reset — when |actual - EMA| > 10° on samples>=3, replace EMA with actual + decay samples to 40% (catches preset changes in 1 hit).")
+_cs_log_color_raw("V9.31: correction-flip server-side-fail GUARD (only flip side when angle was actually wrong >5° — stops L/R oscillation & BF:opposite garbage) + LOCKED-target head-pref (relax NL safepoint on 8+sample/60+conf targets → head not body).")
 _cs_log_color_raw("Logging: " .. (log_enabled:get() and ("ON" .. (log_verbose:get() and " (verbose)" or ""))  or "OFF"))
 _cs_log_color_raw("=========================================")
