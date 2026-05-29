@@ -1,20 +1,22 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 9.23                                   ║
+-- ║  Version: 9.24                                   ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 9.23
--- @description Advisor panel moved INSIDE NL menu (was on-screen overlay).
---   * Pre-create label slots in g_advisor. advisor_panel_update() rewrites their
---     text via the `:name()` method (confirmed pattern from bloodwings /
---     frostlive / grenade_helper). Refresh / Next / Show buttons drive updates.
---   * On-screen render_advisor_panel + advisor_panel_show toggle removed.
---   * Event ticker (top-right) stays — was the intended screen visual.
---   * v9.22 Predicted-Alt mag fix carries.
+-- @version 9.24
+-- @description Two log-driven fixes:
+--   * effective_desync samples gate 2 → 1. One measured sample beats blind 58°.
+--     Observed: BF:opposite shot 57° at enemy with measured 24.2° because the
+--     2-sample threshold fell through to max_desync. Now 24.2° applies after
+--     the first hit confirms it. Same applies to Networked-Meas path.
+--   * LBY-Snap-Guess miss flip-on-mismatch-only. Earlier code flipped on every
+--     miss; logs showed misses where our delta MATCHED measDesync exactly
+--     (server-side backtrack fail, not our side error). Flipping then oscillated.
+--     Now we flip only when |our_delta - measured| > 5°.
 
-local SEL01_VERSION = "9.23"
+local SEL01_VERSION = "9.24"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -2205,13 +2207,25 @@ events.aim_ack:set(function(event)
             cs_log_verbose("DEF-AA detected idx=%d delta=%.1f samples=%d",
                            Ent:get_index(), s.def_delta or 0, s.def_samples or 0)
         end
-        -- V9.6: LBY-Snap-Guess miss = our guessed side wrong → flip immediately
+        -- V9.6+V9.24: LBY-Snap-Guess miss flip ONLY when angle was actually wrong.
+        -- Earlier code flipped on every miss, but logs showed misses where our
+        -- delta exactly matched measured_desync (server-side backtrack failure /
+        -- network noise — not our side error). Flipping then = next attempt picks
+        -- WRONG side, oscillation. Only flip when |delta - measured| > 5°.
         if (reason == "correction" or reason == "prediction error") and
            tostring(s.mode):find("LBY%-Snap%-Guess") then
-            s.last_hit_side = -s.last_hit_side
-            if s.last_hit_side == 0 then s.last_hit_side = -1 end
-            s.fs_cached_time = nil
-            cs_log_verbose("LBY-Snap miss → FLIP last_hit_side=%d", s.last_hit_side)
+            local our_delta  = NormalizeAngle((s.last_resolved or 0) - (s.last_eye_yaw or 0))
+            local angle_err  = math.abs(math.abs(our_delta) - (s.measured_desync or 0))
+            if angle_err > 5 then
+                s.last_hit_side = -s.last_hit_side
+                if s.last_hit_side == 0 then s.last_hit_side = -1 end
+                s.fs_cached_time = nil
+                cs_log_verbose("LBY-Snap miss FLIP idx=%d our_delta=%.1f measDsync=%.1f err=%.1f → side=%d",
+                               Ent:get_index(), our_delta, s.measured_desync or 0, angle_err, s.last_hit_side)
+            else
+                cs_log_verbose("LBY-Snap miss KEEP idx=%d our_delta=%.1f measDsync=%.1f err=%.1f (server-side fail, no flip)",
+                               Ent:get_index(), our_delta, s.measured_desync or 0, angle_err)
+            end
         end
         -- V7.8 + V8.2: correction-miss → wrong side picked. Track + flip immediately.
         if reason == "correction" and s.last_shot_side ~= 0 then
@@ -2563,14 +2577,19 @@ end
 -- effective desync: measured EMA falls vorhanden, sonst theoretical
 local function effective_desync(s, max_desync, side)
     -- side: +1 (right), -1 (left), 0/nil (any)
+    -- V9.24: threshold lowered 2 → 1. One real measured sample beats blindly
+    -- shooting at max_desync (58°). Observed bug: BF:opposite shot 57° at
+    -- an enemy with measured 24.2° because samples_right was 0 + desync_samples
+    -- was 1 — fell through to max_desync. With this change, the 24.2° measured
+    -- value is used as soon as a single hit confirms it.
     if side and exp_perside_desync and exp_perside_desync:get() then
-        if side > 0 and s.samples_right >= 2 and s.measured_right > 0 then
+        if side > 0 and (s.samples_right or 0) >= 1 and (s.measured_right or 0) > 5 then
             return s.measured_right
-        elseif side < 0 and s.samples_left >= 2 and s.measured_left > 0 then
+        elseif side < 0 and (s.samples_left or 0) >= 1 and (s.measured_left or 0) > 5 then
             return s.measured_left
         end
     end
-    if s.desync_samples >= 2 and s.measured_desync > 0 then
+    if (s.desync_samples or 0) >= 1 and (s.measured_desync or 0) > 5 then
         return s.measured_desync
     end
     return max_desync
@@ -2953,8 +2972,8 @@ local function _pick_first_shot_impl(p, s, anim, eye_yaw, max_desync, preset)
         s.mode = "Networked"
         return sy
     end
-    -- server-yaw too weak: use measured if available, else streak/default ±29°
-    if s.desync_samples >= 2 and s.measured_desync > 5 then
+    -- server-yaw too weak: use measured if available (V9.24: 2→1), else streak/default
+    if (s.desync_samples or 0) >= 1 and (s.measured_desync or 0) > 5 then
         local side = s.last_hit_side ~= 0 and s.last_hit_side or 1
         s.mode = "Networked-Meas"
         return eye_yaw + s.measured_desync * side
@@ -4446,5 +4465,6 @@ _cs_log_color_raw("V9.20: AA Advisor tab → per-enemy config recommendations (R
 _cs_log_color_raw("V9.21: Event ticker top-right (HIT/MISS/KILL always visible) + Advisor on-screen panel toggle (📺) + console HIT/MISS always-on.")
 _cs_log_color_raw("V9.22: Predicted-Alt/Streak mag-fix — uses per-side measured (was preset 58° × 0.85). Dom-R 36° enemy: 49° → 36° (no over-shoot).")
 _cs_log_color_raw("V9.23: Advisor panel moved INSIDE NL menu (label :name() updates) — no on-screen overlay. Event ticker stays top-right.")
+_cs_log_color_raw("V9.24: effective_desync 2→1 sample gate (one hit beats blind 58°) + LBY-Snap miss flips only on |delta-measured|>5° (no flip-flop on backtrack fails).")
 _cs_log_color_raw("Logging: " .. (log_enabled:get() and ("ON" .. (log_verbose:get() and " (verbose)" or ""))  or "OFF"))
 _cs_log_color_raw("=========================================")
