@@ -1,15 +1,18 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Config — Neverlose CSGO HvH config        ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 3.5                                    ║
+-- ║  Version: 3.6                                    ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Config
 -- @author seltonmt01
--- @version 3.5
--- @description Peek Boost min_dmg override REMOVED entirely (slider + override deleted).
---              NL min_dmg is the source of truth, lua never touches it.
+-- @version 3.6
+-- @description Anti-resolver bundle:
+--   * Defensive AA on hit-taken (player_hurt → 2s max desync + random side + fake-duck)
+--   * Slow-walk AA boost (NL Slow Walk held → max desync + 2× anti-BF variance)
+--   * Fake-lag variance (NL Fake Lag Limit ±2 ticks every 1–3s)
+-- + DEF / SW-BOOST / FL-VAR indicators in bottom HvH strip.
 
-local SEL01_CFG_VERSION = "3.5"
+local SEL01_CFG_VERSION = "3.6"
 
 -- DEBUG: print to CSGO console at major load checkpoints. Plain print() bypasses
 -- NL chat (which may not flush before crash) and writes directly to CSGO console.
@@ -105,6 +108,18 @@ local aa_pitch_jitter   = g_aa:switch("Pitch jitter (head Y bob Down/Up)", false
 -- V3.0 anti-HS: auto-fakeduck while moving (ducked head = different Y)
 local aa_move_fakeduck  = g_aa:switch("Auto fake-duck while moving (ground only)", false)
 local aa_move_fd_thresh = g_aa:slider("Move-FD velocity threshold (u/s)", 50, 250, 100)
+g_aa:label(" ")
+g_aa:label(accent .. ui.get_icon"shield" .. accent .. "  Anti-resolver (v3.6)")
+-- V3.6: defensive AA when WE take damage. player_hurt → max desync + random side
+-- flip + force fake-duck for N seconds. Breaks resolvers that just learned us.
+local aa_def_on_dmg   = g_aa:switch("Defensive AA on hit-taken", true)
+local aa_def_duration = g_aa:slider("  └ Defensive duration (ms)", 500, 4000, 2000)
+-- V3.6: slow-walk = easy target. NL Slow Walk hotkey held → max desync 58 +
+-- random side + 2× anti-BF variance so resolver can't pattern-lock us.
+local aa_slow_boost   = g_aa:switch("Slow-walk AA boost (max desync + chaos)", true)
+-- V3.6: periodic NL Fake Lag Limit variance (±2 ticks every 1–3s) to break
+-- choke prediction. Off by default — may conflict with NL Double Tap.
+local aa_fl_var       = g_aa:switch("Fake-lag variance (±2 ticks every 1–3s)", false)
 
 -- ══════════════════════════════════════════════════════════════════════════
 -- MOVEMENT UI
@@ -438,9 +453,14 @@ local aa_jitter_counter     = 0
 local aa_jitter_dir         = 1
 -- V1.6 HvH state — runtime flags shared with indicators + AA decisions
 local aa_state = {
-    on_shot_until = 0,
-    fakeduck_until = 0,
-    last_fire_time = 0,
+    on_shot_until    = 0,
+    fakeduck_until   = 0,
+    last_fire_time   = 0,
+    -- V3.6
+    defensive_until  = 0,       -- realtime cutoff for defensive AA mode
+    fl_next_change   = 0,       -- next realtime at which to re-randomize fake-lag
+    fl_active        = false,   -- dirty-track for clearing override
+    fl_base          = nil,     -- captured user fake-lag value before first override
 }
 
 -- V2.3: air-AA improvements for jumping aggressive play. New air-extras (rapid
@@ -449,6 +469,7 @@ local aa_state = {
 local aa_periodic_last_tick = 0
 local _was_airborne   = false
 local _move_fd_active = false  -- V3.3 dirty-track for fake-duck override
+local _def_inv_active = false  -- V3.6 dirty-track for bodyyaw_inv override (defensive/slow random side)
 
 local function aa_periodic_sync()
     if not (enable_master:get() and aa_enable:get()) then return end
@@ -502,19 +523,33 @@ local function aa_periodic_sync()
         if _vel_cache > (aa_move_thresh:get() or 100) then move_set_active = true end
     end
 
-    if not (air_set_active or on_shot_active or anti_bf_active or move_set_active) then return end
+    -- V3.6: defensive window after we took damage — max desync + random side + fake-duck
+    local defensive_active = aa_def_on_dmg:get() and now < (aa_state.defensive_until or 0)
+    -- V3.6: slow-walk boost — when NL Slow Walk hotkey held, force max desync + chaos
+    local slow_active = false
+    if aa_slow_boost:get() and nl_refs.aa_slowwalk then
+        local ok, v = pcall(function() return nl_refs.aa_slowwalk:get() end)
+        if ok and v then slow_active = true end
+    end
 
-    -- V3.2: desync magnitude priority: air > move > on-shot reduction > base
+    if not (air_set_active or on_shot_active or anti_bf_active or move_set_active
+            or defensive_active or slow_active) then return end
+
+    -- V3.2: desync magnitude priority: defensive > air > slow > move > on-shot reduction > base
     local lim = aa_desync:get()
     if move_set_active then lim = aa_move_mag:get() end
     if air_set_active  then lim = aa_air_mag:get() end
     if on_shot_active  then lim = math.max(15, math.floor(lim * 0.5)) end
+    -- V3.6: slow + defensive both push to max
+    if slow_active      then lim = 58 end
+    if defensive_active then lim = 58 end
 
     local l_lim, r_lim = lim, lim
-    if anti_bf_active then
+    if anti_bf_active or slow_active or defensive_active then
         local var = aa_anti_bf_var:get()
-        -- 1.5x variance airborne for more chaos
-        if air_set_active then var = math.min(58, var * 1.5) end
+        -- 1.5x variance airborne for more chaos; 2x for slow / defensive
+        if air_set_active                       then var = math.min(58, var * 1.5) end
+        if slow_active or defensive_active      then var = math.min(58, var * 2.0) end
         l_lim = lim + (math.random() * 2 - 1) * var
         r_lim = lim + (math.random() * 2 - 1) * var
     end
@@ -522,6 +557,17 @@ local function aa_periodic_sync()
     if r_lim < 0 then r_lim = 0 elseif r_lim > 58 then r_lim = 58 end
     nl_override(nl_refs.aa_bodyyaw_l, math.floor(l_lim))
     nl_override(nl_refs.aa_bodyyaw_r, math.floor(r_lim))
+
+    -- V3.6: defensive/slow → random body-yaw inverter every periodic tick. Dirty-tracked
+    -- so falling edge clears the override and ground AA returns to user's preset.
+    local def_or_slow = defensive_active or slow_active
+    if def_or_slow then
+        nl_override(nl_refs.aa_bodyyaw_inv, (math.random() < 0.5))
+        _def_inv_active = true
+    elseif _def_inv_active then
+        pcall(function() if nl_refs.aa_bodyyaw_inv then nl_refs.aa_bodyyaw_inv:override() end end)
+        _def_inv_active = false
+    end
 
     -- V2.3 AIR EXTRAS — only when airborne
     if air_set_active then
@@ -565,8 +611,10 @@ local function aa_periodic_sync()
         end
         if vel > (aa_move_fd_thresh:get() or 100) then want_move_fd = true end
     end
-    -- Combine with air-fakeduck so we don't fight it
-    local want_fd = want_move_fd or (air_set_active and aa_air_fakeduck:get())
+    -- Combine with air-fakeduck + V3.6 defensive so we don't fight them
+    local want_fd = want_move_fd
+        or (air_set_active and aa_air_fakeduck:get())
+        or defensive_active
     if want_fd and not _move_fd_active then
         nl_override(nl_refs.aa_fakeduck, true)
         _move_fd_active = true
@@ -620,6 +668,35 @@ local function createmove_handler(cmd)
     end)
 end
 
+-- V3.6: fake-lag variance. Re-randomize NL Fake Lag Limit every 1–3s within
+-- ±2 ticks of user's set value. Read user's current value once on activation
+-- (via :get()), then alternate around it. Dirty-tracked so toggle-off clears.
+local function fake_lag_variance_tick()
+    if not (enable_master:get() and aa_fl_var and aa_fl_var:get()) then
+        if aa_state.fl_active then
+            pcall(function() if nl_refs.fl_limit then nl_refs.fl_limit:override() end end)
+            aa_state.fl_active = false
+            aa_state.fl_base   = nil       -- forget so next on-cycle re-captures
+        end
+        return
+    end
+    if not nl_refs.fl_limit then return end
+    local now = globals.realtime or 0
+    if now < (aa_state.fl_next_change or 0) then return end
+    aa_state.fl_next_change = now + 1.0 + math.random() * 2.0   -- 1–3s
+    -- Capture user's base value ONCE before we start overriding. Reading
+    -- :get() while we have an active :override would drift.
+    if not aa_state.fl_base then
+        local v0 = 5
+        pcall(function() v0 = nl_refs.fl_limit:get() or 5 end)
+        aa_state.fl_base = v0
+    end
+    local delta = math.random(-2, 2)
+    local v = math.max(1, math.min(16, (aa_state.fl_base or 5) + delta))
+    nl_override(nl_refs.fl_limit, v)
+    aa_state.fl_active = true
+end
+
 -- Single createmove handler that runs movement + NL-visual override sync.
 -- V1.5: also drains pending_preset so preset writes happen OUTSIDE menu callback.
 -- V2.0: dirty-track restored (only write NL :override on toggle change)
@@ -634,6 +711,8 @@ local function createmove_unified(cmd)
     createmove_handler(cmd)
     -- V2.0: AA periodic sync restored (still throttled + alive-checked + lazy).
     aa_periodic_sync()
+    -- V3.6: fake-lag variance loop (cheap, internally throttled)
+    fake_lag_variance_tick()
     -- V2.2: visual NL :overrides REMOVED. Scope Overlay is a combo element
     -- (confirmed via JAG0YAW :set("Remove All")). Hit Marker Sound + Force
     -- Thirdperson are also likely combos. :override(bool) on a combo userdata
@@ -868,6 +947,10 @@ pcall(function()
                     snapshot = _snapshot_aa_state(),
                 })
                 while #hits_taken_log > HITS_TAKEN_MAX do table.remove(hits_taken_log, 1) end
+                -- V3.6: trigger defensive AA window
+                if aa_def_on_dmg and aa_def_on_dmg:get() then
+                    aa_state.defensive_until = (globals.realtime or 0) + (aa_def_duration:get() / 1000.0)
+                end
                 return  -- don't run damage-given accumulator for received hits
             end
 
@@ -1129,6 +1212,23 @@ pcall(function()
             -- Anti-BF variance
             if aa_on and aa_anti_bf:get() then
                 table.insert(indicators, {txt = "ANTI-BF", col = color(200, 180, 255, 220)})
+            end
+            -- V3.6: DEF (defensive AA on hit-taken — pulse while active window)
+            if aa_on and aa_def_on_dmg:get() and now < (aa_state.defensive_until or 0) then
+                local a = pulse_alpha(7)
+                table.insert(indicators, {txt = "DEF", col = color(255, 100, 100, a)})
+            end
+            -- V3.6: SW-BOOST (slow-walk boost active — yellow glow)
+            if aa_on and aa_slow_boost:get() and nl_refs.aa_slowwalk then
+                local sw = false
+                pcall(function() sw = nl_refs.aa_slowwalk:get() == true end)
+                if sw then
+                    table.insert(indicators, {txt = "SW-BOOST", col = color(255, 220, 80, 255)})
+                end
+            end
+            -- V3.6: FL-VAR (fake-lag variance active)
+            if aa_on and aa_fl_var:get() and aa_state.fl_active then
+                table.insert(indicators, {txt = "FL-VAR", col = color(180, 180, 220, 220)})
             end
             -- FREE (Freestanding)
             if aa_on and aa_freestanding:get() then
@@ -1491,7 +1591,7 @@ end)
 -- LOAD BANNER
 -- ══════════════════════════════════════════════════════════════════════════
 cs_log_color("══════════════════════════════════════════")
-cs_log_color("Sel01-Config v" .. SEL01_CFG_VERSION .. " loaded (CSGO HvH — Peek MinDmg override REMOVED; NL min_dmg untouched)")
+cs_log_color("Sel01-Config v" .. SEL01_CFG_VERSION .. " loaded (CSGO HvH — anti-resolver bundle: DEF on-dmg / SW-boost / FL-variance)")
 cs_log(string.format("  hooks  createmove=%s  aim_fire=%s",
     tostring(_hooks_status.createmove or "MISSING"),
     tostring(_hooks_status.aim_fire or "MISSING")))
