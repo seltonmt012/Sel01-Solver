@@ -1,18 +1,19 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Config — Neverlose CSGO HvH config        ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 3.6                                    ║
+-- ║  Version: 3.7                                    ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Config
 -- @author seltonmt01
--- @version 3.6
--- @description Anti-resolver bundle:
---   * Defensive AA on hit-taken (player_hurt → 2s max desync + random side + fake-duck)
---   * Slow-walk AA boost (NL Slow Walk held → max desync + 2× anti-BF variance)
---   * Fake-lag variance (NL Fake Lag Limit ±2 ticks every 1–3s)
--- + DEF / SW-BOOST / FL-VAR indicators in bottom HvH strip.
+-- @version 3.7
+-- @description Anti-resolver bundle extended + fixes:
+--   * V3.6 fix: defensive AA now BULLET-ONLY (hitgroup 1-7); nade/world dmg skipped
+--   * V3.7 fix: defensive no longer force-fake-ducks (was crouching mid-movement)
+--   * Yaw base rotation (Forward/Backward/Left/Right cycle every 4-8s random)
+--   * Side-streak limit (auto inverter flip after N consecutive same-side shots)
+-- + YAW-ROT indicator in bottom HvH strip.
 
-local SEL01_CFG_VERSION = "3.6"
+local SEL01_CFG_VERSION = "3.7"
 
 -- DEBUG: print to CSGO console at major load checkpoints. Plain print() bypasses
 -- NL chat (which may not flush before crash) and writes directly to CSGO console.
@@ -109,10 +110,11 @@ local aa_pitch_jitter   = g_aa:switch("Pitch jitter (head Y bob Down/Up)", false
 local aa_move_fakeduck  = g_aa:switch("Auto fake-duck while moving (ground only)", false)
 local aa_move_fd_thresh = g_aa:slider("Move-FD velocity threshold (u/s)", 50, 250, 100)
 g_aa:label(" ")
-g_aa:label(accent .. ui.get_icon"shield" .. accent .. "  Anti-resolver (v3.6)")
--- V3.6: defensive AA when WE take damage. player_hurt → max desync + random side
--- flip + force fake-duck for N seconds. Breaks resolvers that just learned us.
-local aa_def_on_dmg   = g_aa:switch("Defensive AA on hit-taken", true)
+g_aa:label(accent .. ui.get_icon"shield" .. accent .. "  Anti-resolver (v3.6 / 3.7)")
+-- V3.6: defensive AA when WE take damage. player_hurt (bullet hits only,
+-- nade/world skipped) → max desync + random side flip for N seconds. V3.7:
+-- force-fake-duck removed (was crouching mid-movement). Mobility kept.
+local aa_def_on_dmg   = g_aa:switch("Defensive AA on hit-taken (bullet only)", true)
 local aa_def_duration = g_aa:slider("  └ Defensive duration (ms)", 500, 4000, 2000)
 -- V3.6: slow-walk = easy target. NL Slow Walk hotkey held → max desync 58 +
 -- random side + 2× anti-BF variance so resolver can't pattern-lock us.
@@ -120,6 +122,13 @@ local aa_slow_boost   = g_aa:switch("Slow-walk AA boost (max desync + chaos)", t
 -- V3.6: periodic NL Fake Lag Limit variance (±2 ticks every 1–3s) to break
 -- choke prediction. Off by default — may conflict with NL Double Tap.
 local aa_fl_var       = g_aa:switch("Fake-lag variance (±2 ticks every 1–3s)", false)
+-- V3.7: periodically rotate NL Yaw Base (Forward/Backward/Left/Right) every
+-- 4-8s random. Breaks resolvers that learned our eye_yaw → fake_yaw mapping.
+local aa_yaw_rotate   = g_aa:switch("Yaw base rotation (anti eye-yaw track)", false)
+-- V3.7: force NL body-yaw inverter flip after N consecutive same-side shots.
+-- Resolvers like ours track streak{L=9 R=0} → predict L; flipping breaks it.
+local aa_side_streak  = g_aa:switch("Side-streak limit (auto flip after N shots)", true)
+local aa_side_streak_n= g_aa:slider("  └ Flip after consecutive same-side shots", 2, 6, 3)
 
 -- ══════════════════════════════════════════════════════════════════════════
 -- MOVEMENT UI
@@ -461,6 +470,12 @@ local aa_state = {
     fl_next_change   = 0,       -- next realtime at which to re-randomize fake-lag
     fl_active        = false,   -- dirty-track for clearing override
     fl_base          = nil,     -- captured user fake-lag value before first override
+    -- V3.7
+    yaw_next_change  = 0,       -- next realtime to re-roll yaw base
+    yaw_active       = false,   -- dirty-track yaw-base override
+    side_streak_dir  = 0,       -- our last-shot side: +1 right, -1 left, 0 unknown
+    side_streak_n    = 0,       -- count of consecutive same-side shots
+    side_force_inv   = nil,     -- when set, force aa_bodyyaw_inv to this bool next sync
 }
 
 -- V2.3: air-AA improvements for jumping aggressive play. New air-extras (rapid
@@ -564,6 +579,11 @@ local function aa_periodic_sync()
     if def_or_slow then
         nl_override(nl_refs.aa_bodyyaw_inv, (math.random() < 0.5))
         _def_inv_active = true
+    elseif aa_state.side_force_inv ~= nil then
+        -- V3.7: streak-limit forced flip — apply once then clear
+        nl_override(nl_refs.aa_bodyyaw_inv, aa_state.side_force_inv)
+        aa_state.side_force_inv = nil
+        _def_inv_active = true   -- mark so next non-forced tick clears
     elseif _def_inv_active then
         pcall(function() if nl_refs.aa_bodyyaw_inv then nl_refs.aa_bodyyaw_inv:override() end end)
         _def_inv_active = false
@@ -611,10 +631,11 @@ local function aa_periodic_sync()
         end
         if vel > (aa_move_fd_thresh:get() or 100) then want_move_fd = true end
     end
-    -- Combine with air-fakeduck + V3.6 defensive so we don't fight them
+    -- Combine with air-fakeduck. V3.7: defensive no longer force-fake-ducks (was
+    -- crouching during movement, hindering escape). Defensive now = max desync +
+    -- random side flip only; user keeps full mobility.
     local want_fd = want_move_fd
         or (air_set_active and aa_air_fakeduck:get())
-        or defensive_active
     if want_fd and not _move_fd_active then
         nl_override(nl_refs.aa_fakeduck, true)
         _move_fd_active = true
@@ -668,6 +689,29 @@ local function createmove_handler(cmd)
     end)
 end
 
+-- V3.7: yaw base rotation. Periodic NL Yaw Base override cycling
+-- Forward/Backward/Left/Right every 4–8s random. Breaks resolvers that
+-- learned our eye_yaw → fake_yaw mapping. :override on a combo with a
+-- matching option STRING is the safe pattern (combo :override(bool) segfaults).
+local YAW_BASE_OPTS = { "Forward", "Backward", "Left", "Right" }
+local function yaw_rotation_tick()
+    if not (enable_master:get() and aa_enable:get()
+            and aa_yaw_rotate and aa_yaw_rotate:get()) then
+        if aa_state.yaw_active then
+            pcall(function() if nl_refs.aa_yaw_base then nl_refs.aa_yaw_base:override() end end)
+            aa_state.yaw_active = false
+        end
+        return
+    end
+    if not nl_refs.aa_yaw_base then return end
+    local now = globals.realtime or 0
+    if now < (aa_state.yaw_next_change or 0) then return end
+    aa_state.yaw_next_change = now + 4.0 + math.random() * 4.0   -- 4–8s
+    local pick = YAW_BASE_OPTS[math.random(1, #YAW_BASE_OPTS)]
+    nl_override(nl_refs.aa_yaw_base, pick)
+    aa_state.yaw_active = true
+end
+
 -- V3.6: fake-lag variance. Re-randomize NL Fake Lag Limit every 1–3s within
 -- ±2 ticks of user's set value. Read user's current value once on activation
 -- (via :get()), then alternate around it. Dirty-tracked so toggle-off clears.
@@ -713,6 +757,8 @@ local function createmove_unified(cmd)
     aa_periodic_sync()
     -- V3.6: fake-lag variance loop (cheap, internally throttled)
     fake_lag_variance_tick()
+    -- V3.7: yaw-base rotation (cheap, internally throttled)
+    yaw_rotation_tick()
     -- V2.2: visual NL :overrides REMOVED. Scope Overlay is a combo element
     -- (confirmed via JAG0YAW :set("Remove All")). Hit Marker Sound + Force
     -- Thirdperson are also likely combos. :override(bool) on a combo userdata
@@ -884,6 +930,28 @@ pcall(function()
                     while #hit_log > HIT_LOG_MAX do table.remove(hit_log, 1) end
                 end
             end
+            -- V3.7: side-streak tracker. After every shot, read NL body-yaw inverter
+            -- state and count consecutive same-side. When the streak crosses the
+            -- user-set threshold, queue a forced inverter flip for the next periodic
+            -- sync. Breaks resolvers that track streak{L=N R=0} → predict L pattern.
+            if aa_side_streak and aa_side_streak:get() and nl_refs.aa_bodyyaw_inv then
+                local cur
+                pcall(function() cur = nl_refs.aa_bodyyaw_inv:get() end)
+                if cur ~= nil then
+                    local dir = cur and 1 or -1
+                    if dir == aa_state.side_streak_dir then
+                        aa_state.side_streak_n = aa_state.side_streak_n + 1
+                    else
+                        aa_state.side_streak_n = 1
+                        aa_state.side_streak_dir = dir
+                    end
+                    if aa_state.side_streak_n >= (aa_side_streak_n:get() or 3) then
+                        aa_state.side_force_inv  = not cur
+                        aa_state.side_streak_n   = 0
+                        aa_state.side_streak_dir = 0
+                    end
+                end
+            end
         end)
     end)
 end)
@@ -947,8 +1015,10 @@ pcall(function()
                     snapshot = _snapshot_aa_state(),
                 })
                 while #hits_taken_log > HITS_TAKEN_MAX do table.remove(hits_taken_log, 1) end
-                -- V3.6: trigger defensive AA window
-                if aa_def_on_dmg and aa_def_on_dmg:get() then
+                -- V3.6 + V3.7: trigger defensive AA window — ONLY on bullet hits
+                -- (hitgroup 1-7). Skip hitgroup 0 = nade / world / fall damage; user
+                -- reported defensive fake-duck mid-movement during nade hits = annoying.
+                if aa_def_on_dmg and aa_def_on_dmg:get() and hb_in >= 1 and hb_in <= 7 then
                     aa_state.defensive_until = (globals.realtime or 0) + (aa_def_duration:get() / 1000.0)
                 end
                 return  -- don't run damage-given accumulator for received hits
@@ -1229,6 +1299,10 @@ pcall(function()
             -- V3.6: FL-VAR (fake-lag variance active)
             if aa_on and aa_fl_var:get() and aa_state.fl_active then
                 table.insert(indicators, {txt = "FL-VAR", col = color(180, 180, 220, 220)})
+            end
+            -- V3.7: YAW-ROT (yaw-base rotation active)
+            if aa_on and aa_yaw_rotate:get() and aa_state.yaw_active then
+                table.insert(indicators, {txt = "YAW-ROT", col = color(140, 220, 200, 220)})
             end
             -- FREE (Freestanding)
             if aa_on and aa_freestanding:get() then
@@ -1591,7 +1665,7 @@ end)
 -- LOAD BANNER
 -- ══════════════════════════════════════════════════════════════════════════
 cs_log_color("══════════════════════════════════════════")
-cs_log_color("Sel01-Config v" .. SEL01_CFG_VERSION .. " loaded (CSGO HvH — anti-resolver bundle: DEF on-dmg / SW-boost / FL-variance)")
+cs_log_color("Sel01-Config v" .. SEL01_CFG_VERSION .. " loaded (CSGO HvH — defensive bullet-only + no force-FD; +YAW-ROT +SIDE-STREAK)")
 cs_log(string.format("  hooks  createmove=%s  aim_fire=%s",
     tostring(_hooks_status.createmove or "MISSING"),
     tostring(_hooks_status.aim_fire or "MISSING")))
