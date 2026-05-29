@@ -1,12 +1,18 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 9.36                                   ║
+-- ║  Version: 9.37                                   ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 9.36
--- @description Snapshot-match regression fix (v9.33 self-inflicted):
+-- @version 9.37
+-- @description Air first-contact fix (Air was the worst mode @25%):
+--   * Air-Guess magnitude now biased HIGH (max(adaptive_median, 42)) — airborne
+--     enemies can't move-desync so they sit near max desync; the lobby median was
+--     undershooting (guessed ~18-30 on 42-58° air enemies).
+--   * first-contact air SIDE now uses steam-memory dominant side instead of a blind
+--     +1 coin-flip.
+-- @description-prev Snapshot-match regression fix (v9.33 self-inflicted):
 --   * aim_ack snapshot picker now matches event.tick (the acked shot) again, not
 --     globals.tickcount (ack-time). v9.33 broke this: on rapid fire the ack for shot
 --     A grabbed shot B's snapshot → wrong eye/resolved → WRONG hit_side learned →
@@ -58,7 +64,7 @@
 --   * v9.26 drift-bump (alpha 0.55 on 5-10° diff) still handles small shifts.
 --   * v9.29 coach variants carry.
 
-local SEL01_VERSION = "9.36"
+local SEL01_VERSION = "9.37"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -3679,6 +3685,17 @@ local function resolve_player(p)
         local server_yaw = RebuildServerYaw(p) or anim.m_flEyeYaw  -- V9.32: nil=fail → eye_yaw
         -- V8.2: switch-AA alternate (both sides hit) → use opposite of last hit
         local both_air = (s.samples_left or 0) >= 1 and (s.samples_right or 0) >= 1
+        -- V9.37: best side we know even without a confirmed hit (steam dom → +1), and a
+        -- HIGH air magnitude prior. Airborne enemies can't move-desync, so they sit near
+        -- their max/static desync — Air was the WORST mode (25%) because first-contact
+        -- guesses used the lobby median (~30) and undershot the ~42-58° air enemies, and
+        -- the side was a blind +1 coin-flip even when steam-memory knew the dom side.
+        local air_side = s.last_hit_side
+        if air_side == 0 then
+            local _mem = get_steam_mem(p)
+            air_side = (_mem and _mem.dominant_side ~= 0 and _mem.dominant_side) or 1
+        end
+        local air_guess_mag = math.max(adaptive_guess_mag(), 42)
         if s.aa_type == "switch" and both_air and s.last_hit_side ~= 0 then
             -- V9.19: dom-bias for Air-Alt — prefer dom if it leads by 2+
             local side = alt_side_pick(s)
@@ -3708,16 +3725,15 @@ local function resolve_player(p)
         end
         -- V9.6+V9.19: never resolve to exact eye_yaw — offset by adaptive median
         if math.abs(NormalizeAngle(server_yaw - anim.m_flEyeYaw)) < 5 then
-            local fallback_side = (s.last_hit_side ~= 0 and s.last_hit_side) or 1
+            local fallback_side = air_side
             s.mode = "Air-Guess"
             -- V9.33 EXPERIMENTAL pose-param side read (OFF default; A/B test point).
-            -- Uses the animated body-yaw SIGN over the last-hit coin-flip; magnitude
-            -- still from adaptive_guess (pose magnitude unreliable on networked enemies).
             if pose_read_tog and pose_read_tog:get() then
                 local pd = read_pose_desync(p)
                 if pd then fallback_side = (pd >= 0) and 1 or -1; s.mode = "Air-PoseGuess" end
             end
-            server_yaw = anim.m_flEyeYaw + adaptive_guess_mag() * fallback_side
+            -- V9.37: HIGH air magnitude prior (was the lobby median, which undershot air)
+            server_yaw = anim.m_flEyeYaw + air_guess_mag * fallback_side
         end
         s.last_eye_yaw  = anim.m_flEyeYaw
         s.last_resolved = server_yaw
@@ -4936,5 +4952,6 @@ _cs_log_color_raw("V9.33: air-branch recent_resolved push (cancel-conf/conf now 
 _cs_log_color_raw("V9.34: AIR-branch hardening — per-side magnitude in air corr-aware path (was global, wrong for bimodal) + update_jitter now runs in air (yaw_cache/rate warm → correct aa_type on landing + air-spin visible).")
 _cs_log_color_raw("V9.35: fast-fire tightened — only fires fast on stable (stddev<12) + well-sampled resolves, hc floors raised (30/45 not 15/22/30). Stops the 'shoots too early' marginal shots that caught bad backtrack records → correction/prediction-error rejects.")
 _cs_log_color_raw("V9.36: snapshot-match REGRESSION FIX — v9.33 matched ack-time tickcount (grabbed the most-recent snapshot, mis-learned sides on rapid fire). Restored event.tick matching of the actual acked shot; kept the stale-reject guard.")
+_cs_log_color_raw("V9.37: AIR first-contact fix (Air was worst @25%) — air guess magnitude biased high (max(median,42), airborne=near-max desync) + first-contact side uses steam-mem dom instead of blind +1.")
 _cs_log_color_raw("Logging: " .. (log_enabled:get() and ("ON" .. (log_verbose:get() and " (verbose)" or ""))  or "OFF"))
 _cs_log_color_raw("=========================================")
