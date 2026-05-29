@@ -1,14 +1,14 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 9.16                                   ║
+-- ║  Version: 9.17                                   ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 9.16
--- @description LBY-Snap-Guess hardcoded 29° fixed — uses measured_desync when available, cycles 29/45/58 on repeated misses
+-- @version 9.17
+-- @description Stop overriding min_damage to 1 in counter-fire + close-miss when user has respect_man on (preserves NL min_dmg=100 for 1-tap precision)
 
-local SEL01_VERSION = "9.16"
+local SEL01_VERSION = "9.17"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -3414,11 +3414,15 @@ pcall(function()
                 local wc_cf = get_weapon_class()
                 if wc_cf ~= "sniper" and intel and intel.conf >= 10 then
                     counter_fire_active = true
-                    pcall(function() ctx:override_hitchance(15) end)        -- was 25, fires sooner
-                    pcall(function() ctx:override_min_damage(1) end)
-                    pcall(function() ctx:override_hitbox(0) end)            -- V9.11: force head
-                    pcall(function() ctx:override_safe_point(false) end)    -- V9.11: backtrack to head-visible tick
-                    pcall(function() ctx:override_multipoint(true) end)     -- multipoint head scan for missed-hitbox cases
+                    pcall(function() ctx:override_hitchance(15) end)
+                    -- V9.17: only force mindmg=1 when respect_man is OFF. User had NL min_dmg=100
+                    -- for 1-tap precision, counter-fire dropping to 1 turned that into body taps.
+                    if not (exp_respect_man and exp_respect_man:get()) then
+                        pcall(function() ctx:override_min_damage(1) end)
+                    end
+                    pcall(function() ctx:override_hitbox(0) end)
+                    pcall(function() ctx:override_safe_point(false) end)
+                    pcall(function() ctx:override_multipoint(true) end)
                     pcall(function() ctx:override_multipoint_scale(0.85) end)
                     cs_log_verbose("counter-fire+head idx=%d conf=%d aimed=%s (fired %d ticks ago)",
                                    target:get_index(), intel.conf,
@@ -3540,7 +3544,10 @@ pcall(function()
         -- fires the next frame the head is takable.
         if mode_now == "Aggressive" and s and s.missed >= 1 and target_dist < 1000 and not counter_fire_active then
             pcall(function() ctx:override_hitchance(10) end)
-            pcall(function() ctx:override_min_damage(1) end)
+            -- V9.17: respect_man preserves user's min_dmg (1-tap precision)
+            if not (exp_respect_man and exp_respect_man:get()) then
+                pcall(function() ctx:override_min_damage(1) end)
+            end
             pcall(function() ctx:override_hitbox(0) end)
             pcall(function() ctx:override_safe_point(false) end)
             pcall(function() ctx:override_multipoint(true) end)

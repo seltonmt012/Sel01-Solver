@@ -1,15 +1,15 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Config — Neverlose CSGO HvH config        ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 3.3                                    ║
+-- ║  Version: 3.4                                    ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Config
 -- @author seltonmt01
--- @version 3.3
--- @description Fix sticky fake-duck — clear aa_fakeduck override on falling edge of move-FD/air-FD
---              conditions. Aggressive preset move-fakeduck default OFF (was forced ON in v3.2).
+-- @version 3.4
+-- @description Peek Boost default MinDmg 1→50 — peek-boost was overriding user's NL min_dmg=100
+--              down to 1 → ragebot accepted any-hitbox body shots for 3-6 dmg during peeks.
 
-local SEL01_CFG_VERSION = "3.3"
+local SEL01_CFG_VERSION = "3.4"
 
 -- DEBUG: print to CSGO console at major load checkpoints. Plain print() bypasses
 -- NL chat (which may not flush before crash) and writes directly to CSGO console.
@@ -114,7 +114,10 @@ g_move:label(accent .. ui.get_icon"running" .. accent .. "  Movement helpers")
 -- V3.1: label shortened ("Peek Boost") — long label was cut off in NL UI ("Mindm").
 local mv_peek_boost_k = g_move:hotkey("Peek Boost (hold)")
 local mv_peek_hc      = g_move:slider("Peek HC", 10, 80, 30)
-local mv_peek_mindmg  = g_move:slider("Peek MinDmg", 1, 100, 1)
+-- V3.4: default raised 1->50. At 1 the peek window accepted arm/leg taps for 3-6 dmg,
+-- which is the symptom the user reported ("hitte für mies wenig dmg trotz min_dmg=100").
+-- 50 still allows generous shots while filtering out clearly non-lethal hits.
+local mv_peek_mindmg  = g_move:slider("Peek MinDmg", 1, 100, 50)
 g_move:label(" ")
 g_move:label(accent .. "  Bind same key as NL Peek Assist for 2-in-1")
 g_move:label(accent .. "  Slow-walk / Fake-duck: NL Anti Aim/Misc tab")
@@ -1495,7 +1498,7 @@ end)
 -- LOAD BANNER
 -- ══════════════════════════════════════════════════════════════════════════
 cs_log_color("══════════════════════════════════════════")
-cs_log_color("Sel01-Config v" .. SEL01_CFG_VERSION .. " loaded (CSGO HvH — Sticky fake-duck fixed; move-fakeduck default OFF)")
+cs_log_color("Sel01-Config v" .. SEL01_CFG_VERSION .. " loaded (CSGO HvH — Peek MinDmg default 1→50 (was eating your NL min_dmg))")
 cs_log(string.format("  hooks  createmove=%s  aim_fire=%s",
     tostring(_hooks_status.createmove or "MISSING"),
     tostring(_hooks_status.aim_fire or "MISSING")))
