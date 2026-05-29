@@ -1,12 +1,22 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Config — Neverlose CSGO HvH config        ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 3.12                                   ║
+-- ║  Version: 3.13                                   ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Config
 -- @author seltonmt01
--- @version 3.12
--- @description Correlated (anti-median) jitter:
+-- @version 3.13
+-- @description Slow-walk / defensive / air ANTI-EMA two-cluster magnitude:
+--   * These "sitting-duck" states used to sit at a FIXED center (58 for slow/def,
+--     the air slider for air) and rely on symmetric anti-BF noise — which an EMA
+--     resolver averages straight back to that center and beams you (hits-taken log
+--     showed every hit at desync=58, resolved clean).
+--   * Now they alternate TWO magnitude clusters (~base / ~base-22) every 0.4-1.1s
+--     so the resolver's tracked mean lands in the empty GAP and matches neither.
+--     Side is already randomized per-tick for these states (v3.6), so now both
+--     side AND magnitude are unpredictable. Auto — no toggle; user mag-jitter /
+--     bimodal still override it.
+-- @description-prev Correlated (anti-median) jitter:
 --   * New OFF-default toggle replaces the independent symmetric per-side noise
 --     with a CORRELATED pattern: sawtooth ramp (same-sign deltas → EMA chases
 --     but never centers) or anti-phase L/R (sides pushed opposite from one
@@ -36,7 +46,7 @@
 --     variance for full per-side chaos.
 --   * MAG-JIT indicator added to bottom HvH strip; dumped in v3.8 stats.
 
-local SEL01_CFG_VERSION = "3.12"
+local SEL01_CFG_VERSION = "3.13"
 
 -- DEBUG: print to CSGO console at major load checkpoints. Plain print() bypasses
 -- NL chat (which may not flush before crash) and writes directly to CSGO console.
@@ -179,6 +189,9 @@ local aa_corr_jitter    = g_aa:switch("Correlated jitter (anti-median)", false)
 local aa_corr_antiphase = g_aa:switch("  └ Anti-phase L/R (off = sawtooth ramp)", false)
 local aa_corr_amp       = g_aa:slider("  └ Amplitude (deg)", 5, 38, 20)
 local aa_corr_phase     = 0
+-- V3.13: alternation state for the slow-walk / defensive / air ANTI-EMA two-cluster
+-- magnitude (replaces fixed-center-+-symmetric-noise, which EMA resolvers average out).
+local slow_aa_state     = { mode = 1, next = 0 }
 
 -- ══════════════════════════════════════════════════════════════════════════
 -- MOVEMENT UI
@@ -606,9 +619,28 @@ local function aa_periodic_sync()
     if move_set_active then lim = aa_move_mag:get() end
     if air_set_active  then lim = aa_air_mag:get() end
     if on_shot_active  then lim = math.max(15, math.floor(lim * 0.5)) end
-    -- V3.6: slow + defensive both push to max
+    -- V3.6: slow + defensive both push to max (base); V3.13 two-cluster overrides below
     if slow_active      then lim = 58 end
     if defensive_active then lim = 58 end
+
+    -- V3.13: ANTI-EMA two-cluster for the chaos states (slow-walk / defensive / air).
+    -- These used to sit at a FIXED center (58 for slow/def, the slider for air) and
+    -- lean on symmetric anti-BF noise — but an EMA/median resolver averages symmetric
+    -- noise straight back to that center and beams you (hits-taken log: every hit at
+    -- desync=58, resolved clean). Alternate TWO clusters (~base and ~base-22) every
+    -- 0.4-1.1s so the resolver's tracked mean lands in the EMPTY gap and matches
+    -- neither. anti-BF still adds per-side spread on top. Skipped if the user
+    -- explicitly enabled Magnitude jitter / Bimodal (those take precedence below).
+    if (slow_active or defensive_active or air_set_active)
+       and not aa_mag_jitter:get() and not aa_bimodal:get() then
+        if now >= slow_aa_state.next then
+            slow_aa_state.mode = 3 - slow_aa_state.mode
+            slow_aa_state.next = now + 0.4 + math.random() * 0.7
+        end
+        local hi = math.min(58, lim)            -- high cluster = the base magnitude
+        local lo = math.max(18, lim - 22)       -- low cluster ~22° below
+        lim = (slow_aa_state.mode == 1 and lo or hi) + (math.random() * 4 - 2)
+    end
 
     -- V3.9: per-tick magnitude jitter. When enabled, base magnitude is picked
     -- randomly inside [min,max] every periodic-sync tick. EMA-based resolvers
