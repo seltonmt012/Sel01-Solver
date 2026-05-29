@@ -1,12 +1,19 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Config — Neverlose CSGO HvH config        ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 3.13                                   ║
+-- ║  Version: 3.14                                   ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Config
 -- @author seltonmt01
--- @version 3.13
--- @description Slow-walk / defensive / air ANTI-EMA two-cluster magnitude:
+-- @version 3.14
+-- @description Smart freestand (anti-headshot):
+--   * NL freestanding is deterministic — it always picks the same "safe" side, so a
+--     resolver models it and headshots the predictably-exposed side (user report:
+--     "head outside because of freestand"). New OFF→ON toggle auto-DISABLES freestand
+--     during the chaos states (defensive after a hit / slow-walk) so the randomized
+--     body-yaw inverter controls the side → head peeks an unpredictable side under
+--     fire. Freestand still protects normally; restored on the falling edge.
+-- @description-prev Slow-walk / defensive / air ANTI-EMA two-cluster magnitude:
 --   * These "sitting-duck" states used to sit at a FIXED center (58 for slow/def,
 --     the air slider for air) and rely on symmetric anti-BF noise — which an EMA
 --     resolver averages straight back to that center and beams you (hits-taken log
@@ -46,7 +53,7 @@
 --     variance for full per-side chaos.
 --   * MAG-JIT indicator added to bottom HvH strip; dumped in v3.8 stats.
 
-local SEL01_CFG_VERSION = "3.13"
+local SEL01_CFG_VERSION = "3.14"
 
 -- DEBUG: print to CSGO console at major load checkpoints. Plain print() bypasses
 -- NL chat (which may not flush before crash) and writes directly to CSGO console.
@@ -110,6 +117,12 @@ local aa_yaw_mod_int = g_aa:slider("Jitter Interval (ticks)", 1, 16, 2)
 local aa_desync      = g_aa:slider("Desync Range (deg)", 0, 60, 58)
 local aa_desync_side = g_aa:combo("Desync Side", {"Auto (alternate)", "Left", "Right", "Random"}, 1)
 local aa_freestanding= g_aa:switch("Freestanding (auto-best-side)", true)
+-- V3.14: NL freestanding is DETERMINISTIC — it always picks the same "safe" side, so
+-- a resolver models it and headshots the predictably-exposed side (user report). When
+-- this is on, freestand is auto-DISABLED during the chaos states (defensive after a
+-- hit / slow-walk) so the RANDOM body-yaw inverter controls the side → the head peeks
+-- an unpredictable side under fire. Freestand still protects you the rest of the time.
+local aa_smart_free  = g_aa:switch("  └ Smart freestand (random side when beamed)", true)
 local aa_at_targets  = g_aa:switch("Yaw points at targets (At-Target mode)", false)
 g_aa:label(" ")
 g_aa:label(accent .. ui.get_icon"bolt" .. accent .. "  HvH extras")
@@ -192,6 +205,7 @@ local aa_corr_phase     = 0
 -- V3.13: alternation state for the slow-walk / defensive / air ANTI-EMA two-cluster
 -- magnitude (replaces fixed-center-+-symmetric-noise, which EMA resolvers average out).
 local slow_aa_state     = { mode = 1, next = 0 }
+local _smart_free_off   = false  -- V3.14: dirty flag for smart-freestand override
 
 -- ══════════════════════════════════════════════════════════════════════════
 -- MOVEMENT UI
@@ -707,6 +721,18 @@ local function aa_periodic_sync()
     elseif _def_inv_active then
         pcall(function() if nl_refs.aa_bodyyaw_inv then nl_refs.aa_bodyyaw_inv:override() end end)
         _def_inv_active = false
+    end
+
+    -- V3.14: SMART FREESTAND — during the chaos states (defensive / slow) deterministic
+    -- freestanding re-locks a predictable side (the one getting your head shot) and
+    -- fights the random inverter above. Disable it there so the random inverter rules;
+    -- restore the user's freestand setting on the falling edge (override revert).
+    if aa_smart_free:get() and aa_freestanding:get() and def_or_slow then
+        nl_override(nl_refs.aa_freestand, false)
+        _smart_free_off = true
+    elseif _smart_free_off then
+        nl_clear(nl_refs.aa_freestand)
+        _smart_free_off = false
     end
 
     -- V2.3 AIR EXTRAS — only when airborne
