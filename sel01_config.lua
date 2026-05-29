@@ -1,12 +1,18 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Config — Neverlose CSGO HvH config        ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 3.9                                    ║
+-- ║  Version: 3.10                                   ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Config
 -- @author seltonmt01
--- @version 3.9
--- @description Magnitude jitter (per-tick variance, anti-EMA-resolver):
+-- @version 3.10
+-- @description Event-log forward-decl fix (hit_log ring):
+--   * hit_log / HIT_LOG_MAX were declared AFTER the aim_ack + player_death
+--     closures that write them → Lua bound the writers to a nil global, so
+--     table.insert silently threw inside their pcall. The top-left event log
+--     never recorded AND the v3.7 side-streak anti-resolver tracker (same
+--     pcall) never ran. Moved the decls above the closures.
+-- @description-prev Magnitude jitter (per-tick variance, anti-EMA-resolver):
 --   * New toggle randomizes the desync magnitude between [min, max] every
 --     periodic-sync tick instead of using a fixed value.
 --   * Resolvers that track measured_desync via EMA (including Sel01-Solver
@@ -16,7 +22,7 @@
 --     variance for full per-side chaos.
 --   * MAG-JIT indicator added to bottom HvH strip; dumped in v3.8 stats.
 
-local SEL01_CFG_VERSION = "3.9"
+local SEL01_CFG_VERSION = "3.10"
 
 -- DEBUG: print to CSGO console at major load checkpoints. Plain print() bypasses
 -- NL chat (which may not flush before crash) and writes directly to CSGO console.
@@ -796,6 +802,14 @@ _hooks_status.createmove = register_first(createmove_unified, "createmove", "set
 -- V1.7: dropped hit_events (never used) + hitmark_dmg (set but never read)
 local damage_pops = {}   -- floating "−X HP" entries
 local hitmark_time = 0
+-- V3.10 FORWARD-DECL FIX: the hit-log ring MUST be declared before the aim_ack /
+-- player_death closures (created ~914/984) that table.insert into it. Lua binds
+-- upvalues at parse-time, so the previous `local hit_log` lower in the file left
+-- those writers bound to a nil GLOBAL — table.insert(nil,..) threw inside their
+-- pcall and was swallowed, so the top-left event log AND the v3.7 side-streak
+-- anti-resolver tracker (same pcall) silently never ran. (moved up from ~1124)
+local hit_log = {}
+local HIT_LOG_MAX = 8   -- V2.9: bigger since hits + misses + kills all share log
 
 -- Forward-decl: update_clantag is defined further down but referenced inside the
 -- events.render closure created below. NL UI callbacks capture upvalues at parse-
@@ -1120,9 +1134,8 @@ local function update_specs()
     end)
 end
 
--- Hit-log ring (last 5 entries: {time, target_name, dmg, hitbox})
-local hit_log = {}
-local HIT_LOG_MAX = 8   -- V2.9: bigger since hits + misses + kills all share log
+-- Hit-log ring is declared near damage_pops (top of Visuals) so the aim_ack /
+-- player_death writer closures bind to the same upvalue (V3.10 forward-decl fix).
 
 -- Hardcoded durations (no slider clutter)
 local HITMARK_DURATION_S = 0.3
