@@ -1,12 +1,18 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 9.34                                   ║
+-- ║  Version: 9.35                                   ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 9.34
--- @description Air-branch hardening (air resolver focus):
+-- @version 9.35
+-- @description Fast-fire tightened (stop shooting too early):
+--   * fast-fire used to drop hitchance to 30 on conf>=50 — firing a marginal shot
+--     that, on high-desync enemies, caught a bad backtrack record → correction /
+--     prediction-error rejects ("shoots too early, misses a lot"). Now it only fires
+--     fast on a STABLE (stddev<12) + well-sampled resolve (conf85/s3→hc30,
+--     conf70/s2→hc45), hc floors raised toward NL's manual 72 (v9.18-aligned).
+-- @description-prev Air-branch hardening (air resolver focus):
 --   * air corr-aware path now uses PER-SIDE measured magnitude (was global
 --     measured_desync — wrong for bimodal/per-side enemies; v9.22-class fix for air).
 --   * update_jitter now runs in the air-branch (used to return before it) → yaw_cache
@@ -47,7 +53,7 @@
 --   * v9.26 drift-bump (alpha 0.55 on 5-10° diff) still handles small shifts.
 --   * v9.29 coach variants carry.
 
-local SEL01_VERSION = "9.34"
+local SEL01_VERSION = "9.35"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -4325,23 +4331,26 @@ pcall(function()
             -- auto / heavy_pistol / other: no override — trust NL config
         end
 
-        -- V9.6 + V9.11: FAST-FIRE on confident targets. Thresholds lowered:
-        -- conf 70->50, samples 2->1 (one real hit + decent conf is enough). HC tiers:
-        --   conf >= 85 + samples >= 2  -> hc 15 (most aggressive)
-        --   conf >= 70                  -> hc 22
-        --   conf >= 50 + samples >= 1   -> hc 30
-        -- skip when respect-manual on (preserve user's NL hc)
+        -- V9.35: FAST-FIRE TIGHTENED — the old conf>=50/hc=30 tier fired the ragebot
+        -- on a marginal 30%-hitchance shot the moment we had ANY decent conf. On
+        -- high-desync enemies that early fire caught a bad backtrack record →
+        -- correction / prediction-error rejects (user: "shoots too early, misses a
+        -- lot"). Now fast-fire ONLY triggers on a STABLE (low-stddev), well-SAMPLED
+        -- resolve, and the hc floors are raised toward NL's manual value so even a
+        -- fast shot stays high-quality. Lowering hc below NL's 72 is exactly the
+        -- v9.18 regression — keep the downgrade small and only when truly locked.
         local respect_active = (wc == "sniper") and exp_respect_man and exp_respect_man:get()
         if not respect_active and s and s.missed == 0 then
+            local sd = resolve_stddev(s)
+            local stable = sd < 12   -- low angle variance = trustworthy resolve
             local fast_hc
-            if intel.conf >= 85 and intel.samples >= 2 then fast_hc = 15
-            elseif intel.conf >= 70                       then fast_hc = 22
-            elseif intel.conf >= 50 and intel.samples >= 1 then fast_hc = 30
+            if intel.conf >= 85 and intel.samples >= 3 and stable then fast_hc = 30
+            elseif intel.conf >= 70 and intel.samples >= 2 and stable then fast_hc = 45
             end
             if fast_hc then
                 pcall(function() ctx:override_hitchance(fast_hc) end)
-                cs_log_verbose("fast-fire idx=%d conf=%d samples=%d hc=%d",
-                               target:get_index(), intel.conf, intel.samples, fast_hc)
+                cs_log_verbose("fast-fire idx=%d conf=%d samples=%d sd=%.1f hc=%d",
+                               target:get_index(), intel.conf, intel.samples, sd, fast_hc)
             end
         end
 
@@ -4919,5 +4928,6 @@ _cs_log_color_raw("V9.31: correction-flip server-side-fail GUARD (only flip side
 _cs_log_color_raw("V9.32: bimodal-switch detection (suppress global hard-reset thrash on two-mode enemies) + event ticker shows Δ/meas/conf/side + bt on misses + RebuildServerYaw nil-sentinel (no more resolve-to-0° on reconstruct fail).")
 _cs_log_color_raw("V9.33: air-branch recent_resolved push (cancel-conf/conf now air-aware) + snapshot tick-window guard (no stale cross-engagement match) + boot nil-guard + adaptive-guess cap 58 + [EXP off] pose-param side read.")
 _cs_log_color_raw("V9.34: AIR-branch hardening — per-side magnitude in air corr-aware path (was global, wrong for bimodal) + update_jitter now runs in air (yaw_cache/rate warm → correct aa_type on landing + air-spin visible).")
+_cs_log_color_raw("V9.35: fast-fire tightened — only fires fast on stable (stddev<12) + well-sampled resolves, hc floors raised (30/45 not 15/22/30). Stops the 'shoots too early' marginal shots that caught bad backtrack records → correction/prediction-error rejects.")
 _cs_log_color_raw("Logging: " .. (log_enabled:get() and ("ON" .. (log_verbose:get() and " (verbose)" or ""))  or "OFF"))
 _cs_log_color_raw("=========================================")
