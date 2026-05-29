@@ -1,24 +1,22 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 9.25                                   ║
+-- ║  Version: 9.26                                   ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 9.25
--- @description User-friendly polish + console-events fix:
---   * cs_event_* now uses 3-fallback console writers (client.color_log →
---     client.log → print) so HIT/MISS/KILL show in the in-game console even
---     on NL builds where color_log isn't exposed. Each event is also pushed to
---     log_buffer (📋 Copy captures them).
---   * AA Advisor recommendations rewritten for clarity: plain English,
---     concrete slider/toggle names + values, color-coded lines (green=DO,
---     grey=why, orange=warn, cyan=good). Header now says "Their AA: SWITCH |
---     prefers RIGHT side | desync ≈ 36°" instead of cryptic stats.
---   * Stats lines simplified to "Our data: 5 hits | L=2 R=5 | miss-rate 17%".
---   * v9.24 fixes carry (effective_desync 2→1, LBY-Snap flip on mismatch).
+-- @version 9.26
+-- @description Coach-chat button + EMA drift-bump:
+--   * 📨 New AA Advisor button "Send tips to CSGO chat" — utils.console_exec
+--     fires 2-3 short say lines (<127 chars) tailored to the selected enemy
+--     (their AA type + dom-side + magnitude) with concrete improvement advice.
+--   * EMA drift-bump: when latest hit's actual desync differs from the stored
+--     EMA by > 5°, alpha jumps from 0.30 → 0.55 so the model catches drift in
+--     2-3 hits instead of 6-8. Applied to global + per-side EMAs independently.
+--     Observed v9.25 log: enemy with stored 25° suddenly hit at 28° twice → BF
+--     tried 29° instead of an updated 27°-28° = missed by 1°.
 
-local SEL01_VERSION = "9.25"
+local SEL01_VERSION = "9.26"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -645,7 +643,7 @@ advisor_btn_show = g_advisor:button("💡 Refresh recommendations", function()
     pcall(advisor_rebuild)
     pcall(advisor_panel_update)
 end)
-advisor_btn_all = g_advisor:button("📜 Dump recs for ALL to chat", function()
+advisor_btn_all = g_advisor:button("📜 Dump recs for ALL to console", function()
     pcall(advisor_rebuild)
     if #advisor_state.list == 0 then
         cs_log_color("[Advisor] no enemies tracked yet")
@@ -657,6 +655,59 @@ advisor_btn_all = g_advisor:button("📜 Dump recs for ALL to chat", function()
         pcall(advisor_show)
     end
     advisor_state.idx = save_idx
+end)
+
+-- V9.26: send compact AA tips to CSGO game chat. Builds 1-3 short say lines
+-- (<127 chars each) and fires them with a tiny gap so flood-throttle doesn't
+-- eat the second message. Plain English so the enemy can read it.
+function advisor_chat_send()
+    if #advisor_state.list == 0 then
+        cs_event_console("Advisor: no enemy selected — click 🔁 Refresh first", 240, 200, 100)
+        return
+    end
+    local e = advisor_state.list[advisor_state.idx]
+    if not e then return end
+    local lines = {}
+    -- Line 1: identity + their AA profile
+    local dom_word = (e.dom > 0) and "right" or (e.dom < 0) and "left" or "balanced"
+    lines[#lines+1] = string.format(
+        "[Sel01-Coach] hey - ur AA is %s, %s-side, ~%.0f deg desync",
+        tostring(e.aa_type), dom_word, e.mag)
+    -- Line 2: targeted fix based on AA type
+    if e.aa_type == "static" then
+        lines[#lines+1] = "tip: switch to jitter AA (interval 1-2 ticks) and add anti-bruteforce variance"
+    elseif e.aa_type == "switch" then
+        lines[#lines+1] = "tip: max desync 58 + flip inverter every 2 shots + randomize yaw base"
+    elseif e.aa_type == "jitter" then
+        lines[#lines+1] = "tip: vary desync 35-45 + odd intervals (3 or 5) + slow-walk peek"
+    elseif e.aa_type == "spinner" then
+        lines[#lines+1] = "tip: spinner is risky - add yaw base rotation + max anti-bf variance"
+    else
+        lines[#lines+1] = "tip: enable defensive-on-dmg + flip after 3 shots + anti-bf jitter"
+    end
+    -- Line 3: dom-side fix (only if strong dom)
+    if e.dom ~= 0 and (e.samples_l + e.samples_r) >= 4 then
+        local their_word = e.dom > 0 and "right" or "left"
+        lines[#lines+1] = string.format(
+            "ur %s-side is too predictable - manual %s OR force inverter flip",
+            their_word, e.dom > 0 and "left" or "right")
+    end
+    -- Send lines through CSGO chat with small in-game ticks gap. utils.console_exec
+    -- pattern is the same one Sel01-Roast already uses for kill-say.
+    for i, msg in ipairs(lines) do
+        -- escape any embedded quotes defensively
+        msg = msg:gsub('"', "'")
+        if #msg > 126 then msg = msg:sub(1, 126) end
+        local sent = false
+        sent = pcall(function() utils.console_exec(string.format('say "%s"', msg)) end)
+        if not sent then
+            pcall(function() engine.execute_client_cmd(string.format('say "%s"', msg)) end)
+        end
+        cs_event_console("[Coach→chat] " .. msg, 180, 220, 255)
+    end
+end
+advisor_btn_chat = g_advisor:button("📨 Send tips to CSGO chat (selected)", function()
+    pcall(advisor_chat_send)
 end)
 -- V9.23: in-menu advisor panel. Pre-create label slots that get their text
 -- updated at runtime via the NL `:name(string)` method (confirmed pattern from
@@ -2351,7 +2402,18 @@ events.aim_ack:set(function(event)
         if src_res ~= 0 and src_eye ~= 0 then
             local actual = math.abs(NormalizeAngle(src_res - src_eye))
             if actual >= 1 and actual <= 65 then
+                -- V9.26: drift-bump. Default alpha 0.30 (slow EMA, anti-noise).
+                -- When the latest hit's actual differs from the current EMA by
+                -- > 5°, the enemy probably changed their desync magnitude
+                -- (cycled to a new setting / preset switched). Use alpha 0.55
+                -- so the EMA catches up in 2-3 hits instead of 6-8. Observed
+                -- in v9.25 logs: enemy with stored 25° suddenly hit at 28°
+                -- twice → BF tried 29° (close but off by 1). Faster EMA fix.
                 local alpha = 0.30
+                if s.desync_samples > 0
+                   and math.abs(actual - (s.measured_desync or 0)) > 5 then
+                    alpha = 0.55
+                end
                 -- global EMA (legacy fallback)
                 if s.desync_samples == 0 then
                     s.measured_desync = actual
@@ -2362,13 +2424,15 @@ events.aim_ack:set(function(event)
                 -- V9.19: push every hit-derived measurement into the session ring
                 -- so adaptive_guess_mag() reflects current lobby AA magnitudes.
                 session_push_desync(actual)
-                -- per-side EMA
+                -- per-side EMA (V9.26: own drift-bump per side too)
                 if exp_perside_desync and exp_perside_desync:get() then
                     if hit_side > 0 then
                         if s.samples_right == 0 then
                             s.measured_right = actual
                         else
-                            s.measured_right = s.measured_right * (1 - alpha) + actual * alpha
+                            local a_r = 0.30
+                            if math.abs(actual - (s.measured_right or 0)) > 5 then a_r = 0.55 end
+                            s.measured_right = s.measured_right * (1 - a_r) + actual * a_r
                         end
                         s.samples_right = math.min(s.samples_right + 1, 99)
                         s.real_right = math.min((s.real_right or 0) + 1, 99)  -- V9.1
@@ -2376,7 +2440,9 @@ events.aim_ack:set(function(event)
                         if s.samples_left == 0 then
                             s.measured_left = actual
                         else
-                            s.measured_left = s.measured_left * (1 - alpha) + actual * alpha
+                            local a_l = 0.30
+                            if math.abs(actual - (s.measured_left or 0)) > 5 then a_l = 0.55 end
+                            s.measured_left = s.measured_left * (1 - a_l) + actual * a_l
                         end
                         s.samples_left = math.min(s.samples_left + 1, 99)
                         s.real_left = math.min((s.real_left or 0) + 1, 99)  -- V9.1
@@ -4501,5 +4567,6 @@ _cs_log_color_raw("V9.22: Predicted-Alt/Streak mag-fix — uses per-side measure
 _cs_log_color_raw("V9.23: Advisor panel moved INSIDE NL menu (label :name() updates) — no on-screen overlay. Event ticker stays top-right.")
 _cs_log_color_raw("V9.24: effective_desync 2→1 sample gate (one hit beats blind 58°) + LBY-Snap miss flips only on |delta-measured|>5° (no flip-flop on backtrack fails).")
 _cs_log_color_raw("V9.25: cs_event_* console fallback (HIT/MISS/KILL now print to in-game console too) + AA Advisor wording rewritten plain-English with color-coded DO/why/warn/good lines.")
+_cs_log_color_raw("V9.26: 📨 Send tips to CSGO chat button (Advisor) + EMA drift-bump alpha 0.30→0.55 on >5° change (catches enemy mag changes in 2-3 hits).")
 _cs_log_color_raw("Logging: " .. (log_enabled:get() and ("ON" .. (log_verbose:get() and " (verbose)" or ""))  or "OFF"))
 _cs_log_color_raw("=========================================")
