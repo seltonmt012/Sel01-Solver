@@ -1,19 +1,22 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Config — Neverlose CSGO HvH config        ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 3.8                                    ║
+-- ║  Version: 3.9                                    ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Config
 -- @author seltonmt01
--- @version 3.8
--- @description Comprehensive Dump Debug Stats. Sections covered now:
---   SESSION / DEALT / Hitbox split / Damage / Recent event-log (last 8) /
---   Hits taken w/ full AA snapshots / AA config (all sliders+switches) /
---   Anti-resolver state (v3.6/3.7 toggles + live activity) / NL Ragebot live
---   (HC/MinDmg/SafePoints/HitboxSafety/FakeLag from user's NL settings) /
---   Perf + live velocity/airborne.
+-- @version 3.9
+-- @description Magnitude jitter (per-tick variance, anti-EMA-resolver):
+--   * New toggle randomizes the desync magnitude between [min, max] every
+--     periodic-sync tick instead of using a fixed value.
+--   * Resolvers that track measured_desync via EMA (including Sel01-Solver
+--     v9.x) settle to the AVERAGE of the randomized values — actual fake
+--     yaw stays 5-15° off that average every shot. Breaks the lock-on path.
+--   * Default OFF. Sliders default 35-58° range. Combines with anti-BF
+--     variance for full per-side chaos.
+--   * MAG-JIT indicator added to bottom HvH strip; dumped in v3.8 stats.
 
-local SEL01_CFG_VERSION = "3.8"
+local SEL01_CFG_VERSION = "3.9"
 
 -- DEBUG: print to CSGO console at major load checkpoints. Plain print() bypasses
 -- NL chat (which may not flush before crash) and writes directly to CSGO console.
@@ -129,6 +132,14 @@ local aa_yaw_rotate   = g_aa:switch("Yaw base rotation (anti eye-yaw track)", fa
 -- Resolvers like ours track streak{L=9 R=0} → predict L; flipping breaks it.
 local aa_side_streak  = g_aa:switch("Side-streak limit (auto flip after N shots)", true)
 local aa_side_streak_n= g_aa:slider("  └ Flip after consecutive same-side shots", 2, 6, 3)
+-- V3.9: per-tick magnitude variance. Randomize desync magnitude between
+-- min/max every periodic-sync tick instead of a fixed value. Resolvers that
+-- use EMA on measured_desync (including ours v9.x) settle to the AVERAGE of
+-- the randomized magnitudes — so if user picks 35-58 their EMA → 46° but
+-- the actual fake yaw cycles {35,42,51,58,38...} → always 5-12° off.
+local aa_mag_jitter   = g_aa:switch("Magnitude jitter (per-tick variance, anti-EMA)", false)
+local aa_mag_jit_min  = g_aa:slider("  └ Min magnitude (deg)", 10, 58, 35)
+local aa_mag_jit_max  = g_aa:slider("  └ Max magnitude (deg)", 10, 58, 58)
 
 -- ══════════════════════════════════════════════════════════════════════════
 -- MOVEMENT UI
@@ -558,6 +569,18 @@ local function aa_periodic_sync()
     -- V3.6: slow + defensive both push to max
     if slow_active      then lim = 58 end
     if defensive_active then lim = 58 end
+
+    -- V3.9: per-tick magnitude jitter. When enabled, base magnitude is picked
+    -- randomly inside [min,max] every periodic-sync tick. EMA-based resolvers
+    -- (incl ours v9.x) lock onto the average; randomized mag keeps the actual
+    -- value 5-15° off that average each shot. Off by default — combine with
+    -- anti-BF below for full per-side chaos.
+    if aa_mag_jitter:get() then
+        local mj_lo = aa_mag_jit_min:get()
+        local mj_hi = aa_mag_jit_max:get()
+        if mj_lo > mj_hi then mj_lo, mj_hi = mj_hi, mj_lo end
+        lim = mj_lo + math.random() * (mj_hi - mj_lo)
+    end
 
     local l_lim, r_lim = lim, lim
     if anti_bf_active or slow_active or defensive_active then
@@ -1304,6 +1327,10 @@ pcall(function()
             if aa_on and aa_yaw_rotate:get() and aa_state.yaw_active then
                 table.insert(indicators, {txt = "YAW-ROT", col = color(140, 220, 200, 220)})
             end
+            -- V3.9: MAG-JIT (per-tick magnitude jitter active)
+            if aa_on and aa_mag_jitter:get() then
+                table.insert(indicators, {txt = "MAG-JIT", col = color(200, 160, 220, 220)})
+            end
             -- FREE (Freestanding)
             if aa_on and aa_freestanding:get() then
                 table.insert(indicators, {txt = "FREE", col = color(180, 200, 255, 255)})
@@ -1640,6 +1667,8 @@ local function dump_stats()
         _b(aa_yaw_rotate:get()), _b(aa_state.yaw_active),
         _b(aa_side_streak:get()), aa_side_streak_n:get(),
         aa_state.side_streak_n or 0, aa_state.side_streak_dir or 0))
+    cs_log(string.format("  Mag-jitter=%s  range=%d-%d°",
+        _b(aa_mag_jitter:get()), aa_mag_jit_min:get(), aa_mag_jit_max:get()))
 
     -- ── NL RAGEBOT LIVE (read user's NL config) ──
     cs_log_color("── NL RAGEBOT (live) ──")
@@ -1779,7 +1808,7 @@ end)
 -- LOAD BANNER
 -- ══════════════════════════════════════════════════════════════════════════
 cs_log_color("══════════════════════════════════════════")
-cs_log_color("Sel01-Config v" .. SEL01_CFG_VERSION .. " loaded (CSGO HvH — full Dump Debug Stats; everything in one click)")
+cs_log_color("Sel01-Config v" .. SEL01_CFG_VERSION .. " loaded (CSGO HvH — +Magnitude jitter per-tick variance, anti EMA-resolvers)")
 cs_log(string.format("  hooks  createmove=%s  aim_fire=%s",
     tostring(_hooks_status.createmove or "MISSING"),
     tostring(_hooks_status.aim_fire or "MISSING")))
