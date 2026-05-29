@@ -1,12 +1,20 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 9.32                                   ║
+-- ║  Version: 9.33                                   ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 9.32
--- @description Bimodal resolver + enriched event ticker + RebuildServerYaw nil:
+-- @version 9.33
+-- @description Batch 3 — air recent_resolved, snapshot window, boot nil-guard, pose-read:
+--   * air-branch now pushes recent_resolved so cancel-conf/confidence reflect air.
+--   * snapshot matched on tickcount + rejected if >64 ticks stale (+ prune at push)
+--     so a cross-engagement snapshot can't teach the wrong side.
+--   * LearnedModel boot nil-coalesces fields (partial learned.lua no longer aborts).
+--   * adaptive_guess ring capped at 58 so >58 reads can't bias the median high.
+--   * [EXP, OFF] pose-param side read (m_flPoseParameter[11]) — A/B tiebreaker in
+--     Air-Guess; mapping undocumented, validate in-game before trusting.
+-- @description-prev Bimodal resolver + enriched event ticker + RebuildServerYaw nil:
 --   * V9.32 bimodal: detect true switch-AA (two stable per-side magnitudes >12°
 --     apart) and suppress the v9.30 GLOBAL hard-reset so it stops thrashing the
 --     averaged EMA on every alternation (per-side EMAs already hit these).
@@ -34,7 +42,7 @@
 --   * v9.26 drift-bump (alpha 0.55 on 5-10° diff) still handles small shifts.
 --   * v9.29 coach variants carry.
 
-local SEL01_VERSION = "9.32"
+local SEL01_VERSION = "9.33"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -321,6 +329,11 @@ local exp_head_strict   = g_experimental:switch(accent .. ui.get_icon"crosshairs
 -- cap). Only toggles safepoint+multipoint (NEVER mindmg/hitbox) → respects the
 -- never-override-NL-config rule; baseline unchanged for un-learned enemies.
 exp_lock_headpref = g_experimental:switch(accent .. ui.get_icon"bullseye" .. accent .. "  Head-Pref on Locked Targets (less body)", true)
+-- V9.33 EXPERIMENTAL: read the enemy's animated body-yaw pose param to pick the
+-- guess SIDE without shooting. NL exposes m_flPoseParameter[] but the desync index
+-- + mapping are NOT documented, so this is a guess (index 11, range ±60°) — OFF by
+-- default, A/B test in-game. Only replaces the side coin-flip in guess fallbacks.
+pose_read_tog = g_experimental:switch(accent .. ui.get_icon"flask" .. accent .. "  [EXP] Pose-param side read (A/B test)", false)
 
 -- ─── ESP / HUD dedicated group ─────────────────────────
 local esp_master       = g_esp:switch(accent .. ui.get_icon"bullseye"  .. accent .. "  ESP Master (on/off)", true)
@@ -997,7 +1010,7 @@ end
 -- under-shot constantly. Adaptive median catches up automatically.
 sel01_session_desyncs = { cap = 20, head = 0, count = 0, dirty = true }
 function session_push_desync(v)
-    if not v or v < 5 or v > 65 then return end
+    if not v or v < 5 or v > 58 then return end  -- V9.33: cap at 58 (max desync) so >58 reads can't bias the median high
     local r = sel01_session_desyncs
     r.head = (r.head % r.cap) + 1
     r[r.head] = v
@@ -2587,13 +2600,17 @@ events.aim_ack:set(function(event)
         local src_eye, src_res = s.last_eye_yaw, s.last_resolved
         if exp_aim_fire_snap and exp_aim_fire_snap:get() and #s.shot_snapshots > 0 then
             -- pick snapshot closest to event.tick if provided, else most recent
-            local target_tick = event.tick or event.tick_count or (globals.tickcount or 0)
+            -- V9.33: match against globals.tickcount (same clock as snap.tick) and
+            -- reject matches >64 ticks (~1s) away so a stale cross-engagement snapshot
+            -- can't be picked (would teach the wrong side). No fresh match → keep the
+            -- s.last_eye_yaw/last_resolved defaults from the line above (no regression).
+            local target_tick = globals.tickcount or 0
             local best, best_diff = nil, math.huge
             for _, snap in ipairs(s.shot_snapshots) do
                 local diff = math.abs((snap.tick or 0) - target_tick)
                 if diff < best_diff then best, best_diff = snap, diff end
             end
-            if best then
+            if best and best_diff <= 64 then
                 src_eye, src_res = best.eye_yaw, best.resolved
                 cs_log_verbose("snapshot match idx=%d tick=%d (target=%d) mode=%s",
                                Ent:get_index(), best.tick, target_tick, tostring(best.mode))
@@ -3521,6 +3538,18 @@ local function refresh_tick_cache()
     return tick_cache.valid
 end
 
+-- V9.33 EXPERIMENTAL: read animated body-yaw pose param → desync side (+ right /
+-- - left). GLOBAL (200-local cap). m_flPoseParameter[] is exposed by NL but the
+-- desync index/mapping is undocumented — [11] + (v*120-60) is a best-guess and must
+-- be A/B validated. pcall-guarded; returns nil on failure → caller keeps coin-flip.
+function read_pose_desync(p)
+    local ok, v = pcall(function() return p.m_flPoseParameter[11] end)
+    if not ok or type(v) ~= "number" then return nil end
+    local deg = v * 120 - 60
+    if math.abs(deg) < 3 or math.abs(deg) > 62 then return nil end
+    return deg
+end
+
 local function resolve_player(p)
     if not can_resolve(p) then return end
 
@@ -3550,20 +3579,27 @@ local function resolve_player(p)
         end
         -- V4: boot from persistent LearnedModel (richer data, across sessions)
         local lrn = learning_lookup(p)
-        if lrn and (lrn.sl + lrn.sr) >= 5 then
-            if lrn.dom ~= 0 then s.last_hit_side = lrn.dom end
-            if lrn.sl >= 2 and lrn.dl > 0 then
-                s.measured_left = lrn.dl
-                s.samples_left  = math.min(lrn.sl, 10)
+        -- V9.33: nil-coalesce learned fields. A partial/old/hand-edited learned.lua
+        -- entry with a missing field would throw on the arithmetic and silently abort
+        -- the whole resolve (boot is pcall'd), leaving the enemy unresolved that tick.
+        local lsl, lsr = (lrn and lrn.sl or 0), (lrn and lrn.sr or 0)
+        local ldl, ldr = (lrn and lrn.dl or 0), (lrn and lrn.dr or 0)
+        if lrn and (lsl + lsr) >= 5 then
+            if (lrn.dom or 0) ~= 0 then s.last_hit_side = lrn.dom end
+            if lsl >= 2 and ldl > 0 then
+                s.measured_left = ldl
+                s.samples_left  = math.min(lsl, 10)
             end
-            if lrn.sr >= 2 and lrn.dr > 0 then
-                s.measured_right = lrn.dr
-                s.samples_right  = math.min(lrn.sr, 10)
+            if lsr >= 2 and ldr > 0 then
+                s.measured_right = ldr
+                s.samples_right  = math.min(lsr, 10)
             end
             if s.measured_desync == 0 then
-                local total = lrn.sl + lrn.sr
-                s.measured_desync = (lrn.dl * lrn.sl + lrn.dr * lrn.sr) / total
-                s.desync_samples  = math.min(total, 10)
+                local total = lsl + lsr
+                if total > 0 then
+                    s.measured_desync = (ldl * lsl + ldr * lsr) / total
+                    s.desync_samples  = math.min(total, 10)
+                end
             end
             -- V6: boot best_modes (per-aa-type historically best mode for this player)
             s.boot_best_modes = {
@@ -3577,7 +3613,7 @@ local function resolve_player(p)
             if (now_rt - (s.last_boot_log or 0)) > 10 then
                 s.last_boot_log = now_rt
                 cs_log_verbose("LearnedModel boot idx=%d L=%d(%.1f°) R=%d(%.1f°) dom=%d hits=%d best{j=%s s=%s sw=%s}",
-                               p:get_index(), lrn.sl, lrn.dl, lrn.sr, lrn.dr, lrn.dom, lrn.hits or 0,
+                               p:get_index(), lsl, ldl, lsr, ldr, (lrn.dom or 0), lrn.hits or 0,
                                tostring(lrn.best_jitter), tostring(lrn.best_static), tostring(lrn.best_switch))
             end
         end
@@ -3646,12 +3682,24 @@ local function resolve_player(p)
         end
         -- V9.6+V9.19: never resolve to exact eye_yaw — offset by adaptive median
         if math.abs(NormalizeAngle(server_yaw - anim.m_flEyeYaw)) < 5 then
-            local fallback_side = s.last_hit_side ~= 0 and s.last_hit_side or 1
-            server_yaw = anim.m_flEyeYaw + adaptive_guess_mag() * fallback_side
+            local fallback_side = (s.last_hit_side ~= 0 and s.last_hit_side) or 1
             s.mode = "Air-Guess"
+            -- V9.33 EXPERIMENTAL pose-param side read (OFF default; A/B test point).
+            -- Uses the animated body-yaw SIGN over the last-hit coin-flip; magnitude
+            -- still from adaptive_guess (pose magnitude unreliable on networked enemies).
+            if pose_read_tog and pose_read_tog:get() then
+                local pd = read_pose_desync(p)
+                if pd then fallback_side = (pd >= 0) and 1 or -1; s.mode = "Air-PoseGuess" end
+            end
+            server_yaw = anim.m_flEyeYaw + adaptive_guess_mag() * fallback_side
         end
         s.last_eye_yaw  = anim.m_flEyeYaw
         s.last_resolved = server_yaw
+        -- V9.33: push to recent_resolved (mirrors the ground path) so cancel-conf's
+        -- stddev gate + confidence() reflect AIR volatility, not stale ground data.
+        local now_ct = tick_cache.curtime or 0
+        table.insert(s.recent_resolved, {a = server_yaw, t = now_ct})
+        while #s.recent_resolved > 5 do table.remove(s.recent_resolved, 1) end
         anim.m_flGoalFeetYaw = NormalizeAngle(server_yaw)
         return
     end
@@ -3893,6 +3941,12 @@ local function push_shot_snapshot(target_idx)
         measured = s.measured_desync,
     }
     table.insert(s.shot_snapshots, snap)
+    -- V9.33: prune snapshots older than ~1s (@64 tick) so a stale snapshot from a
+    -- prior engagement can't be matched to the current ack (would learn wrong side).
+    local now_t = globals.tickcount or 0
+    while #s.shot_snapshots > 0 and (now_t - (s.shot_snapshots[1].tick or 0)) > 64 do
+        table.remove(s.shot_snapshots, 1)
+    end
     while #s.shot_snapshots > 8 do table.remove(s.shot_snapshots, 1) end
     cs_log_verbose("snapshot pushed idx=%d mode=%s eye=%.1f res=%.1f tick=%d",
                    target_idx, tostring(snap.mode), snap.eye_yaw, snap.resolved, snap.tick)
@@ -4849,5 +4903,6 @@ _cs_log_color_raw("V9.29: Coach-chat 3 wording variants per category (name-hash 
 _cs_log_color_raw("V9.30: AA-switch hard-reset — when |actual - EMA| > 10° on samples>=3, replace EMA with actual + decay samples to 40% (catches preset changes in 1 hit).")
 _cs_log_color_raw("V9.31: correction-flip server-side-fail GUARD (only flip side when angle was actually wrong >5° — stops L/R oscillation & BF:opposite garbage) + LOCKED-target head-pref (relax NL safepoint on 8+sample/60+conf targets → head not body).")
 _cs_log_color_raw("V9.32: bimodal-switch detection (suppress global hard-reset thrash on two-mode enemies) + event ticker shows Δ/meas/conf/side + bt on misses + RebuildServerYaw nil-sentinel (no more resolve-to-0° on reconstruct fail).")
+_cs_log_color_raw("V9.33: air-branch recent_resolved push (cancel-conf/conf now air-aware) + snapshot tick-window guard (no stale cross-engagement match) + boot nil-guard + adaptive-guess cap 58 + [EXP off] pose-param side read.")
 _cs_log_color_raw("Logging: " .. (log_enabled:get() and ("ON" .. (log_verbose:get() and " (verbose)" or ""))  or "OFF"))
 _cs_log_color_raw("=========================================")
