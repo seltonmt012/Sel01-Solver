@@ -9,7 +9,7 @@ Two Neverlose **CSGO** (legacy build, NOT CS2) Lua scripts for HvH / rage play. 
 | Script | Role | Working copy | NL load path |
 |---|---|---|---|
 | **Sel01-Solver** (`resolverv2_35544.lua`, ~3700 lines, v9.x) | Resolver: per-player AA learning, JSON export, HUD/ESP overlay, FFI clipboard copy-logs, Sel01-Roast chat-spam | `C:\Users\Seltonmt\Desktop\sazz\aron\ownlua\resolverv2_35544.lua` | `E:\SteamLibrary\steamapps\common\Counter-Strike Global Offensive\nl\scripts\Sel01-Solver_59853.lua` |
-| **Sel01-Config** (`sel01_config.lua`, ~1200 lines, v1.x) | Companion: AA presets, anti-bruteforce jitter, on-shot/air-desync overrides, fake-duck assist on hostile-fire, watermark + indicators + skeet hit-log + damage popups + rotating AA arrow | `C:\Users\Seltonmt\Desktop\sazz\aron\ownlua\sel01_config.lua` | `E:\SteamLibrary\steamapps\common\Counter-Strike Global Offensive\nl\scripts\sel01_config_59908.lua` |
+| **Sel01-Config** (`sel01_config.lua`, ~1400 lines, v3.x) | Companion: AA presets (Aggressive/Dynamic/Defensive/Spin), anti-bruteforce jitter, air-desync + move-desync overrides, anti-HS extras (pitch jitter, move-fakeduck), peek-boost hotkey, hits-taken log with AA-state snapshots, kill/miss/hit event log top-left, debug stats, watermark + indicators + rotating AA arrow | `C:\Users\Seltonmt\Desktop\sazz\aron\ownlua\sel01_config.lua` | `E:\SteamLibrary\steamapps\common\Counter-Strike Global Offensive\nl\scripts\sel01_config_59908.lua` |
 
 **Dual-copy rule (MANDATORY).** After every Edit/Write to either working copy, immediately overwrite the matching NL file (same path, no new files, no renames). PowerShell one-liner: `Copy-Item -Force -LiteralPath '<working>' -Destination '<nl-path>'`. The git repo only tracks working copies — the NL copies need the mirror so reload in NL picks up the change.
 
@@ -60,6 +60,16 @@ luac -p sel01_config.lua        # config
 **Event-name aliases vary by NL build.** Use `register_first(handler, name1, name2, ...)` (Sel01-Config v1.7 helper): walks aliases, `:set` on the first one that exists, returns its name for status logging. Triple-registering all aliases is dead code — the second `:set` overwrites the first.
 
 **Defer menu-callback work to next tick.** Button callbacks that synchronously call `:set` on combo / slider elements during the menu render lifecycle freeze the menu (Sel01-Config v1.5 fix). Set a `pending_X = name` flag in the button callback and drain it from the next `events.createmove` tick.
+
+**Never `:override(bool)` on NL combo elements** (Sel01-Config v2.2 incident). Scope Overlay, Hit Marker Sound, Force Thirdperson, Self-Glow, NL Glow chams — these LOOK like switches in the menu but are actually multi-value combos under the hood. JAG0YAW writes them with strings (`scope_overlay:set("Remove All")`). Writing `:override(true/false)` segfaults CSGO the first tick the script becomes active in a match. Safe NL :override target types are switches (bool), sliders (int/float), and combos written with the matching string. If unsure, just don't override.
+
+**Never `:override` on NL hotkey elements** (Sel01-Config v2.0 incident). Peek Assist is a hotkey UI element, JAG0YAW only `:get()`s it (gingersense too) and never overrides. Calling `:override(int)` per tick on a hotkey userdata segfaults CSGO at spawn. Use `:get()` to read whether the user is holding the hotkey, then drive OTHER refs (hitchance, mindmg) instead.
+
+**`events.weapon_fire` and `events.player_hurt` cannot read enemy entity properties safely** (Sel01-Config v1.12 incident). CSGO returns invalid memory for `shooter.m_vecOrigin / m_angEyeAngles / victim.m_vecOrigin` on players in transition states (just-respawned, dying, weapon-switching). pcall does NOT catch C++ segfaults from invalid userdata. Skip property reads entirely — use only event fields (event.userid, event.hitgroup, event.dmg_health) plus `entity.get(uid, true)` object-identity comparison against `entity.get_local_player()` (JAG0YAW pattern).
+
+**`aim_ack` nil-state means HIT, not MISS** (Sel01-Config v2.9 fix). NL fires `aim_ack` with `event.state` set to "hit" / "damaged" / "hit-damaged" for hits, named miss reasons for misses, OR nil-state when the shot landed without a specific tag. Resolver uses `is_hit = (reason == nil) or HIT_STATES[reason]`. Config v2.6-v2.8 used `if reason and HIT_STATES[reason] then hit` which inverted nil into miss — caused the stats panel to show 0% hit-rate despite resolver showing 73%+. Always match the resolver pattern.
+
+**`event.hitbox` (aim_ack) is unreliable; `event.hitgroup` (player_hurt) is reliable.** On the user's NL build aim_ack never populates hitbox. Hitbox-bucketing stats must come from player_hurt's hitgroup (1=head, 2=chest, 3=stomach, 6/7=leg). Keep two maps: `HB_INDEX_NAMES = {[0]="head", [3]="chest", ...}` for hitbox-index, `HB_GROUP_NAMES = {[1]="head", [2]="chest", ...}` for hitgroup. _hb_name() should walk both plus string passthrough.
 
 **Per-tick functions mutate state → oscillation.** `pick_bruteforce_angle` runs 64×/sec. Four caching layers prevent state-thrash:
 - `bf_cached_missed/angle/mode/eye` — BF only recomputes when `missed` count changes OR eye drifts >20°
@@ -204,7 +214,7 @@ Always-on features (no toggle):
 - **V6**: close-priority tiered (V9.4 sniper hc-floor), per-AA best-mode tracking (V9.0 filter BF/Guess), intel-aware cancel-conf, BF eye-drift invalidate, FS-cache result validation, guess-side per-engagement, learning-cleanup (7d/200-entry)
 - **V7**: lock-on visual indicators, session-trend tracker, V7.1 passive learning, V7.7 6-pattern sid fallback + known-player fast-path
 - **V8**: V8.0 miss-rate-aware confidence + yaw_rate consistency, V8.2 correction-flip + switch-AA alternating, V8.3 JSON export, V8.4 stationary detect + baim hc-drop + jump-shot + auto-save 10s, V8.5 jump-scout extended range, V8.6 robust persistence (every hit + passive persist + force-save), V8.7 FFI clipboard, V8.8 backtrack-failure handle + comprehensive copy
-- **V9**: V9.0 yaw_rate clamp 720°/s + AA-stability + BF filter, V9.1 real-vs-seeded sample tracking + Init log filter, V9.2 decay measured + dist-scale + Slow-Alt, V9.3 Spinner-Rot + ping-aware extrap + per-weapon predict + def-AA delta fingerprint + log_buffer ring, V9.4 SSG-Pro tuned, V9.5 BF def_delta cycle + tighter spinner detect, V9.6 fast-fire + Air-Guess + LBY auto-flip
+- **V9**: V9.0 yaw_rate clamp 720°/s + AA-stability + BF filter, V9.1 real-vs-seeded sample tracking + Init log filter, V9.2 decay measured + dist-scale + Slow-Alt, V9.3 Spinner-Rot + ping-aware extrap + per-weapon predict + def-AA delta fingerprint + log_buffer ring, V9.4 SSG-Pro tuned, V9.5 BF def_delta cycle + tighter spinner detect, V9.6 fast-fire + Air-Guess + LBY auto-flip, V9.7 Still-Alt + still/slow hard-reset on yaw spike, V9.8 counter-fire (events.weapon_fire hostile detect → bypass cancel-conf), V9.9 bulk easy-wins (dominant-side conf-boost / 2-miss mode-blacklist / crouch-aware hitbox / hostile-fire HUD / per-tick lp+wc cache / symmetric-data low-conf / backtrack-fail penalty / yaw-consistency extrap-boost), V9.10 log_buffer cap 80→200 + AA-type hysteresis tightened (7-consecutive + 2s lockout + anti-flap 5s freeze if >3 commits in 10s), V9.11 enhanced counter-fire (force head + safepoint-off + HC 15 + multipoint) + fast-fire tier system (conf 50/70/85 thresholds), V9.12 close-range first-miss follow-up (Aggressive + missed≥1 + dist<1000 → HC 10 + force head + safepoint-off)
 
 ## HUD-overlay anatomy
 
@@ -239,7 +249,7 @@ git push origin master
 
 If hook failure on commit: investigate root cause, fix, create NEW commit (don't amend — pre-commit hooks fail means commit didn't happen, amend would modify previous one).
 
-## Sel01-Config layout (`sel01_config.lua`, v1.8, ~1200 lines)
+## Sel01-Config layout (`sel01_config.lua`, v3.x, ~1400 lines)
 
 | Section | Purpose |
 |---|---|
@@ -259,7 +269,7 @@ If hook failure on commit: investigate root cause, fix, create NEW commit (don't
 
 `events.createmove` → `createmove_unified(cmd)` → drain `pending_preset` (if any) via `pcall(_do_apply_preset, name)` → `createmove_handler(cmd)` (movement helpers, pcall'd) → `aa_periodic_sync()` (compute Body Yaw L/R from base desync + air override + on-shot reduction + anti-BF variance; clamp [0,58]; nl_override on body-yaw + freestand refs) → if master enabled, sync NL visuals overrides (hit-marker sound, thirdperson, scope overlay) + fake-duck during `fakeduck_until` window.
 
-### Sel01-Config presets (v1.8)
+### Sel01-Config presets (v3.x)
 
 | Toggle | Aggressive | Dynamic | Defensive | Spin |
 |---|---|---|---|---|
@@ -272,7 +282,23 @@ If hook failure on commit: investigate root cause, fix, create NEW commit (don't
 | air desync | ON | ON | ON | ON |
 | anti-BF | ON | ON | **OFF** | ON (25°) |
 | fake-duck assist | ON | ON | ON | ON |
+| move-desync override (v3.2) | **ON** | OFF | OFF | OFF |
+| pitch jitter (v3.0/3.2) | **ON** | OFF | OFF | OFF |
+| move-fakeduck (v3.0/3.2) | **ON** | OFF | OFF | OFF |
 | NL fake-lag limit | 7 | 5 | 3 | (varies) |
+
+### Sel01-Config V2-V3 feature timeline
+
+- **V2.0-2.1**: Re-enable subsystems after v1.13 BISECT confirmed stable baseline. Drop `nl_override` on Peek Assist hotkey (use gingersense pattern: `:get()` read). Switch player_hurt to JAG0YAW entity-compare.
+- **V2.2**: Drop visual NL :override calls (Scope Overlay etc are combo elements).
+- **V2.3**: Air-AA extras — rapid inverter flip + max jitter boost + optional fake-duck while airborne, 1.5× anti-BF variance, transition handling clears overrides on land. Arrow indicator follows `aa_jitter_dir` when our AA override on (was reading NL inverter, always pointed right).
+- **V2.4-2.5**: AI Peek iteration (sidemove cycle) — later replaced by Peek Boost.
+- **V2.6**: Debug stats accumulator (shots fired/hit/miss + total dmg + biggest + 1-taps) + dump button.
+- **V2.7-2.8**: Peek Boost as hold hotkey — drives NL hitchance + mindmg :override on rising/falling edge of our own hotkey (NL Peek Assist hotkey unchanged, user binds same key for 2-in-1). Hits-Taken log (cap 10) with AA-state snapshot per incident: desync / air-override / anti-BF / on-shot / fd-assist / freestanding / airborne / velocity / peek-boost / jitter direction.
+- **V2.9**: aim_ack hit-detection fixed (nil = HIT, was MISS). Unified event log: HITS + MISSES (with reason) + KILLS (from `events.player_death`) — color-coded top-left, default ON in all presets.
+- **V3.0**: Hitbox stats moved from aim_ack to player_hurt (hitgroup-based). Two name maps factored out. Anti-headshot extras (pitch jitter via NL Pitch combo set to "Jitter Down/Up", auto-fakeduck while moving above velocity threshold). Both default OFF until opted in.
+- **V3.1**: Peek Boost UI label shortened (text overflow). Print Recommendations button (data-driven advice based on stats). Anti-HS Bundle quick-toggle.
+- **V3.2**: Move-AA extras (running on ground above velocity threshold) — own desync magnitude, rapid inverter flip, max jitter boost. Aggressive preset auto-enables full anti-HS bundle (pitch_jitter + move_fakeduck + move-AA extras).
 
 ### Common Sel01-Config gotchas (each has bitten)
 

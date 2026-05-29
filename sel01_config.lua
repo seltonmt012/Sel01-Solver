@@ -1,15 +1,15 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Config — Neverlose CSGO HvH config        ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 3.2                                    ║
+-- ║  Version: 3.3                                    ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Config
 -- @author seltonmt01
--- @version 3.2
--- @description Move-AA extras (when running on ground): desync override, rapid inverter flip,
---              max jitter boost — analog to Air-extras. Aggressive preset enables anti-HS + move-AA defaults.
+-- @version 3.3
+-- @description Fix sticky fake-duck — clear aa_fakeduck override on falling edge of move-FD/air-FD
+--              conditions. Aggressive preset move-fakeduck default OFF (was forced ON in v3.2).
 
-local SEL01_CFG_VERSION = "3.2"
+local SEL01_CFG_VERSION = "3.3"
 
 -- DEBUG: print to CSGO console at major load checkpoints. Plain print() bypasses
 -- NL chat (which may not flush before crash) and writes directly to CSGO console.
@@ -294,14 +294,16 @@ local function _do_apply_preset(name)
         safe_set(aa_air_flip, true)
         safe_set(aa_air_boost, true)
         safe_set(aa_air_fakeduck, false)
-        -- V3.2: Move-AA + Anti-HS enabled by default in Aggressive
+        -- V3.2 + V3.3: Move-AA + Pitch-jitter enabled. move_fakeduck stays default
+        -- OFF (v3.2 had it ON which left NL fake-duck stuck after the user stopped
+        -- running — sticky-fakeduck bug). User can opt-in via the toggle.
         safe_set(aa_move_set, true)
         safe_set(aa_move_mag, 45)
         safe_set(aa_move_thresh, 100)
         safe_set(aa_move_flip, true)
         safe_set(aa_move_boost, true)
         safe_set(aa_pitch_jitter, true)
-        safe_set(aa_move_fakeduck, true)
+        safe_set(aa_move_fakeduck, false)
         safe_set(aa_move_fd_thresh, 100)
         safe_set(aa_anti_bf, true)
         safe_set(aa_anti_bf_var, 15)
@@ -446,7 +448,8 @@ local aa_state = {
 -- inverter flip, max-jitter boost, force fake-duck). Transition handling clears
 -- overrides on land so ground AA returns to user's preset state.
 local aa_periodic_last_tick = 0
-local _was_airborne = false
+local _was_airborne   = false
+local _move_fd_active = false  -- V3.3 dirty-track for fake-duck override
 
 local function aa_periodic_sync()
     if not (enable_master:get() and aa_enable:get()) then return end
@@ -545,21 +548,32 @@ local function aa_periodic_sync()
     end
 
     -- V3.0 ANTI-HEADSHOT EXTRAS — head Y-axis randomization vs enemy resolver
-    -- Pitch jitter: NL Pitch combo set to "Jitter Down/Up" makes head bob between
-    -- -89 and +89 each tick. Enemy multipoint head-scan misses center mass.
     if aa_pitch_jitter:get() then
         nl_override(nl_refs.aa_pitch, "Jitter Down/Up")
     end
-    -- Auto fake-duck while moving on ground: ducked head at lower Y, harder HS
+    -- V3.0/V3.3: auto fake-duck while moving on ground. Dirty-track via
+    -- _move_fd_active so we ONLY override on rising edge and CLEAR on falling
+    -- edge. Without the clear, NL kept the fake-duck override true forever
+    -- after the user stopped moving (v3.2 sticky-fakeduck bug).
+    local want_move_fd = false
     if aa_move_fakeduck:get() and not airborne then
-        local vel = 0
-        pcall(function()
-            local v = lp.m_vecVelocity
-            vel = math.sqrt((v.x or 0)^2 + (v.y or 0)^2)
-        end)
-        if vel > (aa_move_fd_thresh:get() or 100) then
-            nl_override(nl_refs.aa_fakeduck, true)
+        local vel = _vel_cache  -- already computed above for move_set_active
+        if vel == 0 then
+            pcall(function()
+                local v = lp.m_vecVelocity
+                vel = math.sqrt((v.x or 0)^2 + (v.y or 0)^2)
+            end)
         end
+        if vel > (aa_move_fd_thresh:get() or 100) then want_move_fd = true end
+    end
+    -- Combine with air-fakeduck so we don't fight it
+    local want_fd = want_move_fd or (air_set_active and aa_air_fakeduck:get())
+    if want_fd and not _move_fd_active then
+        nl_override(nl_refs.aa_fakeduck, true)
+        _move_fd_active = true
+    elseif (not want_fd) and _move_fd_active then
+        pcall(function() if nl_refs.aa_fakeduck then nl_refs.aa_fakeduck:override() end end)
+        _move_fd_active = false
     end
 end
 
@@ -1481,7 +1495,7 @@ end)
 -- LOAD BANNER
 -- ══════════════════════════════════════════════════════════════════════════
 cs_log_color("══════════════════════════════════════════")
-cs_log_color("Sel01-Config v" .. SEL01_CFG_VERSION .. " loaded (CSGO HvH — Move-AA extras + Aggressive auto-enables anti-HS)")
+cs_log_color("Sel01-Config v" .. SEL01_CFG_VERSION .. " loaded (CSGO HvH — Sticky fake-duck fixed; move-fakeduck default OFF)")
 cs_log(string.format("  hooks  createmove=%s  aim_fire=%s",
     tostring(_hooks_status.createmove or "MISSING"),
     tostring(_hooks_status.aim_fire or "MISSING")))
