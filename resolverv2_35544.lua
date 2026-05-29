@@ -1,12 +1,20 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 9.31                                   ║
+-- ║  Version: 9.32                                   ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 9.31
--- @description Server-side-fail flip guard + locked-target head preference:
+-- @version 9.32
+-- @description Bimodal resolver + enriched event ticker + RebuildServerYaw nil:
+--   * V9.32 bimodal: detect true switch-AA (two stable per-side magnitudes >12°
+--     apart) and suppress the v9.30 GLOBAL hard-reset so it stops thrashing the
+--     averaged EMA on every alternation (per-side EMAs already hit these).
+--   * V9.32 event ticker HIT/MISS lines now show Δdelta / measured / conf / side
+--     and bt (backtrack tick) on misses — high bt = stale-record/netcode miss.
+--   * V9.32 RebuildServerYaw returns nil on failure (callers `or eye_yaw`) so a
+--     failed reconstruct no longer resolves to a literal 0°.
+-- @description-prev Server-side-fail flip guard + locked-target head preference:
 --   * V9.31 correction-flip fix: a `correction` miss where our resolved delta
 --     == measured_desync means the SIDE was right and the server rejected the
 --     shot (fake-lag/backtrack). Old code flipped side anyway → oscillation +
@@ -26,7 +34,7 @@
 --   * v9.26 drift-bump (alpha 0.55 on 5-10° diff) still handles small shifts.
 --   * v9.29 coach variants carry.
 
-local SEL01_VERSION = "9.31"
+local SEL01_VERSION = "9.32"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -910,14 +918,33 @@ function cs_event_console(text, r, g, b)
     end
     pcall(function() log_buffer_push(line) end)
 end
-function cs_event_hit(idx, mode)
-    local txt = string.format("✓ HIT #%d  %s", idx or 0, tostring(mode or "?"))
+-- V9.32: enriched HIT/MISS lines. delta = resolved-vs-eye angle, m = measured EMA,
+-- c = confidence, side L/R, bt = backtrack tick (high = stale-record/netcode miss,
+-- not our angle error). Extra args optional → callers without them get the short line.
+function _side_tag(side)  -- GLOBAL (main chunk at 200-local cap)
+    return side and (side > 0 and "R" or (side < 0 and "L" or "·")) or "·"
+end
+function cs_event_hit(idx, mode, delta, meas, conf, side)
+    local txt
+    if delta then
+        txt = string.format("✓ HIT #%d %s  Δ%.0f m%.0f c%d %s",
+            idx or 0, tostring(mode or "?"), delta or 0, meas or 0, conf or 0, _side_tag(side))
+    else
+        txt = string.format("✓ HIT #%d  %s", idx or 0, tostring(mode or "?"))
+    end
     event_ticker_push(txt, 110, 240, 130)
     cs_event_console(txt, 110, 240, 130)
 end
-function cs_event_miss(idx, reason, mode)
-    local txt = string.format("✗ MISS #%d  %s  (%s)",
-        idx or 0, tostring(reason or "?"), tostring(mode or "?"))
+function cs_event_miss(idx, reason, mode, delta, meas, bt, conf)
+    local txt
+    if delta then
+        txt = string.format("✗ MISS #%d %s (%s)  Δ%.0f m%.0f bt%d c%d",
+            idx or 0, tostring(reason or "?"), tostring(mode or "?"),
+            delta or 0, meas or 0, bt or 0, conf or 0)
+    else
+        txt = string.format("✗ MISS #%d  %s  (%s)",
+            idx or 0, tostring(reason or "?"), tostring(mode or "?"))
+    end
     event_ticker_push(txt, 240, 110, 110)
     cs_event_console(txt, 240, 110, 110)
 end
@@ -2211,10 +2238,13 @@ local function DegToRad(Deg) return Deg * (math.pi / 180) end
 local function RadToDeg(Rad) return Rad * (180 / math.pi) end
 local Lerp = function(a, b, t) return a + (b - a) * t end
 local function RebuildServerYaw(player)
-    if not player then return 0 end
+    -- V9.32: return nil (not 0) on failure so callers can distinguish a genuine
+    -- ~0° server-yaw from a failed computation. They do `... or eye_yaw`, turning a
+    -- failure into a 0° delta → existing guess fallback (was resolving to literal 0°).
+    if not player then return nil end
     local ok, result = pcall(function()
     local Animstate = player:get_anim_state()
-    if not Animstate then return 0 end
+    if not Animstate then return nil end
     local vx, vy, vz = 0, 0, 0
     pcall(function()
         local v = player.m_vecVelocity
@@ -2246,7 +2276,7 @@ local function RebuildServerYaw(player)
     end
 	return NormalizeAngle(FinalServerYaw)
     end)
-    if not ok or result == nil then return 0 end
+    if not ok or result == nil then return nil end
     return result
 end
 
@@ -2539,7 +2569,9 @@ events.aim_ack:set(function(event)
                 s.hit_streak_left, s.hit_streak_right, tostring(s.defensive_aa)
             )
             -- V9.21: also surface to event ticker + console (always-on)
-            pcall(cs_event_miss, Ent:get_index(), reason, s.mode)
+            pcall(cs_event_miss, Ent:get_index(), reason, s.mode,
+                  NormalizeAngle((s.last_resolved or 0) - (s.last_eye_yaw or 0)),
+                  s.measured_desync, bt, confidence(s))
         end
     else
         -- V9.9-B: clear mode-blacklist + miss-counter on HIT (mode proven working)
@@ -2600,8 +2632,10 @@ events.aim_ack:set(function(event)
                 if s.desync_samples > 0 and diff > 5 then alpha = 0.55 end
                 if s.desync_samples == 0 then
                     s.measured_desync = actual
-                elseif s.desync_samples >= 3 and diff > 10 then
+                elseif (not s.bimodal) and s.desync_samples >= 3 and diff > 10 then
                     -- V9.30 SWITCH-RESET: take the new value as-is, decay samples
+                    -- V9.32: suppressed when bimodal — a stable two-mode enemy must
+                    -- NOT hard-reset the global on every alternation (that thrashes).
                     s.measured_desync = actual
                     s.desync_samples = math.max(2, math.floor(s.desync_samples * 0.4))
                     cs_log_verbose("AA-switch hard-reset idx=%d global EMA %.1f → %.1f (diff=%.1f, samples↓)",
@@ -2657,6 +2691,23 @@ events.aim_ack:set(function(event)
                         end
                         s.samples_left = math.min(s.samples_left + 1, 99)
                     end
+                    -- V9.32: BIMODAL detection. A true switch-AA enemy alternates two
+                    -- magnitudes (e.g. L=26° R=41°). The per-side EMAs converge cleanly,
+                    -- but the GLOBAL measured_desync averages them and the v9.30 global
+                    -- hard-reset then THRASHES (every alternation differs >10° from the
+                    -- mid value) → adaptive_guess + LBY checks get garbage. Flag bimodal
+                    -- off the stable per-side EMAs; hysteresis (>12 set, ≤8 clear) stops
+                    -- flag flap. Per-side hard-resets stay active (a real 1-side preset
+                    -- switch still moves that side; |L-R| stays small so bimodal=false).
+                    local _sl, _sr = (s.samples_left or 0), (s.samples_right or 0)
+                    if _sl >= 2 and _sr >= 2 then
+                        local _ml, _mr = (s.measured_left or 0), (s.measured_right or 0)
+                        if _ml > 5 and _mr > 5 and math.abs(_ml - _mr) > 12 then
+                            s.bimodal = true
+                        elseif math.abs(_ml - _mr) <= 8 then
+                            s.bimodal = false
+                        end
+                    end
                 end
             end
         end
@@ -2687,7 +2738,9 @@ events.aim_ack:set(function(event)
                 s.hit_streak_left, s.hit_streak_right
             )
             -- V9.21: also surface to event ticker + console (always-on)
-            pcall(cs_event_hit, Ent:get_index(), s.mode)
+            pcall(cs_event_hit, Ent:get_index(), s.mode,
+                  NormalizeAngle((s.last_resolved or 0) - (s.last_eye_yaw or 0)),
+                  s.measured_desync, confidence(s), s.last_hit_side)
         end
         s.missed = 0
         s.bf_cached_missed = nil  -- clear BF cache so next miss recomputes fresh
@@ -3056,7 +3109,7 @@ local function _pick_first_shot_impl(p, s, anim, eye_yaw, max_desync, preset)
                 s.mode = "Still-Alt"
                 return eye_yaw + mag * side
             end
-            local sy = RebuildServerYaw(p)
+            local sy = RebuildServerYaw(p) or eye_yaw  -- V9.32: nil=fail → eye_yaw → guess
             local sy_delta = NormalizeAngle(sy - eye_yaw)
             if math.abs(sy_delta) >= 5 and math.abs(sy_delta) <= 65 then
                 s.mode = "Still-Server"
@@ -3128,7 +3181,7 @@ local function _pick_first_shot_impl(p, s, anim, eye_yaw, max_desync, preset)
                 return eye_yaw + s.measured_desync * side
             end
             -- 2) server-yaw if it returns meaningful delta
-            local sy = RebuildServerYaw(p)
+            local sy = RebuildServerYaw(p) or eye_yaw  -- V9.32: nil=fail → eye_yaw → guess
             local sy_delta = NormalizeAngle(sy - eye_yaw)
             if math.abs(sy_delta) >= 5 then
                 -- if measured exists but smaller than sy_delta — boost to measured side
@@ -3166,7 +3219,7 @@ local function _pick_first_shot_impl(p, s, anim, eye_yaw, max_desync, preset)
     end
 
     if preset.first_shot == "networked" then
-        local sy = RebuildServerYaw(p)
+        local sy = RebuildServerYaw(p) or eye_yaw  -- V9.32: nil=fail → eye_yaw → guess
         -- V6: harden — if server-yaw returned eye_yaw (no info), fallback to guess
         if math.abs(NormalizeAngle(sy - eye_yaw)) < 5 then
             local side = s.last_hit_side ~= 0 and s.last_hit_side or 1
@@ -3271,7 +3324,7 @@ local function _pick_first_shot_impl(p, s, anim, eye_yaw, max_desync, preset)
     end
 
     -- static enemy / fallback: try networked yaw, with same boost-fallback as static-class
-    local sy = RebuildServerYaw(p)
+    local sy = RebuildServerYaw(p) or eye_yaw  -- V9.32: nil=fail → eye_yaw → guess
     local sy_delta = NormalizeAngle(sy - eye_yaw)
     if math.abs(sy_delta) >= 5 then
         if s.desync_samples >= 2 and s.measured_desync > math.abs(sy_delta) then
@@ -3566,7 +3619,7 @@ local function resolve_player(p)
     -- (old approach assumed 0 desync → broke on nospread)
     if air_resolve_tog:get() and not anim.m_bOnGround then
         s.mode = "Air"
-        local server_yaw = RebuildServerYaw(p)
+        local server_yaw = RebuildServerYaw(p) or anim.m_flEyeYaw  -- V9.32: nil=fail → eye_yaw
         -- V8.2: switch-AA alternate (both sides hit) → use opposite of last hit
         local both_air = (s.samples_left or 0) >= 1 and (s.samples_right or 0) >= 1
         if s.aa_type == "switch" and both_air and s.last_hit_side ~= 0 then
@@ -4795,5 +4848,6 @@ _cs_log_color_raw("V9.28: Coach-chat each line explains WHY enemy AA is exploita
 _cs_log_color_raw("V9.29: Coach-chat 3 wording variants per category (name-hash deterministic) + data-driven WHY (real streak/dom counts) + BIMODAL detection.")
 _cs_log_color_raw("V9.30: AA-switch hard-reset — when |actual - EMA| > 10° on samples>=3, replace EMA with actual + decay samples to 40% (catches preset changes in 1 hit).")
 _cs_log_color_raw("V9.31: correction-flip server-side-fail GUARD (only flip side when angle was actually wrong >5° — stops L/R oscillation & BF:opposite garbage) + LOCKED-target head-pref (relax NL safepoint on 8+sample/60+conf targets → head not body).")
+_cs_log_color_raw("V9.32: bimodal-switch detection (suppress global hard-reset thrash on two-mode enemies) + event ticker shows Δ/meas/conf/side + bt on misses + RebuildServerYaw nil-sentinel (no more resolve-to-0° on reconstruct fail).")
 _cs_log_color_raw("Logging: " .. (log_enabled:get() and ("ON" .. (log_verbose:get() and " (verbose)" or ""))  or "OFF"))
 _cs_log_color_raw("=========================================")
