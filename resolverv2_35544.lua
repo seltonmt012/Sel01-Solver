@@ -1,14 +1,14 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 9.17                                   ║
+-- ║  Version: 9.18                                   ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 9.17
--- @description Stop overriding min_damage to 1 in counter-fire + close-miss when user has respect_man on (preserves NL min_dmg=100 for 1-tap precision)
+-- @version 9.18
+-- @description Strip ALL min_damage overrides + delete HEAD-FOCUS hc=40 block (was downgrading user's NL hc=72 + multi-hitbox → missing open heads). NL config is respected globally.
 
-local SEL01_VERSION = "9.17"
+local SEL01_VERSION = "9.18"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -3377,10 +3377,7 @@ pcall(function()
             local effective_hc = priority_hc
             if wc == "sniper" and effective_hc < 40 then effective_hc = 40 end
             pcall(function() ctx:override_hitchance(effective_hc) end)
-            -- V9.4: sniper preserves min-damage (NL has 100 for 1-tap) — non-sniper drops to 1
-            if wc ~= "sniper" then
-                pcall(function() ctx:override_min_damage(1) end)
-            end
+            -- V9.18: min_dmg overrides removed globally — NL min_dmg is the source of truth
             -- V9.4: respect safe-points "Prefer" mode when respect-manual on (sniper)
             if not (wc == "sniper" and exp_respect_man and exp_respect_man:get()) then
                 pcall(function() ctx:override_safe_point(false) end)
@@ -3415,11 +3412,7 @@ pcall(function()
                 if wc_cf ~= "sniper" and intel and intel.conf >= 10 then
                     counter_fire_active = true
                     pcall(function() ctx:override_hitchance(15) end)
-                    -- V9.17: only force mindmg=1 when respect_man is OFF. User had NL min_dmg=100
-                    -- for 1-tap precision, counter-fire dropping to 1 turned that into body taps.
-                    if not (exp_respect_man and exp_respect_man:get()) then
-                        pcall(function() ctx:override_min_damage(1) end)
-                    end
+                    -- V9.18: min_dmg overrides removed globally — NL min_dmg=100 stays in effect
                     pcall(function() ctx:override_hitbox(0) end)
                     pcall(function() ctx:override_safe_point(false) end)
                     pcall(function() ctx:override_multipoint(true) end)
@@ -3486,35 +3479,22 @@ pcall(function()
             end
         end
 
-        -- V3 #10 + V4: AUTO PER-WEAPON SETTINGS (applied BEFORE other overrides)
-        -- V4: respect manual SSG/sniper settings — user's NL config better than my override
+        -- V3 #10 + V4 + V9.18: AUTO PER-WEAPON — only multipoint hint + knife disable.
+        -- All hitchance/min_damage/hitbox overrides removed: user's NL settings (hc=72,
+        -- mindmg=100, multi-hitbox Head/Chest/Stomach, Safepoints Prefer) are already
+        -- well-tuned. Lua-side downgrades were causing fires at insufficient confidence.
         if exp_auto_weapon and exp_auto_weapon:get() then
             local wc = get_weapon_class()
             if wc == "sniper" then
-                if not (exp_respect_man and exp_respect_man:get()) then
-                    pcall(function() ctx:override_hitchance(50) end)
-                    pcall(function() ctx:override_min_damage(80) end)
-                    pcall(function() ctx:override_hitbox(0) end)
-                    cs_log_verbose("per-weapon: sniper override (hc=50 mindmg=80 head-only)")
-                else
-                    -- respect mode: just gentle multipoint hint, no hitchance/mindmg/hitbox override
-                    pcall(function() ctx:override_multipoint(true) end)
-                    pcall(function() ctx:override_multipoint_scale(0.75) end)
-                    cs_log_verbose("per-weapon: sniper RESPECT (manual NL settings preserved)")
-                end
-            elseif wc == "auto" then
-                pcall(function() ctx:override_hitchance(40) end)
-                pcall(function() ctx:override_min_damage(25) end)
-                cs_log_verbose("per-weapon: auto-rifle (hc=40 mindmg=25)")
-            elseif wc == "heavy_pistol" then
-                pcall(function() ctx:override_hitchance(45) end)
-                pcall(function() ctx:override_min_damage(50) end)
-                cs_log_verbose("per-weapon: heavy-pistol (hc=45 mindmg=50)")
+                pcall(function() ctx:override_multipoint(true) end)
+                pcall(function() ctx:override_multipoint_scale(0.75) end)
+                cs_log_verbose("per-weapon: sniper RESPECT (NL settings preserved, multipoint hint)")
             elseif wc == "knife" then
                 pcall(function() ctx:override_hitchance(99) end)  -- effectively disable
                 cs_log_verbose("per-weapon: knife (resolver disabled)")
                 return
             end
+            -- auto / heavy_pistol / other: no override — trust NL config
         end
 
         -- V9.6 + V9.11: FAST-FIRE on confident targets. Thresholds lowered:
@@ -3544,10 +3524,7 @@ pcall(function()
         -- fires the next frame the head is takable.
         if mode_now == "Aggressive" and s and s.missed >= 1 and target_dist < 1000 and not counter_fire_active then
             pcall(function() ctx:override_hitchance(10) end)
-            -- V9.17: respect_man preserves user's min_dmg (1-tap precision)
-            if not (exp_respect_man and exp_respect_man:get()) then
-                pcall(function() ctx:override_min_damage(1) end)
-            end
+            -- V9.18: min_dmg overrides removed globally — NL min_dmg stays in effect
             pcall(function() ctx:override_hitbox(0) end)
             pcall(function() ctx:override_safe_point(false) end)
             pcall(function() ctx:override_multipoint(true) end)
@@ -3569,7 +3546,7 @@ pcall(function()
         if exp_nospread and exp_nospread:get() then
             pcall(function() ctx:override_hitbox(0) end)            -- head ALWAYS
             pcall(function() ctx:override_hitchance(1) end)         -- 1% = always fire
-            pcall(function() ctx:override_min_damage(100) end)      -- 100hp = guaranteed OHK
+            -- V9.18: min_dmg removed — user's NL min_dmg=100 already enforces OHK
             pcall(function() ctx:override_safe_point(false) end)
             pcall(function() ctx:override_multipoint(false) end)
             cs_log_verbose("NOSPREAD head-shot mode=%s missed=%d", tostring(s and s.mode), s and s.missed or 0)
@@ -3579,30 +3556,22 @@ pcall(function()
             if target_crouched then
                 pcall(function() ctx:override_hitbox(3) end)        -- chest (head occluded when crouched)
                 pcall(function() ctx:override_hitchance(40) end)
-                pcall(function() ctx:override_min_damage(50) end)
             else
                 pcall(function() ctx:override_hitbox(0) end)        -- head ALWAYS
                 pcall(function() ctx:override_hitchance(45) end)
-                pcall(function() ctx:override_min_damage(30) end)
             end
+            -- V9.18: min_dmg removed — NL min_dmg stays in effect
             pcall(function() ctx:override_safe_point(false) end)
             pcall(function() ctx:override_multipoint(false) end)
             cs_log_verbose("HEAD-STRICT %s mode=%s missed=%d",
                            target_crouched and "CHEST(crouched)" or "head",
                            tostring(s and s.mode), s and s.missed or 0)
-        -- AGGRESSIVE HEAD-FOCUS: bias toward head via multipoint + low hitchance + low min-dmg
-        elseif exp_head_focus and exp_head_focus:get() and mode_str() == "Aggressive" and s and s.missed == 0 then
-            -- V3 #11: try hitbox-chain first, fallback to single head override
-            local chain_ok = apply_hitbox_chain(ctx)
-            if not chain_ok then
-                -- ragebot natural priority picks head if visible, body fallback if head occluded
-                pcall(function() ctx:override_multipoint(true) end)
-                pcall(function() ctx:override_multipoint_scale(0.85) end)
-            end
-            pcall(function() ctx:override_hitchance(40) end)
-            pcall(function() ctx:override_min_damage(25) end)
-            pcall(function() ctx:override_safe_point(false) end)
-            cs_log_verbose("HEAD-FOCUS aggressive first-shot (hc=40 mindmg=25 chain=%s)", tostring(chain_ok))
+        -- V9.18: AGGRESSIVE HEAD-FOCUS block REMOVED. Was forcing hc=40 + mindmg=25 +
+        -- safepoint=off on every Aggressive first-shot, which downgraded user's NL
+        -- hc=72 and overrode user's multi-hitbox Head/Chest/Stomach config — directly
+        -- caused "open head miss" symptoms because ragebot fired at insufficient
+        -- confidence. Multipoint hint moved to the generic branch below; the toggle
+        -- itself is left in UI but no longer applies a hitchance/mindmg downgrade.
         -- multipoint hint when first-shot networked-mode
         elseif exp_multipoint and exp_multipoint:get() then
             if s and s.missed == 0 and (s.mode == "Networked" or s.mode == "Predicted" or s.mode == "Static") then
@@ -3615,9 +3584,11 @@ pcall(function()
 
         if should_force_baim(target) then
             local hb_idx = baim_hb_id()
-            local mindmg = baim_min_damage:get()
             pcall(function() ctx:override_hitbox(hb_idx) end)
-            pcall(function() ctx:override_min_damage(mindmg) end)
+            -- V9.18: min_dmg override removed — NL min_dmg stays in effect. NOTE: if NL
+            -- min_dmg is set high (e.g. 100), force-baim body hits may still be rejected
+            -- by NL since body shots typically deal <100 dmg. Lower NL min_dmg manually
+            -- if you want baim to actually fire after misses.
             pcall(function() ctx:override_safe_point(false) end)
             -- V8.4: drop hitchance based on miss-count → faster body follow-up
             -- More misses = lower hc (tries body shot quicker). Scales 25 → 10.
@@ -3632,32 +3603,29 @@ pcall(function()
             -- V8.4: multipoint scan body for chest hits
             pcall(function() ctx:override_multipoint(true) end)
             pcall(function() ctx:override_multipoint_scale(1.0) end)
-            cs_log_verbose("force baim → hitbox=%d mindmg=%d hc=%d miss=%d",
-                           hb_idx, mindmg, baim_hc, s and s.missed or 0)
+            cs_log_verbose("force baim → hitbox=%d hc=%d miss=%d",
+                           hb_idx, baim_hc, s and s.missed or 0)
         end
 
         -- V8.5 + V9.4: JUMP-SHOT improvement — extended range + smart hitbox
         if lp_airborne and not close_priority and target_dist < 4000 then
             local respect_sniper = (wc == "sniper") and exp_respect_man and exp_respect_man:get()
             if respect_sniper then
-                -- V9.4: SSG-Pro respect mode — preserve NL multi-hitbox, just bias head + lower hc
+                -- V9.18: SSG-Pro respect mode — preserve NL hc + multi-hitbox entirely
                 pcall(function() ctx:override_multipoint(true) end)
                 pcall(function() ctx:override_multipoint_scale(0.85) end)
-                pcall(function() ctx:override_hitchance(40) end)       -- balance with user's hc=72
-                cs_log_verbose("jump-scout SSG-RESPECT idx=%d dist=%.0f vz=%.0f (NL hitboxes preserved)",
+                cs_log_verbose("jump-scout SSG-RESPECT idx=%d dist=%.0f vz=%.0f (NL settings preserved)",
                                target:get_index(), target_dist, lp_vz)
             else
-                -- Standard jump-shot: head-only override
+                -- Standard jump-shot: head-only + low hc (min_dmg now respects NL)
                 pcall(function() ctx:override_hitbox(0) end)
                 pcall(function() ctx:override_multipoint(false) end)
                 pcall(function() ctx:override_safe_point(false) end)
                 if wc == "sniper" then
                     pcall(function() ctx:override_hitchance(35) end)
-                    pcall(function() ctx:override_min_damage(80) end)
                     cs_log_verbose("jump-scout SNIPER idx=%d dist=%.0f hc=35", target:get_index(), target_dist)
                 else
                     pcall(function() ctx:override_hitchance(30) end)
-                    pcall(function() ctx:override_min_damage(35) end)
                     cs_log_verbose("jump-shot HEAD idx=%d dist=%.0f wc=%s", target:get_index(), target_dist, tostring(wc))
                 end
             end
@@ -4057,5 +4025,6 @@ _cs_log_color_raw("V4 Features: " ..
 _cs_log_color_raw("Performance: anim-cache + FOV-cull(110°) + dist-cull(4500u) + lazy-log → ON")
 _cs_log_color_raw("Accuracy: measured-desync EMA + side-streak bias + yaw-extrapolation → ON")
 _cs_log_color_raw("Aggressive preset = first-shot velocity bias, opposite→58 brute-force, baim after 2 misses")
+_cs_log_color_raw("V9.18: ALL min_damage overrides REMOVED — NL min_dmg is source of truth. HEAD-FOCUS hc=40 block DELETED (was downgrading NL hc).")
 _cs_log_color_raw("Logging: " .. (log_enabled:get() and ("ON" .. (log_verbose:get() and " (verbose)" or ""))  or "OFF"))
 _cs_log_color_raw("=========================================")
