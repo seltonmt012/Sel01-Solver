@@ -1,12 +1,17 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 9.35                                   ║
+-- ║  Version: 9.36                                   ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 9.35
--- @description Fast-fire tightened (stop shooting too early):
+-- @version 9.36
+-- @description Snapshot-match regression fix (v9.33 self-inflicted):
+--   * aim_ack snapshot picker now matches event.tick (the acked shot) again, not
+--     globals.tickcount (ack-time). v9.33 broke this: on rapid fire the ack for shot
+--     A grabbed shot B's snapshot → wrong eye/resolved → WRONG hit_side learned →
+--     corrupted per-side desync. Kept the v9.33 >64 stale-reject + push-prune.
+-- @description-prev Fast-fire tightened (stop shooting too early):
 --   * fast-fire used to drop hitchance to 30 on conf>=50 — firing a marginal shot
 --     that, on high-desync enemies, caught a bad backtrack record → correction /
 --     prediction-error rejects ("shoots too early, misses a lot"). Now it only fires
@@ -53,7 +58,7 @@
 --   * v9.26 drift-bump (alpha 0.55 on 5-10° diff) still handles small shifts.
 --   * v9.29 coach variants carry.
 
-local SEL01_VERSION = "9.35"
+local SEL01_VERSION = "9.36"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -2610,12 +2615,13 @@ events.aim_ack:set(function(event)
         -- HIT: prefer snapshot from aim_fire if available (accurate per-shot state)
         local src_eye, src_res = s.last_eye_yaw, s.last_resolved
         if exp_aim_fire_snap and exp_aim_fire_snap:get() and #s.shot_snapshots > 0 then
-            -- pick snapshot closest to event.tick if provided, else most recent
-            -- V9.33: match against globals.tickcount (same clock as snap.tick) and
-            -- reject matches >64 ticks (~1s) away so a stale cross-engagement snapshot
-            -- can't be picked (would teach the wrong side). No fresh match → keep the
-            -- s.last_eye_yaw/last_resolved defaults from the line above (no regression).
-            local target_tick = globals.tickcount or 0
+            -- V9.36 REGRESSION FIX: prefer event.tick (the tick the ACK refers to) so
+            -- we match the EXACT shot being acked. V9.33 wrongly used globals.tickcount
+            -- (the ACK-time tick) which always picks the MOST RECENT snapshot — on rapid
+            -- fire the ack for shot A would grab shot B's snapshot → wrong eye/resolved →
+            -- wrong hit_side learned → corrupted per-side data. Keep the >64 stale-reject
+            -- (if event.tick is on a bad clock it rejects to the safe last_* defaults).
+            local target_tick = event.tick or event.tick_count or (globals.tickcount or 0)
             local best, best_diff = nil, math.huge
             for _, snap in ipairs(s.shot_snapshots) do
                 local diff = math.abs((snap.tick or 0) - target_tick)
@@ -4929,5 +4935,6 @@ _cs_log_color_raw("V9.32: bimodal-switch detection (suppress global hard-reset t
 _cs_log_color_raw("V9.33: air-branch recent_resolved push (cancel-conf/conf now air-aware) + snapshot tick-window guard (no stale cross-engagement match) + boot nil-guard + adaptive-guess cap 58 + [EXP off] pose-param side read.")
 _cs_log_color_raw("V9.34: AIR-branch hardening — per-side magnitude in air corr-aware path (was global, wrong for bimodal) + update_jitter now runs in air (yaw_cache/rate warm → correct aa_type on landing + air-spin visible).")
 _cs_log_color_raw("V9.35: fast-fire tightened — only fires fast on stable (stddev<12) + well-sampled resolves, hc floors raised (30/45 not 15/22/30). Stops the 'shoots too early' marginal shots that caught bad backtrack records → correction/prediction-error rejects.")
+_cs_log_color_raw("V9.36: snapshot-match REGRESSION FIX — v9.33 matched ack-time tickcount (grabbed the most-recent snapshot, mis-learned sides on rapid fire). Restored event.tick matching of the actual acked shot; kept the stale-reject guard.")
 _cs_log_color_raw("Logging: " .. (log_enabled:get() and ("ON" .. (log_verbose:get() and " (verbose)" or ""))  or "OFF"))
 _cs_log_color_raw("=========================================")
