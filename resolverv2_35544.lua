@@ -1,14 +1,14 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 9.12                                   ║
+-- ║  Version: 9.13                                   ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 9.12
--- @description Close-range first-miss follow-up: drop HC to 10 + force head + safepoint off for fast trade
+-- @version 9.13
+-- @description SSG-Pro preset now enables Aggressive Head-Focus (head priority + chest fallback). Forces head resolve for snipers.
 
-local SEL01_VERSION = "9.12"
+local SEL01_VERSION = "9.13"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -1339,7 +1339,7 @@ local function apply_preset(name)
         safe_set(exp_multipoint,     true)        -- NL Head/Chest/Stomach multipoint stays active
         safe_set(exp_def_aa,         true)
         safe_set(exp_steam_mem,      true)
-        safe_set(exp_head_focus,     false)       -- DON'T override user's NL multi-hitbox
+        safe_set(exp_head_focus,     true)        -- V9.13: head priority + NL multi-hitbox chest/stomach fallback
         safe_set(exp_nospread,       false)
         safe_set(exp_classify_int,   6)
         safe_set(exp_aim_fire_snap,  true)
@@ -1347,12 +1347,12 @@ local function apply_preset(name)
         safe_set(exp_esp_overlay,    true)
         safe_set(exp_cancel_conf,    true)         -- precision — wait for stable resolve
         safe_set(exp_auto_weapon,    true)
-        safe_set(exp_hitbox_chain,   false)        -- NL multi-hitbox handles fallback
+        safe_set(exp_hitbox_chain,   true)         -- V9.13: head -> chest -> stomach chain for forced head
         safe_set(exp_persistent_lm,  true)
         safe_set(exp_extrapolation,  true)
         safe_set(exp_respect_man,    true)         -- preserve hc=72 dmg=100 multi-hitbox + safe-points
         safe_set(exp_predict_ticks,  3)
-        safe_set(exp_head_strict,    false)
+        safe_set(exp_head_strict,    false)        -- still false; head_focus is enough, strict locks user out
         -- V9.4: smart strategy synced
         safe_set(strat_learning,     "Adaptive (Recommended)")
         safe_set(strat_predict,      "Aggressive")
@@ -1362,9 +1362,9 @@ local function apply_preset(name)
         safe_set(esp_show_labels,    true)
         safe_set(esp_show_confbar,   true)
         safe_set(esp_show_hud,       true)
-        _cs_log_color_raw("✓ PRESET: SSG-PRO v9.4 — Tuned for hc=72/dmg=100/multi-hitbox NL config")
-        _cs_log_color_raw("  Preserves: hitchance, min-damage, hitboxes Head/Chest/Stomach, safe-points 'Prefer'")
-        _cs_log_color_raw("  Enhancements: per-weapon +1 predict tick, def-AA fingerprint, ping-aware extrap")
+        _cs_log_color_raw("✓ PRESET: SSG-PRO v9.13 — Tuned for hc=72/dmg=100/multi-hitbox + HEAD-FOCUS")
+        _cs_log_color_raw("  Preserves: hitchance, min-damage, safe-points 'Prefer'")
+        _cs_log_color_raw("  Enhancements: HEAD-FOCUS + hitbox chain (head->chest->stomach), per-weapon +1 predict, def-AA fingerprint")
     elseif name == "head_only" then
         -- V7.9: Headshot-Only on normal (spread) servers — head every shot, reasonable hc
         safe_set(resolver.enable,    true)
