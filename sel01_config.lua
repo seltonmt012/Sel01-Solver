@@ -1,12 +1,19 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Config — Neverlose CSGO HvH config        ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 3.10                                   ║
+-- ║  Version: 3.11                                   ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Config
 -- @author seltonmt01
--- @version 3.10
--- @description Event-log forward-decl fix (hit_log ring):
+-- @version 3.11
+-- @description Bimodal magnitude (two-cluster anti-EMA AA):
+--   * New OFF-default toggle alternates desync between two fixed clusters
+--     (default 25° / 55°) every 2-5s with a small ±3° wobble, instead of
+--     uniform random. A uniform jitter's mean IS its center, which an EMA /
+--     median resolver locks onto exactly; bimodal's long-run mean sits in the
+--     empty gap between clusters, so the tracked value matches no real shot.
+--   * Mutually exclusive with Magnitude jitter; drives the same body-yaw refs.
+-- @description-prev Event-log forward-decl fix (hit_log ring):
 --   * hit_log / HIT_LOG_MAX were declared AFTER the aim_ack + player_death
 --     closures that write them → Lua bound the writers to a nil global, so
 --     table.insert silently threw inside their pcall. The top-left event log
@@ -22,7 +29,7 @@
 --     variance for full per-side chaos.
 --   * MAG-JIT indicator added to bottom HvH strip; dumped in v3.8 stats.
 
-local SEL01_CFG_VERSION = "3.10"
+local SEL01_CFG_VERSION = "3.11"
 
 -- DEBUG: print to CSGO console at major load checkpoints. Plain print() bypasses
 -- NL chat (which may not flush before crash) and writes directly to CSGO console.
@@ -146,6 +153,15 @@ local aa_side_streak_n= g_aa:slider("  └ Flip after consecutive same-side shot
 local aa_mag_jitter   = g_aa:switch("Magnitude jitter (per-tick variance, anti-EMA)", false)
 local aa_mag_jit_min  = g_aa:slider("  └ Min magnitude (deg)", 10, 58, 35)
 local aa_mag_jit_max  = g_aa:slider("  └ Max magnitude (deg)", 10, 58, 58)
+-- V3.10: BIMODAL magnitude — alternate between TWO fixed clusters (e.g. 25° / 55°)
+-- every 2-5s instead of uniform random. Uniform jitter's mean == its center, which
+-- an EMA / median resolver locks onto EXACTLY; bimodal puts the long-run mean in the
+-- EMPTY gap between the clusters, so the resolver's tracked value matches NO actual
+-- shot. Strongest anti-EMA option. Mutually exclusive with magnitude jitter above.
+local aa_bimodal      = g_aa:switch("Bimodal magnitude (two clusters, anti-EMA)", false)
+local aa_bimodal_lo   = g_aa:slider("  └ Cluster A (deg)", 10, 58, 25)
+local aa_bimodal_hi   = g_aa:slider("  └ Cluster B (deg)", 10, 58, 55)
+local aa_bimodal_state = { mode = 1, next_switch = 0 }
 
 -- ══════════════════════════════════════════════════════════════════════════
 -- MOVEMENT UI
@@ -586,6 +602,17 @@ local function aa_periodic_sync()
         local mj_hi = aa_mag_jit_max:get()
         if mj_lo > mj_hi then mj_lo, mj_hi = mj_hi, mj_lo end
         lim = mj_lo + math.random() * (mj_hi - mj_lo)
+    elseif aa_bimodal:get() then
+        -- V3.10: flip cluster every 2-5s; small ±3° wobble so each cluster isn't a
+        -- dead-constant the resolver could lock per-side. Long-run mean sits in the
+        -- gap between A and B → resolver EMA/median matches no actual shot.
+        local now2 = globals.realtime or 0
+        if now2 >= aa_bimodal_state.next_switch then
+            aa_bimodal_state.mode = 3 - aa_bimodal_state.mode  -- 1 <-> 2
+            aa_bimodal_state.next_switch = now2 + 2.0 + math.random() * 3.0
+        end
+        local base = (aa_bimodal_state.mode == 1) and aa_bimodal_lo:get() or aa_bimodal_hi:get()
+        lim = base + (math.random() * 2 - 1) * 3
     end
 
     local l_lim, r_lim = lim, lim
