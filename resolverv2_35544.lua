@@ -1,21 +1,21 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 9.27                                   ║
+-- ║  Version: 9.28                                   ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 9.27
--- @description Coach-chat rewrite:
---   * Each line now addresses the enemy by name (@playername) so chat shows
---     WHO the advice is for. Name auto-trimmed to 22 chars to fit the CSGO
---     127-char line limit.
---   * Up to 4 lines now: identity, type-specific fix, dom-side fix, magnitude
---     tip. Every line is concrete and actionable (slider names / value ranges)
---     instead of vague "tip:" prefix.
+-- @version 9.28
+-- @description Coach-chat WHY+HOW rewrite:
+--   * Each line now explains WHY the enemy's current AA is exploitable (the
+--     diagnosis) before saying HOW to fix it. Old wording was "ur AA: switch,
+--     left-side, ~25 deg" — only stated facts, didn't teach.
+--   * Up to 4 lines: (1) problem + why, (2) fix + brief why-it-works, (3)
+--     dom-side reason + manual side fix, (4) magnitude reason + value advice.
+--   * Name trim 22 → 18 chars to leave room for the longer messages.
 --   * v9.26 EMA drift-bump carries.
 
-local SEL01_VERSION = "9.27"
+local SEL01_VERSION = "9.28"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -656,9 +656,10 @@ advisor_btn_all = g_advisor:button("📜 Dump recs for ALL to console", function
     advisor_state.idx = save_idx
 end)
 
--- V9.26+V9.27: send compact, addressed AA tips to CSGO game chat. Each enemy
--- gets their NAME in line 1 so the chat clearly shows who the advice is for.
--- Three lines total, each kept under the ~127-char CSGO chat limit.
+-- V9.26+V9.27+V9.28: addressed AA coach in CSGO chat. Every line names the
+-- enemy AND explains WHY their current AA is exploitable + HOW to fix it (not
+-- just "do X"). Compact phrasing so each line stays under the 127-char CSGO
+-- chat limit. Up to 4 lines per send.
 function advisor_chat_send()
     if #advisor_state.list == 0 then
         cs_event_console("Advisor: no enemy selected — click 🔁 Refresh first", 240, 200, 100)
@@ -667,67 +668,81 @@ function advisor_chat_send()
     local e = advisor_state.list[advisor_state.idx]
     if not e then return end
 
-    -- Trim CSGO name to 22 chars so the rest of the message fits.
+    -- Trim CSGO name to 18 chars so the explanation fits.
     local nm = tostring(e.name or "enemy")
-    if #nm > 22 then nm = nm:sub(1, 22) end
-
-    local dom_word = (e.dom > 0) and "right-side"
-                  or (e.dom < 0) and "left-side"
-                  or "no-clear-dom"
+    if #nm > 18 then nm = nm:sub(1, 18) end
 
     local lines = {}
 
-    -- Line 1: address + their AA profile in plain words
-    lines[#lines+1] = string.format(
-        "[Sel01-Coach] @%s -> ur AA: %s, %s, ~%.0f deg desync",
-        nm, tostring(e.aa_type), dom_word, e.mag)
-
-    -- Line 2: type-specific concrete fix
+    -- Line 1: PROBLEM + WHY (diagnosis the enemy may not realise).
     if e.aa_type == "static" then
         lines[#lines+1] = string.format(
-            "@%s fix: switch yaw mod to JITTER (1-2 ticks) + anti-BF variance ON, ur fake is too still",
+            "[Sel01-Coach] @%s ur static-AA = same side every shot, resolvers lock ur fake yaw after 1-2 hits",
             nm)
     elseif e.aa_type == "switch" then
         lines[#lines+1] = string.format(
-            "@%s fix: desync 58 + flip body-yaw inverter every 2 shots + yaw base rotation ON",
+            "[Sel01-Coach] @%s ur switch-AA L<->R is rhythmic, resolvers track ur streak and predict the next side",
             nm)
     elseif e.aa_type == "jitter" then
         lines[#lines+1] = string.format(
-            "@%s fix: desync 35-45 (not max), jitter interval 3 or 5 ticks, slow-walk on peek",
+            "[Sel01-Coach] @%s ur jitter has a fixed interval, resolvers sync to it and lead onto ur real head",
             nm)
     elseif e.aa_type == "spinner" then
         lines[#lines+1] = string.format(
-            "@%s fix: spinner is leaky - add yaw base rotation + max anti-BF variance, drop spinner if u can",
+            "[Sel01-Coach] @%s ur spinner leaks position via yaw_rate sign, resolvers compute desync from rotation",
             nm)
     else
         lines[#lines+1] = string.format(
-            "@%s fix: enable defensive-on-dmg + force inverter flip after 3 shots + anti-BF ON",
+            "[Sel01-Coach] @%s ur AA still readable (no defensive reaction on hit), resolvers exploit consistency",
             nm)
     end
 
-    -- Line 3 (optional): dom-side fix when enemy clearly favors one side
+    -- Line 2: FIX + brief why-it-works.
+    if e.aa_type == "static" then
+        lines[#lines+1] = string.format(
+            "@%s fix: switch Yaw Mod to JITTER (interval 1-2 ticks) so ur fake angle moves and cant be locked",
+            nm)
+    elseif e.aa_type == "switch" then
+        lines[#lines+1] = string.format(
+            "@%s fix: desync max 58 + auto flip body-yaw inverter every 2 shots, breaks the streak they read",
+            nm)
+    elseif e.aa_type == "jitter" then
+        lines[#lines+1] = string.format(
+            "@%s fix: jitter interval ODD (3 or 5) + desync 35-45 (not max), desyncs them from ur clock",
+            nm)
+    elseif e.aa_type == "spinner" then
+        lines[#lines+1] = string.format(
+            "@%s fix: drop spinner, use jitter + yaw base rotation + max anti-BF variance, less signal to read",
+            nm)
+    else
+        lines[#lines+1] = string.format(
+            "@%s fix: enable defensive-on-dmg (max desync 2s after hit) + force inverter flip after 3 shots",
+            nm)
+    end
+
+    -- Line 3 (optional): dom-side issue + reason
     if e.dom ~= 0 and (e.samples_l + e.samples_r) >= 4 then
         local their_side = e.dom > 0 and "right" or "left"
         local your_side  = e.dom > 0 and "left"  or "right"
         lines[#lines+1] = string.format(
-            "@%s ur %s-side is loud - manual %s or auto flip every 2 shots to mismatch resolvers",
+            "@%s u land on %s side too often, resolvers spot the dom and aim there - manual %s OR auto flip",
             nm, their_side, your_side)
     end
 
-    -- Line 4 (optional): magnitude tip
+    -- Line 4 (optional): magnitude reasoning
     if e.mag >= 35 then
         lines[#lines+1] = string.format(
-            "@%s ur ~%.0f deg desync is BIG, resolvers train on big values, try low 20-25 instead",
+            "@%s desync %.0f is BIG, most resolvers train on big values - drop to 20-25 to fall under their guess",
             nm, e.mag)
     elseif e.mag > 0 and e.mag <= 22 then
         lines[#lines+1] = string.format(
-            "@%s ur ~%.0f deg desync is SMALL, easy to under-shoot, push it to 50-58 max",
+            "@%s desync %.0f is SMALL, resolvers under-shoot u easily - push to 50-58 max so the gap is wide",
             nm, e.mag)
     end
 
-    -- Send each through CSGO chat. Same utils.console_exec pattern Sel01-Roast
-    -- uses, with engine.execute_client_cmd as fallback. Strip embedded quotes
-    -- so the say command parser doesn't choke. Clamp to 126 chars.
+    -- Send each through CSGO chat. utils.console_exec is the Sel01-Roast
+    -- pattern; engine.execute_client_cmd is the fallback. Strip embedded
+    -- quotes (the say parser dies on those), clamp 126 chars.
     for _, msg in ipairs(lines) do
         msg = msg:gsub('"', "'")
         if #msg > 126 then msg = msg:sub(1, 126) end
@@ -4601,5 +4616,6 @@ _cs_log_color_raw("V9.24: effective_desync 2→1 sample gate (one hit beats blin
 _cs_log_color_raw("V9.25: cs_event_* console fallback (HIT/MISS/KILL now print to in-game console too) + AA Advisor wording rewritten plain-English with color-coded DO/why/warn/good lines.")
 _cs_log_color_raw("V9.26: 📨 Send tips to CSGO chat button (Advisor) + EMA drift-bump alpha 0.30→0.55 on >5° change (catches enemy mag changes in 2-3 hits).")
 _cs_log_color_raw("V9.27: Coach-chat lines now address @enemy by name + up to 4 concrete tips per send (type + dom + magnitude). No more bare 'hey'.")
+_cs_log_color_raw("V9.28: Coach-chat each line explains WHY enemy AA is exploitable + HOW to fix (was only stating facts). 4 lines: problem/fix/dom/mag.")
 _cs_log_color_raw("Logging: " .. (log_enabled:get() and ("ON" .. (log_verbose:get() and " (verbose)" or ""))  or "OFF"))
 _cs_log_color_raw("=========================================")
