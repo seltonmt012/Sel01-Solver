@@ -1,15 +1,15 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Config — Neverlose CSGO HvH config        ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 3.0                                    ║
+-- ║  Version: 3.1                                    ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Config
 -- @author seltonmt01
--- @version 3.0
--- @description Hitbox stats from player_hurt hitgroup (reliable, was aim_ack hitbox = nil).
---              Anti-headshot: pitch jitter + auto-fakeduck-while-moving (both default OFF).
+-- @version 3.1
+-- @description UI overflow fix (Peek Boost label shorter). New "Print Recommendations" button.
+--              Anti-HS Bundle quick-toggle.
 
-local SEL01_CFG_VERSION = "3.0"
+local SEL01_CFG_VERSION = "3.1"
 
 -- DEBUG: print to CSGO console at major load checkpoints. Plain print() bypasses
 -- NL chat (which may not flush before crash) and writes directly to CSGO console.
@@ -104,15 +104,14 @@ local aa_move_fd_thresh = g_aa:slider("Move-FD velocity threshold (u/s)", 50, 25
 -- MOVEMENT UI
 -- ══════════════════════════════════════════════════════════════════════════
 g_move:label(accent .. ui.get_icon"running" .. accent .. "  Movement helpers")
--- V2.8: Peek Boost is now a HOLD HOTKEY. While held, lowers ragebot HC + mindmg
--- so first-bullet fires instantly. Independent of NL Peek Assist hotkey — user
--- can bind to same key as NL Peek Assist (2-in-1) or to a separate key.
-local mv_peek_boost_k = g_move:hotkey("Peek Boost (hold — lowers HC + mindmg)")
-local mv_peek_hc      = g_move:slider("Peek-window Hit Chance", 10, 80, 30)
-local mv_peek_mindmg  = g_move:slider("Peek-window Min Damage", 1, 100, 1)
+-- V2.8 + V3.1: Peek Boost = HOLD hotkey. Lowers ragebot HC + mindmg while held.
+-- V3.1: label shortened ("Peek Boost") — long label was cut off in NL UI ("Mindm").
+local mv_peek_boost_k = g_move:hotkey("Peek Boost (hold)")
+local mv_peek_hc      = g_move:slider("Peek HC", 10, 80, 30)
+local mv_peek_mindmg  = g_move:slider("Peek MinDmg", 1, 100, 1)
 g_move:label(" ")
-g_move:label(accent .. "  Bind same key as NL Aimbot/Ragebot/Main/Peek Assist for 2-in-1")
-g_move:label(accent .. "  Slow-walk / Fake-duck: NL Aimbot/Anti Aim/Misc tab")
+g_move:label(accent .. "  Bind same key as NL Peek Assist for 2-in-1")
+g_move:label(accent .. "  Slow-walk / Fake-duck: NL Anti Aim/Misc tab")
 
 -- ══════════════════════════════════════════════════════════════════════════
 -- VISUALS UI
@@ -144,10 +143,12 @@ local qol_clantag_st = g_qol:combo("Clantag style", {"Wave", "Spin", "Pulse"}, 1
 -- ══════════════════════════════════════════════════════════════════════════
 -- INFO UI
 -- ══════════════════════════════════════════════════════════════════════════
-local btn_status = g_info:button("Print Status", function() end) -- callback wired later
+local btn_status = g_info:button("Print Status", function() end)
 local btn_reset  = g_info:button("Reset Settings", function() end)
 local btn_stats  = g_info:button("Dump Debug Stats", function() end) -- V2.6
 local btn_clear  = g_info:button("Clear Stats", function() end) -- V2.6
+local btn_recom  = g_info:button("Print Recommendations", function() end) -- V3.1
+local btn_antihs = g_info:button("Toggle Anti-HS Bundle", function() end) -- V3.1
 g_info:label(" ")
 g_info:label(accent .. "  Sel01-Solver handles RESOLVING (separate tab)")
 g_info:label(accent .. "  This script handles AA / Movement / Visuals / QoL only")
@@ -1354,6 +1355,70 @@ pcall(function() btn_clear:set_callback(function()
     cs_log_color("Stats cleared.")
 end) end)
 
+-- V3.1: data-driven recommendations based on current session stats
+local function print_recommendations()
+    cs_log_color("══ Sel01-Config v" .. SEL01_CFG_VERSION .. " RECOMMENDATIONS ══")
+    local fired    = stats.shots_fired
+    local hits     = stats.shots_hit
+    local hit_rate = fired > 0 and (hits / fired * 100) or 0
+    local hs_rate  = hits  > 0 and (stats.hits_head / hits * 100) or 0
+    local taken    = stats.hits_taken or 0
+    local dmg_in   = stats.dmg_taken  or 0
+    local kd       = taken > 0 and (hits / taken) or hits
+
+    -- Hit rate guidance
+    if fired >= 5 then
+        if hit_rate < 50 then
+            cs_log("[OFFENSE] Hit-rate " .. math.floor(hit_rate) .. "% — enable resolver Aggressive Head-Focus (Advanced tab) or drop NL Hit Chance")
+        elseif hs_rate < 30 and hits >= 3 then
+            cs_log("[OFFENSE] HS-rate " .. math.floor(hs_rate) .. "% — enable resolver Aggressive Head-Focus + NL Min. Damage 80+ for head priority")
+        else
+            cs_log("[OFFENSE] OK — hit-rate " .. math.floor(hit_rate) .. "% / HS " .. math.floor(hs_rate) .. "%")
+        end
+    end
+
+    -- Defense guidance (taking too many head shots = enable anti-HS)
+    if taken >= 3 then
+        cs_log(string.format("[DEFENSE] %d hits taken / %d dmg in this session", taken, dmg_in))
+        -- check recent hits for head pattern
+        local head_hits, total = 0, 0
+        for _, e in ipairs(hits_taken_log) do
+            total = total + 1
+            if e.hb_id == 1 or e.hitbox == "head" then head_hits = head_hits + 1 end
+        end
+        if total > 0 and (head_hits / total) >= 0.5 then
+            cs_log(string.format("[DEFENSE] %d/%d recent hits were HEAD — enable Pitch jitter + Auto fake-duck (Anti-HS Bundle button)",
+                head_hits, total))
+        end
+        if not aa_pitch_jitter:get() then
+            cs_log("[DEFENSE] Pitch jitter OFF — head Y stays constant. Click Anti-HS Bundle to enable.")
+        end
+        if not aa_move_fakeduck:get() then
+            cs_log("[DEFENSE] Auto fake-duck OFF — running head exposed. Click Anti-HS Bundle to enable.")
+        end
+    end
+
+    -- K/D-ish guidance
+    if taken >= 5 and kd < 1 then
+        cs_log(string.format("[KD] %.2f — try Defensive preset or enable Peek Boost hotkey + bind to NL Peek Assist", kd))
+    end
+
+    -- Resolver flag check
+    cs_log("[TIP] Resolver Aggressive Head-Focus is OFF by default. Enable in Solver tab → Advanced for HS priority.")
+    cs_log_color("══ END RECOMMENDATIONS ══")
+end
+pcall(function() btn_recom:set_callback(function() print_recommendations() end) end)
+
+-- V3.1: Anti-HS Bundle = enable pitch_jitter + move_fakeduck + reasonable threshold
+pcall(function() btn_antihs:set_callback(function()
+    local on = not (aa_pitch_jitter:get() and aa_move_fakeduck:get())
+    safe_set(aa_pitch_jitter,  on)
+    safe_set(aa_move_fakeduck, on)
+    safe_set(aa_move_fd_thresh, 100)
+    cs_log_color("Anti-HS Bundle " .. (on and "ENABLED" or "DISABLED")
+        .. " (pitch jitter + move-fakeduck @100u/s)")
+end) end)
+
 -- ══════════════════════════════════════════════════════════════════════════
 -- SHUTDOWN
 -- ══════════════════════════════════════════════════════════════════════════
@@ -1383,7 +1448,7 @@ end)
 -- LOAD BANNER
 -- ══════════════════════════════════════════════════════════════════════════
 cs_log_color("══════════════════════════════════════════")
-cs_log_color("Sel01-Config v" .. SEL01_CFG_VERSION .. " loaded (CSGO HvH — Hitbox stats fixed + Anti-HS extras)")
+cs_log_color("Sel01-Config v" .. SEL01_CFG_VERSION .. " loaded (CSGO HvH — Recommendations + Anti-HS Bundle button)")
 cs_log(string.format("  hooks  createmove=%s  aim_fire=%s",
     tostring(_hooks_status.createmove or "MISSING"),
     tostring(_hooks_status.aim_fire or "MISSING")))
