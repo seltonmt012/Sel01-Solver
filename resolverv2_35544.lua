@@ -1,12 +1,17 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 9.33                                   ║
+-- ║  Version: 9.34                                   ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 9.33
--- @description Batch 3 — air recent_resolved, snapshot window, boot nil-guard, pose-read:
+-- @version 9.34
+-- @description Air-branch hardening (air resolver focus):
+--   * air corr-aware path now uses PER-SIDE measured magnitude (was global
+--     measured_desync — wrong for bimodal/per-side enemies; v9.22-class fix for air).
+--   * update_jitter now runs in the air-branch (used to return before it) → yaw_cache
+--     / yaw_rate stay warm, so aa_type is correct on landing and air-spin is visible.
+-- @description-prev Batch 3 — air recent_resolved, snapshot window, boot nil-guard, pose-read:
 --   * air-branch now pushes recent_resolved so cancel-conf/confidence reflect air.
 --   * snapshot matched on tickcount + rejected if >64 ticks stale (+ prune at push)
 --     so a cross-engagement snapshot can't teach the wrong side.
@@ -42,7 +47,7 @@
 --   * v9.26 drift-bump (alpha 0.55 on 5-10° diff) still handles small shifts.
 --   * v9.29 coach variants carry.
 
-local SEL01_VERSION = "9.33"
+local SEL01_VERSION = "9.34"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -3655,6 +3660,10 @@ local function resolve_player(p)
     -- (old approach assumed 0 desync → broke on nospread)
     if air_resolve_tog:get() and not anim.m_bOnGround then
         s.mode = "Air"
+        -- V9.34: keep yaw_cache / yaw_rate warm during air-time. The air-branch used
+        -- to return BEFORE update_jitter ran, so the jitter buffer went stale (wrong
+        -- aa_type the moment they land) and air-spin was invisible. pcall-guarded inside.
+        update_jitter(p, s)
         local server_yaw = RebuildServerYaw(p) or anim.m_flEyeYaw  -- V9.32: nil=fail → eye_yaw
         -- V8.2: switch-AA alternate (both sides hit) → use opposite of last hit
         local both_air = (s.samples_left or 0) >= 1 and (s.samples_right or 0) >= 1
@@ -3678,7 +3687,12 @@ local function resolve_player(p)
                     s.mode = "Air-CorrFlip"
                 end
             end
-            server_yaw = anim.m_flEyeYaw + s.measured_desync * side
+            -- V9.34: per-side magnitude (was global measured_desync — wrong for
+            -- bimodal / per-side enemies; same class as the v9.22 ground fix).
+            local mag = (side > 0 and (s.measured_right or 0) > 5) and s.measured_right
+                     or (side < 0 and (s.measured_left or 0) > 5)  and s.measured_left
+                     or s.measured_desync
+            server_yaw = anim.m_flEyeYaw + mag * side
         end
         -- V9.6+V9.19: never resolve to exact eye_yaw — offset by adaptive median
         if math.abs(NormalizeAngle(server_yaw - anim.m_flEyeYaw)) < 5 then
@@ -4904,5 +4918,6 @@ _cs_log_color_raw("V9.30: AA-switch hard-reset — when |actual - EMA| > 10° on
 _cs_log_color_raw("V9.31: correction-flip server-side-fail GUARD (only flip side when angle was actually wrong >5° — stops L/R oscillation & BF:opposite garbage) + LOCKED-target head-pref (relax NL safepoint on 8+sample/60+conf targets → head not body).")
 _cs_log_color_raw("V9.32: bimodal-switch detection (suppress global hard-reset thrash on two-mode enemies) + event ticker shows Δ/meas/conf/side + bt on misses + RebuildServerYaw nil-sentinel (no more resolve-to-0° on reconstruct fail).")
 _cs_log_color_raw("V9.33: air-branch recent_resolved push (cancel-conf/conf now air-aware) + snapshot tick-window guard (no stale cross-engagement match) + boot nil-guard + adaptive-guess cap 58 + [EXP off] pose-param side read.")
+_cs_log_color_raw("V9.34: AIR-branch hardening — per-side magnitude in air corr-aware path (was global, wrong for bimodal) + update_jitter now runs in air (yaw_cache/rate warm → correct aa_type on landing + air-spin visible).")
 _cs_log_color_raw("Logging: " .. (log_enabled:get() and ("ON" .. (log_verbose:get() and " (verbose)" or ""))  or "OFF"))
 _cs_log_color_raw("=========================================")
