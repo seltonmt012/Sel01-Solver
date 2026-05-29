@@ -1,14 +1,14 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 9.15                                   ║
+-- ║  Version: 9.16                                   ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 9.15
--- @description Tighter cancel-conf for blind first shots: sniper threshold 10->18, samples=0 forces 30+ conf. Stops wasted blind shots that BF-cycle had to recover.
+-- @version 9.16
+-- @description LBY-Snap-Guess hardcoded 29° fixed — uses measured_desync when available, cycles 29/45/58 on repeated misses
 
-local SEL01_VERSION = "9.15"
+local SEL01_VERSION = "9.16"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -1671,6 +1671,7 @@ setmetatable(PlayerState, {__index = function(t, k)
         last_seen    = 0,
         last_shot    = 0,
         lby_snap     = false,
+        lby_snap_attempts = 0,  -- V9.16: magnitude cycle counter for LBY-Snap-Guess
         last_lby     = 0,
         yaw_cache    = {},
         yaw_idx      = 0,
@@ -2022,6 +2023,7 @@ events.aim_ack:set(function(event)
         s.fs_cached_time   = nil  -- clear FS cache so re-engagement re-evaluates
         s.fs_cached_angle  = nil
         s.guess_cached_side = nil
+        s.lby_snap_attempts = 0  -- V9.16: reset LBY-Snap-Guess magnitude cycle on hit
         s.guess_cached_miss = nil
         -- V7.8: hit confirms current side — decay correction counters on opposite side
         if hit_side > 0 then
@@ -2499,12 +2501,26 @@ local function _pick_first_shot_impl(p, s, anim, eye_yaw, max_desync, preset)
         s.mode = "LBY-Snap"
         s.lby_snap = false
         local lby = p.m_flLowerBodyYawTarget
-        -- V6: harden — if LBY equals eye (no snap actually) fallback to guess
+        -- V6+V9.16: harden — if LBY equals eye (no snap actually), guess intelligently:
+        --   if we have a measured_desync from prior hits, use that magnitude.
+        --   otherwise cycle 29 -> 45 -> 58 across repeated LBY-Snap-Guess attempts so
+        --   a single wrong-mag guess (e.g. user-reported amy:3 measDesync ~42 vs hardcoded 29)
+        --   does not cause 3 misses in a row before BF takes over.
         if not lby or math.abs(NormalizeAngle(lby - eye_yaw)) < 5 then
             local side = s.last_hit_side ~= 0 and s.last_hit_side or 1
+            local mag
+            if s.measured_desync and s.measured_desync >= 10 then
+                mag = s.measured_desync
+            else
+                s.lby_snap_attempts = (s.lby_snap_attempts or 0) + 1
+                local cycle = {29, 45, 58}
+                mag = cycle[((s.lby_snap_attempts - 1) % 3) + 1]
+            end
             s.mode = "LBY-Snap-Guess"
-            return eye_yaw + 29 * side
+            return eye_yaw + mag * side
         end
+        -- successful LBY snap (server returned real value) — reset cycle counter
+        s.lby_snap_attempts = 0
         return lby
     end
 
