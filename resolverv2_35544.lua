@@ -1,14 +1,14 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 9.14                                   ║
+-- ║  Version: 9.15                                   ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 9.14
--- @description Stationary / slow-walker bypass cancel-conf (was gating AFK shots) + cancel-conf threshold for unknown low-conf raised so confident-enough fires through
+-- @version 9.15
+-- @description Tighter cancel-conf for blind first shots: sniper threshold 10->18, samples=0 forces 30+ conf. Stops wasted blind shots that BF-cycle had to recover.
 
-local SEL01_VERSION = "9.14"
+local SEL01_VERSION = "9.15"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -3441,19 +3441,27 @@ pcall(function()
                                target:get_index(), intel.samples)
             else
                 local sd_threshold   = (wc == "sniper") and 50  or 25
-                local conf_threshold = (wc == "sniper") and 10  or 25
+                -- V9.15: sniper threshold 10 -> 18. Low-conf blind shots were
+                -- slipping through because 10 was almost no gate at all.
+                local conf_threshold = (wc == "sniper") and 18  or 25
+                -- V9.15: zero-real-samples = blind first shot. Require conf 30+ no
+                -- matter the weapon class so we don't burn a shot guessing the
+                -- side. The user reported "miesses random wo hin geschossen" — that
+                -- is exactly the symptom of firing blind on fresh enemies.
+                if intel.samples == 0 then
+                    conf_threshold = math.max(conf_threshold, 30)
+                end
                 -- known player but mode mismatch → slightly tighter wait (try right mode first)
                 if intel.known and not intel.mode_match then
                     conf_threshold = conf_threshold + 15
                 end
                 if sd > sd_threshold or intel.conf < conf_threshold then
-                    if wc ~= "sniper" then
-                        pcall(function() ctx:override_hitchance(99) end)
-                    end
-                    cs_log_verbose("cancel-conf idx=%d sd=%.1f° conf=%d%% wc=%s known=%s match=%s (wait=%s)",
-                                   target:get_index(), sd, intel.conf, tostring(wc),
-                                   tostring(intel.known), tostring(intel.mode_match), tostring(wc ~= "sniper"))
-                    if wc ~= "sniper" then return end
+                    -- V9.15: snipers now also cancel (was: only verbose-log, no actual hc bump).
+                    pcall(function() ctx:override_hitchance(99) end)
+                    cs_log_verbose("cancel-conf idx=%d sd=%.1f° conf=%d%% samples=%d wc=%s thresh=%d (wait)",
+                                   target:get_index(), sd, intel.conf, intel.samples,
+                                   tostring(wc), conf_threshold)
+                    return
                 end
             end
         end
