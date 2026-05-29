@@ -1,19 +1,19 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Config — Neverlose CSGO HvH config        ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 3.7                                    ║
+-- ║  Version: 3.8                                    ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Config
 -- @author seltonmt01
--- @version 3.7
--- @description Anti-resolver bundle extended + fixes:
---   * V3.6 fix: defensive AA now BULLET-ONLY (hitgroup 1-7); nade/world dmg skipped
---   * V3.7 fix: defensive no longer force-fake-ducks (was crouching mid-movement)
---   * Yaw base rotation (Forward/Backward/Left/Right cycle every 4-8s random)
---   * Side-streak limit (auto inverter flip after N consecutive same-side shots)
--- + YAW-ROT indicator in bottom HvH strip.
+-- @version 3.8
+-- @description Comprehensive Dump Debug Stats. Sections covered now:
+--   SESSION / DEALT / Hitbox split / Damage / Recent event-log (last 8) /
+--   Hits taken w/ full AA snapshots / AA config (all sliders+switches) /
+--   Anti-resolver state (v3.6/3.7 toggles + live activity) / NL Ragebot live
+--   (HC/MinDmg/SafePoints/HitboxSafety/FakeLag from user's NL settings) /
+--   Perf + live velocity/airborne.
 
-local SEL01_CFG_VERSION = "3.7"
+local SEL01_CFG_VERSION = "3.8"
 
 -- DEBUG: print to CSGO console at major load checkpoints. Plain print() bypasses
 -- NL chat (which may not flush before crash) and writes directly to CSGO console.
@@ -1520,7 +1520,18 @@ end
 pcall(function() btn_status:set_callback(function() dump_status() end) end)
 pcall(function() btn_reset:set_callback(function() apply_preset("dynamic") end) end)
 
--- V2.6 + V2.8: debug stats dump
+-- V3.8: full debug stats dump — every eckdatum the user might want.
+-- Sections: SESSION → DEALT → HITBOX → DAMAGE → KILL/HIT-LOG-SUMMARY →
+--           TAKEN (all 10 incidents + AA snapshots) → CONFIG → NL-RAGEBOT-LIVE →
+--           AA-LIVE → MOVEMENT-LIVE → PERF → ANTI-RESOLVER (v3.6/3.7 flags).
+local function _nl_get(ref, fallback)
+    if not ref then return fallback end
+    local ok, v = pcall(function() return ref:get() end)
+    if ok then return v end
+    return fallback
+end
+local function _b(v) return v and "ON" or "OFF" end
+
 local function dump_stats()
     local now      = globals.realtime or 0
     local elapsed  = now - (stats.session_start or now)
@@ -1529,42 +1540,145 @@ local function dump_stats()
     local misses   = stats.shots_missed
     local hit_rate = fired > 0 and (hits / fired * 100) or 0
     local hs_rate  = hits  > 0 and (stats.hits_head / hits * 100) or 0
-    cs_log_color("══ Sel01-Config v" .. SEL01_CFG_VERSION .. " DEBUG STATS ══")
-    cs_log(string.format("Session: %.1f min  |  Master=%s  AA=%s",
-        elapsed / 60, tostring(enable_master:get()), tostring(aa_enable:get())))
-    cs_log(string.format("DEALT: %d fired  %d hit  %d miss  -> %.1f%% hit-rate",
+    local kills    = 0
+    -- count kills from hit_log
+    for _, e in ipairs(hit_log) do if e.kind == "kill" then kills = kills + 1 end end
+
+    cs_log_color("══════════════════════════════════════════════════")
+    cs_log_color("  Sel01-Config v" .. SEL01_CFG_VERSION .. " — DEBUG STATS DUMP")
+    cs_log_color("══════════════════════════════════════════════════")
+
+    -- ── SESSION ──
+    cs_log_color("── SESSION ──")
+    cs_log(string.format("  Time: %.1f min  |  Master=%s  AA-override=%s",
+        elapsed / 60, _b(enable_master:get()), _b(aa_enable:get())))
+
+    -- ── DEALT ──
+    cs_log_color("── DEALT ──")
+    cs_log(string.format("  Shots: %d fired  %d hit  %d miss  =  %.1f%% hit-rate",
         fired, hits, misses, hit_rate))
-    cs_log(string.format("  Hitbox: head=%d chest=%d stomach=%d leg=%d other=%d  -> HS-rate %.1f%%",
+    cs_log(string.format("  Hitbox split: head=%d chest=%d stomach=%d leg=%d other=%d  =  %.1f%% HS",
         stats.hits_head, stats.hits_chest, stats.hits_stomach, stats.hits_leg,
         stats.hits_other, hs_rate))
-    cs_log(string.format("  Damage: total=%d  biggest=%d  1-taps(>=100)=%d",
-        stats.total_dmg, stats.biggest_hit, stats.one_taps))
-    cs_log(string.format("  Avg: %.1f/shot  |  %.1f/hit",
+    cs_log(string.format("  Damage: total=%d  biggest=%d  1-taps(>=100)=%d  kills=%d",
+        stats.total_dmg, stats.biggest_hit, stats.one_taps, kills))
+    cs_log(string.format("  Avg dmg: %.1f / shot  |  %.1f / hit  |  KD-ish=%.2f",
         fired > 0 and (stats.total_dmg / fired) or 0,
-        hits  > 0 and (stats.total_dmg / hits)  or 0))
-    cs_log_color("── HITS TAKEN ──")
-    cs_log(string.format("TAKEN: %d hits  %d dmg total  |  K/D-ish: %.2f",
-        stats.hits_taken, stats.dmg_taken,
+        hits  > 0 and (stats.total_dmg / hits)  or 0,
         stats.hits_taken > 0 and (hits / stats.hits_taken) or hits))
-    if #hits_taken_log > 0 then
-        cs_log_color("Last incidents (newest first):")
-        for i = #hits_taken_log, math.max(1, #hits_taken_log - 4), -1 do
-            local e = hits_taken_log[i]
-            local s = e.snapshot or {}
-            cs_log(string.format(
-                "  [%.1fs ago] %s hit %s for %d (hp_left=%d)",
-                now - e.time, e.atk_name, e.hitbox, e.dmg, e.hp_left))
-            cs_log(string.format(
-                "    AA=%s desync=%d air=%s(%d) anti_bf=%s onshot=%s fd=%s free=%s air=%s vel=%d peek=%s",
-                tostring(s.aa_enable), s.desync or 0,
-                tostring(s.air_set),   s.air_mag or 0,
-                tostring(s.anti_bf),   tostring(s.on_shot),
-                tostring(s.fd_assist), tostring(s.freestanding),
-                tostring(s.airborne),  s.velocity or 0,
-                tostring(s.peek_boost)))
+
+    -- ── RECENT EVENT-LOG SUMMARY (last 8 from hit_log) ──
+    cs_log_color("── RECENT EVENTS (last 8) ──")
+    local start_idx = math.max(1, #hit_log - 7)
+    for i = #hit_log, start_idx, -1 do
+        local e = hit_log[i]
+        local age = now - (e.time or 0)
+        if e.kind == "hit" then
+            cs_log(string.format("  [%.1fs] HIT  %s  %s  dmg=%d",
+                age, tostring(e.name), tostring(e.hitbox), e.dmg or 0))
+        elseif e.kind == "miss" then
+            cs_log(string.format("  [%.1fs] MISS %s  (%s)",
+                age, tostring(e.name), tostring(e.reason)))
+        elseif e.kind == "kill" then
+            cs_log(string.format("  [%.1fs] KILL %s", age, tostring(e.name)))
         end
     end
-    cs_log_color("══ END STATS ══")
+
+    -- ── HITS TAKEN ──
+    cs_log_color("── HITS TAKEN (full incidents w/ AA snapshot) ──")
+    cs_log(string.format("  TAKEN: %d hits  %d dmg total  avg=%.1f/hit",
+        stats.hits_taken, stats.dmg_taken,
+        stats.hits_taken > 0 and (stats.dmg_taken / stats.hits_taken) or 0))
+    if #hits_taken_log > 0 then
+        for i = #hits_taken_log, 1, -1 do
+            local e = hits_taken_log[i]
+            local s = e.snapshot or {}
+            cs_log(string.format("  [%.1fs ago] %s hit %s for %d (hp_left=%d)",
+                now - e.time, e.atk_name or "?", e.hitbox or "?", e.dmg or 0, e.hp_left or 0))
+            cs_log(string.format("    AA=%s desync=%d air-override=%s(mag=%d) anti-BF=%s onshot=%s fd-assist=%s freestand=%s",
+                _b(s.aa_enable),
+                s.desync or 0, _b(s.air_set), s.air_mag or 0,
+                _b(s.anti_bf), _b(s.on_shot), _b(s.fd_assist),
+                _b(s.freestanding)))
+            cs_log(string.format("    airborne=%s velocity=%d peek-boost=%s",
+                _b(s.airborne), s.velocity or 0, _b(s.peek_boost)))
+        end
+    end
+
+    -- ── CURRENT AA CONFIG (Sel01-Config sliders + switches) ──
+    cs_log_color("── AA CONFIG (Sel01-Config) ──")
+    cs_log(string.format("  pitch=%s  yaw_base=%s  yaw_mod=%s int=%d mag=%d",
+        tostring(aa_pitch:get()), tostring(aa_yaw_base:get()),
+        tostring(aa_yaw_mod:get()), aa_yaw_mod_int:get(), aa_yaw_mod_mag:get()))
+    cs_log(string.format("  desync=%d side=%s  freestand=%s  at-targets=%s",
+        aa_desync:get(), tostring(aa_desync_side:get()),
+        _b(aa_freestanding:get()), _b(aa_at_targets:get())))
+    cs_log(string.format("  on-shot=%s dur=%dms  air-override=%s mag=%d  anti-BF=%s var=%d",
+        _b(aa_onshot:get()),   aa_onshot_dur:get(),
+        _b(aa_air_set:get()),  aa_air_mag:get(),
+        _b(aa_anti_bf:get()),  aa_anti_bf_var:get()))
+    cs_log(string.format("  air-extras: flip=%s boost=%s fakeduck=%s",
+        _b(aa_air_flip:get()), _b(aa_air_boost:get()), _b(aa_air_fakeduck:get())))
+    cs_log(string.format("  move-override=%s mag=%d thresh=%d  flip=%s boost=%s",
+        _b(aa_move_set:get()), aa_move_mag:get(), aa_move_thresh:get(),
+        _b(aa_move_flip:get()), _b(aa_move_boost:get())))
+    cs_log(string.format("  fd-assist=%s dur=%dms  pitch-jitter=%s  move-fakeduck=%s thresh=%d",
+        _b(aa_fd_assist:get()), aa_fd_duration:get(),
+        _b(aa_pitch_jitter:get()),
+        _b(aa_move_fakeduck:get()), aa_move_fd_thresh:get()))
+
+    -- ── ANTI-RESOLVER (v3.6/3.7) ──
+    cs_log_color("── ANTI-RESOLVER (v3.6/3.7) ──")
+    cs_log(string.format("  DEF-on-dmg=%s dur=%dms  active=%s (until %.1fs)",
+        _b(aa_def_on_dmg:get()), aa_def_duration:get(),
+        _b(now < (aa_state.defensive_until or 0)),
+        math.max(0, (aa_state.defensive_until or 0) - now)))
+    cs_log(string.format("  Slow-walk-boost=%s  FL-variance=%s active=%s base=%s",
+        _b(aa_slow_boost:get()), _b(aa_fl_var:get()),
+        _b(aa_state.fl_active), tostring(aa_state.fl_base)))
+    cs_log(string.format("  Yaw-rotation=%s active=%s  Side-streak limit=%s thresh=%d (cur streak=%d dir=%d)",
+        _b(aa_yaw_rotate:get()), _b(aa_state.yaw_active),
+        _b(aa_side_streak:get()), aa_side_streak_n:get(),
+        aa_state.side_streak_n or 0, aa_state.side_streak_dir or 0))
+
+    -- ── NL RAGEBOT LIVE (read user's NL config) ──
+    cs_log_color("── NL RAGEBOT (live) ──")
+    cs_log(string.format("  HC=%s  MinDmg=%s  Penetrate=%s  AutoScope=%s",
+        tostring(_nl_get(nl_refs.rage_hc,         "?")),
+        tostring(_nl_get(nl_refs.rage_mindmg,     "?")),
+        tostring(_nl_get(nl_refs.rage_autowall,   "?")),
+        tostring(_nl_get(nl_refs.rage_autoscope,  "?"))))
+    cs_log(string.format("  BodyAim=%s  SafePoints=%s  HitboxSafety=%s",
+        tostring(_nl_get(nl_refs.rage_bodyaim,    "?")),
+        tostring(_nl_get(nl_refs.rage_safepoint,  "?")),
+        tostring(_nl_get(nl_refs.rage_hitsafety,  "?"))))
+    cs_log(string.format("  FakeLag: limit=%s var=%s",
+        tostring(_nl_get(nl_refs.fl_limit,        "?")),
+        tostring(_nl_get(nl_refs.fl_variability,  "?"))))
+    cs_log(string.format("  NL slow-walk=%s  NL fake-duck=%s",
+        _b(_nl_get(nl_refs.aa_slowwalk, false)),
+        _b(_nl_get(nl_refs.aa_fakeduck, false))))
+
+    -- ── PERF + MOVEMENT LIVE ──
+    cs_log_color("── PERF + LIVE ──")
+    local vel_now, airborne_now = 0, false
+    pcall(function()
+        local lp = entity.get_local_player()
+        if lp then
+            local v = lp.m_vecVelocity
+            vel_now = math.sqrt((v.x or 0)^2 + (v.y or 0)^2)
+            local f = lp.m_fFlags or 0
+            airborne_now = bit.band(f, 1) == 0
+        end
+    end)
+    cs_log(string.format("  FPS=%d  ping=%d ms  velocity=%.0f u/s  airborne=%s",
+        perf.fps, perf.ping, vel_now, _b(airborne_now)))
+    cs_log(string.format("  Hit-log entries: %d (cap %d)  |  Hits-taken entries: %d (cap %d)",
+        #hit_log, HIT_LOG_MAX, #hits_taken_log, HITS_TAKEN_MAX))
+
+    cs_log_color("══════════════════════════════════════════════════")
+    cs_log_color("  END DUMP — copy from chat ↑ for sharing")
+    cs_log_color("══════════════════════════════════════════════════")
 end
 pcall(function() btn_stats:set_callback(function() dump_stats() end) end)
 pcall(function() btn_clear:set_callback(function()
@@ -1665,7 +1779,7 @@ end)
 -- LOAD BANNER
 -- ══════════════════════════════════════════════════════════════════════════
 cs_log_color("══════════════════════════════════════════")
-cs_log_color("Sel01-Config v" .. SEL01_CFG_VERSION .. " loaded (CSGO HvH — defensive bullet-only + no force-FD; +YAW-ROT +SIDE-STREAK)")
+cs_log_color("Sel01-Config v" .. SEL01_CFG_VERSION .. " loaded (CSGO HvH — full Dump Debug Stats; everything in one click)")
 cs_log(string.format("  hooks  createmove=%s  aim_fire=%s",
     tostring(_hooks_status.createmove or "MISSING"),
     tostring(_hooks_status.aim_fire or "MISSING")))

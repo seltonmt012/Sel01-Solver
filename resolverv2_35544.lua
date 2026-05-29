@@ -1,20 +1,19 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 9.21                                   ║
+-- ║  Version: 9.22                                   ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 9.21
--- @description On-screen event ticker + advisor panel + console-always HIT/MISS.
---   * Top-right Event Ticker (toggle in ESP/HUD) — last 12 HIT/MISS/KILL/INFO
---     events color-coded with fade. No console toggle required.
---   * AA Advisor on-screen panel toggle (📺 in Advisor group) — selected enemy's
---     recommendations render mid-left of screen, driven by menu buttons.
---   * cs_event_hit / cs_event_miss / cs_event_kill helpers print to console via
---     client.color_log every event regardless of cs_log_enabled toggle.
+-- @version 9.22
+-- @description Predicted-Alt / Predicted-Streak magnitude fix.
+--   * Was using preset.max_desync (58°) * 0.85 mult after side was picked from
+--     per-side measured data. On dom-R enemy with sr=4/36° we shot at ~49° = miss
+--     by 13°. Now recomputes effective_desync(s, max_desync, chosen_side) and
+--     drops the 0.85 mult when measured side is used.
+--   * v9.21 carries (event ticker + advisor panel + console-always HIT/MISS).
 
-local SEL01_VERSION = "9.21"
+local SEL01_VERSION = "9.22"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -2811,6 +2810,7 @@ local function _pick_first_shot_impl(p, s, anim, eye_yaw, max_desync, preset)
         -- trigger conditions: (a) both sides hit, OR (b) 2+ corrections (enemy known to switch)
         local both_hit = (s.samples_left or 0) >= 1 and (s.samples_right or 0) >= 1
         local corr_total = (s.correction_left or 0) + (s.correction_right or 0)
+        local used_measured = false   -- V9.22: track if we picked side from real data
         if s.aa_type == "switch" and (both_hit or corr_total >= 2) then
             -- V9.19: dom-bias — prefer dom if it leads by 2+, else alternate
             side = alt_side_pick(s)
@@ -2820,6 +2820,7 @@ local function _pick_first_shot_impl(p, s, anim, eye_yaw, max_desync, preset)
                 else side = 1 end
             end
             s.mode = "Predicted-Alt"
+            used_measured = true
         elseif s.hit_streak_left + s.hit_streak_right >= 1 then
             if s.hit_streak_right >= s.hit_streak_left then
                 side = 1
@@ -2827,6 +2828,7 @@ local function _pick_first_shot_impl(p, s, anim, eye_yaw, max_desync, preset)
                 side = -1
             end
             s.mode = "Predicted-Streak"
+            used_measured = true
         else
             local move_yaw = math.deg(math.atan2(vy, vx))
             local rel = NormalizeAngle(move_yaw - eye_yaw)
@@ -2841,8 +2843,17 @@ local function _pick_first_shot_impl(p, s, anim, eye_yaw, max_desync, preset)
                 return eye_yaw + s.def_delta * side
             end
         end
-        local mult = close and 1.0 or 0.85
-        return eye_yaw + desync * side * mult
+        -- V9.22 FIX: recompute desync using chosen side's measured value when
+        -- available. The top-of-function `desync` was computed with `guess_side`
+        -- (last_hit_side) — Predicted-Alt and -Streak pick different sides so the
+        -- magnitude was wrong (e.g. dom-R enemy with sr=4/36° was getting preset
+        -- max_desync=58° instead of the 36° we measured). Drop the 0.85 mult on
+        -- measured paths — undershooting an already-correct angle = miss.
+        local pick_desync = used_measured
+            and effective_desync(s, max_desync, side)
+            or  desync
+        local mult = used_measured and 1.0 or (close and 1.0 or 0.85)
+        return eye_yaw + pick_desync * side * mult
     end
 
     -- static enemy / fallback: try networked yaw, with same boost-fallback as static-class
@@ -4417,5 +4428,6 @@ _cs_log_color_raw("V9.18: ALL min_damage overrides REMOVED — NL min_dmg is sou
 _cs_log_color_raw("V9.19: Adaptive guess magnitude (session median replaces 29° fallback) + Alt-mode dom-bias (Predicted-Alt/Air-Alt/Slow-Alt/Still-Alt prefer dom-side over blind flip).")
 _cs_log_color_raw("V9.20: AA Advisor tab → per-enemy config recommendations (Refresh / Next / Show / Show-ALL buttons).")
 _cs_log_color_raw("V9.21: Event ticker top-right (HIT/MISS/KILL always visible) + Advisor on-screen panel toggle (📺) + console HIT/MISS always-on.")
+_cs_log_color_raw("V9.22: Predicted-Alt/Streak mag-fix — uses per-side measured (was preset 58° × 0.85). Dom-R 36° enemy: 49° → 36° (no over-shoot).")
 _cs_log_color_raw("Logging: " .. (log_enabled:get() and ("ON" .. (log_verbose:get() and " (verbose)" or ""))  or "OFF"))
 _cs_log_color_raw("=========================================")
