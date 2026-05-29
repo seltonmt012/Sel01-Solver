@@ -1,14 +1,14 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 9.13                                   ║
+-- ║  Version: 9.14                                   ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 9.13
--- @description SSG-Pro preset now enables Aggressive Head-Focus (head priority + chest fallback). Forces head resolve for snipers.
+-- @version 9.14
+-- @description Stationary / slow-walker bypass cancel-conf (was gating AFK shots) + cancel-conf threshold for unknown low-conf raised so confident-enough fires through
 
-local SEL01_VERSION = "9.13"
+local SEL01_VERSION = "9.14"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -3430,6 +3430,15 @@ pcall(function()
                 -- skip cancel — let ragebot fire at proven mode
             elseif wc == "sniper" and in_peek_window and s.missed == 0 then
                 cs_log_verbose("cancel-conf SKIPPED idx=%d (sniper peek-shot priority)", target:get_index())
+            -- V9.14: stationary target with ANY data → trust. AFK enemies are easy
+            -- shots — user reported watching ragebot refuse to fire at AFK players.
+            elseif s.is_stationary and intel.samples >= 1 then
+                cs_log_verbose("cancel-conf SKIPPED idx=%d (stationary + %d samples)",
+                               target:get_index(), intel.samples)
+            -- V9.14: slow-walker with 2+ samples → trust (predictable target)
+            elseif s.is_slow_target and intel.samples >= 2 then
+                cs_log_verbose("cancel-conf SKIPPED idx=%d (slow-walker + %d samples)",
+                               target:get_index(), intel.samples)
             else
                 local sd_threshold   = (wc == "sniper") and 50  or 25
                 local conf_threshold = (wc == "sniper") and 10  or 25
