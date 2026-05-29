@@ -1,20 +1,20 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 9.19                                   ║
+-- ║  Version: 9.20                                   ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 9.19
--- @description Adaptive fallback magnitude + Alt-mode dom-bias.
---   * Session-rolling median of measured desyncs replaces hardcoded ±29° in all
---     *-Guess paths (Static / Networked / LBY-Snap / Air). User's lobby modal ~38°
---     was under-shot by the 29° default — adaptive auto-tunes per-lobby.
---   * Predicted-Alt / Air-Alt / Slow-Alt / Still-Alt now prefer dom-side when it
---     leads by 2+ samples instead of blind alternate. Fixes Predicted-Alt 33% miss
---     rate on streak{L=9 R=0} enemies that were flipping into the open side.
+-- @version 9.20
+-- @description AA Advisor (per-enemy config recommendations).
+--   * New tab section "🎯 AA Advisor" — Refresh / Next / Show / Show-ALL buttons.
+--   * Reads currently-tracked PlayerState entries, snapshots aa_type / dom / mag /
+--     samples / passive-obs / miss-rate. Cycle through with ▶, hit 💡 to dump
+--     config-side AA recommendations to chat (DEF / YAW-ROT / Side-streak /
+--     desync magnitude / preferred side, all in Sel01-Config v3.7 terms).
+--   * v9.19 changes carried (adaptive fallback magnitude + Alt-mode dom-bias).
 
-local SEL01_VERSION = "9.19"
+local SEL01_VERSION = "9.20"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -224,6 +224,9 @@ local g_experimental = ui.create(TAB, "Advanced (Fine Control)", 1)
 local g_perf         = ui.create(TAB, "Performance Info",  2)
 local g_logging      = ui.create(TAB, "Logging",           2)
 local g_chat         = ui.create(TAB, "Sel01-Roast (on kill)", 1)
+-- V9.20: AA Advisor group — global (no `local`) to dodge main-chunk 200-local limit.
+-- Per-enemy AA tuning recommendations based on what the resolver has learned.
+g_advisor = ui.create(TAB, "🎯 AA Advisor (Per-enemy)", 2)
 
 -- Header
 g_main:label(accent .. ui.get_icon"user" .. accent .. "  Welcome:  " .. common.get_username())
@@ -403,6 +406,164 @@ end)
 
 g_smart:label(" ")
 g_smart:label(accent .. ui.get_icon"link-slash" .. accent .. "  Tip: click preset above → strategy auto-applies. Advanced toggles below override.")
+
+-- ╔══════════════════════════════════════════════════╗
+-- ║ V9.20: AA ADVISOR — per-enemy tuning advisor     ║
+-- ╠══════════════════════════════════════════════════╣
+-- ║ Build a snapshot of all currently-tracked        ║
+-- ║ enemies from PlayerState. Cycle through them and ║
+-- ║ generate AA-config recommendations based on what ║
+-- ║ the resolver learned about THEIR style. Output   ║
+-- ║ goes to chat (color_log) — copy / read live.     ║
+-- ║ All state + helpers declared as GLOBALS so they  ║
+-- ║ don't consume the main-chunk 200-local budget.   ║
+-- ╚══════════════════════════════════════════════════╝
+advisor_state = { idx = 0, list = {} }
+
+function advisor_rebuild()
+    advisor_state.list = {}
+    for idx = 1, 64 do
+        local s = PlayerState[idx]
+        if s then
+            local sl, sr = s.samples_left or 0, s.samples_right or 0
+            local pass   = s.passive_samples or 0
+            if (sl + sr) >= 1 or pass >= 5 then
+                local nm = "idx#" .. idx
+                pcall(function()
+                    local p = entity.get(idx)
+                    if p and p.get_name then
+                        local got = p:get_name()
+                        if got and got ~= "" then nm = got end
+                    end
+                end)
+                local mag = math.max(s.measured_left or 0, s.measured_right or 0, s.measured_desync or 0)
+                local dom = 0
+                if sr >= sl + 2 then dom =  1
+                elseif sl >= sr + 2 then dom = -1
+                end
+                advisor_state.list[#advisor_state.list + 1] = {
+                    idx        = idx,
+                    name       = nm,
+                    aa_type    = s.aa_type or "?",
+                    samples_l  = sl,
+                    samples_r  = sr,
+                    measured_l = s.measured_left or 0,
+                    measured_r = s.measured_right or 0,
+                    mag        = mag,
+                    dom        = dom,
+                    hits       = sl + sr,
+                    miss       = s.missed or 0,
+                    miss_rate  = math.floor(s.recent_miss_rate or 0),
+                    passive    = pass,
+                    last_mode  = s.mode or "?",
+                }
+            end
+        end
+    end
+    table.sort(advisor_state.list, function(a, b)
+        if a.hits ~= b.hits then return a.hits > b.hits end
+        return a.passive > b.passive
+    end)
+    if #advisor_state.list == 0 then advisor_state.idx = 0
+    elseif advisor_state.idx == 0 or advisor_state.idx > #advisor_state.list then
+        advisor_state.idx = 1
+    end
+end
+
+function advisor_dom_label(d)
+    if d > 0 then return "RIGHT" end
+    if d < 0 then return "LEFT" end
+    return "BALANCED"
+end
+
+function advisor_show()
+    if #advisor_state.list == 0 then
+        cs_log_color("[Advisor] empty list — click 🔁 Refresh first")
+        return
+    end
+    local e = advisor_state.list[advisor_state.idx]
+    if not e then return end
+    cs_log_color(string.format("══ AA Advisor: %s (#%d/%d) ══",
+        e.name, advisor_state.idx, #advisor_state.list))
+    cs_log_color(string.format("  AA-type=%s | dom=%s | mag=%.1f° | hits=%d miss=%d | last-mode=%s",
+        e.aa_type:upper(), advisor_dom_label(e.dom), e.mag, e.hits, e.miss, e.last_mode))
+    cs_log_color(string.format("  L=%d/%.1f° R=%d/%.1f° passive-obs=%d miss-rate=%d%%",
+        e.samples_l, e.measured_l, e.samples_r, e.measured_r, e.passive, e.miss_rate))
+    cs_log_color("── Config-side AA recommendations vs this enemy ──")
+    if e.aa_type == "static" then
+        cs_log_color("  → They use STATIC AA. Their resolver of you likely expects static/dom-side too.")
+        cs_log_color("    SET: Yaw Modifier=Jitter int 1-2 ticks, Anti-BF ON, YAW-ROT ON")
+        cs_log_color("    AVOID: fixed Manual L/R preset")
+    elseif e.aa_type == "switch" then
+        cs_log_color("  → They SWITCH-AA. Resolver-of-you likely runs alt-track.")
+        cs_log_color("    SET: Desync 58 + Side-streak limit thresh=2, YAW-ROT ON, DEF-on-dmg ON")
+        cs_log_color("    AVOID: regular L↔R alternation in your preset")
+    elseif e.aa_type == "jitter" then
+        cs_log_color("  → They JITTER. Resolver-of-you likely jitter-period sync.")
+        cs_log_color("    SET: Desync 35-45, Slow-walk boost ON, jitter-interval ODD value (3 or 5)")
+        cs_log_color("    AVOID: matching their interval (2 or 4)")
+    elseif e.aa_type == "spinner" then
+        cs_log_color("  → They SPINNER. Continuous rotation — uncommon. Resolver of you usually weak.")
+        cs_log_color("    SET: YAW-ROT ON + Side-streak 2 + Anti-BF max variance")
+    else
+        cs_log_color("  → AA-type still unknown (need more samples). Generic defense:")
+        cs_log_color("    SET: DEF-on-dmg ON, Side-streak thresh=3, Anti-BF ON")
+    end
+    if e.mag >= 35 then
+        cs_log_color(string.format("  → High-mag enemy (%.0f°). Their resolver trained on big desync.", e.mag))
+        cs_log_color("    SET: your desync 20-30 OR full 58 (mismatch training data, avoid 35-45 middle)")
+    elseif e.mag > 0 and e.mag <= 22 then
+        cs_log_color(string.format("  → Low-mag enemy (~%.0f°). Their resolver under-shoots.", e.mag))
+        cs_log_color("    SET: your desync 58 fixed (NL anti-BF OFF maximizes the gap)")
+    end
+    if e.dom ~= 0 and (e.samples_l + e.samples_r) >= 4 then
+        local their = e.dom > 0 and "RIGHT" or "LEFT"
+        local opp   = e.dom > 0 and "LEFT"  or "RIGHT"
+        cs_log_color(string.format("  → They strongly dom-%s their fake. Resolver-of-you probably assumes you too.", their))
+        cs_log_color(string.format("    SET: prefer Manual %s side OR side-streak thresh=2 (force flip earlier)", opp))
+    end
+    if e.miss_rate >= 30 then
+        cs_log_color(string.format("  → Recent miss-rate HIGH (%d%%). Resolver less sure about THEM too.", e.miss_rate))
+        cs_log_color("    Consider Smart Strategy → predict=Conservative for this match")
+    end
+    cs_log_color("══")
+end
+
+advisor_btn_refresh = g_advisor:button("🔁 Refresh player list", function()
+    pcall(advisor_rebuild)
+    cs_log_color(string.format("[Advisor] %d tracked players — use ▶ Next to cycle",
+        #advisor_state.list))
+end)
+advisor_btn_next = g_advisor:button("▶ Next player", function()
+    if #advisor_state.list == 0 then
+        cs_log_color("[Advisor] empty list — click 🔁 Refresh first")
+        return
+    end
+    advisor_state.idx = (advisor_state.idx % #advisor_state.list) + 1
+    local e = advisor_state.list[advisor_state.idx]
+    cs_log_color(string.format("[Advisor] selected #%d/%d: %s  (aa=%s mag=%.0f° dom=%s hits=%d)",
+        advisor_state.idx, #advisor_state.list, e.name, e.aa_type, e.mag,
+        advisor_dom_label(e.dom), e.hits))
+end)
+advisor_btn_show = g_advisor:button("💡 Show AA recommendations", function()
+    pcall(advisor_show)
+end)
+advisor_btn_all = g_advisor:button("📜 Show recs for ALL learned", function()
+    pcall(advisor_rebuild)
+    if #advisor_state.list == 0 then
+        cs_log_color("[Advisor] no enemies tracked yet")
+        return
+    end
+    local save_idx = advisor_state.idx
+    for i = 1, #advisor_state.list do
+        advisor_state.idx = i
+        pcall(advisor_show)
+    end
+    advisor_state.idx = save_idx
+end)
+g_advisor:label(" ")
+g_advisor:label("\a{Link Active}  Output goes to chat (in-game console).")
+g_advisor:label("\a{Link Active}  Recs reference Config v3.7 toggles (DEF/YAW-ROT/Side-streak).")
 
 -- Performance info (labels — settings hardcoded ON)
 g_perf:label(accent .. ui.get_icon"bolt"     .. accent .. "  Anim-state cache: ON (per tick)")
@@ -4088,5 +4249,6 @@ _cs_log_color_raw("Accuracy: measured-desync EMA + side-streak bias + yaw-extrap
 _cs_log_color_raw("Aggressive preset = first-shot velocity bias, opposite→58 brute-force, baim after 2 misses")
 _cs_log_color_raw("V9.18: ALL min_damage overrides REMOVED — NL min_dmg is source of truth. HEAD-FOCUS hc=40 block DELETED (was downgrading NL hc).")
 _cs_log_color_raw("V9.19: Adaptive guess magnitude (session median replaces 29° fallback) + Alt-mode dom-bias (Predicted-Alt/Air-Alt/Slow-Alt/Still-Alt prefer dom-side over blind flip).")
+_cs_log_color_raw("V9.20: AA Advisor tab → per-enemy config recommendations (Refresh / Next / Show / Show-ALL buttons).")
 _cs_log_color_raw("Logging: " .. (log_enabled:get() and ("ON" .. (log_verbose:get() and " (verbose)" or ""))  or "OFF"))
 _cs_log_color_raw("=========================================")
