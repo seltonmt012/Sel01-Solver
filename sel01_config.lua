@@ -1,12 +1,19 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Config — Neverlose CSGO HvH config        ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 3.11                                   ║
+-- ║  Version: 3.12                                   ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Config
 -- @author seltonmt01
--- @version 3.11
--- @description Bimodal magnitude (two-cluster anti-EMA AA):
+-- @version 3.12
+-- @description Correlated (anti-median) jitter:
+--   * New OFF-default toggle replaces the independent symmetric per-side noise
+--     with a CORRELATED pattern: sawtooth ramp (same-sign deltas → EMA chases
+--     but never centers) or anti-phase L/R (sides pushed opposite from one
+--     shared sine phase → whichever side the resolver locks, the other is
+--     maximally wrong). Median/EMA trackers smooth symmetric noise to its mean;
+--     correlated patterns deny that. Amplitude slider 5-38°.
+-- @description-prev Bimodal magnitude (two-cluster anti-EMA AA):
 --   * New OFF-default toggle alternates desync between two fixed clusters
 --     (default 25° / 55°) every 2-5s with a small ±3° wobble, instead of
 --     uniform random. A uniform jitter's mean IS its center, which an EMA /
@@ -29,7 +36,7 @@
 --     variance for full per-side chaos.
 --   * MAG-JIT indicator added to bottom HvH strip; dumped in v3.8 stats.
 
-local SEL01_CFG_VERSION = "3.11"
+local SEL01_CFG_VERSION = "3.12"
 
 -- DEBUG: print to CSGO console at major load checkpoints. Plain print() bypasses
 -- NL chat (which may not flush before crash) and writes directly to CSGO console.
@@ -162,6 +169,16 @@ local aa_bimodal      = g_aa:switch("Bimodal magnitude (two clusters, anti-EMA)"
 local aa_bimodal_lo   = g_aa:slider("  └ Cluster A (deg)", 10, 58, 25)
 local aa_bimodal_hi   = g_aa:slider("  └ Cluster B (deg)", 10, 58, 55)
 local aa_bimodal_state = { mode = 1, next_switch = 0 }
+-- V3.11: CORRELATED (anti-median) jitter. The anti-BF block draws TWO INDEPENDENT
+-- zero-mean uniform offsets per side — but the median/EMA of symmetric independent
+-- noise about `lim` IS `lim`, so a median tracker (incl ours) smooths it away.
+-- Correlated patterns defeat that: a sawtooth ramp has same-sign successive deltas
+-- (EMA chases but never centers); anti-phase pushes L and R in opposite directions
+-- from one shared phase (whichever side the resolver locks, the other is max wrong).
+local aa_corr_jitter    = g_aa:switch("Correlated jitter (anti-median)", false)
+local aa_corr_antiphase = g_aa:switch("  └ Anti-phase L/R (off = sawtooth ramp)", false)
+local aa_corr_amp       = g_aa:slider("  └ Amplitude (deg)", 5, 38, 20)
+local aa_corr_phase     = 0
 
 -- ══════════════════════════════════════════════════════════════════════════
 -- MOVEMENT UI
@@ -535,6 +552,7 @@ local function aa_periodic_sync()
     if aa_yaw_jitter_counter % jint == 0 then aa_jitter_dir = -aa_jitter_dir end
     if tick - aa_periodic_last_tick < 4 then return end
     aa_periodic_last_tick = tick
+    aa_corr_phase = aa_corr_phase + 1  -- V3.11: advance once per EXECUTED sync (post-throttle)
 
     -- airborne detection (FL_ONGROUND bit 0)
     local f = 0
@@ -616,7 +634,21 @@ local function aa_periodic_sync()
     end
 
     local l_lim, r_lim = lim, lim
-    if anti_bf_active or slow_active or defensive_active then
+    if aa_corr_jitter:get() then
+        -- V3.11: correlated pattern REPLACES the independent symmetric draw (stacking
+        -- a second random layer would just re-introduce the averaging it defeats).
+        local amp = aa_corr_amp:get()
+        if aa_corr_antiphase:get() then
+            local sn = math.sin(aa_corr_phase * 0.6)
+            l_lim = lim + amp * sn
+            r_lim = lim - amp * sn
+        else
+            local span = math.max(1, amp)
+            local ramp = (aa_corr_phase * 8) % span   -- same-sign walk; EMA never centers
+            l_lim = lim + ramp
+            r_lim = lim + ramp
+        end
+    elseif anti_bf_active or slow_active or defensive_active then
         local var = aa_anti_bf_var:get()
         -- 1.5x variance airborne for more chaos; 2x for slow / defensive
         if air_set_active                       then var = math.min(58, var * 1.5) end
