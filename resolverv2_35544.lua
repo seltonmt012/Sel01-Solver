@@ -1,21 +1,21 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 9.28                                   ║
+-- ║  Version: 9.29                                   ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 9.28
--- @description Coach-chat WHY+HOW rewrite:
---   * Each line now explains WHY the enemy's current AA is exploitable (the
---     diagnosis) before saying HOW to fix it. Old wording was "ur AA: switch,
---     left-side, ~25 deg" — only stated facts, didn't teach.
---   * Up to 4 lines: (1) problem + why, (2) fix + brief why-it-works, (3)
---     dom-side reason + manual side fix, (4) magnitude reason + value advice.
---   * Name trim 22 → 18 chars to leave room for the longer messages.
---   * v9.26 EMA drift-bump carries.
+-- @version 9.29
+-- @description Coach-chat variety + data-driven + bimodal detection:
+--   * 3 wording variants per category (diagnosis / fix / dom / mag) — picked
+--     deterministically from enemy-name hash so the same enemy keeps one
+--     flavour across calls but different enemies vary.
+--   * Diagnosis now cites REAL stats (switch streak counts, dom counts, etc).
+--   * BIMODAL enemy detection (per-side mag diff > 10°) gets its own special
+--     line — calls out the L=X° R=Y° leak.
+--   * v9.26 EMA drift-bump carries. Resolver math unchanged.
 
-local SEL01_VERSION = "9.28"
+local SEL01_VERSION = "9.29"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -656,10 +656,16 @@ advisor_btn_all = g_advisor:button("📜 Dump recs for ALL to console", function
     advisor_state.idx = save_idx
 end)
 
--- V9.26+V9.27+V9.28: addressed AA coach in CSGO chat. Every line names the
--- enemy AND explains WHY their current AA is exploitable + HOW to fix it (not
--- just "do X"). Compact phrasing so each line stays under the 127-char CSGO
--- chat limit. Up to 4 lines per send.
+-- V9.29 coach-chat. Goals:
+--   * Mention REAL stats in the diagnosis (streak counts, per-side magnitudes,
+--     dom counts, hits-on-them) so each enemy gets a personalised line rather
+--     than the same template every time.
+--   * Pick from 2-3 wording variants per category (deterministic-by-name so
+--     the same enemy gets the same flavour across calls, but different enemies
+--     vary).
+--   * Detect BIMODAL desync (per-side mags differ by >10°) and call it out
+--     specifically — the resolver handles bimodal via per-side EMA but the
+--     enemy doesn't know they're leaking 2 distinct values.
 function advisor_chat_send()
     if #advisor_state.list == 0 then
         cs_event_console("Advisor: no enemy selected — click 🔁 Refresh first", 240, 200, 100)
@@ -668,81 +674,159 @@ function advisor_chat_send()
     local e = advisor_state.list[advisor_state.idx]
     if not e then return end
 
-    -- Trim CSGO name to 18 chars so the explanation fits.
+    -- Trim CSGO name to 18 chars so longer messages fit.
     local nm = tostring(e.name or "enemy")
     if #nm > 18 then nm = nm:sub(1, 18) end
 
+    -- Variant picker: deterministic from name + AA type so same enemy keeps
+    -- one phrasing across calls but different enemies vary.
+    local function variant_pick(list, salt)
+        local h = (#nm) + (salt or 0)
+        for i = 1, #nm do h = h + string.byte(nm, i) end
+        return list[(h % #list) + 1]
+    end
+
+    -- Detect bimodal (two distinct per-side magnitudes >10° apart).
+    local bimodal = false
+    if (e.samples_l or 0) >= 2 and (e.samples_r or 0) >= 2
+       and math.abs((e.measured_l or 0) - (e.measured_r or 0)) > 10 then
+        bimodal = true
+    end
+
+    -- Variant pools per AA type. Each pool has 3 phrasings of the SAME
+    -- diagnosis (PROBLEM + WHY). All <127 chars when prefixed with "[Sel01-
+    -- Coach] @<nm> " (max 32 chars prefix).
+    local diag_static = {
+        "ur static-AA picks the same side every shot, resolvers lock ur fake yaw after 1-2 hits and just shoot opp",
+        "u use static body-yaw - no movement on the fake = trivial to learn, every resolver beats this in 2 hits",
+        "ur AA never flips, server reads ur fake angle as constant, resolvers fire opposite side blind and hit",
+    }
+    local diag_switch = {
+        "ur switch-AA L<->R is rhythmic, resolvers track ur streak (%d/%d) and predict the next side",
+        "u alternate sides predictably (streak L=%d R=%d), good resolvers count the pattern and lead it",
+        "ur switch-pattern is readable - hit count L=%d R=%d makes side prediction easy after 3 shots",
+    }
+    local diag_jitter = {
+        "ur jitter has a fixed interval, resolvers sync to it and lead onto ur real head every ~3rd shot",
+        "jitter w/ steady interval = clock signal, resolvers period-match and fire when fake hits zero",
+        "ur jitter cycles too regular - resolvers detect the period and time shots into ur real yaw window",
+    }
+    local diag_spinner = {
+        "spinner leaks position via yaw_rate sign, resolvers compute desync side from rotation direction",
+        "ur spinner gives away the AA side by rotation - resolvers invert yaw_rate sign and hit opposite",
+        "spinner = yaw_rate live broadcast, resolvers use it to predict fake yaw within one tick",
+    }
+    local diag_unknown = {
+        "ur AA still readable, no defensive reaction on getting hit = resolvers keep using their first guess",
+        "no AA panic-mode here, ur pattern stays steady even after taking dmg - that locks resolvers harder",
+        "ur AA has no break-out behaviour, resolvers refine their lock-on each round with no reset",
+    }
+
+    -- Fix pools (HOW + brief why).
+    local fix_static = {
+        "fix: set Yaw Modifier to JITTER, interval 1-2 ticks - fake angle moves every tick, no lock possible",
+        "fix: drop static, enable Jitter yaw mod 1-2 tick + Anti-BF variance ON, breaks every dom-side resolver",
+        "fix: yaw mod = Jitter (interval 2) + anti-BF noise = fake angle drifts and no resolver can pin it",
+    }
+    local fix_switch = {
+        "fix: desync max 58 + auto flip body-yaw inverter every 2 shots, breaks the L<->R streak they read",
+        "fix: enable side-streak limit (flip after 2 shots) + max desync 58 = next side becomes random",
+        "fix: max desync + force inverter flip after 2 shots = breaks the alternation pattern they predict",
+    }
+    local fix_jitter = {
+        "fix: jitter interval ODD (3 or 5) + desync 35-45 not max, kills the clock sync most resolvers use",
+        "fix: switch jitter interval to 3 or 5 (avoid 2 and 4) + desync 40 mid-range = no period to lock onto",
+        "fix: jitter int 3 or 5, plus anti-BF magnitude variance - resolvers cant period-match a moving target",
+    }
+    local fix_spinner = {
+        "fix: drop spinner, use jitter + yaw base rotation + max anti-BF variance = signal stops being readable",
+        "fix: switch spinner -> jitter, add yaw rotation every 4-8s = yaw_rate sign keeps inverting on them",
+        "fix: spinner off, use jitter w/ random interval + anti-BF max var, removes the rotation tell",
+    }
+    local fix_unknown = {
+        "fix: enable defensive-on-dmg (max desync 2s after hit) + force inverter flip after 3 shots = panic mode works",
+        "fix: turn on defensive AA window (2s after taking dmg) + side-streak 3 = resolvers reset on hit",
+        "fix: defensive-on-dmg ON + flip-after-3 + anti-BF variance, gives ur AA a break-out routine",
+    }
+
     local lines = {}
 
-    -- Line 1: PROBLEM + WHY (diagnosis the enemy may not realise).
+    -- Line 1: diagnosis. switch uses streak counts in the line.
+    local pool, head, used_stats
     if e.aa_type == "static" then
-        lines[#lines+1] = string.format(
-            "[Sel01-Coach] @%s ur static-AA = same side every shot, resolvers lock ur fake yaw after 1-2 hits",
-            nm)
+        pool = diag_static; head = variant_pick(pool, 1)
     elseif e.aa_type == "switch" then
-        lines[#lines+1] = string.format(
-            "[Sel01-Coach] @%s ur switch-AA L<->R is rhythmic, resolvers track ur streak and predict the next side",
-            nm)
+        pool = diag_switch; head = variant_pick(pool, 1)
+        head = string.format(head, e.samples_l or 0, e.samples_r or 0)
+        used_stats = true
     elseif e.aa_type == "jitter" then
-        lines[#lines+1] = string.format(
-            "[Sel01-Coach] @%s ur jitter has a fixed interval, resolvers sync to it and lead onto ur real head",
-            nm)
+        pool = diag_jitter; head = variant_pick(pool, 1)
     elseif e.aa_type == "spinner" then
-        lines[#lines+1] = string.format(
-            "[Sel01-Coach] @%s ur spinner leaks position via yaw_rate sign, resolvers compute desync from rotation",
-            nm)
+        pool = diag_spinner; head = variant_pick(pool, 1)
     else
-        lines[#lines+1] = string.format(
-            "[Sel01-Coach] @%s ur AA still readable (no defensive reaction on hit), resolvers exploit consistency",
-            nm)
+        pool = diag_unknown; head = variant_pick(pool, 1)
     end
+    lines[#lines+1] = string.format("[Sel01-Coach] @%s %s", nm, head)
 
-    -- Line 2: FIX + brief why-it-works.
-    if e.aa_type == "static" then
-        lines[#lines+1] = string.format(
-            "@%s fix: switch Yaw Mod to JITTER (interval 1-2 ticks) so ur fake angle moves and cant be locked",
-            nm)
-    elseif e.aa_type == "switch" then
-        lines[#lines+1] = string.format(
-            "@%s fix: desync max 58 + auto flip body-yaw inverter every 2 shots, breaks the streak they read",
-            nm)
-    elseif e.aa_type == "jitter" then
-        lines[#lines+1] = string.format(
-            "@%s fix: jitter interval ODD (3 or 5) + desync 35-45 (not max), desyncs them from ur clock",
-            nm)
-    elseif e.aa_type == "spinner" then
-        lines[#lines+1] = string.format(
-            "@%s fix: drop spinner, use jitter + yaw base rotation + max anti-BF variance, less signal to read",
-            nm)
-    else
-        lines[#lines+1] = string.format(
-            "@%s fix: enable defensive-on-dmg (max desync 2s after hit) + force inverter flip after 3 shots",
-            nm)
+    -- Line 2: fix.
+    local fix_pool
+    if e.aa_type == "static" then fix_pool = fix_static
+    elseif e.aa_type == "switch" then fix_pool = fix_switch
+    elseif e.aa_type == "jitter" then fix_pool = fix_jitter
+    elseif e.aa_type == "spinner" then fix_pool = fix_spinner
+    else                              fix_pool = fix_unknown
     end
+    lines[#lines+1] = string.format("@%s %s", nm, variant_pick(fix_pool, 2))
 
-    -- Line 3 (optional): dom-side issue + reason
-    if e.dom ~= 0 and (e.samples_l + e.samples_r) >= 4 then
+    -- Line 3 (special): BIMODAL detection — overrides dom line.
+    if bimodal then
+        lines[#lines+1] = string.format(
+            "@%s u use 2 different desync values (L=%.0f° R=%.0f°), resolvers learn each side independently",
+            nm, e.measured_l, e.measured_r)
+    elseif e.dom ~= 0 and (e.samples_l + e.samples_r) >= 4 then
         local their_side = e.dom > 0 and "right" or "left"
         local your_side  = e.dom > 0 and "left"  or "right"
-        lines[#lines+1] = string.format(
-            "@%s u land on %s side too often, resolvers spot the dom and aim there - manual %s OR auto flip",
-            nm, their_side, your_side)
+        local dom_count  = e.dom > 0 and e.samples_r or e.samples_l
+        local other      = e.dom > 0 and e.samples_l or e.samples_r
+        local dom_variants = {
+            "u land %s %d of %d times = strong dom, resolvers see the lean and aim %s - manual %s or auto flip every 2 shots",
+            "%s side has %d/%d ur hits - thats a clear lean, resolvers pre-shoot %s - flip to manual %s",
+            "%s-side count %d (vs %d) is too one-sided, dom-bias resolvers nail u - force manual %s",
+        }
+        local fmt = variant_pick(dom_variants, 3)
+        local msg
+        if fmt == dom_variants[1] then
+            msg = string.format(fmt, their_side, dom_count, dom_count + other, their_side, your_side)
+        elseif fmt == dom_variants[2] then
+            msg = string.format(fmt, their_side, dom_count, dom_count + other, their_side, your_side)
+        else
+            msg = string.format(fmt, their_side, dom_count, other, your_side)
+        end
+        lines[#lines+1] = string.format("@%s %s", nm, msg)
     end
 
-    -- Line 4 (optional): magnitude reasoning
+    -- Line 4 (optional): magnitude. Cites actual avg.
     if e.mag >= 35 then
-        lines[#lines+1] = string.format(
-            "@%s desync %.0f is BIG, most resolvers train on big values - drop to 20-25 to fall under their guess",
-            nm, e.mag)
+        local big_variants = {
+            "desync ~%.0f is BIG, most resolvers train on this range - drop to 20-25 to fall under their guess",
+            "ur %.0f° desync is in the resolver sweet spot, lower it to 22 or push to 58 max to escape",
+            "%.0f° is the standard rage value, every resolver expects it - jump to 58 or hide at 22",
+        }
+        local fmt = variant_pick(big_variants, 4)
+        lines[#lines+1] = string.format("@%s " .. fmt, nm, e.mag)
     elseif e.mag > 0 and e.mag <= 22 then
-        lines[#lines+1] = string.format(
-            "@%s desync %.0f is SMALL, resolvers under-shoot u easily - push to 50-58 max so the gap is wide",
-            nm, e.mag)
+        local small_variants = {
+            "desync ~%.0f is SMALL, resolvers under-shoot u easily - push to 50-58 max so the gap is wide",
+            "ur %.0f° desync barely moves the fake - bump to 55+ for real protection",
+            "%.0f° is below the resolver guess floor (~29°), they may even miss accidentally - go max 58 for safety",
+        }
+        local fmt = variant_pick(small_variants, 4)
+        lines[#lines+1] = string.format("@%s " .. fmt, nm, e.mag)
     end
 
-    -- Send each through CSGO chat. utils.console_exec is the Sel01-Roast
+    -- Send each line through CSGO chat. utils.console_exec is the Sel01-Roast
     -- pattern; engine.execute_client_cmd is the fallback. Strip embedded
-    -- quotes (the say parser dies on those), clamp 126 chars.
+    -- quotes (the say parser dies on those), clamp to 126 chars.
     for _, msg in ipairs(lines) do
         msg = msg:gsub('"', "'")
         if #msg > 126 then msg = msg:sub(1, 126) end
@@ -4617,5 +4701,6 @@ _cs_log_color_raw("V9.25: cs_event_* console fallback (HIT/MISS/KILL now print t
 _cs_log_color_raw("V9.26: 📨 Send tips to CSGO chat button (Advisor) + EMA drift-bump alpha 0.30→0.55 on >5° change (catches enemy mag changes in 2-3 hits).")
 _cs_log_color_raw("V9.27: Coach-chat lines now address @enemy by name + up to 4 concrete tips per send (type + dom + magnitude). No more bare 'hey'.")
 _cs_log_color_raw("V9.28: Coach-chat each line explains WHY enemy AA is exploitable + HOW to fix (was only stating facts). 4 lines: problem/fix/dom/mag.")
+_cs_log_color_raw("V9.29: Coach-chat 3 wording variants per category (name-hash deterministic) + data-driven WHY (real streak/dom counts) + BIMODAL detection.")
 _cs_log_color_raw("Logging: " .. (log_enabled:get() and ("ON" .. (log_verbose:get() and " (verbose)" or ""))  or "OFF"))
 _cs_log_color_raw("=========================================")
