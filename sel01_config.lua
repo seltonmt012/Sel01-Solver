@@ -1,15 +1,15 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Config — Neverlose CSGO HvH config        ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 2.9                                    ║
+-- ║  Version: 3.0                                    ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Config
 -- @author seltonmt01
--- @version 2.9
--- @description aim_ack hit-detection fixed (nil-reason = HIT now, matches resolver). Added
---              MISS_STATES + unknown-state logging. Per-mode shot counter, deaths log.
+-- @version 3.0
+-- @description Hitbox stats from player_hurt hitgroup (reliable, was aim_ack hitbox = nil).
+--              Anti-headshot: pitch jitter + auto-fakeduck-while-moving (both default OFF).
 
-local SEL01_CFG_VERSION = "2.9"
+local SEL01_CFG_VERSION = "3.0"
 
 -- DEBUG: print to CSGO console at major load checkpoints. Plain print() bypasses
 -- NL chat (which may not flush before crash) and writes directly to CSGO console.
@@ -92,6 +92,13 @@ local aa_anti_bf_var = g_aa:slider("Anti-BF variance (deg)", 5, 25, 15)
 -- audio/init events on spawn, suspected contributor to v1.8 spawn-crash)
 local aa_fd_assist   = g_aa:switch("Fake-duck assist (auto on hostile-fire)", false)
 local aa_fd_duration = g_aa:slider("Fake-duck duration (ms)", 200, 2000, 800)
+g_aa:label(" ")
+g_aa:label(accent .. "  Anti-headshot extras (default OFF — test first)")
+-- V3.0 anti-HS: pitch jitter (head Y bobs)
+local aa_pitch_jitter   = g_aa:switch("Pitch jitter (head Y bob Down/Up)", false)
+-- V3.0 anti-HS: auto-fakeduck while moving (ducked head = different Y)
+local aa_move_fakeduck  = g_aa:switch("Auto fake-duck while moving (ground only)", false)
+local aa_move_fd_thresh = g_aa:slider("Move-FD velocity threshold (u/s)", 50, 250, 100)
 
 -- ══════════════════════════════════════════════════════════════════════════
 -- MOVEMENT UI
@@ -456,6 +463,12 @@ local function aa_periodic_sync()
     end
     _was_airborne = airborne
 
+    -- V3.0: clear pitch override if pitch_jitter is OFF (so user's manual NL pitch
+    -- combo value comes back). Cheap: NL handles no-op clears.
+    if not aa_pitch_jitter:get() then
+        pcall(function() if nl_refs.aa_pitch then nl_refs.aa_pitch:override() end end)
+    end
+
     local now = globals.realtime or 0
     local on_shot_active = aa_onshot:get() and now < aa_state.on_shot_until
     local anti_bf_active = aa_anti_bf:get()
@@ -493,6 +506,24 @@ local function aa_periodic_sync()
         end
         -- force fake-duck in air — alt LBY break, ragebot harder to hit ducked target
         if aa_air_fakeduck:get() then
+            nl_override(nl_refs.aa_fakeduck, true)
+        end
+    end
+
+    -- V3.0 ANTI-HEADSHOT EXTRAS — head Y-axis randomization vs enemy resolver
+    -- Pitch jitter: NL Pitch combo set to "Jitter Down/Up" makes head bob between
+    -- -89 and +89 each tick. Enemy multipoint head-scan misses center mass.
+    if aa_pitch_jitter:get() then
+        nl_override(nl_refs.aa_pitch, "Jitter Down/Up")
+    end
+    -- Auto fake-duck while moving on ground: ducked head at lower Y, harder HS
+    if aa_move_fakeduck:get() and not airborne then
+        local vel = 0
+        pcall(function()
+            local v = lp.m_vecVelocity
+            vel = math.sqrt((v.x or 0)^2 + (v.y or 0)^2)
+        end)
+        if vel > (aa_move_fd_thresh:get() or 100) then
             nl_override(nl_refs.aa_fakeduck, true)
         end
     end
@@ -593,9 +624,20 @@ _hooks_status.aim_fire = nil   -- not registered in v1.13
 local hits_taken_log = {}
 local HITS_TAKEN_MAX = 10
 
+-- V3.0: two distinct mappings.
+--   HB_INDEX = aim_ack's event.hitbox (bone-index, 0 = head, 3 = chest, etc.)
+--   HB_GROUP = player_hurt's event.hitgroup (CSGO hitgroup, 1 = head, 2 = chest, etc.)
+-- _hb_name auto-detects: string passes through, 0 = head (index), 1 = head (group).
+local HB_INDEX_NAMES = { [0]="head", [3]="chest", [4]="stomach", [6]="leg", [7]="leg" }
+local HB_GROUP_NAMES = { [1]="head", [2]="chest", [3]="stomach",
+                         [4]="arm",  [5]="arm",
+                         [6]="leg",  [7]="leg" }
+
 local function _hb_name(hb)
-    local map = { [0]="head", [3]="chest", [4]="stomach", [6]="leg", [7]="leg" }
-    return map[hb] or tostring(hb or "?")
+    -- player_hurt sends integer hitgroup (1-7). aim_ack rarely fills hitbox.
+    -- If unknown integer, fall back to string repr.
+    if type(hb) == "string" then return hb end
+    return HB_GROUP_NAMES[hb] or HB_INDEX_NAMES[hb] or tostring(hb or "?")
 end
 
 -- V2.8: capture our AA state at the moment we get hit
@@ -690,13 +732,8 @@ pcall(function()
             local hb_name     = HB_NAMES_C[event.hitbox] or tostring(event.hitbox or "?")
             if is_hit then
                 stats.shots_hit = stats.shots_hit + 1
-                local hb = event.hitbox or -1
-                if     hb == 0 then stats.hits_head    = stats.hits_head    + 1
-                elseif hb == 3 then stats.hits_chest   = stats.hits_chest   + 1
-                elseif hb == 4 then stats.hits_stomach = stats.hits_stomach + 1
-                elseif hb == 6 or hb == 7 then stats.hits_leg = stats.hits_leg + 1
-                else stats.hits_other = stats.hits_other + 1
-                end
+                -- V3.0: hitbox bucketing moved to player_hurt (event.hitgroup is
+                -- reliable; event.hitbox in aim_ack returns nil in this NL build).
                 if vis_hitmarker:get() then hitmark_time = globals.realtime or 0 end
                 if vis_hitlog:get() then
                     table.insert(hit_log, {
@@ -800,6 +837,13 @@ pcall(function()
             stats.total_dmg = stats.total_dmg + dmg
             if dmg > stats.biggest_hit then stats.biggest_hit = dmg end
             if dmg >= 100 then stats.one_taps = stats.one_taps + 1 end
+            -- V3.0: hitbox bucketing using HITGROUP (1=head, 2=chest, etc) — reliable
+            if     hb == 1 then stats.hits_head    = stats.hits_head    + 1
+            elseif hb == 2 then stats.hits_chest   = stats.hits_chest   + 1
+            elseif hb == 3 then stats.hits_stomach = stats.hits_stomach + 1
+            elseif hb == 6 or hb == 7 then stats.hits_leg = stats.hits_leg + 1
+            else stats.hits_other = stats.hits_other + 1
+            end
             if not vis_dmgind:get() then return end
             table.insert(damage_pops, {
                 time      = globals.realtime or 0,
@@ -1339,7 +1383,7 @@ end)
 -- LOAD BANNER
 -- ══════════════════════════════════════════════════════════════════════════
 cs_log_color("══════════════════════════════════════════")
-cs_log_color("Sel01-Config v" .. SEL01_CFG_VERSION .. " loaded (CSGO HvH — Hit-detect fix + Kill/Miss/Hit event log)")
+cs_log_color("Sel01-Config v" .. SEL01_CFG_VERSION .. " loaded (CSGO HvH — Hitbox stats fixed + Anti-HS extras)")
 cs_log(string.format("  hooks  createmove=%s  aim_fire=%s",
     tostring(_hooks_status.createmove or "MISSING"),
     tostring(_hooks_status.aim_fire or "MISSING")))

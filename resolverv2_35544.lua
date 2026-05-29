@@ -1,14 +1,14 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 9.11                                   ║
+-- ║  Version: 9.12                                   ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 9.11
--- @description Enhanced counter-fire (force head + safepoint-off + HC 15) + fast-fire lowered conf threshold 70->50 / samples 2->1
+-- @version 9.12
+-- @description Close-range first-miss follow-up: drop HC to 10 + force head + safepoint off for fast trade
 
-local SEL01_VERSION = "9.11"
+local SEL01_VERSION = "9.12"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -3498,6 +3498,22 @@ pcall(function()
                 cs_log_verbose("fast-fire idx=%d conf=%d samples=%d hc=%d",
                                target:get_index(), intel.conf, intel.samples, fast_hc)
             end
+        end
+
+        -- V9.12: CLOSE-RANGE FIRST-MISS FOLLOW-UP — user reported missing the first
+        -- close shot then waiting too long for ragebot to fire again. After 1+ miss
+        -- on a close target (<1000u) in Aggressive mode, drop hc to 10, mindmg to 1,
+        -- force head, safepoint off — same package as counter-fire so the trade-shot
+        -- fires the next frame the head is takable.
+        if mode_now == "Aggressive" and s and s.missed >= 1 and target_dist < 1000 and not counter_fire_active then
+            pcall(function() ctx:override_hitchance(10) end)
+            pcall(function() ctx:override_min_damage(1) end)
+            pcall(function() ctx:override_hitbox(0) end)
+            pcall(function() ctx:override_safe_point(false) end)
+            pcall(function() ctx:override_multipoint(true) end)
+            pcall(function() ctx:override_multipoint_scale(0.85) end)
+            cs_log_verbose("close-miss followup idx=%d dist=%.0f missed=%d",
+                           target:get_index(), target_dist, s.missed)
         end
 
         -- V9.9-C: CROUCH-AWARE HITBOX — target ducked → head harder to hit (smaller + lower).
