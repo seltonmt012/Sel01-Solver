@@ -1,14 +1,20 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 9.18                                   ║
+-- ║  Version: 9.19                                   ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 9.18
--- @description Strip ALL min_damage overrides + delete HEAD-FOCUS hc=40 block (was downgrading user's NL hc=72 + multi-hitbox → missing open heads). NL config is respected globally.
+-- @version 9.19
+-- @description Adaptive fallback magnitude + Alt-mode dom-bias.
+--   * Session-rolling median of measured desyncs replaces hardcoded ±29° in all
+--     *-Guess paths (Static / Networked / LBY-Snap / Air). User's lobby modal ~38°
+--     was under-shot by the 29° default — adaptive auto-tunes per-lobby.
+--   * Predicted-Alt / Air-Alt / Slow-Alt / Still-Alt now prefer dom-side when it
+--     leads by 2+ samples instead of blind alternate. Fixes Predicted-Alt 33% miss
+--     rate on streak{L=9 R=0} enemies that were flipping into the open side.
 
-local SEL01_VERSION = "9.18"
+local SEL01_VERSION = "9.19"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -425,6 +431,48 @@ local function log_buffer_iter()
         out[#out + 1] = log_buffer[idx]
     end
     return out
+end
+
+-- V9.19: SESSION-ROLLING DESYNC RING + adaptive guess-magnitude helper.
+-- Declared as MODULE GLOBALS (no `local`) because main-chunk is already near
+-- the Lua 5.1 200-local limit. Globals are looked up in _G; tiny overhead per
+-- call but functionally identical. Safe — these names are unique to this script.
+-- Tracks the last N measured desyncs from all hits across all enemies in current
+-- lobby. samples=0 fallback paths (Predicted-Guess, Networked-Guess, *-Guess)
+-- previously used hardcoded ±29°. User's lobby modal desync was ~37-38° so 29°
+-- under-shot constantly. Adaptive median catches up automatically.
+sel01_session_desyncs = { cap = 20, head = 0, count = 0 }
+function session_push_desync(v)
+    if not v or v < 5 or v > 65 then return end
+    local r = sel01_session_desyncs
+    r.head = (r.head % r.cap) + 1
+    r[r.head] = v
+    if r.count < r.cap then r.count = r.count + 1 end
+end
+function adaptive_guess_mag()
+    local r = sel01_session_desyncs
+    if r.count == 0 then return 29 end
+    local tmp = {}
+    for i = 1, r.count do tmp[i] = r[i] end
+    table.sort(tmp)
+    local mid = tmp[math.ceil(r.count / 2)]
+    if mid < 20 then return 20 end
+    if mid > 58 then return 58 end
+    return mid
+end
+
+-- V9.19: ALT-MODE side picker. Predicted-Alt / Air-Alt / Slow-Alt / Still-Alt
+-- previously did blind `-last_hit_side` flip. On enemies with clear dom (e.g.
+-- streak{L=9 R=0}) flipping = miss every time. New rule: if dom-side leads by
+-- 2+ samples, STAY on dom. Otherwise blind alternate as before. Returns +1 (R),
+-- -1 (L), or 0 if no signal — caller falls back to its own default.
+function alt_side_pick(s)
+    local sl, sr = s.samples_left or 0, s.samples_right or 0
+    if sl >= sr + 2 then return -1 end
+    if sr >= sl + 2 then return  1 end
+    if (s.last_hit_side or 0) > 0 then return -1 end
+    if (s.last_hit_side or 0) < 0 then return  1 end
+    return 0
 end
 
 local log_copy_btn = g_logging:button("📋 Copy Last Logs (for share)", function()
@@ -1968,6 +2016,9 @@ events.aim_ack:set(function(event)
                     s.measured_desync = s.measured_desync * (1 - alpha) + actual * alpha
                 end
                 s.desync_samples = math.min(s.desync_samples + 1, 99)
+                -- V9.19: push every hit-derived measurement into the session ring
+                -- so adaptive_guess_mag() reflects current lobby AA magnitudes.
+                session_push_desync(actual)
                 -- per-side EMA
                 if exp_perside_desync and exp_perside_desync:get() then
                     if hit_side > 0 then
@@ -2362,7 +2413,9 @@ local function _pick_first_shot_impl(p, s, anim, eye_yaw, max_desync, preset)
             local sw_both = (s.samples_left or 0) >= 1 and (s.samples_right or 0) >= 1
             local sw_corr = ((s.correction_left or 0) + (s.correction_right or 0)) >= 2
             if s.aa_type == "switch" and s.last_hit_side ~= 0 and (sw_both or sw_corr) then
-                local side = -s.last_hit_side
+                -- V9.19: dom-bias — if one side leads by 2+, prefer dom over blind alt
+                local side = alt_side_pick(s)
+                if side == 0 then side = -s.last_hit_side end
                 local mag
                 if side > 0 and (s.samples_right or 0) >= 1 and (s.measured_right or 0) > 5 then
                     mag = s.measured_right
@@ -2371,7 +2424,7 @@ local function _pick_first_shot_impl(p, s, anim, eye_yaw, max_desync, preset)
                 elseif (s.measured_desync or 0) > 5 then
                     mag = s.measured_desync
                 else
-                    mag = 29
+                    mag = adaptive_guess_mag()
                 end
                 s.mode = "Still-Alt"
                 return eye_yaw + mag * side
@@ -2402,8 +2455,9 @@ local function _pick_first_shot_impl(p, s, anim, eye_yaw, max_desync, preset)
         local corr_diff = (s.correction_right or 0) - (s.correction_left or 0)
         local pref_side
         if s.aa_type == "switch" and (both_hit or corr_total >= 2) and s.last_hit_side ~= 0 then
-            -- alt: opposite of last hit
-            pref_side = -s.last_hit_side
+            -- V9.19: dom-bias — prefer dom if it leads by 2+, else opposite of last hit
+            pref_side = alt_side_pick(s)
+            if pref_side == 0 then pref_side = -s.last_hit_side end
             s.mode = "Slow-Alt"
         elseif math.abs(corr_diff) >= 2 then
             pref_side = corr_diff > 0 and -1 or 1
@@ -2470,7 +2524,7 @@ local function _pick_first_shot_impl(p, s, anim, eye_yaw, max_desync, preset)
                     or (s.hit_streak_right >= s.hit_streak_left and 1 or -1)
             end
             s.mode = "Static-Guess"
-            return eye_yaw + 29 * side
+            return eye_yaw + adaptive_guess_mag() * side
         elseif s.aa_type == "jitter" and s.last_hit_side ~= 0 then
             s.mode = "Jitter-Cls"
             return eye_yaw + desync * s.last_hit_side
@@ -2490,7 +2544,7 @@ local function _pick_first_shot_impl(p, s, anim, eye_yaw, max_desync, preset)
         if math.abs(NormalizeAngle(sy - eye_yaw)) < 5 then
             local side = s.last_hit_side ~= 0 and s.last_hit_side or 1
             s.mode = "Networked-Guess"
-            return eye_yaw + 29 * side
+            return eye_yaw + adaptive_guess_mag() * side
         end
         s.mode = "Networked"
         return sy
@@ -2512,8 +2566,10 @@ local function _pick_first_shot_impl(p, s, anim, eye_yaw, max_desync, preset)
             if s.measured_desync and s.measured_desync >= 10 then
                 mag = s.measured_desync
             else
+                -- V9.19: cycle anchored on adaptive lobby median, not hardcoded 29
                 s.lby_snap_attempts = (s.lby_snap_attempts or 0) + 1
-                local cycle = {29, 45, 58}
+                local base = adaptive_guess_mag()
+                local cycle = { base, math.min(58, base + 16), 58 }
                 mag = cycle[((s.lby_snap_attempts - 1) % 3) + 1]
             end
             s.mode = "LBY-Snap-Guess"
@@ -2542,10 +2598,13 @@ local function _pick_first_shot_impl(p, s, anim, eye_yaw, max_desync, preset)
         local both_hit = (s.samples_left or 0) >= 1 and (s.samples_right or 0) >= 1
         local corr_total = (s.correction_left or 0) + (s.correction_right or 0)
         if s.aa_type == "switch" and (both_hit or corr_total >= 2) then
-            -- alternate based on last_hit_side (do opposite of last hit)
-            if s.last_hit_side > 0 then side = -1
-            elseif s.last_hit_side < 0 then side = 1
-            else side = 1 end
+            -- V9.19: dom-bias — prefer dom if it leads by 2+, else alternate
+            side = alt_side_pick(s)
+            if side == 0 then
+                if s.last_hit_side > 0 then side = -1
+                elseif s.last_hit_side < 0 then side = 1
+                else side = 1 end
+            end
             s.mode = "Predicted-Alt"
         elseif s.hit_streak_left + s.hit_streak_right >= 1 then
             if s.hit_streak_right >= s.hit_streak_left then
@@ -2614,7 +2673,7 @@ local function _pick_first_shot_impl(p, s, anim, eye_yaw, max_desync, preset)
     s.guess_cached_side = side
     s.guess_cached_miss = s.missed
     s.mode = "Networked-Guess"
-    return eye_yaw + 29 * side
+    return eye_yaw + adaptive_guess_mag() * side
 end
 
 -- wrapper: caches first-shot result for ~150ms to prevent branch oscillation
@@ -2867,7 +2926,9 @@ local function resolve_player(p)
         -- V8.2: switch-AA alternate (both sides hit) → use opposite of last hit
         local both_air = (s.samples_left or 0) >= 1 and (s.samples_right or 0) >= 1
         if s.aa_type == "switch" and both_air and s.last_hit_side ~= 0 then
-            local side = -s.last_hit_side
+            -- V9.19: dom-bias for Air-Alt — prefer dom if it leads by 2+
+            local side = alt_side_pick(s)
+            if side == 0 then side = -s.last_hit_side end
             local mag = (side > 0 and s.measured_right > 5) and s.measured_right
                      or (side < 0 and s.measured_left > 5)  and s.measured_left
                      or s.measured_desync
@@ -2886,10 +2947,10 @@ local function resolve_player(p)
             end
             server_yaw = anim.m_flEyeYaw + s.measured_desync * side
         end
-        -- V9.6: never resolve to exact eye_yaw — always offset at least ±29°
+        -- V9.6+V9.19: never resolve to exact eye_yaw — offset by adaptive median
         if math.abs(NormalizeAngle(server_yaw - anim.m_flEyeYaw)) < 5 then
             local fallback_side = s.last_hit_side ~= 0 and s.last_hit_side or 1
-            server_yaw = anim.m_flEyeYaw + 29 * fallback_side
+            server_yaw = anim.m_flEyeYaw + adaptive_guess_mag() * fallback_side
             s.mode = "Air-Guess"
         end
         s.last_eye_yaw  = anim.m_flEyeYaw
@@ -4026,5 +4087,6 @@ _cs_log_color_raw("Performance: anim-cache + FOV-cull(110°) + dist-cull(4500u) 
 _cs_log_color_raw("Accuracy: measured-desync EMA + side-streak bias + yaw-extrapolation → ON")
 _cs_log_color_raw("Aggressive preset = first-shot velocity bias, opposite→58 brute-force, baim after 2 misses")
 _cs_log_color_raw("V9.18: ALL min_damage overrides REMOVED — NL min_dmg is source of truth. HEAD-FOCUS hc=40 block DELETED (was downgrading NL hc).")
+_cs_log_color_raw("V9.19: Adaptive guess magnitude (session median replaces 29° fallback) + Alt-mode dom-bias (Predicted-Alt/Air-Alt/Slow-Alt/Still-Alt prefer dom-side over blind flip).")
 _cs_log_color_raw("Logging: " .. (log_enabled:get() and ("ON" .. (log_verbose:get() and " (verbose)" or ""))  or "OFF"))
 _cs_log_color_raw("=========================================")
