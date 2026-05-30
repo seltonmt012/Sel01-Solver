@@ -1,11 +1,11 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Config — Neverlose CSGO HvH config        ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 3.15                                   ║
+-- ║  Version: 3.16                                   ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Config
 -- @author seltonmt01
--- @version 3.15
+-- @version 3.16
 -- @description Smart freestand (anti-headshot):
 --   * NL freestanding is deterministic — it always picks the same "safe" side, so a
 --     resolver models it and headshots the predictably-exposed side (user report:
@@ -53,7 +53,7 @@
 --     variance for full per-side chaos.
 --   * MAG-JIT indicator added to bottom HvH strip; dumped in v3.8 stats.
 
-local SEL01_CFG_VERSION = "3.15"
+local SEL01_CFG_VERSION = "3.16"
 
 -- DEBUG: print to CSGO console at major load checkpoints. Plain print() bypasses
 -- NL chat (which may not flush before crash) and writes directly to CSGO console.
@@ -98,6 +98,7 @@ local btn_aggressive = g_main:button("Aggressive (full send)",   function() appl
 local btn_dynamic    = g_main:button("Dynamic (balanced)",       function() apply_preset_fwd("dynamic")    end)
 local btn_defensive  = g_main:button("Defensive (safe AA)",      function() apply_preset_fwd("defensive")  end)
 local btn_spin       = g_main:button("Spin (full spinbot)",      function() apply_preset_fwd("spin")       end)
+local btn_troll      = g_main:button("Troll / Bait (run-in chaos)", function() apply_preset_fwd("troll")    end)
 
 g_main:label(" ")
 local enable_master = g_main:switch(accent .. ui.get_icon"power" .. accent .. "  Master Enable (all features)", true)
@@ -367,7 +368,7 @@ end)  -- outer pcall
 -- on combo / slider elements during the menu render lifecycle (V1.4 user reported
 -- the menu hung mid-callback). We defer the work to the next createmove tick
 -- which runs OUTSIDE the menu render pipeline.
-local pending_preset = nil  -- "aggressive" / "dynamic" / "defensive" / "legit" or nil
+local pending_preset = nil  -- "aggressive" / "dynamic" / "defensive" / "spin" / "troll" or nil
 
 -- The actual apply runs from createmove (see createmove_unified below).
 -- Combo :set() calls are skipped entirely — they were the most likely crash source.
@@ -411,6 +412,15 @@ local function _do_apply_preset(name)
         safe_set(aa_anti_bf, true)
         safe_set(aa_anti_bf_var, 15)
         safe_set(aa_fd_assist, true)
+        -- V3.16: enable Magnitude jitter in Aggressive. The debug dumps showed enemies
+        -- repeatedly headshotting at a STABLE desync (58/45/35) — that is exactly what an
+        -- EMA resolver (incl. Sel01-Solver itself) locks onto. Per-tick magnitude jitter
+        -- leaves the real fake-yaw 5-15° off the learned average every shot. Only affects
+        -- the OUTGOING anti-aim (how enemies see you) — zero cost to your own hit-rate.
+        safe_set(aa_mag_jitter, true)
+        safe_set(aa_mag_jit_min, 38)
+        safe_set(aa_mag_jit_max, 58)
+        safe_set(aa_fl_var, true)        -- fake-lag variance — breaks backtrack resolvers too
         safe_set(vis_watermark, true)
         safe_set(vis_indicators, true)
         safe_set(vis_velwarn, true)
@@ -513,6 +523,65 @@ local function _do_apply_preset(name)
         nl_override(nl_refs.aa_avoidbackstab, false)
         nl_override(nl_refs.fl_switch, true)
         cs_log_color("SPIN preset applied (full spinbot — no freestanding, max jitter)")
+    elseif name == "troll" then
+        -- V3.16: TROLL / BAIT — NOT competitive. Built for running or slow-walking
+        -- straight INTO enemies to see who can actually resolve you (everyone else
+        -- whiffs). Stacks EVERY anti-resolver layer at once: per-tick magnitude jitter
+        -- (kills EMA resolvers — including the kind Sel01-Solver itself is), fake-lag
+        -- variance (breaks backtrack), yaw-base rotation (anti eye-yaw fingerprint),
+        -- fast side-streak flipping (never a predictable side), defensive-on-hit +
+        -- slow-walk chaos. Freestanding OFF on purpose — it picks a DETERMINISTIC side
+        -- (resolvable); pure jitter is less trackable for a bait.
+        safe_set(aa_enable, true)
+        safe_set(aa_freestanding, false)
+        safe_set(aa_at_targets, false)
+        safe_set(aa_desync, 58)            -- max angle
+        safe_set(aa_yaw_add, 0)
+        safe_set(aa_yaw_mod_mag, 58)
+        safe_set(aa_yaw_mod_int, 1)        -- flip every tick
+        safe_set(aa_onshot, true)
+        safe_set(aa_air_set, true)
+        safe_set(aa_air_mag, 58)
+        safe_set(aa_air_flip, true)
+        safe_set(aa_air_boost, true)
+        safe_set(aa_air_fakeduck, true)
+        safe_set(aa_move_set, true)        -- keep desync while running in
+        safe_set(aa_move_mag, 58)
+        safe_set(aa_move_thresh, 100)
+        safe_set(aa_move_flip, true)
+        safe_set(aa_move_boost, true)
+        safe_set(aa_pitch_jitter, true)    -- anti-headshot vertical
+        safe_set(aa_move_fakeduck, false)  -- avoid the sticky-fakeduck bug (v3.3)
+        safe_set(aa_move_fd_thresh, 100)
+        safe_set(aa_anti_bf, true)
+        safe_set(aa_anti_bf_var, 25)       -- max bruteforce variance
+        safe_set(aa_fd_assist, true)
+        -- ── the whole anti-resolver bundle ON (this is the point of the preset) ──
+        safe_set(aa_mag_jitter, true)      -- THE EMA-resolver killer
+        safe_set(aa_mag_jit_min, 35)
+        safe_set(aa_mag_jit_max, 58)
+        safe_set(aa_fl_var, true)          -- breaks backtrack records
+        safe_set(aa_yaw_rotate, true)      -- rotates yaw base, anti eye-yaw fingerprint
+        safe_set(aa_side_streak, true)
+        safe_set(aa_side_streak_n, 2)      -- flip after 2 same-side shots = never predictable
+        safe_set(aa_def_on_dmg, true)
+        safe_set(aa_def_duration, 3000)    -- long chaos window when hit
+        safe_set(aa_slow_boost, true)      -- max chaos while slow-walking in
+        safe_set(vis_watermark, true)
+        safe_set(vis_indicators, true)
+        safe_set(vis_velwarn, true)
+        safe_set(vis_aaarrows, true)
+        safe_set(vis_hitmarker, true)
+        safe_set(vis_hitlog, true)
+        safe_set(vis_keybinds, true)
+        safe_set(vis_dmgind, true)
+        safe_set(vis_specoverlay, true)
+        safe_set(qol_clantag, true)
+        nl_override(nl_refs.aa_enabled, true)
+        nl_override(nl_refs.aa_freestand, false)
+        nl_override(nl_refs.aa_avoidbackstab, false)
+        nl_override(nl_refs.fl_switch, true)
+        cs_log_color("TROLL/BAIT preset applied — max anti-resolver chaos. Run/slow-walk in + watch who whiffs.")
     end
 end
 
