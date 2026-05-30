@@ -1,11 +1,11 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 9.42                                   ║
+-- ║  Version: 9.43                                   ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 9.42
+-- @version 9.43
 -- @description Correction side guard + serverfail retry:
 --   * correction/prediction-error misses now check SIDE evidence, not only
 --     magnitude. A BF shot on the unlearned opposite side no longer gets labeled
@@ -73,7 +73,7 @@
 --   * v9.26 drift-bump (alpha 0.55 on 5-10° diff) still handles small shifts.
 --   * v9.29 coach variants carry.
 
-local SEL01_VERSION = "9.42"
+local SEL01_VERSION = "9.43"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -2659,10 +2659,15 @@ events.aim_ack:set(function(event)
                 -- range) actually triggers on the enemies that cause it.
                 if bt > 6 then
                     s.bt_fail_count = (s.bt_fail_count or 0) + 1
-                    if s.bt_fail_count >= 3 and not s.backtrack_resistant then
+                    -- V9.43: escalate faster on point-blank fakelaggers. Waiting for 3
+                    -- high-bt fails wasted 2 sure shots on the recurring "correct angle
+                    -- (our=meas, err=0), point-blank, server rejects bt 7-10" enemy.
+                    -- Now: 2 high-bt fails OR a single clearly-stale record (bt > 12)
+                    -- flips the resistant flag → predict_ticks-1 + full-spread multipoint.
+                    if not s.backtrack_resistant and (s.bt_fail_count >= 2 or bt > 12) then
                         s.backtrack_resistant = true
-                        cs_log_verbose("backtrack-resistant idx=%d (bt-driven, high-bt corr fails=%d)",
-                                       Ent:get_index(), s.bt_fail_count)
+                        cs_log_verbose("backtrack-resistant idx=%d (bt-driven, fails=%d bt=%d)",
+                                       Ent:get_index(), s.bt_fail_count, bt)
                     end
                 end
                 resolver_note_serverfail_retry(s, ack_shot_side, math.max(math.abs(ack_delta), ack_measured))
@@ -5119,6 +5124,7 @@ _cs_log_color_raw("V9.38: correction guard is side-aware + correct-angle serverf
 _cs_log_color_raw("V9.39: sample-count EMA alpha ramp (0.55 on hit 1-2, 0.42 on hit 3-4, then 0.30) on global + both per-side — converges in 2-3 hits instead of 5-6, faster + smoother lock (side settles sooner, fewer first-shot mode flips).")
 _cs_log_color_raw("V9.40: point-blank stale-record fix — non-sniper close-priority now forces multipoint (was sniper-only) so a single-point head shot stops whiffing on an enemy running at you (correct angle, high bt, reason=correction). + bt-driven backtrack-resistance (high event.backtrack on correction/prediction-error now counts, was string-only).")
 _cs_log_color_raw("V9.41: air-guess magnitude is per-player passive-aware — uses THIS enemy's measured/passive-seeded desync before the blind floor (v9.37's max(median,42) overshot low-desync air enemies by ~30° and ignored 50+ passive obs we already had). Blind floor softened 42→36.")
+_cs_log_color_raw("V9.43: backtrack-resistance escalates faster — point-blank fakelaggers with correct angle (our=meas, err=0) but server-reject (bt 7-10) now flip the resistant flag after 2 high-bt fails OR one bt>12, instead of 3 (was wasting 2 sure shots). Pairs with v9.40 full-spread multipoint to catch slightly-stale records.")
 _cs_log_color_raw("V9.42: side-flip from SIDE evidence not magnitude error — ack_angle_err is a MAGNITUDE metric (wrong-side miss = small err, magnitude overshoot = large err), so old 'err>5 → flip' flipped the correct side on magnitude misses (idx=4: real 36°L, we 55°L, wrongly flipped R). Now flip only on learned side-conflict or blind first-contact; magnitude misses keep side, BF cycles the magnitude.")
 _cs_log_color_raw("Logging: " .. (log_enabled:get() and ("ON" .. (log_verbose:get() and " (verbose)" or ""))  or "OFF"))
 _cs_log_color_raw("=========================================")
