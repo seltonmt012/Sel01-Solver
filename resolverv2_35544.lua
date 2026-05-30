@@ -1,11 +1,11 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 9.49                                   ║
+-- ║  Version: 9.50                                   ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 9.49
+-- @version 9.50
 -- @description Correction side guard + serverfail retry:
 --   * correction/prediction-error misses now check SIDE evidence, not only
 --     magnitude. A BF shot on the unlearned opposite side no longer gets labeled
@@ -73,7 +73,7 @@
 --   * v9.26 drift-bump (alpha 0.55 on 5-10° diff) still handles small shifts.
 --   * v9.29 coach variants carry.
 
-local SEL01_VERSION = "9.49"
+local SEL01_VERSION = "9.50"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -1163,6 +1163,16 @@ local log_copy_btn = g_logging:button("📋 Copy Last Logs (for share)", functio
         sess_total > 0 and (session_stats.total_hits / sess_total * 100) or 0,
         session_stats.early_rate or 0, session_stats.recent_rate or 0,
         (session_stats.recent_rate or 0) - (session_stats.early_rate or 0)))
+    -- V9.50: surface the V9.49 server-fail filter. These correct-angle misses the server
+    -- rejected (stale backtrack record) are excluded from the hit-rate above — show how
+    -- many were filtered so the headline % is trustworthy + the netcode load is visible.
+    local sf = sel01_session_serverfails or 0
+    if sf > 0 then
+        local raw_shots = sess_total + sf
+        _cs_log_raw(string.format("[SESSION] %d server-fails filtered (correct angle, server rejected) — raw %d/%d = %.1f%% before filter",
+            sf, session_stats.total_hits or 0, raw_shots,
+            raw_shots > 0 and (session_stats.total_hits / raw_shots * 100) or 0))
+    end
 
     -- mode hit-rates + AUTO-SUGGESTIONS
     _cs_log_raw("--- MODE HIT-RATES + SUGGESTIONS ---")
@@ -1348,6 +1358,7 @@ local log_reset_session = g_logging:button("🗑 Reset Session Stats (in-memory)
     session_stats.early_rate  = 0
     session_stats.recent_rate = 0
     for k in pairs(session_stats.history) do session_stats.history[k] = nil end
+    sel01_session_serverfails = 0  -- V9.50: clear server-fail filter counter
     -- mode stats
     for k in pairs(mode_stats) do mode_stats[k] = nil end
     -- steam memory
@@ -5005,6 +5016,15 @@ local esp_paint_handler = function()
                 string.format("Trend: %s (recent %.0f%% vs early %.0f%%)",
                     trend_str, session_stats.recent_rate, session_stats.early_rate))
         end
+        -- V9.50: server-fail filter readout. Shows how many correct-angle misses the
+        -- server rejected (stale backtrack) were excluded from the hit-rate above, so the
+        -- headline % is trustworthy and the netcode load on this server is visible.
+        local sf = sel01_session_serverfails or 0
+        if sf > 0 then
+            render.text(3, vector(x0, y0 + line_h * 9 + 2), color(150, 180, 210, 230), nil,
+                string.format("Netcode: %d server-fail%s filtered (not our miss)",
+                    sf, sf == 1 and "" or "s"))
+        end
     end)
 end
 
@@ -5256,6 +5276,7 @@ _cs_log_color_raw("V9.45: seed-only keep-side fix — the 'magnitude matched mea
 _cs_log_color_raw("V9.46: teleport-on-peek detection — horizontal origin delta vs max run-speed reveals a blink-peek (lag-switch / fakelag-flush). On detect, time-box 0.4s that disables extrapolation (yaw_rate from before the blink can't predict the landing) + forces full-spread multipoint at close range so NL's stale backtrack record still lands. Reacts on the FIRST peek instead of after 2 misses; never touches side/EMA so v9.45 + learned patterns stay intact.")
 _cs_log_color_raw("V9.47: side-conflict overrides high-bt keep when angle was off — a learned wrong-side shot with a LARGE magnitude error (>10) now flips even under bt>8, because a clean stale-record reject leaves err~0. Old order let bt>8 short-circuit the flip and retry the wrong side (logs: idx=8, 1 R-hit, shot L -21.6 vs meas 39.5 err=17.9 bt=12 — kept L; next real hit confirmed R). err~0 + side-conflict still keeps (switch-stale / v9.42 overshoot / v9.44 locked protected).")
 _cs_log_color_raw("V9.48: alt_side_pick uses REAL-hit dominance when both sides have real hits — the seeded-inclusive sample counts (sl/sr carry passive+seeded entries) mispinned a genuine 50/50 switch enemy. Logs: idx=4 sl=3 sr=1 pinned LEFT for Predicted-Alt but real hits were 1L/1R and the correct side was RIGHT (Predicted-Alt 0/2). Balanced real data now alternates off last_hit_side; one-sided enemies (rr=0) keep the old seeded dom path so streak{L=9 R=0} is unaffected.")
+_cs_log_color_raw("V9.50: server-fail filter readout — the V9.49 netcode-miss counter (sel01_session_serverfails + per-player s.serverfail_misses) is now surfaced in the copy-dump ([SESSION] shows N filtered + the raw pre-filter %) AND the HUD corner ('Netcode: N server-fails filtered'). Makes the headline hit-rate trustworthy: you can see how many correct-angle shots the server rejected vs real resolver misses. Counter clears on Reset Session Stats. Pure observability, no resolver-behaviour change.")
 _cs_log_color_raw("V9.49: confirmed server-fail keeps no longer pollute stats — a correct angle (err~0) the server rejects via a stale backtrack record (high bt, side kept) is netcode, not a resolver miss. It's now excluded from session hit-rate, per-mode stats, per-player rate AND the persistent learned ratio (s.missed still increments so BF cycle + force-baim escalate). Logs: idx=9 fired -21.8° ×3 into bt 20→10→5 err=0 then hit shot 4; idx=4 kept ×3 err=0.3 across Air+Jitter-Cls — these dragged session ~56% when true resolver rate was ~82% and falsely flagged Air as 'weak'. Plus never-hit explore: after 2 consecutive correct-angle keeps on a real_active==0 enemy, flip once to break a frozen wrong-side guess (idx=5 0/2 shot LEFT while passive leaned RIGHT 42.9°); a single real hit disables it.")
 _cs_log_color_raw("V9.43: backtrack-resistance escalates faster — point-blank fakelaggers with correct angle (our=meas, err=0) but server-reject (bt 7-10) now flip the resistant flag after 2 high-bt fails OR one bt>12, instead of 3 (was wasting 2 sure shots). Pairs with v9.40 full-spread multipoint to catch slightly-stale records.")
 _cs_log_color_raw("V9.42: side-flip from SIDE evidence not magnitude error — ack_angle_err is a MAGNITUDE metric (wrong-side miss = small err, magnitude overshoot = large err), so old 'err>5 → flip' flipped the correct side on magnitude misses (idx=4: real 36°L, we 55°L, wrongly flipped R). Now flip only on learned side-conflict or blind first-contact; magnitude misses keep side, BF cycles the magnitude.")
