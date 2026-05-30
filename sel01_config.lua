@@ -1,11 +1,11 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Config — Neverlose CSGO HvH config        ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 3.14                                   ║
+-- ║  Version: 3.15                                   ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Config
 -- @author seltonmt01
--- @version 3.14
+-- @version 3.15
 -- @description Smart freestand (anti-headshot):
 --   * NL freestanding is deterministic — it always picks the same "safe" side, so a
 --     resolver models it and headshots the predictably-exposed side (user report:
@@ -53,7 +53,7 @@
 --     variance for full per-side chaos.
 --   * MAG-JIT indicator added to bottom HvH strip; dumped in v3.8 stats.
 
-local SEL01_CFG_VERSION = "3.14"
+local SEL01_CFG_VERSION = "3.15"
 
 -- DEBUG: print to CSGO console at major load checkpoints. Plain print() bypasses
 -- NL chat (which may not flush before crash) and writes directly to CSGO console.
@@ -342,7 +342,10 @@ pcall(function()
     -- pattern), never :override. Reading a hotkey state is safe; writing crashes.
     nl_refs.rage_peek_assist = nl_find_safe("Aimbot", "Ragebot", "Main", "Peek Assist")
     nl_refs.rage_hc          = nl_find_safe("Aimbot", "Ragebot", "Selection", "Hit Chance")
-    -- V3.5: rage_mindmg ref removed — lua never touches NL min_damage anymore
+    -- V3.15: rage_mindmg re-added READ-ONLY for the dump display. The V3.5 removal was
+    -- to stop WRITING NL min-damage (never-override rule) — reading via :get() is safe.
+    -- Verified path "Min. Damage" (was the wrong key before → dump showed MinDmg=?).
+    nl_refs.rage_mindmg      = nl_find_safe("Aimbot", "Ragebot", "Selection", "Min. Damage")
     nl_refs.rage_autowall    = nl_find_safe("Aimbot", "Ragebot", "Selection", "Penetrate Walls")
     nl_refs.rage_bodyaim     = nl_find_safe("Aimbot", "Ragebot", "Safety", "Body Aim")
     nl_refs.rage_safepoint   = nl_find_safe("Aimbot", "Ragebot", "Safety", "Safe Points")
@@ -1012,6 +1015,8 @@ local stats = {
     one_taps       = 0,    -- >= 100 dmg single hit
     hits_taken     = 0,    -- V2.8: we got shot
     dmg_taken      = 0,
+    kills          = 0,    -- V3.15: monotonic kill counter (was recounted from the
+                           -- 8-entry hit_log ring → always 0 after the ring rotated)
 }
 
 local function _stats_clear()
@@ -1029,6 +1034,7 @@ local function _stats_clear()
     stats.one_taps       = 0
     stats.hits_taken     = 0
     stats.dmg_taken      = 0
+    stats.kills          = 0
     hits_taken_log       = {}  -- clear hits-taken log too
 end
 
@@ -1124,6 +1130,10 @@ pcall(function()
             if not victim or victim == lp then return end
             local victim_name = "?"
             pcall(function() victim_name = victim:get_name() end)
+            -- V3.15: count the kill in a MONOTONIC stat (independent of the event-log
+            -- toggle + the 8-entry ring). The dump used to recount from hit_log, which
+            -- rotates → showed kills=0 despite 21 one-taps + a 297 headshot.
+            stats.kills = (stats.kills or 0) + 1
             if vis_hitlog:get() then
                 table.insert(hit_log, {
                     time = globals.realtime or 0,
@@ -1697,9 +1707,8 @@ local function dump_stats()
     local misses   = stats.shots_missed
     local hit_rate = fired > 0 and (hits / fired * 100) or 0
     local hs_rate  = hits  > 0 and (stats.hits_head / hits * 100) or 0
-    local kills    = 0
-    -- count kills from hit_log
-    for _, e in ipairs(hit_log) do if e.kind == "kill" then kills = kills + 1 end end
+    local kills    = stats.kills or 0  -- V3.15: monotonic counter (was recounted from
+                                       -- the rotating hit_log ring → always 0)
 
     cs_log_color("══════════════════════════════════════════════════")
     cs_log_color("  Sel01-Config v" .. SEL01_CFG_VERSION .. " — DEBUG STATS DUMP")
@@ -1801,16 +1810,29 @@ local function dump_stats()
         _b(aa_mag_jitter:get()), aa_mag_jit_min:get(), aa_mag_jit_max:get()))
 
     -- ── NL RAGEBOT LIVE (read user's NL config) ──
+    -- V3.15: format multi-select combos (HitboxSafety etc) — :get() returns a TABLE
+    -- (array of selected labels OR {label=true} map), so tostring() printed a raw
+    -- "table: 0x..." pointer. Join into a readable "Arms+Legs+Feet" string.
+    local function _fmt_val(v)
+        if type(v) ~= "table" then return tostring(v) end
+        local parts = {}
+        for k, val in pairs(v) do
+            if type(k) == "number" then parts[#parts + 1] = tostring(val)
+            elseif val == true then parts[#parts + 1] = tostring(k)
+            elseif type(val) == "string" then parts[#parts + 1] = val end
+        end
+        return #parts > 0 and table.concat(parts, "+") or "(none)"
+    end
     cs_log_color("── NL RAGEBOT (live) ──")
     cs_log(string.format("  HC=%s  MinDmg=%s  Penetrate=%s  AutoScope=%s",
-        tostring(_nl_get(nl_refs.rage_hc,         "?")),
-        tostring(_nl_get(nl_refs.rage_mindmg,     "?")),
-        tostring(_nl_get(nl_refs.rage_autowall,   "?")),
-        tostring(_nl_get(nl_refs.rage_autoscope,  "?"))))
+        _fmt_val(_nl_get(nl_refs.rage_hc,         "?")),
+        _fmt_val(_nl_get(nl_refs.rage_mindmg,     "?")),
+        _fmt_val(_nl_get(nl_refs.rage_autowall,   "?")),
+        _fmt_val(_nl_get(nl_refs.rage_autoscope,  "?"))))
     cs_log(string.format("  BodyAim=%s  SafePoints=%s  HitboxSafety=%s",
-        tostring(_nl_get(nl_refs.rage_bodyaim,    "?")),
-        tostring(_nl_get(nl_refs.rage_safepoint,  "?")),
-        tostring(_nl_get(nl_refs.rage_hitsafety,  "?"))))
+        _fmt_val(_nl_get(nl_refs.rage_bodyaim,    "?")),
+        _fmt_val(_nl_get(nl_refs.rage_safepoint,  "?")),
+        _fmt_val(_nl_get(nl_refs.rage_hitsafety,  "?"))))
     cs_log(string.format("  FakeLag: limit=%s var=%s",
         tostring(_nl_get(nl_refs.fl_limit,        "?")),
         tostring(_nl_get(nl_refs.fl_variability,  "?"))))
