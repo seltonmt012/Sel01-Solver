@@ -1,12 +1,21 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 9.37                                   ║
+-- ║  Version: 9.39                                   ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 9.37
--- @description Air first-contact fix (Air was the worst mode @25%):
+-- @version 9.39
+-- @description Correction side guard + serverfail retry:
+--   * correction/prediction-error misses now check SIDE evidence, not only
+--     magnitude. A BF shot on the unlearned opposite side no longer gets labeled
+--     "server fail" just because abs(delta) ~= measured_desync.
+--   * correct-angle server/backtrack fails schedule one same-side retry before
+--     normal BF cycling, so a good +45 shot does not immediately become
+--     BF:opposite on the next attempt.
+--   * BF magnitude now trusts strong passive desync data (8+ observations), which
+--     fixes pass-heavy players getting forced back to max_desync.
+-- @description-prev Air first-contact fix (Air was the worst mode @25%):
 --   * Air-Guess magnitude now biased HIGH (max(adaptive_median, 42)) — airborne
 --     enemies can't move-desync so they sit near max desync; the lobby median was
 --     undershooting (guessed ~18-30 on 42-58° air enemies).
@@ -64,7 +73,7 @@
 --   * v9.26 drift-bump (alpha 0.55 on 5-10° diff) still handles small shifts.
 --   * v9.29 coach variants carry.
 
-local SEL01_VERSION = "9.37"
+local SEL01_VERSION = "9.39"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -2420,9 +2429,47 @@ local function reset_state(s)
     s.fs_cached_angle    = nil
     s.guess_cached_side  = nil
     s.guess_cached_miss  = nil
+    resolver_clear_serverfail_retry(s)
 end
 
 local function sign(x) return x >= 0 and 1 or -1 end
+
+function resolver_shot_side_from_delta(delta)
+    delta = tonumber(delta) or 0
+    if math.abs(delta) <= 3 then return 0 end
+    return delta > 0 and 1 or -1
+end
+
+function resolver_side_conflicts(s, shot_side)
+    if not s or not shot_side or shot_side == 0 then return false end
+    local sl, sr = s.samples_left or 0, s.samples_right or 0
+    local rl, rr = s.real_left or 0, s.real_right or 0
+    local hl, hr = s.hit_streak_left or 0, s.hit_streak_right or 0
+    if shot_side > 0 then
+        return (sl >= 1 and sr == 0) or (rl >= 1 and rr == 0) or (hl >= 2 and hr == 0)
+    end
+    return (sr >= 1 and sl == 0) or (rr >= 1 and rl == 0) or (hr >= 2 and hl == 0)
+end
+
+function resolver_note_serverfail_retry(s, shot_side, mag)
+    if not s or not shot_side or shot_side == 0 then return end
+    mag = tonumber(mag) or 0
+    if mag < 5 then mag = s.measured_desync or 0 end
+    if mag < 5 then return end
+    if mag > 58 then mag = 58 end
+    s.serverfail_retry_side  = shot_side
+    s.serverfail_retry_mag   = mag
+    s.serverfail_retry_miss  = s.missed or 0
+    s.serverfail_retry_until = (globals.tickcount or 0) + 64
+end
+
+function resolver_clear_serverfail_retry(s)
+    if not s then return end
+    s.serverfail_retry_side  = nil
+    s.serverfail_retry_mag   = nil
+    s.serverfail_retry_miss  = nil
+    s.serverfail_retry_until = nil
+end
 
 -- known-hit states (everything else is treated as miss to avoid false-positive streak)
 local HIT_STATES  = { hit = true, damaged = true, ["hit-damaged"] = true }
@@ -2490,9 +2537,18 @@ events.aim_ack:set(function(event)
     end
     if not is_hit then
         s.missed = s.missed + 1
+        local ack_reason = tostring(reason)
+        local ack_delta = NormalizeAngle((s.last_resolved or 0) - (s.last_eye_yaw or 0))
+        local ack_shot_side = s.last_shot_side ~= 0 and s.last_shot_side or resolver_shot_side_from_delta(ack_delta)
+        local ack_measured = s.measured_desync or 0
+        local ack_angle_err = ack_measured > 5 and math.abs(math.abs(ack_delta) - ack_measured) or math.huge
+        local ack_side_bad = resolver_side_conflicts(s, ack_shot_side)
+        local ack_resolverish = ack_reason == "correction" or ack_reason == "prediction error" or ack_reason == "prediction_error"
+        local ack_serverfail_like = ack_resolverish and ack_shot_side ~= 0 and not ack_side_bad
+                                     and ((ack_measured > 5 and ack_angle_err <= 5) or bt > 8)
         -- V9.9-B: 2-MISS MODE-BLACKLIST — track misses per mode within engagement.
         -- After 2 misses with same base mode, blacklist it for 3 ticks so alternate path runs.
-        do
+        if not ack_serverfail_like then
             local mode_clean = tostring(s.mode or ""):gsub("%+Pred","")
                                                      :gsub("%-DefInv","")
                                                      :gsub("%-Recall","")
@@ -2507,6 +2563,9 @@ events.aim_ack:set(function(event)
                                    Ent:get_index(), mode_clean, s.mode_misses[mode_clean])
                 end
             end
+        else
+            cs_log_verbose("mode-blacklist skip idx=%d mode=%s (correct-angle serverfail, side=%d)",
+                           Ent:get_index(), tostring(s.mode), ack_shot_side)
         end
         steam_mem_on_miss(Ent)
         -- defensive-AA hint: enemy moved post-fire ("spread" state)
@@ -2523,42 +2582,39 @@ events.aim_ack:set(function(event)
             cs_log_verbose("DEF-AA detected idx=%d delta=%.1f samples=%d",
                            Ent:get_index(), s.def_delta or 0, s.def_samples or 0)
         end
-        -- V9.6+V9.24: LBY-Snap-Guess miss flip ONLY when angle was actually wrong.
+        -- V9.6+V9.24+V9.38: LBY-Snap-Guess miss flip only when angle OR side
+        -- evidence says the resolver was actually wrong.
         -- Earlier code flipped on every miss, but logs showed misses where our
         -- delta exactly matched measured_desync (server-side backtrack failure /
         -- network noise — not our side error). Flipping then = next attempt picks
-        -- WRONG side, oscillation. Only flip when |delta - measured| > 5°.
+        -- WRONG side, oscillation. V9.38 adds side evidence so a wrong-sign
+        -- BF/opposite shot is not hidden by a matching magnitude.
         if (reason == "correction" or reason == "prediction error") and
            tostring(s.mode):find("LBY%-Snap%-Guess") then
-            local our_delta  = NormalizeAngle((s.last_resolved or 0) - (s.last_eye_yaw or 0))
-            local angle_err  = math.abs(math.abs(our_delta) - (s.measured_desync or 0))
-            if angle_err > 5 then
+            if ack_angle_err > 5 or ack_side_bad then
                 s.last_hit_side = -s.last_hit_side
                 if s.last_hit_side == 0 then s.last_hit_side = -1 end
                 s.fs_cached_time = nil
-                cs_log_verbose("LBY-Snap miss FLIP idx=%d our_delta=%.1f measDsync=%.1f err=%.1f → side=%d",
-                               Ent:get_index(), our_delta, s.measured_desync or 0, angle_err, s.last_hit_side)
+                resolver_clear_serverfail_retry(s)
+                cs_log_verbose("LBY-Snap miss FLIP idx=%d our_delta=%.1f measDsync=%.1f err=%.1f side_bad=%s -> side=%d",
+                               Ent:get_index(), ack_delta, ack_measured, ack_angle_err,
+                               tostring(ack_side_bad), s.last_hit_side)
             else
-                cs_log_verbose("LBY-Snap miss KEEP idx=%d our_delta=%.1f measDsync=%.1f err=%.1f (server-side fail, no flip)",
-                               Ent:get_index(), our_delta, s.measured_desync or 0, angle_err)
+                resolver_note_serverfail_retry(s, ack_shot_side, math.max(math.abs(ack_delta), ack_measured))
+                cs_log_verbose("LBY-Snap miss KEEP idx=%d our_delta=%.1f measDsync=%.1f err=%.1f (server-side fail, retry side=%d)",
+                               Ent:get_index(), ack_delta, ack_measured, ack_angle_err, ack_shot_side)
             end
         end
         -- V7.8 + V8.2: correction-miss → wrong side picked. Track + flip immediately.
         -- V9.31: GENERALIZED SERVER-SIDE-FAIL GUARD (was LBY-Snap-only in V9.24).
-        -- Logs proved the dominant miss is `correction` where our resolved delta
-        -- == measured_desync (idx=5 missed Air 3x @ delta==meas==29; idx=10/idx=7
-        -- L<->R thrash). That means our SIDE was right and the server rejected the
-        -- shot (fake-lag / backtrack / lag-comp mismatch) — NOT our error. The old
-        -- code flipped unconditionally, sending the next shot to the WRONG side and
-        -- feeding BF:opposite garbage (25% rate). Now we only flip + decay streak +
-        -- bust the FS cache when the angle was actually wrong (err > 5°). A correct
-        -- angle that the server rejected KEEPS the side and just tallies a
-        -- server-fail streak (used downstream to recognise fake-laggers).
-        if reason == "correction" and s.last_shot_side ~= 0 then
-            local our_delta = NormalizeAngle((s.last_resolved or 0) - (s.last_eye_yaw or 0))
-            local angle_err = math.abs(math.abs(our_delta) - (s.measured_desync or 0))
-            if angle_err > 5 and bt <= 8 then
-                if s.last_shot_side > 0 then
+        -- V9.38: side-aware. Matching magnitude alone is not enough: a wrong-sign
+        -- BF:opposite shot can still have abs(delta) ~= measured_desync. Keep only
+        -- when angle matches AND learned side evidence does not contradict the shot;
+        -- otherwise flip/decay as a real resolver error. Correct-angle server rejects
+        -- schedule one same-side BF:retry before the normal BF cycle.
+        if ack_resolverish and ack_shot_side ~= 0 then
+            if (ack_angle_err > 5 or ack_side_bad) and bt <= 8 then
+                if ack_shot_side > 0 then
                     s.correction_right = s.correction_right + 1
                     s.hit_streak_right = math.max(0, (s.hit_streak_right or 0) - 2)
                     s.last_hit_side = -1
@@ -2571,15 +2627,18 @@ events.aim_ack:set(function(event)
                 s.fs_cached_time   = nil
                 s.fs_cached_angle  = nil
                 s.guess_cached_side = nil
+                resolver_clear_serverfail_retry(s)
                 s.serverfail_streak = 0
-                cs_log_verbose("correction-miss idx=%d shot_side=%d FLIP→%d err=%.1f L=%d R=%d",
-                               Ent:get_index(), s.last_shot_side, s.last_hit_side, angle_err, s.correction_left, s.correction_right)
+                cs_log_verbose("correction-miss idx=%d shot_side=%d FLIP->%d err=%.1f side_bad=%s L=%d R=%d",
+                               Ent:get_index(), ack_shot_side, s.last_hit_side, ack_angle_err,
+                               tostring(ack_side_bad), s.correction_left, s.correction_right)
             else
                 -- angle was correct, server rejected it → server-side / fake-lag fail.
                 -- KEEP the side. Repeated fails flag a hard fake-lagger.
                 s.serverfail_streak = (s.serverfail_streak or 0) + 1
-                cs_log_verbose("correction-miss idx=%d KEEP side=%d our=%.1f meas=%.1f err=%.1f bt=%d (server/backtrack fail #%d, no flip)",
-                               Ent:get_index(), s.last_shot_side, our_delta, s.measured_desync or 0, angle_err, bt, s.serverfail_streak)
+                resolver_note_serverfail_retry(s, ack_shot_side, math.max(math.abs(ack_delta), ack_measured))
+                cs_log_verbose("correction-miss idx=%d KEEP side=%d our=%.1f meas=%.1f err=%.1f bt=%d (server/backtrack fail #%d, retry same)",
+                               Ent:get_index(), ack_shot_side, ack_delta, ack_measured, ack_angle_err, bt, s.serverfail_streak)
             end
         end
         cs_log_verbose("MISS [%s] target=%d count=%d mode=%s",
@@ -2668,8 +2727,16 @@ events.aim_ack:set(function(event)
                 -- using the old EMA after the enemy switches → 2-3 sure misses.
                 local prev_emag = s.measured_desync or 0
                 local diff = math.abs(actual - prev_emag)
+                -- V9.39: sample-count alpha ramp. First few hits weight heavier so
+                -- the EMA converges in 2-3 hits instead of 5-6, then settles to the
+                -- slow anti-noise 0.30 once well-sampled. Drift-bump (diff>5) still
+                -- stacks on top. Faster lock = smoother (side settles sooner → the
+                -- first-shot path stops flip-flopping modes on early engagements).
                 local alpha = 0.30
-                if s.desync_samples > 0 and diff > 5 then alpha = 0.55 end
+                local _sc = s.desync_samples or 0
+                if _sc <= 1 then alpha = 0.55
+                elseif _sc <= 3 then alpha = 0.42 end
+                if _sc > 0 and diff > 5 then alpha = math.max(alpha, 0.55) end
                 if s.desync_samples == 0 then
                     s.measured_desync = actual
                 elseif (not s.bimodal) and s.desync_samples >= 3 and diff > 10 then
@@ -2709,8 +2776,12 @@ events.aim_ack:set(function(event)
                             cs_log_verbose("AA-switch hard-reset idx=%d R-side %.1f → %.1f (diff=%.1f)",
                                            Ent:get_index(), prev, actual, diff_r)
                         else
+                            -- V9.39: sample-count ramp (see global EMA note)
                             local a_r = 0.30
-                            if diff_r > 5 then a_r = 0.55 end
+                            local _scr = s.samples_right or 0
+                            if _scr <= 1 then a_r = 0.55
+                            elseif _scr <= 3 then a_r = 0.42 end
+                            if diff_r > 5 then a_r = math.max(a_r, 0.55) end
                             s.measured_right = s.measured_right * (1 - a_r) + actual * a_r
                         end
                         s.samples_right = math.min(s.samples_right + 1, 99)
@@ -2725,8 +2796,12 @@ events.aim_ack:set(function(event)
                             cs_log_verbose("AA-switch hard-reset idx=%d L-side %.1f → %.1f (diff=%.1f)",
                                            Ent:get_index(), prev, actual, diff_l)
                         else
+                            -- V9.39: sample-count ramp (see global EMA note)
                             local a_l = 0.30
-                            if diff_l > 5 then a_l = 0.55 end
+                            local _scl = s.samples_left or 0
+                            if _scl <= 1 then a_l = 0.55
+                            elseif _scl <= 3 then a_l = 0.42 end
+                            if diff_l > 5 then a_l = math.max(a_l, 0.55) end
                             s.measured_left = s.measured_left * (1 - a_l) + actual * a_l
                         end
                         s.samples_left = math.min(s.samples_left + 1, 99)
@@ -2791,6 +2866,7 @@ events.aim_ack:set(function(event)
         s.lby_snap_attempts = 0  -- V9.16: reset LBY-Snap-Guess magnitude cycle on hit
         s.guess_cached_miss = nil
         s.serverfail_streak = 0  -- V9.31: hit clears the server-side-fail tally
+        resolver_clear_serverfail_retry(s)
         -- V7.8: hit confirms current side — decay correction counters on opposite side
         if hit_side > 0 then
             s.correction_left = math.max(0, (s.correction_left or 0) - 1)
@@ -2954,8 +3030,9 @@ local function get_mode_preset()
         return {
             baim_after   = force_baim_n:get(),
             first_shot   = "predict",
-            -- 9 angles, finer coverage of common desync range first
-            bruteforce   = {"opposite", "+29", "-29", "+58", "-58", "+45", "-45", "0", "lby"},
+            -- measured/passive desync before blind 29° guesses; log dumps showed
+            -- pass-heavy ~45° enemies wasting shots on BF:opposite/+29/-29.
+            bruteforce   = {"opposite", "desync", "-desync", "+45", "-45", "+58", "-58", "+29", "-29", "0", "lby"},
             close_boost  = true,
             jitter_lock  = true,
         }
@@ -2991,10 +3068,23 @@ local function effective_desync(s, max_desync, side)
             return s.measured_right
         elseif side < 0 and (s.samples_left or 0) >= 1 and (s.measured_left or 0) > 5 then
             return s.measured_left
+        elseif (s.passive_samples or 0) >= 8 then
+            if side > 0 and (s.passive_right or 0) > 5 then
+                return s.passive_right
+            elseif side < 0 and (s.passive_left or 0) > 5 then
+                return s.passive_left
+            end
         end
     end
     if (s.desync_samples or 0) >= 1 and (s.measured_desync or 0) > 5 then
         return s.measured_desync
+    end
+    if (s.passive_samples or 0) >= 8 and (s.measured_desync or 0) > 5 then
+        return s.measured_desync
+    end
+    if (s.passive_samples or 0) >= 8 then
+        local passive_mag = math.max(s.passive_left or 0, s.passive_right or 0)
+        if passive_mag > 5 then return passive_mag end
     end
     return max_desync
 end
@@ -3434,6 +3524,24 @@ local function pick_bruteforce_angle(s, anim, eye_yaw, max_desync, p, preset)
        and s.bf_cached_eye and math.abs(NormalizeAngle(eye_yaw - s.bf_cached_eye)) < 20 then
         s.mode = s.bf_cached_mode
         return s.bf_cached_angle
+    end
+
+    -- V9.38: if the previous ack looked like a correct-angle server/backtrack
+    -- reject, retry that exact side/magnitude once before normal BF cycling.
+    if s.serverfail_retry_side and s.serverfail_retry_miss == s.missed
+       and (s.serverfail_retry_until or 0) >= (globals.tickcount or 0) then
+        local side = s.serverfail_retry_side
+        local mag = s.serverfail_retry_mag or effective_desync(s, max_desync, side)
+        if mag > 58 then mag = 58 end
+        if mag >= 5 then
+            local result = eye_yaw + mag * side
+            s.mode = "BF:retry"
+            s.bf_cached_missed = s.missed
+            s.bf_cached_angle  = result
+            s.bf_cached_mode   = s.mode
+            s.bf_cached_eye    = eye_yaw
+            return result
+        end
     end
 
     -- V7.8: static / slow-walker → finer BF cycle
@@ -4953,5 +5061,7 @@ _cs_log_color_raw("V9.34: AIR-branch hardening — per-side magnitude in air cor
 _cs_log_color_raw("V9.35: fast-fire tightened — only fires fast on stable (stddev<12) + well-sampled resolves, hc floors raised (30/45 not 15/22/30). Stops the 'shoots too early' marginal shots that caught bad backtrack records → correction/prediction-error rejects.")
 _cs_log_color_raw("V9.36: snapshot-match REGRESSION FIX — v9.33 matched ack-time tickcount (grabbed the most-recent snapshot, mis-learned sides on rapid fire). Restored event.tick matching of the actual acked shot; kept the stale-reject guard.")
 _cs_log_color_raw("V9.37: AIR first-contact fix (Air was worst @25%) — air guess magnitude biased high (max(median,42), airborne=near-max desync) + first-contact side uses steam-mem dom instead of blind +1.")
+_cs_log_color_raw("V9.38: correction guard is side-aware + correct-angle serverfails retry same side once; BF now trusts strong passive desync before max_desync.")
+_cs_log_color_raw("V9.39: sample-count EMA alpha ramp (0.55 on hit 1-2, 0.42 on hit 3-4, then 0.30) on global + both per-side — converges in 2-3 hits instead of 5-6, faster + smoother lock (side settles sooner, fewer first-shot mode flips).")
 _cs_log_color_raw("Logging: " .. (log_enabled:get() and ("ON" .. (log_verbose:get() and " (verbose)" or ""))  or "OFF"))
 _cs_log_color_raw("=========================================")
