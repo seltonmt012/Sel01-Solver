@@ -1,11 +1,11 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 9.41                                   ║
+-- ║  Version: 9.42                                   ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 9.41
+-- @version 9.42
 -- @description Correction side guard + serverfail retry:
 --   * correction/prediction-error misses now check SIDE evidence, not only
 --     magnitude. A BF shot on the unlearned opposite side no longer gets labeled
@@ -73,7 +73,7 @@
 --   * v9.26 drift-bump (alpha 0.55 on 5-10° diff) still handles small shifts.
 --   * v9.29 coach variants carry.
 
-local SEL01_VERSION = "9.41"
+local SEL01_VERSION = "9.42"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -2613,7 +2613,22 @@ events.aim_ack:set(function(event)
         -- otherwise flip/decay as a real resolver error. Correct-angle server rejects
         -- schedule one same-side BF:retry before the normal BF cycle.
         if ack_resolverish and ack_shot_side ~= 0 then
-            if (ack_angle_err > 5 or ack_side_bad) and bt <= 8 then
+            -- V9.42: decide the side-flip from SIDE evidence, NOT magnitude error.
+            -- ack_angle_err = ||delta| - measured| measures MAGNITUDE accuracy: a true
+            -- wrong-SIDE miss keeps |delta| ~= measured (right magnitude, wrong sign) →
+            -- SMALL err, while a magnitude overshoot on the CORRECT side gives a LARGE
+            -- err. So the old "err > 5 → flip" flipped exactly the magnitude-error case
+            -- and chased the wrong fix (logs: idx=4 real 36°L, we resolved 55°L — correct
+            -- side, 19° overshoot — got flipped to R then missed). Now: never flip on a
+            -- server/backtrack fail (high bt); flip when learned side data conflicts;
+            -- keep side on a magnitude error so BF cycles the magnitude instead; and on a
+            -- blind first-contact miss (no magnitude reference) explore the other side.
+            local do_flip
+            if bt > 8 then do_flip = false
+            elseif ack_side_bad then do_flip = true
+            elseif ack_measured > 5 then do_flip = false
+            else do_flip = true end
+            if do_flip then
                 if ack_shot_side > 0 then
                     s.correction_right = s.correction_right + 1
                     s.hit_streak_right = math.max(0, (s.hit_streak_right or 0) - 2)
@@ -5104,5 +5119,6 @@ _cs_log_color_raw("V9.38: correction guard is side-aware + correct-angle serverf
 _cs_log_color_raw("V9.39: sample-count EMA alpha ramp (0.55 on hit 1-2, 0.42 on hit 3-4, then 0.30) on global + both per-side — converges in 2-3 hits instead of 5-6, faster + smoother lock (side settles sooner, fewer first-shot mode flips).")
 _cs_log_color_raw("V9.40: point-blank stale-record fix — non-sniper close-priority now forces multipoint (was sniper-only) so a single-point head shot stops whiffing on an enemy running at you (correct angle, high bt, reason=correction). + bt-driven backtrack-resistance (high event.backtrack on correction/prediction-error now counts, was string-only).")
 _cs_log_color_raw("V9.41: air-guess magnitude is per-player passive-aware — uses THIS enemy's measured/passive-seeded desync before the blind floor (v9.37's max(median,42) overshot low-desync air enemies by ~30° and ignored 50+ passive obs we already had). Blind floor softened 42→36.")
+_cs_log_color_raw("V9.42: side-flip from SIDE evidence not magnitude error — ack_angle_err is a MAGNITUDE metric (wrong-side miss = small err, magnitude overshoot = large err), so old 'err>5 → flip' flipped the correct side on magnitude misses (idx=4: real 36°L, we 55°L, wrongly flipped R). Now flip only on learned side-conflict or blind first-contact; magnitude misses keep side, BF cycles the magnitude.")
 _cs_log_color_raw("Logging: " .. (log_enabled:get() and ("ON" .. (log_verbose:get() and " (verbose)" or ""))  or "OFF"))
 _cs_log_color_raw("=========================================")
