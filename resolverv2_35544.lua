@@ -1,11 +1,11 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 9.44                                   ║
+-- ║  Version: 9.45                                   ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 9.44
+-- @version 9.45
 -- @description Correction side guard + serverfail retry:
 --   * correction/prediction-error misses now check SIDE evidence, not only
 --     magnitude. A BF shot on the unlearned opposite side no longer gets labeled
@@ -73,7 +73,7 @@
 --   * v9.26 drift-bump (alpha 0.55 on 5-10° diff) still handles small shifts.
 --   * v9.29 coach variants carry.
 
-local SEL01_VERSION = "9.44"
+local SEL01_VERSION = "9.45"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -2626,10 +2626,19 @@ events.aim_ack:set(function(event)
             -- server/backtrack fail (high bt); flip when learned side data conflicts;
             -- keep side on a magnitude error so BF cycles the magnitude instead; and on a
             -- blind first-contact miss (no magnitude reference) explore the other side.
+            -- V9.45: the "magnitude matched measured → keep side (server fail)" branch
+            -- only holds when the measurement is TRUSTWORTHY. On a never-hit enemy the
+            -- measured_desync is pure passive seed (real_active==0) — matching it proves
+            -- nothing, and keeping the same side freezes the oscillation on the WRONG
+            -- side forever (logs: idx=8, p_hits=0/2, seed 52.2°L, shot left 50.8° twice,
+            -- 2nd shot bt=0 = no backtrack at all yet still classed "server fail"). Keep
+            -- only when a real hit backs the magnitude OR genuine backtrack evidence
+            -- (bt>6) makes a server stale-record plausible; otherwise explore the side.
+            local real_active = (s.real_left or 0) + (s.real_right or 0)
             local do_flip
             if bt > 8 then do_flip = false
             elseif ack_side_bad then do_flip = true
-            elseif ack_measured > 5 then do_flip = false
+            elseif ack_measured > 5 and (real_active >= 1 or bt > 6) then do_flip = false
             else do_flip = true end
             if do_flip then
                 if ack_shot_side > 0 then
@@ -5134,6 +5143,7 @@ _cs_log_color_raw("V9.39: sample-count EMA alpha ramp (0.55 on hit 1-2, 0.42 on 
 _cs_log_color_raw("V9.40: point-blank stale-record fix — non-sniper close-priority now forces multipoint (was sniper-only) so a single-point head shot stops whiffing on an enemy running at you (correct angle, high bt, reason=correction). + bt-driven backtrack-resistance (high event.backtrack on correction/prediction-error now counts, was string-only).")
 _cs_log_color_raw("V9.41: air-guess magnitude is per-player passive-aware — uses THIS enemy's measured/passive-seeded desync before the blind floor (v9.37's max(median,42) overshot low-desync air enemies by ~30° and ignored 50+ passive obs we already had). Blind floor softened 42→36.")
 _cs_log_color_raw("V9.44: serverfail-retry magnitude fix — retry now shoots the LEARNED desync, not max(|shot delta|, measured). The old max() memorised a magnitude OVERSHOOT (a kept-side err>5 miss) into serverfail_retry_mag and BF:retry repeated it — fatal on a LOCKED enemy (logs: idx=3, 18 hits, known 22.3°, shot 41.9° twice). Stops the overshoot feedback loop.")
+_cs_log_color_raw("V9.45: seed-only keep-side fix — the 'magnitude matched measured → server fail, keep side' branch now requires a REAL hit (real_active>=1) or genuine backtrack (bt>6). On a never-hit enemy measured_desync is pure passive seed; matching it proved nothing and froze the side on the WRONG guess forever (logs: idx=8, p_hits=0/2, seed 52.2°L, shot left twice, 2nd shot bt=0). Now explores the other side instead.")
 _cs_log_color_raw("V9.43: backtrack-resistance escalates faster — point-blank fakelaggers with correct angle (our=meas, err=0) but server-reject (bt 7-10) now flip the resistant flag after 2 high-bt fails OR one bt>12, instead of 3 (was wasting 2 sure shots). Pairs with v9.40 full-spread multipoint to catch slightly-stale records.")
 _cs_log_color_raw("V9.42: side-flip from SIDE evidence not magnitude error — ack_angle_err is a MAGNITUDE metric (wrong-side miss = small err, magnitude overshoot = large err), so old 'err>5 → flip' flipped the correct side on magnitude misses (idx=4: real 36°L, we 55°L, wrongly flipped R). Now flip only on learned side-conflict or blind first-contact; magnitude misses keep side, BF cycles the magnitude.")
 _cs_log_color_raw("Logging: " .. (log_enabled:get() and ("ON" .. (log_verbose:get() and " (verbose)" or ""))  or "OFF"))
