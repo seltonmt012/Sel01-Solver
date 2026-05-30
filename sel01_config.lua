@@ -1,11 +1,11 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Config — Neverlose CSGO HvH config        ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 3.16                                   ║
+-- ║  Version: 3.17                                   ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Config
 -- @author seltonmt01
--- @version 3.16
+-- @version 3.17
 -- @description Smart freestand (anti-headshot):
 --   * NL freestanding is deterministic — it always picks the same "safe" side, so a
 --     resolver models it and headshots the predictably-exposed side (user report:
@@ -53,7 +53,7 @@
 --     variance for full per-side chaos.
 --   * MAG-JIT indicator added to bottom HvH strip; dumped in v3.8 stats.
 
-local SEL01_CFG_VERSION = "3.16"
+local SEL01_CFG_VERSION = "3.17"
 
 -- DEBUG: print to CSGO console at major load checkpoints. Plain print() bypasses
 -- NL chat (which may not flush before crash) and writes directly to CSGO console.
@@ -382,8 +382,10 @@ local function _safe_step(label, fn)
         cs_log("[STEP-FAIL] " .. label .. " — " .. tostring(err))
     end
 end
+_troll_mode = false  -- V3.16: global flag for the 🤡 TROLL indicator (set true only by troll)
 local function _do_apply_preset(name)
     cs_log("[apply] start " .. tostring(name))
+    _troll_mode = false  -- reset on every preset; troll re-sets it true below
     if name == "aggressive" then
         safe_set(aa_enable, true)
         safe_set(aa_freestanding, true)
@@ -435,6 +437,12 @@ local function _do_apply_preset(name)
         _safe_step("nl aa_freestand",   function() nl_override(nl_refs.aa_freestand, true) end)
         _safe_step("nl aa_avoidbk",     function() nl_override(nl_refs.aa_avoidbackstab, true) end)
         _safe_step("nl fl_switch",      function() nl_override(nl_refs.fl_switch, true) end)
+        -- V3.16: force NL Yaw Base = Backward. The user noticed the fake facing the enemy
+        -- in aggressive — that is Yaw Base "Forward" (fake points toward the look/aim
+        -- direction). "Backward" makes the fake point AWAY while the real angle still
+        -- snaps to the enemy when the ragebot fires. Combo :override takes the option
+        -- STRING (bool segfaults).
+        _safe_step("nl yaw_base_back",  function() nl_override(nl_refs.aa_yaw_base, "Backward") end)
         cs_log_color("AGGRESSIVE preset applied")
     elseif name == "dynamic" then
         safe_set(aa_enable, true)
@@ -551,15 +559,19 @@ local function _do_apply_preset(name)
         safe_set(aa_move_flip, true)
         safe_set(aa_move_boost, true)
         safe_set(aa_pitch_jitter, true)    -- anti-headshot vertical
-        safe_set(aa_move_fakeduck, false)  -- avoid the sticky-fakeduck bug (v3.3)
-        safe_set(aa_move_fd_thresh, 100)
+        -- V3.16-troll-v2: duck-bob while running in. The sticky-fakeduck bug was fixed
+        -- in v3.3 (falling-edge clear), so this is safe now. thresh 50 = bob only while
+        -- MOVING (running/slow-walking in) and STAND the instant you stop to shoot, so
+        -- it stays functional — your ragebot still commits cleanly when stationary.
+        safe_set(aa_move_fakeduck, true)
+        safe_set(aa_move_fd_thresh, 50)
         safe_set(aa_anti_bf, true)
         safe_set(aa_anti_bf_var, 25)       -- max bruteforce variance
         safe_set(aa_fd_assist, true)
         -- ── the whole anti-resolver bundle ON (this is the point of the preset) ──
         safe_set(aa_mag_jitter, true)      -- THE EMA-resolver killer
-        safe_set(aa_mag_jit_min, 35)
-        safe_set(aa_mag_jit_max, 58)
+        safe_set(aa_mag_jit_min, 20)       -- v2: wider (20-58) so the jitter spans low
+        safe_set(aa_mag_jit_max, 58)       --     AND high magnitudes — even harder to lock
         safe_set(aa_fl_var, true)          -- breaks backtrack records
         safe_set(aa_yaw_rotate, true)      -- rotates yaw base, anti eye-yaw fingerprint
         safe_set(aa_side_streak, true)
@@ -577,10 +589,13 @@ local function _do_apply_preset(name)
         safe_set(vis_dmgind, true)
         safe_set(vis_specoverlay, true)
         safe_set(qol_clantag, true)
+        safe_set(qol_clantag_st, "Spin")   -- v2: spinning troll clantag
         nl_override(nl_refs.aa_enabled, true)
         nl_override(nl_refs.aa_freestand, false)
         nl_override(nl_refs.aa_avoidbackstab, false)
         nl_override(nl_refs.fl_switch, true)
+        -- yaw-rotation is ON in troll → NL Yaw Base cycles on its own; no static set.
+        _troll_mode = true   -- v2: drives the 🤡 TROLL indicator in render
         cs_log_color("TROLL/BAIT preset applied — max anti-resolver chaos. Run/slow-walk in + watch who whiffs.")
     end
 end
@@ -1466,6 +1481,19 @@ pcall(function()
                 render.text(3, vector(wx + pad, wy + 5), color(g_r, g_g, g_b, 255), nil, "Sel01")
                 render.text(3, vector(wx + pad + 32, wy + 5), color(220, 230, 255, 255), nil,
                             string.format("| %s | %d fps | %d ms", lp_name, perf.fps, perf.ping))
+            end)
+        end
+
+        -- V3.16: 🤡 TROLL indicator — pulsing top-center banner while the troll preset is
+        -- active, so it is obvious you're in bait mode (not competitive).
+        if _troll_mode then
+            pcall(function()
+                local txt = "🤡 TROLL MODE — run in, watch them whiff"
+                local tw = 0
+                pcall(function() tw = render.measure_text(4, nil, txt).x end)
+                local pulse = math.floor(180 + 75 * math.sin(now * 6))
+                local tx = (sx - tw) / 2
+                render.text(4, vector(tx, 46), color(255, pulse, 60, 255), nil, txt)
             end)
         end
 
