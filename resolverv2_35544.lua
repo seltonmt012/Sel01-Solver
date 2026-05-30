@@ -1,11 +1,11 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 9.48                                   ║
+-- ║  Version: 9.49                                   ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 9.48
+-- @version 9.49
 -- @description Correction side guard + serverfail retry:
 --   * correction/prediction-error misses now check SIDE evidence, not only
 --     magnitude. A BF shot on the unlearned opposite side no longer gets labeled
@@ -73,7 +73,7 @@
 --   * v9.26 drift-bump (alpha 0.55 on 5-10° diff) still handles small shifts.
 --   * v9.29 coach variants carry.
 
-local SEL01_VERSION = "9.48"
+local SEL01_VERSION = "9.49"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -2561,6 +2561,16 @@ events.aim_ack:set(function(event)
         local ack_resolverish = ack_reason == "correction" or ack_reason == "prediction error" or ack_reason == "prediction_error"
         local ack_serverfail_like = ack_resolverish and ack_shot_side ~= 0 and not ack_side_bad
                                      and ((ack_measured > 5 and ack_angle_err <= 5) or bt > 8)
+        -- V9.49: a CONFIRMED server-fail keep (correct angle, high bt, side kept) is not
+        -- a resolver fault. Logs showed these polluting the headline hit-rate badly:
+        -- idx=9 fired the SAME correct -21.8° three times into a declining stale record
+        -- (bt 20→10→5, err=0) then hit on shot 4 — the 3 keeps counted as BF:retry misses
+        -- and dragged session 9/16=56% when the real resolver rate was ~9/11=82%. Air 0/2
+        -- was likewise two bt 19/12 stale-record fails, making a working mode look broken.
+        -- Set in the KEEP branches below; gates mode_stats / session / per-player / learned
+        -- miss counters (mode-blacklist already exempts these — this finishes the job).
+        -- s.missed still increments so BF cycle + force-baim escalation keep advancing.
+        local server_fail_keep = false
         -- V9.9-B: 2-MISS MODE-BLACKLIST — track misses per mode within engagement.
         -- After 2 misses with same base mode, blacklist it for 3 ticks so alternate path runs.
         if not ack_serverfail_like then
@@ -2619,6 +2629,7 @@ events.aim_ack:set(function(event)
                 -- old max() memorised a bad overshoot delta and repeated it (see generic
                 -- path note) — fatal on a locked enemy whose desync we already know.
                 resolver_note_serverfail_retry(s, ack_shot_side, (ack_measured > 5 and ack_measured) or math.abs(ack_delta))
+                server_fail_keep = true  -- V9.49: correct angle, server rejected — not our miss
                 cs_log_verbose("LBY-Snap miss KEEP idx=%d our_delta=%.1f measDsync=%.1f err=%.1f (server-side fail, retry side=%d)",
                                Ent:get_index(), ack_delta, ack_measured, ack_angle_err, ack_shot_side)
             end
@@ -2665,6 +2676,19 @@ events.aim_ack:set(function(event)
             elseif ack_side_bad then do_flip = true
             elseif ack_measured > 5 and (real_active >= 1 or bt > 6) then do_flip = false
             else do_flip = true end
+            -- V9.49: never-hit explore. The bt>8 / bt>6 keep branches above rest on pure
+            -- passive seed when we have NEVER hit this enemy (real_active==0) — both the
+            -- side AND the magnitude are unconfirmed guesses. A genuine stale record gets
+            -- the benefit of the doubt for the first couple keeps, but after 2 consecutive
+            -- correct-angle keeps with zero real confirmation the side guess is most likely
+            -- just wrong (logs: idx=5 LBY-switch 0/2, shot LEFT twice while passive leaned
+            -- RIGHT 42.9°). Force ONE exploration of the other side; the first real hit
+            -- pins real_active>=1 and disables this permanently (idx=5 later self-resolved).
+            if not do_flip and real_active == 0 and (s.serverfail_streak or 0) >= 2 then
+                do_flip = true
+                cs_log_verbose("never-hit explore idx=%d streak=%d real=0 — flip to break frozen side",
+                               Ent:get_index(), s.serverfail_streak or 0)
+            end
             if do_flip then
                 if ack_shot_side > 0 then
                     s.correction_right = s.correction_right + 1
@@ -2714,15 +2738,31 @@ events.aim_ack:set(function(event)
                 -- repeated the overshoot. Logs: locked idx=3 (18 hits, measured 22.3°) shot
                 -- 41.9° on BF:retry then retried 41.9° again. Trust the measurement instead.
                 resolver_note_serverfail_retry(s, ack_shot_side, (ack_measured > 5 and ack_measured) or math.abs(ack_delta))
+                server_fail_keep = true  -- V9.49: correct angle, server rejected — not our miss
                 cs_log_verbose("correction-miss idx=%d KEEP side=%d our=%.1f meas=%.1f err=%.1f bt=%d (server/backtrack fail #%d, retry same)",
                                Ent:get_index(), ack_shot_side, ack_delta, ack_measured, ack_angle_err, bt, s.serverfail_streak)
             end
         end
         cs_log_verbose("MISS [%s] target=%d count=%d mode=%s",
                        tostring(reason), Ent:get_index(), s.missed, tostring(s.mode))
-        learning_update_miss(Ent)
-        mode_stats_update(tostring(s.mode), false)
-        record_player_shot(s, false)  -- V8.0: per-player hit-rate
+        -- V9.49: a CONFIRMED server-fail keep (correct angle, server rejected, side kept)
+        -- is not a resolver fault — exclude it from the headline hit-rate, the per-mode
+        -- stats, the per-player rate AND the persistent learned hit/miss ratio. Without
+        -- this the same correct angle fired repeatedly into a stale backtrack record made
+        -- a working mode (Air, BF:retry) read as broken and dragged session ~56% when the
+        -- true resolver rate was ~82% (logs: idx=9 fired -21.8° ×3 into bt 20→10→5 err=0;
+        -- idx=4 kept side ×3 at err 0.3 across Air + Jitter-Cls). s.missed already
+        -- incremented above so BF cycle + force-baim escalation still advance normally.
+        if server_fail_keep then
+            s.serverfail_misses = (s.serverfail_misses or 0) + 1
+            sel01_session_serverfails = (sel01_session_serverfails or 0) + 1
+            cs_log_verbose("server-fail miss NOT counted idx=%d mode=%s (player#%d session#%d)",
+                           Ent:get_index(), tostring(s.mode), s.serverfail_misses, sel01_session_serverfails)
+        else
+            learning_update_miss(Ent)
+            mode_stats_update(tostring(s.mode), false)
+            record_player_shot(s, false)  -- V8.0: per-player hit-rate
+        end
         -- V5: adaptive predict-ticks tuning (miss → reduce by 1)
         if s.last_used_pred_ticks and tostring(s.mode):find("+Pred") then
             s.adaptive_predict = math.max(1, (s.adaptive_predict or s.last_used_pred_ticks) - 1)
@@ -5216,6 +5256,7 @@ _cs_log_color_raw("V9.45: seed-only keep-side fix — the 'magnitude matched mea
 _cs_log_color_raw("V9.46: teleport-on-peek detection — horizontal origin delta vs max run-speed reveals a blink-peek (lag-switch / fakelag-flush). On detect, time-box 0.4s that disables extrapolation (yaw_rate from before the blink can't predict the landing) + forces full-spread multipoint at close range so NL's stale backtrack record still lands. Reacts on the FIRST peek instead of after 2 misses; never touches side/EMA so v9.45 + learned patterns stay intact.")
 _cs_log_color_raw("V9.47: side-conflict overrides high-bt keep when angle was off — a learned wrong-side shot with a LARGE magnitude error (>10) now flips even under bt>8, because a clean stale-record reject leaves err~0. Old order let bt>8 short-circuit the flip and retry the wrong side (logs: idx=8, 1 R-hit, shot L -21.6 vs meas 39.5 err=17.9 bt=12 — kept L; next real hit confirmed R). err~0 + side-conflict still keeps (switch-stale / v9.42 overshoot / v9.44 locked protected).")
 _cs_log_color_raw("V9.48: alt_side_pick uses REAL-hit dominance when both sides have real hits — the seeded-inclusive sample counts (sl/sr carry passive+seeded entries) mispinned a genuine 50/50 switch enemy. Logs: idx=4 sl=3 sr=1 pinned LEFT for Predicted-Alt but real hits were 1L/1R and the correct side was RIGHT (Predicted-Alt 0/2). Balanced real data now alternates off last_hit_side; one-sided enemies (rr=0) keep the old seeded dom path so streak{L=9 R=0} is unaffected.")
+_cs_log_color_raw("V9.49: confirmed server-fail keeps no longer pollute stats — a correct angle (err~0) the server rejects via a stale backtrack record (high bt, side kept) is netcode, not a resolver miss. It's now excluded from session hit-rate, per-mode stats, per-player rate AND the persistent learned ratio (s.missed still increments so BF cycle + force-baim escalate). Logs: idx=9 fired -21.8° ×3 into bt 20→10→5 err=0 then hit shot 4; idx=4 kept ×3 err=0.3 across Air+Jitter-Cls — these dragged session ~56% when true resolver rate was ~82% and falsely flagged Air as 'weak'. Plus never-hit explore: after 2 consecutive correct-angle keeps on a real_active==0 enemy, flip once to break a frozen wrong-side guess (idx=5 0/2 shot LEFT while passive leaned RIGHT 42.9°); a single real hit disables it.")
 _cs_log_color_raw("V9.43: backtrack-resistance escalates faster — point-blank fakelaggers with correct angle (our=meas, err=0) but server-reject (bt 7-10) now flip the resistant flag after 2 high-bt fails OR one bt>12, instead of 3 (was wasting 2 sure shots). Pairs with v9.40 full-spread multipoint to catch slightly-stale records.")
 _cs_log_color_raw("V9.42: side-flip from SIDE evidence not magnitude error — ack_angle_err is a MAGNITUDE metric (wrong-side miss = small err, magnitude overshoot = large err), so old 'err>5 → flip' flipped the correct side on magnitude misses (idx=4: real 36°L, we 55°L, wrongly flipped R). Now flip only on learned side-conflict or blind first-contact; magnitude misses keep side, BF cycles the magnitude.")
 _cs_log_color_raw("Logging: " .. (log_enabled:get() and ("ON" .. (log_verbose:get() and " (verbose)" or ""))  or "OFF"))
