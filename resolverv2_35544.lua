@@ -1,11 +1,11 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 9.50                                   ║
+-- ║  Version: 9.51                                   ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 9.50
+-- @version 9.51
 -- @description Correction side guard + serverfail retry:
 --   * correction/prediction-error misses now check SIDE evidence, not only
 --     magnitude. A BF shot on the unlearned opposite side no longer gets labeled
@@ -73,7 +73,7 @@
 --   * v9.26 drift-bump (alpha 0.55 on 5-10° diff) still handles small shifts.
 --   * v9.29 coach variants carry.
 
-local SEL01_VERSION = "9.50"
+local SEL01_VERSION = "9.51"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -379,6 +379,10 @@ g_esp:label(accent .. ui.get_icon"link-slash" .. accent .. "  Mode colors auto: 
 -- V9.21: live event ticker top-right of screen — HIT/MISS/KILL/INFO with fade.
 -- Global (no `local`) to dodge main-chunk 200-local limit.
 esp_event_ticker = g_esp:switch(accent .. ui.get_icon"bolt" .. accent .. "  Event Ticker (top-right HUD log)", true)
+-- V9.51: per-enemy ON-MODEL visuals. Globals (no `local`) to dodge the 200-local cap.
+esp_wedge = g_esp:switch(accent .. ui.get_icon"diagram-project" .. accent .. "  Desync Wedge (real vs fake yaw lines on body)", true)
+esp_flash = g_esp:switch(accent .. ui.get_icon"bolt-lightning"  .. accent .. "  Hit/Miss Flash (box on each shot)", true)
+esp_enh   = g_esp:switch(accent .. ui.get_icon"layer-group"      .. accent .. "  Enhanced Tags (AA-glyph / netcode / shot-dots / side-dom)", true)
 
 -- ─── SMART STRATEGY COMBOS (batch-set individual toggles) ─────
 local strat_learning = g_smart:combo(accent .. ui.get_icon"user"      .. accent .. "  Learning Strategy",
@@ -2046,6 +2050,9 @@ local function apply_preset(name)
         safe_set(esp_show_labels,    true)
         safe_set(esp_show_confbar,   true)
         safe_set(esp_show_hud,       true)
+        safe_set(esp_wedge,          true)   -- V9.51: SSG-Pro shows the full on-model visual suite
+        safe_set(esp_flash,          true)
+        safe_set(esp_enh,            true)
         _cs_log_color_raw("✓ PRESET: SSG-PRO v9.13 — Tuned for hc=72/dmg=100/multi-hitbox + HEAD-FOCUS")
         _cs_log_color_raw("  Preserves: hitchance, min-damage, safe-points 'Prefer'")
         _cs_log_color_raw("  Enhancements: HEAD-FOCUS + hitbox chain (head->chest->stomach), per-weapon +1 predict, def-AA fingerprint")
@@ -2528,6 +2535,17 @@ local NON_RESOLVER_MISS = {
     ["backtrack_failure"] = true, ["bt failure"] = true, ["bt_failure"] = true,
 }
 
+-- V9.51: record per-shot result for the on-model ESP flash (B) + shot-dots (E).
+-- Global (no `local`) — at the 200-local cap. kind = "hit" / "miss" / "serverfail".
+function esp_push_shot(s, kind)
+    if not s then return end
+    s.last_shot_result = kind
+    s.last_shot_result_time = globals.curtime or 0
+    s.shot_history = s.shot_history or {}
+    s.shot_history[#s.shot_history + 1] = kind
+    while #s.shot_history > 6 do table.remove(s.shot_history, 1) end
+end
+
 events.aim_ack:set(function(event)
     if event == nil or event.target == nil then return end
     local Ent = entity.get(event.target, true)
@@ -2767,12 +2785,14 @@ events.aim_ack:set(function(event)
         if server_fail_keep then
             s.serverfail_misses = (s.serverfail_misses or 0) + 1
             sel01_session_serverfails = (sel01_session_serverfails or 0) + 1
+            esp_push_shot(s, "serverfail")  -- V9.51: blue flash + blue dot
             cs_log_verbose("server-fail miss NOT counted idx=%d mode=%s (player#%d session#%d)",
                            Ent:get_index(), tostring(s.mode), s.serverfail_misses, sel01_session_serverfails)
         else
             learning_update_miss(Ent)
             mode_stats_update(tostring(s.mode), false)
             record_player_shot(s, false)  -- V8.0: per-player hit-rate
+            esp_push_shot(s, "miss")  -- V9.51: red flash + red dot
         end
         -- V5: adaptive predict-ticks tuning (miss → reduce by 1)
         if s.last_used_pred_ticks and tostring(s.mode):find("+Pred") then
@@ -2805,6 +2825,7 @@ events.aim_ack:set(function(event)
             s.mode_misses[mode_clean] = 0
             if s.mode_blacklist_until then s.mode_blacklist_until[mode_clean] = 0 end
         end
+        esp_push_shot(s, "hit")  -- V9.51: green flash + green dot
         -- HIT: prefer snapshot from aim_fire if available (accurate per-shot state)
         local src_eye, src_res = s.last_eye_yaw, s.last_resolved
         if exp_aim_fire_snap and exp_aim_fire_snap:get() and #s.shot_snapshots > 0 then
@@ -4860,11 +4881,14 @@ local esp_paint_handler = function()
             local s = PlayerState[p:get_index()]
             if not s or s.mode == "Init" then return end
 
+            local ox, oy, oz = p.m_vecOrigin.x, p.m_vecOrigin.y, p.m_vecOrigin.z
             local ok, head_pos = pcall(function()
-                local ox, oy, oz = p.m_vecOrigin.x, p.m_vecOrigin.y, p.m_vecOrigin.z + 72
-                return render.world_to_screen(vector(ox, oy, oz))
+                return render.world_to_screen(vector(ox, oy, oz + 72))
             end)
             if not ok or not head_pos then return end  -- nil when offscreen
+            -- V9.51: feet point (flash box bottom). Nil-safe — box just skips if offscreen.
+            local feet_pos
+            pcall(function() feet_pos = render.world_to_screen(vector(ox, oy, oz + 4)) end)
 
             -- color by mode category
             local r, g, b = 255, 255, 255
@@ -4902,10 +4926,94 @@ local esp_paint_handler = function()
                 brain = string.format(" 👁%d", passive)         -- passive only (not shot yet)
             end
 
-            local txt = string.format("%s %s %.0f°%s", arrow, pred_marker, desync_val, brain)
+            -- V9.51-D: AA-type glyph — quick-read of the enemy's anti-aim type.
+            local enh_on = esp_enh and esp_enh:get()
+            local aa_glyph = ""
+            if enh_on then
+                local at = tostring(s.aa_type or "")
+                if     at == "static"  then aa_glyph = "▣ "
+                elseif at == "switch"  then aa_glyph = "⇄ "
+                elseif at == "jitter"  then aa_glyph = "∿ "
+                elseif at == "spinner" then aa_glyph = "⊛ "
+                end
+            end
+
+            local txt = string.format("%s%s %s %.0f°%s", aa_glyph, arrow, pred_marker, desync_val, brain)
 
             pcall(function()
-                render.text(4, vector(head_pos.x, head_pos.y - 22), color(r, g, b, 255), "c", txt)
+                local now_t = globals.curtime or 0
+
+                -- V9.51-B: HIT/MISS/SERVERFAIL flash box around the model (~0.45s fade).
+                if esp_flash and esp_flash:get() and feet_pos and s.last_shot_result
+                   and (now_t - (s.last_shot_result_time or 0)) < 0.45 then
+                    local age   = now_t - (s.last_shot_result_time or 0)
+                    local alpha = math.floor(220 * (1 - age / 0.45))
+                    local fr, fg, fb = 255, 70, 70                       -- miss = red
+                    if     s.last_shot_result == "hit"        then fr, fg, fb = 90, 255, 110
+                    elseif s.last_shot_result == "serverfail" then fr, fg, fb = 90, 170, 255 end
+                    local h  = math.abs((feet_pos.y or head_pos.y) - head_pos.y)
+                    local bw = math.max(8, h * 0.30)
+                    local x1, x2 = head_pos.x - bw, head_pos.x + bw
+                    local y1, y2 = head_pos.y - 6, (feet_pos.y or (head_pos.y + h))
+                    local fc = color(fr, fg, fb, alpha)
+                    render.rect(vector(x1, y1), vector(x2, y1 + 2), fc, 0, true)   -- top
+                    render.rect(vector(x1, y2 - 2), vector(x2, y2), fc, 0, true)   -- bottom
+                    render.rect(vector(x1, y1), vector(x1 + 2, y2), fc, 0, true)   -- left
+                    render.rect(vector(x2 - 2, y1), vector(x2, y2), fc, 0, true)   -- right
+                end
+
+                -- V9.51-A: desync wedge — two lines from the pelvis. White = the enemy's
+                -- REAL eye_yaw, mode-color = our RESOLVED fake-yaw. The angle between them
+                -- IS the desync we're shooting; lets you eyeball side + magnitude on the body.
+                if esp_wedge and esp_wedge:get() and s.last_eye_yaw and s.last_resolved then
+                    local base, t_eye, t_res
+                    pcall(function() base  = render.world_to_screen(vector(ox, oy, oz + 36)) end)
+                    local function tip(yaw_deg)
+                        local rad = yaw_deg * math.pi / 180
+                        return render.world_to_screen(vector(ox + math.cos(rad) * 26,
+                                                             oy + math.sin(rad) * 26, oz + 36))
+                    end
+                    pcall(function() t_eye = tip(s.last_eye_yaw) end)
+                    pcall(function() t_res = tip(s.last_resolved) end)
+                    if base and t_eye then pcall(function()
+                        render.line(vector(base.x, base.y), vector(t_eye.x, t_eye.y), color(235, 235, 235, 230))
+                    end) end
+                    if base and t_res then pcall(function()
+                        render.line(vector(base.x, base.y), vector(t_res.x, t_res.y), color(r, g, b, 240))
+                    end) end
+                end
+
+                render.text(4, vector(head_pos.x, head_pos.y - 26), color(r, g, b, 255), "c", txt)
+
+                -- V9.51-C: netcode / backtrack tag — THIS enemy is fake-lagging, so a
+                -- resolver "miss" on them is server-side, not our fault.
+                if enh_on then
+                    local tag = ""
+                    if s.backtrack_resistant then tag = tag .. "🛡bt " end
+                    if (s.serverfail_misses or 0) > 0 then tag = tag .. string.format("⚠net×%d ", s.serverfail_misses) end
+                    if s.tp_peek_active then tag = tag .. "⚡peek " end
+                    if tag ~= "" then
+                        render.text(2, vector(head_pos.x, head_pos.y - 14), color(150, 190, 230, 235), "c", tag)
+                    end
+                end
+
+                -- V9.51-E: shot-history dots (last 6) — green hit / red miss / blue serverfail.
+                if enh_on and s.shot_history and #s.shot_history > 0 then
+                    local n  = #s.shot_history
+                    local dw, gap = 5, 2
+                    local total_w = n * dw + (n - 1) * gap
+                    local sx = head_pos.x - total_w / 2
+                    for i = 1, n do
+                        local k = s.shot_history[i]
+                        local dr, dg, db = 255, 70, 70
+                        if     k == "hit"        then dr, dg, db = 90, 255, 110
+                        elseif k == "serverfail" then dr, dg, db = 90, 170, 255 end
+                        local dx = sx + (i - 1) * (dw + gap)
+                        render.rect(vector(dx, head_pos.y - 42), vector(dx + dw, head_pos.y - 38),
+                                    color(dr, dg, db, 230), 0, true)
+                    end
+                end
+
                 if esp_show_confbar and esp_show_confbar:get() then
                     local bar_w = 40
                     local fill = math.floor(bar_w * conf / 100)
@@ -4915,6 +5023,22 @@ local esp_paint_handler = function()
                     render.rect(vector(head_pos.x - bar_w/2, head_pos.y - 8),
                                 vector(head_pos.x - bar_w/2 + fill, head_pos.y - 5),
                                 color(cr, cg, cb, 220), 0, true)
+                    -- V9.51-F: side-dom mini-bar just below conf bar — learned L vs R real
+                    -- hits. Wider side = where this enemy desyncs more often.
+                    if enh_on then
+                        local rl, rr = (s.real_left or 0), (s.real_right or 0)
+                        local tot = rl + rr
+                        if tot > 0 then
+                            local half = bar_w / 2
+                            local lw = math.floor(half * rl / tot)
+                            local rw = math.floor(half * rr / tot)
+                            local cx = head_pos.x
+                            render.rect(vector(cx - lw, head_pos.y - 3), vector(cx, head_pos.y - 1),
+                                        color(255, 180, 90, 210), 0, true)   -- left = orange
+                            render.rect(vector(cx, head_pos.y - 3), vector(cx + rw, head_pos.y - 1),
+                                        color(90, 200, 255, 210), 0, true)   -- right = blue
+                        end
+                    end
                 end
             end)
         end)
@@ -5276,6 +5400,7 @@ _cs_log_color_raw("V9.45: seed-only keep-side fix — the 'magnitude matched mea
 _cs_log_color_raw("V9.46: teleport-on-peek detection — horizontal origin delta vs max run-speed reveals a blink-peek (lag-switch / fakelag-flush). On detect, time-box 0.4s that disables extrapolation (yaw_rate from before the blink can't predict the landing) + forces full-spread multipoint at close range so NL's stale backtrack record still lands. Reacts on the FIRST peek instead of after 2 misses; never touches side/EMA so v9.45 + learned patterns stay intact.")
 _cs_log_color_raw("V9.47: side-conflict overrides high-bt keep when angle was off — a learned wrong-side shot with a LARGE magnitude error (>10) now flips even under bt>8, because a clean stale-record reject leaves err~0. Old order let bt>8 short-circuit the flip and retry the wrong side (logs: idx=8, 1 R-hit, shot L -21.6 vs meas 39.5 err=17.9 bt=12 — kept L; next real hit confirmed R). err~0 + side-conflict still keeps (switch-stale / v9.42 overshoot / v9.44 locked protected).")
 _cs_log_color_raw("V9.48: alt_side_pick uses REAL-hit dominance when both sides have real hits — the seeded-inclusive sample counts (sl/sr carry passive+seeded entries) mispinned a genuine 50/50 switch enemy. Logs: idx=4 sl=3 sr=1 pinned LEFT for Predicted-Alt but real hits were 1L/1R and the correct side was RIGHT (Predicted-Alt 0/2). Balanced real data now alternates off last_hit_side; one-sided enemies (rr=0) keep the old seeded dom path so streak{L=9 R=0} is unaffected.")
+_cs_log_color_raw("V9.51: on-model ESP visuals — (A) desync wedge: white line = enemy real eye_yaw, mode-color line = our resolved fake-yaw, drawn from the pelvis so the angle between them IS the desync. (B) hit/miss flash: a ~0.45s fading box around the model, green=hit / red=miss / blue=server-fail. (C) netcode tag: 🛡bt + ⚠net×N + ⚡peek above the label so you see THIS enemy fake-lags (resolver 'miss' = server-side). (D) AA-glyph ▣static ⇄switch ∿jitter ⊛spinner prefixed to the label. (E) shot-dots: last 6 results as a colored dot row. (F) side-dom mini-bar under the conf bar (orange L vs blue R real-hit split). Three new toggles (Desync Wedge / Hit-Miss Flash / Enhanced Tags), all default ON in the SSG-Pro preset.")
 _cs_log_color_raw("V9.50: server-fail filter readout — the V9.49 netcode-miss counter (sel01_session_serverfails + per-player s.serverfail_misses) is now surfaced in the copy-dump ([SESSION] shows N filtered + the raw pre-filter %) AND the HUD corner ('Netcode: N server-fails filtered'). Makes the headline hit-rate trustworthy: you can see how many correct-angle shots the server rejected vs real resolver misses. Counter clears on Reset Session Stats. Pure observability, no resolver-behaviour change.")
 _cs_log_color_raw("V9.49: confirmed server-fail keeps no longer pollute stats — a correct angle (err~0) the server rejects via a stale backtrack record (high bt, side kept) is netcode, not a resolver miss. It's now excluded from session hit-rate, per-mode stats, per-player rate AND the persistent learned ratio (s.missed still increments so BF cycle + force-baim escalate). Logs: idx=9 fired -21.8° ×3 into bt 20→10→5 err=0 then hit shot 4; idx=4 kept ×3 err=0.3 across Air+Jitter-Cls — these dragged session ~56% when true resolver rate was ~82% and falsely flagged Air as 'weak'. Plus never-hit explore: after 2 consecutive correct-angle keeps on a real_active==0 enemy, flip once to break a frozen wrong-side guess (idx=5 0/2 shot LEFT while passive leaned RIGHT 42.9°); a single real hit disables it.")
 _cs_log_color_raw("V9.43: backtrack-resistance escalates faster — point-blank fakelaggers with correct angle (our=meas, err=0) but server-reject (bt 7-10) now flip the resistant flag after 2 high-bt fails OR one bt>12, instead of 3 (was wasting 2 sure shots). Pairs with v9.40 full-spread multipoint to catch slightly-stale records.")
