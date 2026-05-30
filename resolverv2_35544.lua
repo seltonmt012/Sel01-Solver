@@ -1,11 +1,11 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 9.39                                   ║
+-- ║  Version: 9.40                                   ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 9.39
+-- @version 9.40
 -- @description Correction side guard + serverfail retry:
 --   * correction/prediction-error misses now check SIDE evidence, not only
 --     magnitude. A BF shot on the unlearned opposite side no longer gets labeled
@@ -73,7 +73,7 @@
 --   * v9.26 drift-bump (alpha 0.55 on 5-10° diff) still handles small shifts.
 --   * v9.29 coach variants carry.
 
-local SEL01_VERSION = "9.39"
+local SEL01_VERSION = "9.40"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -2636,6 +2636,20 @@ events.aim_ack:set(function(event)
                 -- angle was correct, server rejected it → server-side / fake-lag fail.
                 -- KEEP the side. Repeated fails flag a hard fake-lagger.
                 s.serverfail_streak = (s.serverfail_streak or 0) + 1
+                -- V9.40: bt-driven backtrack-resistance. The reason-string "backtrack"
+                -- check (NON_RESOLVER_MISS path) NEVER fires for these — NL labels the
+                -- real stale-record netcode miss "correction" / "prediction error" but
+                -- carries a HIGH event.backtrack. Feed those into bt_fail_count so the
+                -- resistant flag (predict_ticks-1 + full-spread multipoint at close
+                -- range) actually triggers on the enemies that cause it.
+                if bt > 6 then
+                    s.bt_fail_count = (s.bt_fail_count or 0) + 1
+                    if s.bt_fail_count >= 3 and not s.backtrack_resistant then
+                        s.backtrack_resistant = true
+                        cs_log_verbose("backtrack-resistant idx=%d (bt-driven, high-bt corr fails=%d)",
+                                       Ent:get_index(), s.bt_fail_count)
+                    end
+                end
                 resolver_note_serverfail_retry(s, ack_shot_side, math.max(math.abs(ack_delta), ack_measured))
                 cs_log_verbose("correction-miss idx=%d KEEP side=%d our=%.1f meas=%.1f err=%.1f bt=%d (server/backtrack fail #%d, retry same)",
                                Ent:get_index(), ack_shot_side, ack_delta, ack_measured, ack_angle_err, bt, s.serverfail_streak)
@@ -4331,6 +4345,16 @@ pcall(function()
             if wc == "sniper" then
                 pcall(function() ctx:override_multipoint(true) end)
                 pcall(function() ctx:override_multipoint_scale(1.0) end)
+            else
+                -- V9.40: non-sniper close-priority — force multipoint on too. A
+                -- point-blank enemy running at you produces near-constant stale NL
+                -- backtrack records (live head has moved past the replayed record),
+                -- so a SINGLE-point head shot whiffs even when our resolved angle is
+                -- correct (logs: our=meas, err=0, bt 7-15, reason=correction). Spread
+                -- aim points across the hitbox so a slightly-stale record still lands.
+                -- Widen to full spread when this target is already flagged stale-record.
+                pcall(function() ctx:override_multipoint(true) end)
+                pcall(function() ctx:override_multipoint_scale((s and s.backtrack_resistant) and 1.0 or 0.85) end)
             end
             cs_log_verbose("close-priority idx=%d dist=%.0f reason=%s hc=%d (eff=%d) wc=%s",
                            target:get_index(), target_dist, priority_reason, priority_hc, effective_hc, tostring(wc))
@@ -5063,5 +5087,6 @@ _cs_log_color_raw("V9.36: snapshot-match REGRESSION FIX — v9.33 matched ack-ti
 _cs_log_color_raw("V9.37: AIR first-contact fix (Air was worst @25%) — air guess magnitude biased high (max(median,42), airborne=near-max desync) + first-contact side uses steam-mem dom instead of blind +1.")
 _cs_log_color_raw("V9.38: correction guard is side-aware + correct-angle serverfails retry same side once; BF now trusts strong passive desync before max_desync.")
 _cs_log_color_raw("V9.39: sample-count EMA alpha ramp (0.55 on hit 1-2, 0.42 on hit 3-4, then 0.30) on global + both per-side — converges in 2-3 hits instead of 5-6, faster + smoother lock (side settles sooner, fewer first-shot mode flips).")
+_cs_log_color_raw("V9.40: point-blank stale-record fix — non-sniper close-priority now forces multipoint (was sniper-only) so a single-point head shot stops whiffing on an enemy running at you (correct angle, high bt, reason=correction). + bt-driven backtrack-resistance (high event.backtrack on correction/prediction-error now counts, was string-only).")
 _cs_log_color_raw("Logging: " .. (log_enabled:get() and ("ON" .. (log_verbose:get() and " (verbose)" or ""))  or "OFF"))
 _cs_log_color_raw("=========================================")
