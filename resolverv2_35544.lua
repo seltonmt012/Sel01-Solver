@@ -1,11 +1,11 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 9.40                                   ║
+-- ║  Version: 9.41                                   ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 9.40
+-- @version 9.41
 -- @description Correction side guard + serverfail retry:
 --   * correction/prediction-error misses now check SIDE evidence, not only
 --     magnitude. A BF shot on the unlearned opposite side no longer gets labeled
@@ -73,7 +73,7 @@
 --   * v9.26 drift-bump (alpha 0.55 on 5-10° diff) still handles small shifts.
 --   * v9.29 coach variants carry.
 
-local SEL01_VERSION = "9.40"
+local SEL01_VERSION = "9.41"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -3817,7 +3817,22 @@ local function resolve_player(p)
             local _mem = get_steam_mem(p)
             air_side = (_mem and _mem.dominant_side ~= 0 and _mem.dominant_side) or 1
         end
-        local air_guess_mag = math.max(adaptive_guess_mag(), 42)
+        -- V9.41: air-guess magnitude is now PER-PLAYER passive-aware. The v9.37 blind
+        -- floor of max(session_median, 42) overshot low-desync air enemies badly
+        -- (logs: idx=3 guessed 42/45, real was 12.4 → 30° miss) and ignored the
+        -- per-player passive observation we already accumulate (idx=6 had 57 passive
+        -- obs of its real ~45° desync, unused). Prefer this enemy's own measured /
+        -- passive-seeded magnitude; only fall to the high blind floor when truly cold
+        -- (under the 8-obs passive-seed threshold), and soften that floor 42→36.
+        local air_guess_mag
+        local _pmax = math.max(s.passive_left or 0, s.passive_right or 0)
+        if (s.measured_desync or 0) > 5 then
+            air_guess_mag = s.measured_desync
+        elseif _pmax > 5 then
+            air_guess_mag = _pmax
+        else
+            air_guess_mag = math.max(adaptive_guess_mag(), 36)
+        end
         if s.aa_type == "switch" and both_air and s.last_hit_side ~= 0 then
             -- V9.19: dom-bias for Air-Alt — prefer dom if it leads by 2+
             local side = alt_side_pick(s)
@@ -5088,5 +5103,6 @@ _cs_log_color_raw("V9.37: AIR first-contact fix (Air was worst @25%) — air gue
 _cs_log_color_raw("V9.38: correction guard is side-aware + correct-angle serverfails retry same side once; BF now trusts strong passive desync before max_desync.")
 _cs_log_color_raw("V9.39: sample-count EMA alpha ramp (0.55 on hit 1-2, 0.42 on hit 3-4, then 0.30) on global + both per-side — converges in 2-3 hits instead of 5-6, faster + smoother lock (side settles sooner, fewer first-shot mode flips).")
 _cs_log_color_raw("V9.40: point-blank stale-record fix — non-sniper close-priority now forces multipoint (was sniper-only) so a single-point head shot stops whiffing on an enemy running at you (correct angle, high bt, reason=correction). + bt-driven backtrack-resistance (high event.backtrack on correction/prediction-error now counts, was string-only).")
+_cs_log_color_raw("V9.41: air-guess magnitude is per-player passive-aware — uses THIS enemy's measured/passive-seeded desync before the blind floor (v9.37's max(median,42) overshot low-desync air enemies by ~30° and ignored 50+ passive obs we already had). Blind floor softened 42→36.")
 _cs_log_color_raw("Logging: " .. (log_enabled:get() and ("ON" .. (log_verbose:get() and " (verbose)" or ""))  or "OFF"))
 _cs_log_color_raw("=========================================")
