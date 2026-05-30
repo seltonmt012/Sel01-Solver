@@ -1,11 +1,11 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 9.47                                   ║
+-- ║  Version: 9.48                                   ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 9.47
+-- @version 9.48
 -- @description Correction side guard + serverfail retry:
 --   * correction/prediction-error misses now check SIDE evidence, not only
 --     magnitude. A BF shot on the unlearned opposite side no longer gets labeled
@@ -73,7 +73,7 @@
 --   * v9.26 drift-bump (alpha 0.55 on 5-10° diff) still handles small shifts.
 --   * v9.29 coach variants carry.
 
-local SEL01_VERSION = "9.47"
+local SEL01_VERSION = "9.48"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -1072,6 +1072,21 @@ end
 -- -1 (L), or 0 if no signal — caller falls back to its own default.
 function alt_side_pick(s)
     local sl, sr = s.samples_left or 0, s.samples_right or 0
+    -- V9.48: when REAL hits exist on BOTH sides the enemy genuinely alternates —
+    -- the seeded-inclusive sample counts (sl/sr also carry passive + seeded entries
+    -- that can lean one way) must not pin a dom side. Use real-hit dominance; balanced
+    -- real data falls to alternation off last_hit_side. Only when a side has no real
+    -- data at all do we trust the seeded counts (the streak{L=9 R=0} dom case stays).
+    -- (logs: idx=4 sl=3 sr=1 → old pinned LEFT, but real hits were 1L/1R and the
+    -- correct side was RIGHT → Predicted-Alt 0/2.)
+    local rl, rr = s.real_left or 0, s.real_right or 0
+    if rl >= 1 and rr >= 1 then
+        if rl >= rr + 2 then return -1 end
+        if rr >= rl + 2 then return  1 end
+        if (s.last_hit_side or 0) > 0 then return -1 end
+        if (s.last_hit_side or 0) < 0 then return  1 end
+        return 0
+    end
     if sl >= sr + 2 then return -1 end
     if sr >= sl + 2 then return  1 end
     if (s.last_hit_side or 0) > 0 then return -1 end
@@ -5200,6 +5215,7 @@ _cs_log_color_raw("V9.44: serverfail-retry magnitude fix — retry now shoots th
 _cs_log_color_raw("V9.45: seed-only keep-side fix — the 'magnitude matched measured → server fail, keep side' branch now requires a REAL hit (real_active>=1) or genuine backtrack (bt>6). On a never-hit enemy measured_desync is pure passive seed; matching it proved nothing and froze the side on the WRONG guess forever (logs: idx=8, p_hits=0/2, seed 52.2°L, shot left twice, 2nd shot bt=0). Now explores the other side instead.")
 _cs_log_color_raw("V9.46: teleport-on-peek detection — horizontal origin delta vs max run-speed reveals a blink-peek (lag-switch / fakelag-flush). On detect, time-box 0.4s that disables extrapolation (yaw_rate from before the blink can't predict the landing) + forces full-spread multipoint at close range so NL's stale backtrack record still lands. Reacts on the FIRST peek instead of after 2 misses; never touches side/EMA so v9.45 + learned patterns stay intact.")
 _cs_log_color_raw("V9.47: side-conflict overrides high-bt keep when angle was off — a learned wrong-side shot with a LARGE magnitude error (>10) now flips even under bt>8, because a clean stale-record reject leaves err~0. Old order let bt>8 short-circuit the flip and retry the wrong side (logs: idx=8, 1 R-hit, shot L -21.6 vs meas 39.5 err=17.9 bt=12 — kept L; next real hit confirmed R). err~0 + side-conflict still keeps (switch-stale / v9.42 overshoot / v9.44 locked protected).")
+_cs_log_color_raw("V9.48: alt_side_pick uses REAL-hit dominance when both sides have real hits — the seeded-inclusive sample counts (sl/sr carry passive+seeded entries) mispinned a genuine 50/50 switch enemy. Logs: idx=4 sl=3 sr=1 pinned LEFT for Predicted-Alt but real hits were 1L/1R and the correct side was RIGHT (Predicted-Alt 0/2). Balanced real data now alternates off last_hit_side; one-sided enemies (rr=0) keep the old seeded dom path so streak{L=9 R=0} is unaffected.")
 _cs_log_color_raw("V9.43: backtrack-resistance escalates faster — point-blank fakelaggers with correct angle (our=meas, err=0) but server-reject (bt 7-10) now flip the resistant flag after 2 high-bt fails OR one bt>12, instead of 3 (was wasting 2 sure shots). Pairs with v9.40 full-spread multipoint to catch slightly-stale records.")
 _cs_log_color_raw("V9.42: side-flip from SIDE evidence not magnitude error — ack_angle_err is a MAGNITUDE metric (wrong-side miss = small err, magnitude overshoot = large err), so old 'err>5 → flip' flipped the correct side on magnitude misses (idx=4: real 36°L, we 55°L, wrongly flipped R). Now flip only on learned side-conflict or blind first-contact; magnitude misses keep side, BF cycles the magnitude.")
 _cs_log_color_raw("Logging: " .. (log_enabled:get() and ("ON" .. (log_verbose:get() and " (verbose)" or ""))  or "OFF"))
