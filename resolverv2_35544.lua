@@ -1,11 +1,11 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 9.51                                   ║
+-- ║  Version: 9.52                                   ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 9.51
+-- @version 9.52
 -- @description Correction side guard + serverfail retry:
 --   * correction/prediction-error misses now check SIDE evidence, not only
 --     magnitude. A BF shot on the unlearned opposite side no longer gets labeled
@@ -73,7 +73,7 @@
 --   * v9.26 drift-bump (alpha 0.55 on 5-10° diff) still handles small shifts.
 --   * v9.29 coach variants carry.
 
-local SEL01_VERSION = "9.51"
+local SEL01_VERSION = "9.52"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -4901,44 +4901,42 @@ local esp_paint_handler = function()
             elseif m:find("LBY")     then r, g, b = 100, 255, 255
             end
 
-            -- V6.8: label + learning-progress indicator
-            local arrow = s.last_hit_side > 0 and "→" or (s.last_hit_side < 0 and "←" or "•")
+            -- V9.52: PLAIN-WORD labels (replaced cryptic glyphs ⇄ ·2+53 ★ 🔒 👁 that
+            -- the user couldn't read). Two clear lines: TYPE SIDE DEG  /  STATE · CONF%.
+            local enh_on = esp_enh and esp_enh:get()
+            local conf = confidence(s)
+            local cr, cg, cb = color_by_confidence(conf)
+            local total_samples = (s.samples_left or 0) + (s.samples_right or 0)
+            local passive = s.passive_samples or 0
+            local locked = total_samples >= 8 and conf >= 60
+
+            -- which side + how big the fake is (per-side measured if we have it)
+            local side_txt = s.last_hit_side > 0 and "R" or (s.last_hit_side < 0 and "L" or "?")
             local desync_val
             if s.last_hit_side > 0 and s.samples_right >= 1 then desync_val = s.measured_right
             elseif s.last_hit_side < 0 and s.samples_left >= 1 then desync_val = s.measured_left
             else desync_val = s.measured_desync end
 
-            local conf = confidence(s)
-            local cr, cg, cb = color_by_confidence(conf)
-            local pred_marker = m:find("+Pred") and "⚡" or ""
-            -- V7.0+V7.1: learning-progress with LOCK + passive observation
-            local total_samples = (s.samples_left or 0) + (s.samples_right or 0)
-            local passive = s.passive_samples or 0
-            local brain = ""
-            local locked = total_samples >= 8 and conf >= 60
-            if locked then
-                brain = string.format(" 🔒%d", total_samples)  -- locked-on
-            elseif total_samples >= 4 then
-                brain = string.format(" ★%d", total_samples)   -- well-learned
-            elseif total_samples >= 1 then
-                brain = string.format(" ·%d+%d", total_samples, passive)  -- some samples + passive obs
-            elseif passive >= 5 then
-                brain = string.format(" 👁%d", passive)         -- passive only (not shot yet)
-            end
+            -- AA type as a readable WORD
+            local at = tostring(s.aa_type or "")
+            local aa_word = "STATIC"
+            if     at == "switch"  then aa_word = "SWITCH"
+            elseif at == "jitter"  then aa_word = "JITTER"
+            elseif at == "spinner" then aa_word = "SPIN"
+            elseif at ~= "static"  then aa_word = "?" end
 
-            -- V9.51-D: AA-type glyph — quick-read of the enemy's anti-aim type.
-            local enh_on = esp_enh and esp_enh:get()
-            local aa_glyph = ""
-            if enh_on then
-                local at = tostring(s.aa_type or "")
-                if     at == "static"  then aa_glyph = "▣ "
-                elseif at == "switch"  then aa_glyph = "⇄ "
-                elseif at == "jitter"  then aa_glyph = "∿ "
-                elseif at == "spinner" then aa_glyph = "⊛ "
-                end
-            end
+            local pred_txt = m:find("+Pred") and "  PRED" or ""
+            -- MAIN line:  TYPE  SIDE DEG  [PRED]   e.g. "SWITCH  R 36°  PRED"
+            local txt = string.format("%s  %s %.0f°%s", aa_word, side_txt, desync_val, pred_txt)
 
-            local txt = string.format("%s%s %s %.0f°%s", aa_glyph, arrow, pred_marker, desync_val, brain)
+            -- STATE line: readable learning progress + confidence %
+            local state_txt, scr, scg, scb
+            if locked then               state_txt = string.format("LOCKED %d", total_samples);   scr, scg, scb = 100, 255, 120
+            elseif total_samples >= 4 then state_txt = string.format("LEARNED %d", total_samples);  scr, scg, scb = 140, 230, 140
+            elseif total_samples >= 1 then state_txt = string.format("LEARNING %d", total_samples); scr, scg, scb = 235, 220, 120
+            elseif passive >= 5 then     state_txt = "SEEN";                                        scr, scg, scb = 160, 160, 160
+            else                         state_txt = "NEW";                                         scr, scg, scb = 150, 150, 150 end
+            local sub_txt = string.format("%s  %d%%", state_txt, conf)
 
             pcall(function()
                 local now_t = globals.curtime or 0
@@ -4983,17 +4981,20 @@ local esp_paint_handler = function()
                     end) end
                 end
 
-                render.text(4, vector(head_pos.x, head_pos.y - 26), color(r, g, b, 255), "c", txt)
+                -- V9.52: two clean stacked lines. MAIN (mode color) nearest the head =
+                -- "TYPE SIDE DEG", STATE line below = "LEARNED 4  72%".
+                render.text(4, vector(head_pos.x, head_pos.y - 24), color(r, g, b, 255), "c", txt)
+                render.text(3, vector(head_pos.x, head_pos.y - 37), color(scr, scg, scb, 255), "c", sub_txt)
 
-                -- V9.51-C: netcode / backtrack tag — THIS enemy is fake-lagging, so a
-                -- resolver "miss" on them is server-side, not our fault.
+                -- V9.52-C: netcode line in PLAIN words — THIS enemy fake-lags, so a
+                -- resolver "miss" on them is server-side (filtered out by v9.49), not ours.
                 if enh_on then
                     local tag = ""
-                    if s.backtrack_resistant then tag = tag .. "🛡bt " end
-                    if (s.serverfail_misses or 0) > 0 then tag = tag .. string.format("⚠net×%d ", s.serverfail_misses) end
-                    if s.tp_peek_active then tag = tag .. "⚡peek " end
+                    if s.backtrack_resistant then tag = tag .. "FAKELAG " end
+                    if (s.serverfail_misses or 0) > 0 then tag = tag .. string.format("NET×%d ", s.serverfail_misses) end
+                    if s.tp_peek_active then tag = tag .. "PEEK " end
                     if tag ~= "" then
-                        render.text(2, vector(head_pos.x, head_pos.y - 14), color(150, 190, 230, 235), "c", tag)
+                        render.text(2, vector(head_pos.x, head_pos.y - 50), color(120, 200, 255, 240), "c", tag)
                     end
                 end
 
@@ -5009,7 +5010,7 @@ local esp_paint_handler = function()
                         if     k == "hit"        then dr, dg, db = 90, 255, 110
                         elseif k == "serverfail" then dr, dg, db = 90, 170, 255 end
                         local dx = sx + (i - 1) * (dw + gap)
-                        render.rect(vector(dx, head_pos.y - 42), vector(dx + dw, head_pos.y - 38),
+                        render.rect(vector(dx, head_pos.y - 63), vector(dx + dw, head_pos.y - 59),
                                     color(dr, dg, db, 230), 0, true)
                     end
                 end
@@ -5400,6 +5401,7 @@ _cs_log_color_raw("V9.45: seed-only keep-side fix — the 'magnitude matched mea
 _cs_log_color_raw("V9.46: teleport-on-peek detection — horizontal origin delta vs max run-speed reveals a blink-peek (lag-switch / fakelag-flush). On detect, time-box 0.4s that disables extrapolation (yaw_rate from before the blink can't predict the landing) + forces full-spread multipoint at close range so NL's stale backtrack record still lands. Reacts on the FIRST peek instead of after 2 misses; never touches side/EMA so v9.45 + learned patterns stay intact.")
 _cs_log_color_raw("V9.47: side-conflict overrides high-bt keep when angle was off — a learned wrong-side shot with a LARGE magnitude error (>10) now flips even under bt>8, because a clean stale-record reject leaves err~0. Old order let bt>8 short-circuit the flip and retry the wrong side (logs: idx=8, 1 R-hit, shot L -21.6 vs meas 39.5 err=17.9 bt=12 — kept L; next real hit confirmed R). err~0 + side-conflict still keeps (switch-stale / v9.42 overshoot / v9.44 locked protected).")
 _cs_log_color_raw("V9.48: alt_side_pick uses REAL-hit dominance when both sides have real hits — the seeded-inclusive sample counts (sl/sr carry passive+seeded entries) mispinned a genuine 50/50 switch enemy. Logs: idx=4 sl=3 sr=1 pinned LEFT for Predicted-Alt but real hits were 1L/1R and the correct side was RIGHT (Predicted-Alt 0/2). Balanced real data now alternates off last_hit_side; one-sided enemies (rr=0) keep the old seeded dom path so streak{L=9 R=0} is unaffected.")
+_cs_log_color_raw("V9.52: ESP labels rewritten in PLAIN WORDS (the v9.51 glyphs ⇄ ·2+53 ★ 🔒 👁 🛡net× were unreadable). Now two clean stacked lines per enemy: MAIN (mode color) = 'TYPE SIDE DEG' e.g. 'SWITCH  R 36°  PRED'; STATE (progress color) = 'LEARNED 4  72%' (NEW / SEEN / LEARNING n / LEARNED n / LOCKED n + confidence%). Netcode tag is now words: 'FAKELAG' (backtrack-resistant) / 'NET×N' (server-fails) / 'PEEK' (teleport-peek). Flash + dots + dom-bar + wedge unchanged (visual, not cryptic). Nothing removed — just readable.")
 _cs_log_color_raw("V9.51: on-model ESP visuals — (A) desync wedge: white line = enemy real eye_yaw, mode-color line = our resolved fake-yaw, drawn from the pelvis so the angle between them IS the desync. (B) hit/miss flash: a ~0.45s fading box around the model, green=hit / red=miss / blue=server-fail. (C) netcode tag: 🛡bt + ⚠net×N + ⚡peek above the label so you see THIS enemy fake-lags (resolver 'miss' = server-side). (D) AA-glyph ▣static ⇄switch ∿jitter ⊛spinner prefixed to the label. (E) shot-dots: last 6 results as a colored dot row. (F) side-dom mini-bar under the conf bar (orange L vs blue R real-hit split). Three new toggles (Desync Wedge / Hit-Miss Flash / Enhanced Tags), all default ON in the SSG-Pro preset.")
 _cs_log_color_raw("V9.50: server-fail filter readout — the V9.49 netcode-miss counter (sel01_session_serverfails + per-player s.serverfail_misses) is now surfaced in the copy-dump ([SESSION] shows N filtered + the raw pre-filter %) AND the HUD corner ('Netcode: N server-fails filtered'). Makes the headline hit-rate trustworthy: you can see how many correct-angle shots the server rejected vs real resolver misses. Counter clears on Reset Session Stats. Pure observability, no resolver-behaviour change.")
 _cs_log_color_raw("V9.49: confirmed server-fail keeps no longer pollute stats — a correct angle (err~0) the server rejects via a stale backtrack record (high bt, side kept) is netcode, not a resolver miss. It's now excluded from session hit-rate, per-mode stats, per-player rate AND the persistent learned ratio (s.missed still increments so BF cycle + force-baim escalate). Logs: idx=9 fired -21.8° ×3 into bt 20→10→5 err=0 then hit shot 4; idx=4 kept ×3 err=0.3 across Air+Jitter-Cls — these dragged session ~56% when true resolver rate was ~82% and falsely flagged Air as 'weak'. Plus never-hit explore: after 2 consecutive correct-angle keeps on a real_active==0 enemy, flip once to break a frozen wrong-side guess (idx=5 0/2 shot LEFT while passive leaned RIGHT 42.9°); a single real hit disables it.")
