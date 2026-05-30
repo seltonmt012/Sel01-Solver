@@ -1,11 +1,11 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 9.45                                   ║
+-- ║  Version: 9.46                                   ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 9.45
+-- @version 9.46
 -- @description Correction side guard + serverfail retry:
 --   * correction/prediction-error misses now check SIDE evidence, not only
 --     magnitude. A BF shot on the unlearned opposite side no longer gets labeled
@@ -73,7 +73,7 @@
 --   * v9.26 drift-bump (alpha 0.55 on 5-10° diff) still handles small shifts.
 --   * v9.29 coach variants carry.
 
-local SEL01_VERSION = "9.45"
+local SEL01_VERSION = "9.46"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -3186,6 +3186,9 @@ local function _pick_first_shot_impl(p, s, anim, eye_yaw, max_desync, preset)
         if s.is_slow_target then can_predict = false end
         -- V8.1 gate 4: no extrapolation on first engagement (samples < 1)
         if ((s.samples_left or 0) + (s.samples_right or 0)) < 1 then can_predict = false end
+        -- V9.46 gate 5: no extrapolation across a teleport-peek — yaw_rate from before
+        -- the blink does not predict where the body lands after it.
+        if s.tp_peek_active then can_predict = false end
 
         if can_predict then
             local ui_ticks = exp_predict_ticks and exp_predict_ticks:get() or 2
@@ -3954,6 +3957,46 @@ local function resolve_player(p)
         s.is_stationary  = (s.still_ticks or 0) >= 8
     end
 
+    -- V9.46: TELEPORT-ON-PEEK detection. HvH peekers blink their networked origin
+    -- (lag-switch / fakelag-flush / teleport-peek) so the body appears across a gap
+    -- in one update. NL then backtracks to a STALE record — the live head has already
+    -- moved, so a single-point shot at our (correct) resolved angle whiffs. Same root
+    -- cause as the bt-driven backtrack_resistant path, just position-derived instead of
+    -- ack-derived, so we can react on the FIRST peek instead of after 2 misses.
+    -- We compare horizontal origin delta vs the max distance run speed allows over the
+    -- elapsed time; a blink exceeds it by a wide margin. On detect: time-box a window
+    -- that (a) disables extrapolation (predicted yaw across a teleport is garbage) and
+    -- (b) forces full-spread multipoint at close range. It NEVER touches side/EMA, so
+    -- the v9.45 seed-only fix + learned pattern stay intact (same player, same AA).
+    do
+        local now_rt = globals.realtime or 0
+        local ox, oy = nil, nil
+        pcall(function()
+            local o = p.m_vecOrigin
+            ox, oy = o.x, o.y
+        end)
+        if ox and s.prev_origin_x and s.prev_origin_t then
+            local dt = now_rt - s.prev_origin_t
+            if dt > 0 and dt < 0.5 then   -- only consecutive resolves
+                local dxy = math.sqrt((ox - s.prev_origin_x)^2 + (oy - s.prev_origin_y)^2)
+                local sp = 0
+                pcall(function()
+                    local v = p.m_vecVelocity
+                    sp = math.sqrt((v.x or 0)^2 + (v.y or 0)^2)
+                end)
+                -- max plausible move + generous margin (16u) for netvar jitter
+                local max_move = math.max(sp, 60) * dt + 16
+                if dxy > max_move and dxy > 40 then
+                    s.tp_peek_until = now_rt + 0.4
+                    cs_log_verbose("TP-peek idx=%d dxy=%.0f max=%.0f dt=%.3f sp=%.0f → full-spread+no-extrap 0.4s",
+                                   p:get_index(), dxy, max_move, dt, sp)
+                end
+            end
+        end
+        if ox then s.prev_origin_x, s.prev_origin_y, s.prev_origin_t = ox, oy, now_rt end
+    end
+    s.tp_peek_active = (s.tp_peek_until or 0) > (globals.realtime or 0)
+
     -- AA-classify periodically — V9.10: 7 consecutive + 2s lockout (V9.0 was 5+1s).
     -- User logs showed idx=14 committing static->jitter->static->jitter rapidly — too
     -- many false flips. Higher consecutive threshold + longer lockout stabilizes classification.
@@ -4407,7 +4450,8 @@ pcall(function()
                 -- aim points across the hitbox so a slightly-stale record still lands.
                 -- Widen to full spread when this target is already flagged stale-record.
                 pcall(function() ctx:override_multipoint(true) end)
-                pcall(function() ctx:override_multipoint_scale((s and s.backtrack_resistant) and 1.0 or 0.85) end)
+                -- V9.46: full spread when stale-record-flagged OR mid teleport-peek blink.
+                pcall(function() ctx:override_multipoint_scale((s and (s.backtrack_resistant or s.tp_peek_active)) and 1.0 or 0.85) end)
             end
             cs_log_verbose("close-priority idx=%d dist=%.0f reason=%s hc=%d (eff=%d) wc=%s",
                            target:get_index(), target_dist, priority_reason, priority_hc, effective_hc, tostring(wc))
@@ -5144,6 +5188,7 @@ _cs_log_color_raw("V9.40: point-blank stale-record fix — non-sniper close-prio
 _cs_log_color_raw("V9.41: air-guess magnitude is per-player passive-aware — uses THIS enemy's measured/passive-seeded desync before the blind floor (v9.37's max(median,42) overshot low-desync air enemies by ~30° and ignored 50+ passive obs we already had). Blind floor softened 42→36.")
 _cs_log_color_raw("V9.44: serverfail-retry magnitude fix — retry now shoots the LEARNED desync, not max(|shot delta|, measured). The old max() memorised a magnitude OVERSHOOT (a kept-side err>5 miss) into serverfail_retry_mag and BF:retry repeated it — fatal on a LOCKED enemy (logs: idx=3, 18 hits, known 22.3°, shot 41.9° twice). Stops the overshoot feedback loop.")
 _cs_log_color_raw("V9.45: seed-only keep-side fix — the 'magnitude matched measured → server fail, keep side' branch now requires a REAL hit (real_active>=1) or genuine backtrack (bt>6). On a never-hit enemy measured_desync is pure passive seed; matching it proved nothing and froze the side on the WRONG guess forever (logs: idx=8, p_hits=0/2, seed 52.2°L, shot left twice, 2nd shot bt=0). Now explores the other side instead.")
+_cs_log_color_raw("V9.46: teleport-on-peek detection — horizontal origin delta vs max run-speed reveals a blink-peek (lag-switch / fakelag-flush). On detect, time-box 0.4s that disables extrapolation (yaw_rate from before the blink can't predict the landing) + forces full-spread multipoint at close range so NL's stale backtrack record still lands. Reacts on the FIRST peek instead of after 2 misses; never touches side/EMA so v9.45 + learned patterns stay intact.")
 _cs_log_color_raw("V9.43: backtrack-resistance escalates faster — point-blank fakelaggers with correct angle (our=meas, err=0) but server-reject (bt 7-10) now flip the resistant flag after 2 high-bt fails OR one bt>12, instead of 3 (was wasting 2 sure shots). Pairs with v9.40 full-spread multipoint to catch slightly-stale records.")
 _cs_log_color_raw("V9.42: side-flip from SIDE evidence not magnitude error — ack_angle_err is a MAGNITUDE metric (wrong-side miss = small err, magnitude overshoot = large err), so old 'err>5 → flip' flipped the correct side on magnitude misses (idx=4: real 36°L, we 55°L, wrongly flipped R). Now flip only on learned side-conflict or blind first-contact; magnitude misses keep side, BF cycles the magnitude.")
 _cs_log_color_raw("Logging: " .. (log_enabled:get() and ("ON" .. (log_verbose:get() and " (verbose)" or ""))  or "OFF"))
