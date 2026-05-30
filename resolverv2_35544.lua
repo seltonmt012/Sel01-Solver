@@ -1,11 +1,11 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 9.43                                   ║
+-- ║  Version: 9.44                                   ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 9.43
+-- @version 9.44
 -- @description Correction side guard + serverfail retry:
 --   * correction/prediction-error misses now check SIDE evidence, not only
 --     magnitude. A BF shot on the unlearned opposite side no longer gets labeled
@@ -73,7 +73,7 @@
 --   * v9.26 drift-bump (alpha 0.55 on 5-10° diff) still handles small shifts.
 --   * v9.29 coach variants carry.
 
-local SEL01_VERSION = "9.43"
+local SEL01_VERSION = "9.44"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -2600,7 +2600,10 @@ events.aim_ack:set(function(event)
                                Ent:get_index(), ack_delta, ack_measured, ack_angle_err,
                                tostring(ack_side_bad), s.last_hit_side)
             else
-                resolver_note_serverfail_retry(s, ack_shot_side, math.max(math.abs(ack_delta), ack_measured))
+                -- V9.43: retry the LEARNED magnitude, not max(|delta|, measured). The
+                -- old max() memorised a bad overshoot delta and repeated it (see generic
+                -- path note) — fatal on a locked enemy whose desync we already know.
+                resolver_note_serverfail_retry(s, ack_shot_side, (ack_measured > 5 and ack_measured) or math.abs(ack_delta))
                 cs_log_verbose("LBY-Snap miss KEEP idx=%d our_delta=%.1f measDsync=%.1f err=%.1f (server-side fail, retry side=%d)",
                                Ent:get_index(), ack_delta, ack_measured, ack_angle_err, ack_shot_side)
             end
@@ -2670,7 +2673,13 @@ events.aim_ack:set(function(event)
                                        Ent:get_index(), s.bt_fail_count, bt)
                     end
                 end
-                resolver_note_serverfail_retry(s, ack_shot_side, math.max(math.abs(ack_delta), ack_measured))
+                -- V9.43: retry the LEARNED magnitude, NOT max(|delta|, measured). The old
+                -- max() stored whatever angle we just shot when it was BIGGER than the
+                -- measured value — so a single magnitude OVERSHOOT (err > 5, kept side per
+                -- v9.42) poisoned serverfail_retry_mag with the bad value and BF:retry
+                -- repeated the overshoot. Logs: locked idx=3 (18 hits, measured 22.3°) shot
+                -- 41.9° on BF:retry then retried 41.9° again. Trust the measurement instead.
+                resolver_note_serverfail_retry(s, ack_shot_side, (ack_measured > 5 and ack_measured) or math.abs(ack_delta))
                 cs_log_verbose("correction-miss idx=%d KEEP side=%d our=%.1f meas=%.1f err=%.1f bt=%d (server/backtrack fail #%d, retry same)",
                                Ent:get_index(), ack_shot_side, ack_delta, ack_measured, ack_angle_err, bt, s.serverfail_streak)
             end
@@ -5124,6 +5133,7 @@ _cs_log_color_raw("V9.38: correction guard is side-aware + correct-angle serverf
 _cs_log_color_raw("V9.39: sample-count EMA alpha ramp (0.55 on hit 1-2, 0.42 on hit 3-4, then 0.30) on global + both per-side — converges in 2-3 hits instead of 5-6, faster + smoother lock (side settles sooner, fewer first-shot mode flips).")
 _cs_log_color_raw("V9.40: point-blank stale-record fix — non-sniper close-priority now forces multipoint (was sniper-only) so a single-point head shot stops whiffing on an enemy running at you (correct angle, high bt, reason=correction). + bt-driven backtrack-resistance (high event.backtrack on correction/prediction-error now counts, was string-only).")
 _cs_log_color_raw("V9.41: air-guess magnitude is per-player passive-aware — uses THIS enemy's measured/passive-seeded desync before the blind floor (v9.37's max(median,42) overshot low-desync air enemies by ~30° and ignored 50+ passive obs we already had). Blind floor softened 42→36.")
+_cs_log_color_raw("V9.44: serverfail-retry magnitude fix — retry now shoots the LEARNED desync, not max(|shot delta|, measured). The old max() memorised a magnitude OVERSHOOT (a kept-side err>5 miss) into serverfail_retry_mag and BF:retry repeated it — fatal on a LOCKED enemy (logs: idx=3, 18 hits, known 22.3°, shot 41.9° twice). Stops the overshoot feedback loop.")
 _cs_log_color_raw("V9.43: backtrack-resistance escalates faster — point-blank fakelaggers with correct angle (our=meas, err=0) but server-reject (bt 7-10) now flip the resistant flag after 2 high-bt fails OR one bt>12, instead of 3 (was wasting 2 sure shots). Pairs with v9.40 full-spread multipoint to catch slightly-stale records.")
 _cs_log_color_raw("V9.42: side-flip from SIDE evidence not magnitude error — ack_angle_err is a MAGNITUDE metric (wrong-side miss = small err, magnitude overshoot = large err), so old 'err>5 → flip' flipped the correct side on magnitude misses (idx=4: real 36°L, we 55°L, wrongly flipped R). Now flip only on learned side-conflict or blind first-contact; magnitude misses keep side, BF cycles the magnitude.")
 _cs_log_color_raw("Logging: " .. (log_enabled:get() and ("ON" .. (log_verbose:get() and " (verbose)" or ""))  or "OFF"))
