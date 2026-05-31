@@ -4,18 +4,25 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-Two Neverlose **CSGO** (legacy build, NOT CS2) Lua scripts for HvH / rage play. Both run together inside the same NL client sandbox; they communicate only via NL's own events/UI, never directly.
+Three Neverlose **CSGO** (legacy build, NOT CS2) Lua scripts for HvH / rage play. Solver + Config run together inside the same NL client sandbox and communicate only via NL's own events/UI, never directly. WalkBot is a standalone movement bot (no cross-talk; aiming stays with the ragebot).
 
 | Script | Role | Working copy | NL load path |
 |---|---|---|---|
-| **Sel01-Solver** (`Sel01-Solver.lua`, ~5200 lines, v9.59) | Resolver: per-player AA learning, JSON export, HUD/ESP overlay + top-right event ticker, FFI clipboard copy-logs, Sel01-Roast chat-spam, AA Advisor (in-menu panel + Coach-chat to CSGO say) | `C:\Users\Seltonmt\Desktop\sazz\aron\ownlua\Sel01-Solver.lua` | `E:\SteamLibrary\steamapps\common\Counter-Strike Global Offensive\nl\scripts\Sel01-Solver_59853.lua` |
+| **Sel01-Solver** (`Sel01-Solver.lua`, ~5200 lines, v9.62) | Resolver: per-player AA learning, JSON export, HUD/ESP overlay + top-right event ticker, FFI clipboard copy-logs, Sel01-Roast chat-spam, AA Advisor (in-menu panel + Coach-chat to CSGO say) | `C:\Users\Seltonmt\Desktop\sazz\aron\ownlua\Sel01-Solver.lua` | `E:\SteamLibrary\steamapps\common\Counter-Strike Global Offensive\nl\scripts\Sel01-Solver_59853.lua` |
 | **Sel01-Config** (`sel01_config.lua`, ~2000 lines, v3.27) | Companion: AA presets (Aggressive/Dynamic/Defensive/Spin), anti-resolver bundle (defensive on hit-taken, slow-walk boost, fake-lag variance, yaw base rotation, side-streak limit, magnitude jitter), anti-HS extras (pitch jitter, move-fakeduck), peek-boost hotkey, comprehensive Dump Debug Stats, hits-taken log with AA-state snapshots, kill/miss/hit event log top-left, watermark + indicators + rotating AA arrow | `C:\Users\Seltonmt\Desktop\sazz\aron\ownlua\sel01_config.lua` | `E:\SteamLibrary\steamapps\common\Counter-Strike Global Offensive\nl\scripts\sel01_config_59908.lua` |
+| **Sel01-WalkBot** (`Sel01-WalkBot.lua`, ~1200 lines, v1.7) | Standalone walk-bot — MOVEMENT only, aiming stays with the ragebot. CSGO nav-mesh A* routing (greedy trace-based fallback), distance-tiered engage (approach / hold-corner shoulder-peek / slow-walk peek / crouch-when-exposed), roam (nav route / HUNT last-seen enemy / leave-spawn / wander), auto-learn routes + bad-spots (persisted), no-jump by default, auto-primary-weapon | `C:\Users\Seltonmt\Desktop\sazz\aron\ownlua\Sel01-WalkBot.lua` | `E:\SteamLibrary\steamapps\common\Counter-Strike Global Offensive\nl\scripts\Sel01-WalkBot_60027.lua` |
 
 **Dual-copy rule (MANDATORY).** After every Edit/Write to either working copy, immediately overwrite the matching NL file (same path, no new files, no renames). PowerShell one-liner: `Copy-Item -Force -LiteralPath '<working>' -Destination '<nl-path>'`. The git repo only tracks working copies — the NL copies need the mirror so reload in NL picks up the change.
 
 **Version constants — keep all touchpoints in sync per script:**
 - Sel01-Solver: `local SEL01_VERSION = "X.Y"` + file-header `@version X.Y` + 3 visible mentions (load-banner, UI label, HUD corner)
 - Sel01-Config: `local SEL01_CFG_VERSION = "X.Y"` + file-header `@version X.Y` (no HUD mention; load banner reads constant directly)
+- Sel01-WalkBot: `local SEL01_WB_VERSION = "X.Y"` + file-header `Version: X.Y` + `@version X.Y` (HUD reads the constant)
+
+WalkBot runtime data (private, gitignored — same `nl/Sel01-WalkBot/` folder the navs are copied into):
+- Per-map learned route: `nl/Sel01-WalkBot/<map>.txt` (plain "x y z" lines, files.read-safe text)
+- Per-map learned bad/stuck spots: `nl/Sel01-WalkBot/<map>_bad.txt`
+- Copied nav meshes: `nl/Sel01-WalkBot/<map>.nav` (binary, read via kernel32 — see WalkBot section)
 
 Solver runtime data (private, gitignored):
 - Persistent learning (Lua-table fast-load): `nl/Sel01-Solver/learned.lua`
@@ -31,6 +38,7 @@ Solver architecture + bug history + UI doc lives in `README.md`. NL API docs at 
 ```powershell
 luac -p Sel01-Solver.lua    # resolver
 luac -p sel01_config.lua        # config
+luac -p Sel01-WalkBot.lua       # walk-bot
 ```
 
 `luac` from scoop (`C:\Users\Seltonmt\scoop\apps\lua\current\bin\luac.exe`). Must exit clean. No test infrastructure — runtime errors only surface when user reloads in NL and reports. After luac passes, **dual-copy to NL** (see paths table above) so the next NL reload sees the change.
@@ -403,6 +411,23 @@ The `Dump Debug Stats` button now emits 9 sections to chat in one click: SESSION
 - **Return-value events use the CALL form, not `:set`** — `events.localplayer_transparency(fn)` where `fn` returns the alpha (0-255), and `events.draw_model(fn)` where `fn` returns `false` to skip a model (e.g. `m.name:find("sleeve")`). pcall-wrap; these are separate from the single render handler.
 - **Verified render/color API on this NL build** (use freely, still pcall for version variance): `render.rect(p1,p2,col, radius|{tl,tr,br,bl})` (4th-arg rounding), `render.blur(p1,p2,strength,alpha,radius)`, `render.push_clip_rect(p1,p2)`/`pop_clip_rect`, `render.gradient(p1,p2,c1,c2,c3,c4)`, `render.push_rotation(deg,centerVec)`/`pop_rotation`, `render.measure_text(font,flags,text)→vector`, `render.load_font(name,size,flags)`, `color():as_hsv(h,s,v)`, `color():lerp(other,frac)`, `color:alpha_modulate(f)`, `ui.get_alpha/get_position/get_size/get_icon/get_mouse_position`, `utils.net_channel().latency[1]/.loss[1]/.choke[1]`, `globals.choked_commands`. `rage.antiaim:get_rotation(true)` = fake yaw, `:get_rotation()` = real yaw (desync delta = `|real-fake|/2`).
 - **On-screen indicator design: minimal + centered, plain text** (v3.27, user iterated hard). JAG0YAW-style under-crosshair stack (title + movement state + few active states) beats big chip panels / left columns / cryptic abbreviations. Use readable names, smooth jumpy values (EMA), keep always-on internal states OFF the HUD.
+
+## Sel01-WalkBot architecture (`Sel01-WalkBot.lua`, v1.7)
+
+A standalone movement bot. ONE `events.createmove` handler (`walkbot_tick`) drives the local player via the cmd userdata; aiming is left to the ragebot. The whole decision tree is distance-tiered.
+
+**Confirmed NL movement API** (from real build scripts externalapaha / chernobl / JAG0YAW, all pcall'd): `cmd.move_yaw` (degrees, WORLD walk direction — independent of view yaw, so the bot walks while the ragebot aims freely) + `cmd.forwardmove` (±450, lower = slow-walk) + `cmd.sidemove` + `cmd.in_jump` + `cmd.in_duck`. Obstacle traces via `utils.trace_line(start, end, skip_ent, mask)` (`.fraction`/`.end_pos`); the 4th arg is a content mask — movement probes pass `MASK_SOLID_BRUSHONLY` (`0x400B`) so they hit world geometry only, NOT players (without it, spawn teammates wedge the bot). Map name = `common.get_map_data().shortname` (`globals.mapname` is nil on this build). Team = `lp.m_iTeam` (2=T, 3=CT). Weapon swap = `utils.console_exec("slot1")`.
+
+**Tick decision flow** (one `walkbot_tick`): drain Record/Clear waypoint buttons → load route + bad-spots + nav on map change → auto-primary weapon → pick target (`pick_target`, modes Nearest/Lowest-HP/Most-Visible/Crosshair). **ENGAGE** when a target is within `Approach Over` (default 1300u): hold-corner shoulder-peek (`assess_corner` — trace-based, no nav) if behind a corner and enemy not pushed, else slow-walk peek (aggressive jiggle ONLY when the enemy is visible) + crouch-when-exposed. **ROAM** when no target OR target far: nav-routed HUNT toward the freshest `enemy_history` entry → learned waypoint patrol → nav/leave-spawn toward map mid → wander. `compute_move(lp, lo, want_yaw, now, base_act, no_stuck)` is the shared mover — look-ahead probe + fan-out avoidance + crouch-to-pass low gaps + escalating wedge-escape (commit a back+side heading 0.8s); `no_stuck=true` from HOLD/peek so a held angle is not flagged STUCK.
+
+**Nav-mesh (hard-won, see [[project_walkbot]] memory).** Read `csgo/maps/<map>.nav` via **kernel32 `CreateFileA`/`ReadFile` through `ffi.load("kernel32")`** — `files.read` truncates at null bytes (no binary mode, docs-confirmed) and `ffi.C.fopen` is absent in the NL sandbox. The maps are pre-copied into `nl/Sel01-WalkBot/`. The documented Valve v16 area layout is WRONG for this build (a build-specific ~99-byte undocumented trailing block per area; no field-width combo fits) AND area IDs are non-contiguous (de_mirage skips 50→52). So `nav_parse_scan` is **scan-based**: read each area's header (id u32, flags u32, NW/SE corners, neZ/swZ) + connections (4×count u32 + ids), then SCAN forward for the next plausible header (flags==0 + 6 in-range corner floats + neZ/swZ in the corner Z band + 4 small connection counts — strong enough that garbage can't fake it). Recovers ~867/903 areas. `nav_astar` routes the connection graph; `nav_dir()` follows the path node-by-node (cached per goal-area, re-paths every 1.5s) and is wired into ROAM HUNT + leave-spawn. Falls back to greedy straight-line when nav is off/unloaded.
+
+**WalkBot gotchas:**
+- **Movement probes MUST use the brush-only mask** or the bot wedges in spawn (traces hit teammates). `assess_corner`/`self_exposed` use it too so a teammate can't fake a corner.
+- **`files.read` cannot read binary** (truncates at the first null) — confirmed via NL docs (single-arg, no binary mode). Use kernel32 for `.nav`; route/bad-spot files are plain text so `files.read` is fine there.
+- **`files.read` on a MISSING path raises an unsuppressable popup** (ui.find class) — only read paths you know exist (the copied navs / your own written files).
+- **Default OFF: jumping** (`Allow Jumping`). Per user, the bot should never jump; bhop + step-up + wedge jumps are all gated behind it. New switches take their default immediately (NL has no persisted value yet), which is how a hard-default-off override reaches an existing user.
+- **Distance is king** — far enemy → ROAM/route, not beeline (rams walls, "thinks 3k is near"). Aggressive peek only when the enemy is genuinely visible; close-but-unseen → careful slow approach to gain the sightline.
 
 ## Common mistakes to avoid
 
