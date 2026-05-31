@@ -1,11 +1,11 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-WalkBot                                     ║
--- ║  Version: 0.9                                      ║
+-- ║  Version: 1.0                                      ║
 -- ║  Greedy nav-bot: map + enemy detect, walk-to-foe  ║
 -- ║  by seltonmt01                                     ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-WalkBot
--- @version 0.9
+-- @version 1.0
 -- @author seltonmt01
 -- @description Greedy walk-bot. Detects map + enemies, walks the local player
 --   toward a chosen target using NL movement cmd (move_yaw + forwardmove) with
@@ -19,7 +19,7 @@
 --   entity.get_players(true) (enemies) / entity.get_local_player() / p.m_vecOrigin / p:get_eye_position()
 --   globals.mapname / globals.tickcount / globals.realtime
 
-local SEL01_WB_VERSION = "0.9"
+local SEL01_WB_VERSION = "1.0"
 
 local ffi_ok, ffi = pcall(require, "ffi")
 
@@ -90,7 +90,7 @@ pcall(function()
     -- hold a corner + shoulder-peek + wait for the enemy to push, instead of
     -- charging straight in (HvH-correct positioning).
     wb_holdcnr  = g_main:switch("Hold Corner (bait the push, don't rush)")
-    wb_holdmin  = g_main:slider("Hold Until Enemy Within", 120, 900, 350)
+    wb_holdmin  = g_main:slider("Hold Until Enemy Within", 120, 900, 220)
     wb_crouch   = g_main:switch("Crouch When Exposed (enemy behind corner)")
     -- roam: when NO enemy, follow recorded waypoints (walk the route yourself once,
     -- the bot replays it). No waypoints -> wander+avoid so it still explores.
@@ -248,16 +248,22 @@ local function pick_target(lp)
     return best, best_dist
 end
 
+-- MASK_SOLID_BRUSHONLY: world geometry only, NOT players. Spawn is crowded with
+-- teammates/enemies; without this the movement probes hit them and the bot wedges in
+-- spawn (the round-start STUCK). The 4th trace_line arg is the content mask (chernobl
+-- passes 0xFFFFFFFF = everything; we want brushes only).
+local PROBE_MASK = 0x400B
+
 -- probe in walk direction; true = clear. Traces at BODY height (z+40, not knee) so
 -- small steps the game auto-climbs (<=18u) don't false-trigger avoidance, AND at head
--- height (z+62) so we catch low overhangs. Blocked if either is blocked.
+-- height (z+62) so we catch low overhangs. World-only (ignores players).
 local function probe_clear(lp, lo, yaw_deg, dist)
     local rad = math.rad(yaw_deg)
     local dx, dy = math.cos(rad) * dist, math.sin(rad) * dist
     local function ray(h)
         local res = nil
         pcall(function()
-            res = utils.trace_line(vector(lo.x, lo.y, lo.z + h), vector(lo.x + dx, lo.y + dy, lo.z + h), lp)
+            res = utils.trace_line(vector(lo.x, lo.y, lo.z + h), vector(lo.x + dx, lo.y + dy, lo.z + h), lp, PROBE_MASK)
         end)
         return (not res) or (res.fraction or 1) >= 0.99   -- trace fail -> assume clear
     end
@@ -273,7 +279,7 @@ local function can_step_up(lp, lo, yaw_deg, dist)
     local hi_from = vector(lo.x, lo.y, lo.z + 50)   -- ~jump apex height
     local hi_to   = vector(lo.x + fx, lo.y + fy, lo.z + 50)
     local res = nil
-    pcall(function() res = utils.trace_line(hi_from, hi_to, lp) end)
+    pcall(function() res = utils.trace_line(hi_from, hi_to, lp, PROBE_MASK) end)
     if not res then return false end                -- unknown -> don't waste a jump
     return (res.fraction or 1) >= 0.99              -- clear up high => step-up jumpable
 end
@@ -311,25 +317,20 @@ end
 local function assess_corner(lp, lo, to)
     local fe, te = get_eye(lp), get_eye(to)
     if not fe or not te then return "open", 0 end
-    local direct = false
-    pcall(function()
-        local r = utils.trace_line(fe, te, lp)
-        direct = r and (r.fraction or 0) >= 0.95
-    end)
+    -- world-only (PROBE_MASK): a teammate standing in the line shouldn't fake a corner.
+    local function clear(from)
+        local r = nil
+        pcall(function() r = utils.trace_line(from, te, lp, PROBE_MASK) end)
+        return r and (r.fraction or 0) >= 0.95
+    end
+    if clear(fe) then return "open", 0 end              -- we already see them -> not a hold
     local yaw = math.rad(dir_yaw(lo, to))
     local px, py = -math.sin(yaw), math.cos(yaw)        -- unit perpendicular to enemy dir
-    local function side_clear(s)
-        local from = vector(lo.x + px * 45 * s, lo.y + py * 45 * s, (fe.z or lo.z + 64))
-        local clear = false
-        pcall(function()
-            local r = utils.trace_line(from, te, lp)
-            clear = r and (r.fraction or 0) >= 0.95
-        end)
-        return clear
-    end
-    if not direct then
-        local cr, cl = side_clear(1), side_clear(-1)
-        if cr or cl then return "hold_corner", (cr and 1 or -1) end
+    -- try several side offsets; first one that reveals the enemy = the peek side. More
+    -- distances = catches more real corners (was a single 45u probe = missed many).
+    for _, off in ipairs({ 38, 64, 95, 130 }) do
+        if clear(vector(lo.x + px * off, lo.y + py * off, fe.z)) then return "hold_corner", 1 end
+        if clear(vector(lo.x - px * off, lo.y - py * off, fe.z)) then return "hold_corner", -1 end
     end
     return "open", 0
 end
@@ -458,44 +459,17 @@ local nav = { ok = false, map = nil, count = 0, areas = nil, err = "not loaded" 
 -- 'cannot read this file') — so we never touch it. fopen returns NULL on miss, clean.
 -- We pre-copy the maps into nl/Sel01-WalkBot/ (game-root relative) for a guaranteed
 -- readable spot, plus try the live csgo/maps and an absolute install path.
-local NAV_DIRS = {
-    "nl/Sel01-WalkBot/",        -- our copied navs (relative to game working dir)
-    "csgo/maps/",               -- live maps (cwd = game root)
-    "maps/",                    -- cwd = csgo/
-    "E:/SteamLibrary/steamapps/common/Counter-Strike Global Offensive/csgo/maps/",
-    "E:/SteamLibrary/steamapps/common/Counter-Strike Global Offensive/nl/Sel01-WalkBot/",
-}
-local nav_cdef_done = false
+-- We pre-copy the maps into nl/Sel01-WalkBot/ (the NL files base = game root, verified
+-- via nl/Sel01-Solver/learned.lua). files.read POPS an error dialog on a MISSING path
+-- (the v0.8 crash) — but NOT on a present one, and the copied file IS present, so
+-- reading it is safe. ffi.C.fopen is unavailable in the NL sandbox, so files.read is
+-- the only working reader. We guard with a presence flag the user can't easily break.
 local function nav_read(map)
-    if not (ffi_ok and ffi) then return nil, "no ffi" end
-    if not nav_cdef_done then
-        pcall(ffi.cdef, [[
-            typedef struct _navFILE _navFILE;
-            _navFILE *fopen(const char *filename, const char *mode);
-            size_t fread(void *ptr, size_t size, size_t count, _navFILE *stream);
-            int fseek(_navFILE *stream, long offset, int origin);
-            long ftell(_navFILE *stream);
-            int fclose(_navFILE *stream);
-        ]])
-        nav_cdef_done = true
-    end
-    for _, dir in ipairs(NAV_DIRS) do
-        local got = nil
-        pcall(function()
-            local f = ffi.C.fopen(dir .. map .. ".nav", "rb")
-            if f ~= nil then
-                ffi.C.fseek(f, 0, 2); local sz = tonumber(ffi.C.ftell(f)); ffi.C.fseek(f, 0, 0)
-                if sz and sz > 64 then
-                    local buf = ffi.new("uint8_t[?]", sz)
-                    local rd = ffi.C.fread(buf, 1, sz, f)
-                    got = ffi.string(buf, rd)
-                end
-                ffi.C.fclose(f)
-            end
-        end)
-        if got and #got > 64 then return got, "fopen " .. dir end
-    end
-    return nil, "not found (copied navs missing? check nl/Sel01-WalkBot/)"
+    local path = "nl/Sel01-WalkBot/" .. map .. ".nav"
+    local data = nil
+    local ok = pcall(function() data = files.read(path) end)
+    if ok and data and #data > 64 then return data, "files.read " .. path end
+    return nil, "not found: " .. path .. " (copy <map>.nav into nl/Sel01-WalkBot/)"
 end
 
 -- parse with a given layout variant; returns areas table + final offset, or errors.
@@ -664,7 +638,7 @@ local function walkbot_tick(cmd)
                 local cmode, pside = assess_corner(lp, lo, to)
                 if cmode == "hold_corner" then
                     if state.hold_since == 0 then state.hold_since = now end
-                    local htimeout = (mstate == "stand") and 10.0 or (mstate == "push") and 14.0 or 6.0
+                    local htimeout = (mstate == "stand") and 12.0 or (mstate == "push") and 16.0 or 9.0
                     if (now - state.hold_since) < htimeout then
                         local dur = (state.peek_phase == "out") and 0.22 or 0.55
                         if (now - (state.peek_phase_t or 0)) > dur then
