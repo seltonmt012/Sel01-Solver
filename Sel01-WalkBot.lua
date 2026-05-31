@@ -1,11 +1,11 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-WalkBot                                     ║
--- ║  Version: 0.8                                      ║
+-- ║  Version: 0.9                                      ║
 -- ║  Greedy nav-bot: map + enemy detect, walk-to-foe  ║
 -- ║  by seltonmt01                                     ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-WalkBot
--- @version 0.8
+-- @version 0.9
 -- @author seltonmt01
 -- @description Greedy walk-bot. Detects map + enemies, walks the local player
 --   toward a chosen target using NL movement cmd (move_yaw + forwardmove) with
@@ -19,7 +19,7 @@
 --   entity.get_players(true) (enemies) / entity.get_local_player() / p.m_vecOrigin / p:get_eye_position()
 --   globals.mapname / globals.tickcount / globals.realtime
 
-local SEL01_WB_VERSION = "0.8"
+local SEL01_WB_VERSION = "0.9"
 
 local ffi_ok, ffi = pcall(require, "ffi")
 
@@ -73,7 +73,7 @@ end
 
 local wb_enable, wb_mode, wb_stopdist, wb_autojump, wb_probe, wb_speed, wb_hud, wb_debug
 local wb_peekslow, wb_peekrng, wb_slowspd, wb_bhop, wb_clantag, wb_nav
-local wb_holdcnr, wb_holdmin, wb_approach
+local wb_holdcnr, wb_holdmin, wb_approach, wb_crouch
 pcall(function()
     wb_enable   = g_main:switch("Enable WalkBot")                 -- the on/off switch (no hotkey)
     wb_mode     = g_main:combo("Target Pick", "Nearest", "Lowest HP", "Most Visible", "Crosshair")
@@ -91,6 +91,7 @@ pcall(function()
     -- charging straight in (HvH-correct positioning).
     wb_holdcnr  = g_main:switch("Hold Corner (bait the push, don't rush)")
     wb_holdmin  = g_main:slider("Hold Until Enemy Within", 120, 900, 350)
+    wb_crouch   = g_main:switch("Crouch When Exposed (enemy behind corner)")
     -- roam: when NO enemy, follow recorded waypoints (walk the route yourself once,
     -- the bot replays it). No waypoints -> wander+avoid so it still explores.
     g_main:button("Record Waypoint (drop my pos)", function() _wb_pending_record = true end)
@@ -107,6 +108,7 @@ pcall(function() if wb_peekslow then wb_peekslow:set(true) end end)
 pcall(function() if wb_bhop then wb_bhop:set(true) end end)
 pcall(function() if wb_clantag then wb_clantag:set(true) end end)
 pcall(function() if wb_holdcnr then wb_holdcnr:set(true) end end)
+pcall(function() if wb_crouch then wb_crouch:set(true) end end)
 pcall(function() if wb_hud then wb_hud:set(true) end end)
 
 -- ─── runtime state ───────────────────────────────────────
@@ -144,6 +146,7 @@ local state = {
     team         = 0,          -- 2 = T, 3 = CT
     last_enemy_pos = nil,      -- last seen enemy origin (HUNT direction when roaming)
     tgt_state    = "?",        -- target motion: stand / push / move
+    crouching    = false,      -- crouch-when-exposed active (HUD)
 }
 -- button -> tick drain flags (module globals: button closures run before `state`
 -- helpers are bound; globals dodge the forward-reference trap, Solver pattern).
@@ -343,6 +346,23 @@ local function target_motion(target, lo, to)
     return (dot > 0 and "push" or "move"), spd
 end
 
+-- are we standing in the OPEN, no cover within ~64u to either side (perpendicular to
+-- the enemy)? Used to crouch when the enemy is around a corner and we're exposed —
+-- a smaller / ducked target lowers their hit chance on the peek.
+local function self_exposed(lp, lo, to)
+    local yaw = math.rad(dir_yaw(lo, to))
+    local px, py = -math.sin(yaw), math.cos(yaw)
+    local function cover_side(s)
+        local res = nil
+        pcall(function()
+            res = utils.trace_line(vector(lo.x, lo.y, lo.z + 40),
+                                   vector(lo.x + px * 64 * s, lo.y + py * 64 * s, lo.z + 40), lp)
+        end)
+        return res and (res.fraction or 1) < 0.85       -- wall close this side = cover
+    end
+    return not cover_side(1) and not cover_side(-1)     -- no cover either side = exposed
+end
+
 -- shared: take a desired world yaw, probe-avoid obstacles + handle stuck, return the
 -- adjusted move_yaw. Sets state.activity/block/diag and schedules jumps. base_act is
 -- the activity label this caller wants ("WALK" / "ROAM" / "WANDER").
@@ -433,49 +453,49 @@ end
 -- (prove the bytes line up in-game); v0.6 adds A* + path-following on top.
 local nav = { ok = false, map = nil, count = 0, areas = nil, err = "not loaded" }
 
--- read the raw .nav bytes. NL files.read base path is unknown across builds, so try
--- several relative paths; fall back to FFI fopen relative to the game's working dir.
+-- read the raw .nav bytes via FFI fopen ONLY. NL's files.read raises a popup error
+-- dialog on a missing / unreadable path that pcall does NOT suppress (v0.8 bug:
+-- 'cannot read this file') — so we never touch it. fopen returns NULL on miss, clean.
+-- We pre-copy the maps into nl/Sel01-WalkBot/ (game-root relative) for a guaranteed
+-- readable spot, plus try the live csgo/maps and an absolute install path.
+local NAV_DIRS = {
+    "nl/Sel01-WalkBot/",        -- our copied navs (relative to game working dir)
+    "csgo/maps/",               -- live maps (cwd = game root)
+    "maps/",                    -- cwd = csgo/
+    "E:/SteamLibrary/steamapps/common/Counter-Strike Global Offensive/csgo/maps/",
+    "E:/SteamLibrary/steamapps/common/Counter-Strike Global Offensive/nl/Sel01-WalkBot/",
+}
+local nav_cdef_done = false
 local function nav_read(map)
-    local tries = {
-        "maps/" .. map .. ".nav",
-        "csgo/maps/" .. map .. ".nav",
-        "../maps/" .. map .. ".nav",
-        "../csgo/maps/" .. map .. ".nav",
-    }
-    for _, p in ipairs(tries) do
-        local data = nil
-        pcall(function() data = files.read(p) end)
-        if data and #data > 64 then return data, "files.read " .. p end
+    if not (ffi_ok and ffi) then return nil, "no ffi" end
+    if not nav_cdef_done then
+        pcall(ffi.cdef, [[
+            typedef struct _navFILE _navFILE;
+            _navFILE *fopen(const char *filename, const char *mode);
+            size_t fread(void *ptr, size_t size, size_t count, _navFILE *stream);
+            int fseek(_navFILE *stream, long offset, int origin);
+            long ftell(_navFILE *stream);
+            int fclose(_navFILE *stream);
+        ]])
+        nav_cdef_done = true
     end
-    -- FFI fopen fallback (binary), relative to csgo.exe working dir
-    if ffi_ok and ffi then
+    for _, dir in ipairs(NAV_DIRS) do
         local got = nil
         pcall(function()
-            pcall(ffi.cdef, [[
-                typedef struct _navFILE _navFILE;
-                _navFILE *fopen(const char *filename, const char *mode);
-                size_t fread(void *ptr, size_t size, size_t count, _navFILE *stream);
-                int fseek(_navFILE *stream, long offset, int origin);
-                long ftell(_navFILE *stream);
-                int fclose(_navFILE *stream);
-            ]])
-            for _, p in ipairs({ "csgo/maps/" .. map .. ".nav", "maps/" .. map .. ".nav" }) do
-                local f = ffi.C.fopen(p, "rb")
-                if f ~= nil then
-                    ffi.C.fseek(f, 0, 2); local sz = ffi.C.ftell(f); ffi.C.fseek(f, 0, 0)
-                    if sz > 64 then
-                        local buf = ffi.new("uint8_t[?]", sz)
-                        local rd = ffi.C.fread(buf, 1, sz, f)
-                        got = ffi.string(buf, rd)
-                    end
-                    ffi.C.fclose(f)
-                    if got then break end
+            local f = ffi.C.fopen(dir .. map .. ".nav", "rb")
+            if f ~= nil then
+                ffi.C.fseek(f, 0, 2); local sz = tonumber(ffi.C.ftell(f)); ffi.C.fseek(f, 0, 0)
+                if sz and sz > 64 then
+                    local buf = ffi.new("uint8_t[?]", sz)
+                    local rd = ffi.C.fread(buf, 1, sz, f)
+                    got = ffi.string(buf, rd)
                 end
+                ffi.C.fclose(f)
             end
         end)
-        if got and #got > 64 then return got, "ffi fopen" end
+        if got and #got > 64 then return got, "fopen " .. dir end
     end
-    return nil, "file not found (files.read + ffi both failed)"
+    return nil, "not found (copied navs missing? check nl/Sel01-WalkBot/)"
 end
 
 -- parse with a given layout variant; returns areas table + final offset, or errors.
@@ -695,7 +715,13 @@ local function walkbot_tick(cmd)
             else
                 state.diag = string.format("engage #%s d=%.0f enemy=%s", tostring(state.target_idx), dist, mstate)
             end
+            -- CROUCH when EXPOSED: enemy around a corner (not visible) + we're standing in
+            -- the open + in combat range -> duck = smaller target, lowers their hit chance.
+            -- Separate mechanic from slow-walk (own toggle); both can apply together.
+            local cr_on = false; pcall(function() cr_on = wb_crouch and wb_crouch:get() end)
+            state.crouching = cr_on and (not visible) and dist <= peekrng and self_exposed(lp, lo, to)
             pcall(function() cmd.move_yaw = move_yaw; cmd.forwardmove = spd; cmd.sidemove = 0 end)
+            if state.crouching then pcall(function() cmd.in_duck = true end) end
             -- no jumping near an enemy; step-up only while still far
             if dist > peekrng and now <= (state.jump_until or 0) then
                 pcall(function() cmd.in_jump = true end)
@@ -706,6 +732,7 @@ local function walkbot_tick(cmd)
 
     -- ════════ ROAM: no target -> patrol waypoints, else wander ════════
     state.target_idx = nil
+    state.crouching = false
     local move_yaw
     if #state.waypoints > 0 then
         local wp = state.waypoints[state.wp_idx] or state.waypoints[1]
@@ -832,7 +859,8 @@ local function render_hud()
         render.text(3, vector(x + 38, y), COL.val(), nil, state.mapname .. "  [" .. tname .. "]")
         y = y + line
         render.text(3, vector(x, y), COL.label(), nil, "State: ")
-        render.text(3, vector(x + 46, y), act_color(state.activity), nil, state.activity)
+        render.text(3, vector(x + 46, y), act_color(state.activity), nil,
+            state.activity .. (state.crouching and "  +DUCK" or ""))
         y = y + line
         if state.target_idx then
             render.text(3, vector(x, y), COL.label(), nil, "Target: ")
