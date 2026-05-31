@@ -1,11 +1,11 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 9.53                                   ║
+-- ║  Version: 9.54                                   ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 9.53
+-- @version 9.54
 -- @description Correction side guard + serverfail retry:
 --   * correction/prediction-error misses now check SIDE evidence, not only
 --     magnitude. A BF shot on the unlearned opposite side no longer gets labeled
@@ -73,7 +73,7 @@
 --   * v9.26 drift-bump (alpha 0.55 on 5-10° diff) still handles small shifts.
 --   * v9.29 coach variants carry.
 
-local SEL01_VERSION = "9.53"
+local SEL01_VERSION = "9.54"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -2586,6 +2586,23 @@ events.aim_ack:set(function(event)
         local ack_shot_side = s.last_shot_side ~= 0 and s.last_shot_side or resolver_shot_side_from_delta(ack_delta)
         local ack_measured = s.measured_desync or 0
         local ack_angle_err = ack_measured > 5 and math.abs(math.abs(ack_delta) - ack_measured) or math.huge
+        -- V9.54: side-aware measured for the serverfail-retry magnitude. The retry
+        -- (resolver_note_serverfail_retry below) used to freeze the GLOBAL EMA
+        -- (ack_measured = s.measured_desync). On a BIMODAL enemy the two sides have
+        -- very different magnitudes (logs: idx=10 L=2/46.2° R=7/29.7°, diff 16°) and
+        -- the global average swings mid-round, so the frozen value mis-shot the kept
+        -- side for up to 64 ticks (idx=10 retried 15.7° on a 29.7° R side, err=16).
+        -- effective_desync already picks per-side correctly — mirror that here so the
+        -- retry shoots the side we actually fired. Identical to global on unimodal
+        -- (both per-side EMAs ~= global), strictly more accurate on bimodal.
+        local ack_side_measured = ack_measured
+        if exp_perside_desync and exp_perside_desync:get() then
+            if ack_shot_side > 0 and (s.samples_right or 0) >= 1 and (s.measured_right or 0) > 5 then
+                ack_side_measured = s.measured_right
+            elseif ack_shot_side < 0 and (s.samples_left or 0) >= 1 and (s.measured_left or 0) > 5 then
+                ack_side_measured = s.measured_left
+            end
+        end
         local ack_side_bad = resolver_side_conflicts(s, ack_shot_side)
         local ack_resolverish = ack_reason == "correction" or ack_reason == "prediction error" or ack_reason == "prediction_error"
         local ack_serverfail_like = ack_resolverish and ack_shot_side ~= 0 and not ack_side_bad
@@ -2657,7 +2674,7 @@ events.aim_ack:set(function(event)
                 -- V9.43: retry the LEARNED magnitude, not max(|delta|, measured). The
                 -- old max() memorised a bad overshoot delta and repeated it (see generic
                 -- path note) — fatal on a locked enemy whose desync we already know.
-                resolver_note_serverfail_retry(s, ack_shot_side, (ack_measured > 5 and ack_measured) or math.abs(ack_delta))
+                resolver_note_serverfail_retry(s, ack_shot_side, (ack_side_measured > 5 and ack_side_measured) or math.abs(ack_delta))
                 server_fail_keep = true  -- V9.49: correct angle, server rejected — not our miss
                 cs_log_verbose("LBY-Snap miss KEEP idx=%d our_delta=%.1f measDsync=%.1f err=%.1f (server-side fail, retry side=%d)",
                                Ent:get_index(), ack_delta, ack_measured, ack_angle_err, ack_shot_side)
@@ -2766,7 +2783,7 @@ events.aim_ack:set(function(event)
                 -- v9.42) poisoned serverfail_retry_mag with the bad value and BF:retry
                 -- repeated the overshoot. Logs: locked idx=3 (18 hits, measured 22.3°) shot
                 -- 41.9° on BF:retry then retried 41.9° again. Trust the measurement instead.
-                resolver_note_serverfail_retry(s, ack_shot_side, (ack_measured > 5 and ack_measured) or math.abs(ack_delta))
+                resolver_note_serverfail_retry(s, ack_shot_side, (ack_side_measured > 5 and ack_side_measured) or math.abs(ack_delta))
                 server_fail_keep = true  -- V9.49: correct angle, server rejected — not our miss
                 cs_log_verbose("correction-miss idx=%d KEEP side=%d our=%.1f meas=%.1f err=%.1f bt=%d (server/backtrack fail #%d, retry same)",
                                Ent:get_index(), ack_shot_side, ack_delta, ack_measured, ack_angle_err, bt, s.serverfail_streak)
@@ -5379,6 +5396,7 @@ _cs_log_color_raw("V9.45: seed-only keep-side fix — the 'magnitude matched mea
 _cs_log_color_raw("V9.46: teleport-on-peek detection — horizontal origin delta vs max run-speed reveals a blink-peek (lag-switch / fakelag-flush). On detect, time-box 0.4s that disables extrapolation (yaw_rate from before the blink can't predict the landing) + forces full-spread multipoint at close range so NL's stale backtrack record still lands. Reacts on the FIRST peek instead of after 2 misses; never touches side/EMA so v9.45 + learned patterns stay intact.")
 _cs_log_color_raw("V9.47: side-conflict overrides high-bt keep when angle was off — a learned wrong-side shot with a LARGE magnitude error (>10) now flips even under bt>8, because a clean stale-record reject leaves err~0. Old order let bt>8 short-circuit the flip and retry the wrong side (logs: idx=8, 1 R-hit, shot L -21.6 vs meas 39.5 err=17.9 bt=12 — kept L; next real hit confirmed R). err~0 + side-conflict still keeps (switch-stale / v9.42 overshoot / v9.44 locked protected).")
 _cs_log_color_raw("V9.48: alt_side_pick uses REAL-hit dominance when both sides have real hits — the seeded-inclusive sample counts (sl/sr carry passive+seeded entries) mispinned a genuine 50/50 switch enemy. Logs: idx=4 sl=3 sr=1 pinned LEFT for Predicted-Alt but real hits were 1L/1R and the correct side was RIGHT (Predicted-Alt 0/2). Balanced real data now alternates off last_hit_side; one-sided enemies (rr=0) keep the old seeded dom path so streak{L=9 R=0} is unaffected.")
+_cs_log_color_raw("V9.54: serverfail-retry magnitude is now PER-SIDE on bimodal enemies — the retry froze the GLOBAL desync EMA (s.measured_desync), but a two-mode enemy (idx=10 L=46.2° R=29.7°, diff 16°) has very different per-side magnitudes and the global average swings mid-round. The kept side then re-fired a wrong magnitude for up to 64 ticks (logs: idx=10 retried 15.7° at a 29.7° R side, err=16). Now mirrors effective_desync's per-side pick (measured_left/right with >=1 real sample). Identical to global on unimodal enemies; strictly more accurate on bimodal.")
 _cs_log_color_raw("V9.53: ESP made COMPACT (v9.52 words too big). Now ONE short line per enemy, smaller font: [aa-icon] [side-arrow] [deg] [learn-icon] e.g. '⇄ → 29° ★'. AA-icon: ▬static ⇄switch ≈jitter ⟳spin. Learn-icon: 🔒locked / ★learned / ·learning. Confidence = the bar (color), no second text line. Netcode shrunk to '⚠×N bt pk'. SIDE-DOM mini-bar REMOVED (redundant — side already in the arrow; was just clutter). Confidence bar stays.")
 _cs_log_color_raw("V9.52: ESP labels rewritten in PLAIN WORDS (the v9.51 glyphs ⇄ ·2+53 ★ 🔒 👁 🛡net× were unreadable). Now two clean stacked lines per enemy: MAIN (mode color) = 'TYPE SIDE DEG' e.g. 'SWITCH  R 36°  PRED'; STATE (progress color) = 'LEARNED 4  72%' (NEW / SEEN / LEARNING n / LEARNED n / LOCKED n + confidence%). Netcode tag is now words: 'FAKELAG' (backtrack-resistant) / 'NET×N' (server-fails) / 'PEEK' (teleport-peek). Flash + dots + dom-bar + wedge unchanged (visual, not cryptic). Nothing removed — just readable.")
 _cs_log_color_raw("V9.51: on-model ESP visuals — (A) desync wedge: white line = enemy real eye_yaw, mode-color line = our resolved fake-yaw, drawn from the pelvis so the angle between them IS the desync. (B) hit/miss flash: a ~0.45s fading box around the model, green=hit / red=miss / blue=server-fail. (C) netcode tag: 🛡bt + ⚠net×N + ⚡peek above the label so you see THIS enemy fake-lags (resolver 'miss' = server-side). (D) AA-glyph ▣static ⇄switch ∿jitter ⊛spinner prefixed to the label. (E) shot-dots: last 6 results as a colored dot row. (F) side-dom mini-bar under the conf bar (orange L vs blue R real-hit split). Three new toggles (Desync Wedge / Hit-Miss Flash / Enhanced Tags), all default ON in the SSG-Pro preset.")
