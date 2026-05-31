@@ -1,11 +1,11 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-WalkBot                                     ║
--- ║  Version: 0.7                                      ║
+-- ║  Version: 0.8                                      ║
 -- ║  Greedy nav-bot: map + enemy detect, walk-to-foe  ║
 -- ║  by seltonmt01                                     ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-WalkBot
--- @version 0.7
+-- @version 0.8
 -- @author seltonmt01
 -- @description Greedy walk-bot. Detects map + enemies, walks the local player
 --   toward a chosen target using NL movement cmd (move_yaw + forwardmove) with
@@ -19,7 +19,7 @@
 --   entity.get_players(true) (enemies) / entity.get_local_player() / p.m_vecOrigin / p:get_eye_position()
 --   globals.mapname / globals.tickcount / globals.realtime
 
-local SEL01_WB_VERSION = "0.7"
+local SEL01_WB_VERSION = "0.8"
 
 local ffi_ok, ffi = pcall(require, "ffi")
 
@@ -73,7 +73,7 @@ end
 
 local wb_enable, wb_mode, wb_stopdist, wb_autojump, wb_probe, wb_speed, wb_hud, wb_debug
 local wb_peekslow, wb_peekrng, wb_slowspd, wb_bhop, wb_clantag, wb_nav
-local wb_holdcnr, wb_holdmin
+local wb_holdcnr, wb_holdmin, wb_approach
 pcall(function()
     wb_enable   = g_main:switch("Enable WalkBot")                 -- the on/off switch (no hotkey)
     wb_mode     = g_main:combo("Target Pick", "Nearest", "Lowest HP", "Most Visible", "Crosshair")
@@ -83,6 +83,7 @@ pcall(function()
     wb_probe    = g_main:slider("Obstacle Probe (units)", 20, 140, 55)
     -- peek slow-walk: when a visible enemy is near, slow-walk + jiggle so their
     -- resolver misses our moving/desynced model while our ragebot lands.
+    wb_approach = g_main:slider("Approach Over (far = just close distance)", 700, 3000, 1300)
     wb_peekslow = g_main:switch("Slow-Walk Peek (near visible enemy)")
     wb_peekrng  = g_main:slider("Peek Range (slow-walk under)", 200, 1500, 750)
     wb_slowspd  = g_main:slider("Slow-Walk Speed", 40, 160, 110)
@@ -142,6 +143,7 @@ local state = {
     stuck_hard   = false,      -- compute_move sets this when wedged > 1.2s
     team         = 0,          -- 2 = T, 3 = CT
     last_enemy_pos = nil,      -- last seen enemy origin (HUNT direction when roaming)
+    tgt_state    = "?",        -- target motion: stand / push / move
 }
 -- button -> tick drain flags (module globals: button closures run before `state`
 -- helpers are bound; globals dodge the forward-reference trap, Solver pattern).
@@ -327,6 +329,18 @@ local function assess_corner(lp, lo, to)
         if cr or cl then return "hold_corner", (cr and 1 or -1) end
     end
     return "open", 0
+end
+
+-- read the target's motion: is it standing still, and (if moving) coming toward us?
+-- standing camper -> bait longer; pushing -> wait for the push; runner -> close in.
+local function target_motion(target, lo, to)
+    local v = nil
+    pcall(function() v = target.m_vecVelocity end)
+    local spd = v and v_len2d(v) or 0
+    if spd < 25 then return "stand", spd end
+    local tx, ty = lo.x - to.x, lo.y - to.y                 -- vector toward us
+    local dot = ((v.x or 0) * tx + (v.y or 0) * ty)
+    return (dot > 0 and "push" or "move"), spd
 end
 
 -- shared: take a desired world yaw, probe-avoid obstacles + handle stuck, return the
@@ -601,20 +615,37 @@ local function walkbot_tick(cmd)
             local stop_d = 450; pcall(function() stop_d = wb_stopdist:get() end)
             local peekslow = false; pcall(function() peekslow = wb_peekslow and wb_peekslow:get() end)
             local peekrng = 750; pcall(function() peekrng = wb_peekrng and wb_peekrng:get() end)
-            -- remember where the enemy is so ROAM can head toward enemy side later
+            local approach_far = 1300; pcall(function() approach_far = wb_approach:get() end)
             state.last_enemy_pos = {x = to.x, y = to.y, z = to.z}
 
-            -- ── HOLD CORNER: bait the push instead of rushing (HvH-correct). Only while
-            -- the enemy is still beyond hold-min (hasn't pushed) AND we're behind a
-            -- corner (stepping sideways reveals them). Shoulder-peek out/in; ragebot
-            -- fires on the out-phase. Times out after 6s so we don't stall forever. ──
+            -- distance-first decisions: how the target is moving + can we actually see it
+            local mstate = target_motion(target, lo, to)   -- stand / push / move
+            state.tgt_state = mstate
+            local visible = has_los(lp, target)
+
+            -- ── FAR (round start): don't peek/jiggle. Just close the distance roughly in
+            -- the enemy's direction (toward A etc). Get fancy only once we're closer. ──
+            if dist > approach_far then
+                local move_yaw = compute_move(lp, lo, dir_yaw(lo, to), now, "APPROACH")
+                local spd = 450; pcall(function() spd = wb_speed:get() end)
+                if state.activity == "APPROACH" then
+                    state.diag = string.format("APPROACH d=%.0f enemy=%s (close distance)", dist, mstate)
+                end
+                pcall(function() cmd.move_yaw = move_yaw; cmd.forwardmove = spd; cmd.sidemove = 0 end)
+                if now <= (state.jump_until or 0) then pcall(function() cmd.in_jump = true end) end
+                return
+            end
+
+            -- ── HOLD CORNER: behind a corner -> shoulder-peek + wait. Hold LONGER vs a
+            -- camper (standing) and basically wait out a pusher (they come to us). ──
             local holdcnr = false; pcall(function() holdcnr = wb_holdcnr and wb_holdcnr:get() end)
             local holdmin = 350; pcall(function() holdmin = wb_holdmin:get() end)
             if holdcnr and dist > holdmin then
                 local cmode, pside = assess_corner(lp, lo, to)
                 if cmode == "hold_corner" then
                     if state.hold_since == 0 then state.hold_since = now end
-                    if (now - state.hold_since) < 6.0 then
+                    local htimeout = (mstate == "stand") and 10.0 or (mstate == "push") and 14.0 or 6.0
+                    if (now - state.hold_since) < htimeout then
                         local dur = (state.peek_phase == "out") and 0.22 or 0.55
                         if (now - (state.peek_phase_t or 0)) > dur then
                             state.peek_phase = (state.peek_phase == "out") and "in" or "out"
@@ -626,10 +657,9 @@ local function walkbot_tick(cmd)
                         local move_yaw = compute_move(lp, lo, math.deg(math.atan2(py * s, px * s)), now, "HOLD")
                         local sw = 110; pcall(function() sw = wb_slowspd:get() end)
                         if state.activity == "HOLD" then
-                            state.diag = string.format("HOLD corner peek=%s side=%d d=%.0f (bait)", state.peek_phase, pside, dist)
+                            state.diag = string.format("HOLD peek=%s side=%d d=%.0f enemy=%s", state.peek_phase, pside, dist, mstate)
                         end
                         pcall(function() cmd.move_yaw = move_yaw; cmd.forwardmove = sw; cmd.sidemove = 0 end)
-                        -- holding a corner near an enemy: never jump
                         state.last_origin = lo
                         return
                     end   -- else: held too long -> fall through and push
@@ -640,12 +670,13 @@ local function walkbot_tick(cmd)
                 state.hold_since = 0
             end
 
-            -- NEVER stand still (a stander is the easiest thing to resolve). In fight
-            -- range, strafe-jiggle perpendicular so a round-start / point-blank enemy
-            -- keeps us moving instead of frozen.
+            -- ── AGGRESSIVE peek ONLY when the enemy is VISIBLE. Close but NOT visible
+            -- (sitting around a corner) -> do NOT blind-jiggle into the angle; slow-
+            -- approach to gain the sightline carefully instead. ──
             local want_yaw = dir_yaw(lo, to)
             local close = dist <= stop_d
-            if close then
+            local aggressive = close and visible
+            if aggressive then
                 if (now - (state.peek_flip_t or 0)) > 0.30 then
                     state.peek_side = -(state.peek_side or 1); state.peek_flip_t = now
                 end
@@ -653,21 +684,19 @@ local function walkbot_tick(cmd)
             end
 
             local move_yaw = compute_move(lp, lo, want_yaw, now, "WALK")
-            -- slow-walk whenever NEAR a target (peek zone), not just on direct LoS — LoS
-            -- is exactly what you lack while peeking, which is why slow-walk barely fired
-            -- before. Full run only when far.
             local near = (peekslow and dist <= peekrng) or close
             local spd = 450; pcall(function() spd = wb_speed:get() end)
             if near then
                 local sw = 110; pcall(function() sw = wb_slowspd:get() end); spd = sw
                 if state.activity == "WALK" or state.activity == "AVOID" then state.activity = "PEEK" end
-                state.diag = string.format("PEEK slow d=%.0f spd=%.0f%s", dist, spd, close and " +jiggle" or "")
+                state.diag = string.format("%s d=%.0f enemy=%s%s",
+                    visible and "PEEK-visible" or "careful-approach", dist, mstate,
+                    aggressive and " +jiggle" or "")
             else
-                state.diag = string.format("engage #%s d=%.0f", tostring(state.target_idx), dist)
+                state.diag = string.format("engage #%s d=%.0f enemy=%s", tostring(state.target_idx), dist, mstate)
             end
             pcall(function() cmd.move_yaw = move_yaw; cmd.forwardmove = spd; cmd.sidemove = 0 end)
-            -- NO jumping near an enemy (airborne = free frag + can't aim). Only step-up
-            -- jump to clear an obstacle while the enemy is still far (approach).
+            -- no jumping near an enemy; step-up only while still far
             if dist > peekrng and now <= (state.jump_until or 0) then
                 pcall(function() cmd.in_jump = true end)
             end
@@ -781,7 +810,7 @@ local function act_color(a)
     elseif a == "STOP" then return COL.stop()
     elseif a == "PEEK" then return COL.peek()
     elseif a == "HOLD" then return COL.hold()
-    elseif a == "ROAM" or a == "WANDER" then return COL.roam()
+    elseif a == "ROAM" or a == "WANDER" or a == "APPROACH" then return COL.roam()
     else return COL.idle() end
 end
 
@@ -808,7 +837,7 @@ local function render_hud()
         if state.target_idx then
             render.text(3, vector(x, y), COL.label(), nil, "Target: ")
             render.text(3, vector(x + 52, y), COL.val(), nil,
-                string.format("#%d  %.0fu", state.target_idx, state.target_dist))
+                string.format("#%d  %.0fu  [%s]", state.target_idx, state.target_dist, tostring(state.tgt_state)))
         else
             render.text(3, vector(x, y), COL.label(), nil, "Target: none")
         end
