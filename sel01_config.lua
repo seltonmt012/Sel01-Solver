@@ -5,7 +5,7 @@
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Config
 -- @author seltonmt01
--- @version 3.23
+-- @version 3.24
 -- @description Smart freestand (anti-headshot):
 --   * NL freestanding is deterministic — it always picks the same "safe" side, so a
 --     resolver models it and headshots the predictably-exposed side (user report:
@@ -53,7 +53,7 @@
 --     variance for full per-side chaos.
 --   * MAG-JIT indicator added to bottom HvH strip; dumped in v3.8 stats.
 
-local SEL01_CFG_VERSION = "3.23"
+local SEL01_CFG_VERSION = "3.24"
 
 -- DEBUG: print to CSGO console at major load checkpoints. Plain print() bypasses
 -- NL chat (which may not flush before crash) and writes directly to CSGO console.
@@ -265,6 +265,28 @@ local _vis_state = { scope_gap = 0, scope_size = 0, model_alpha = 255, vel_a = 0
 local _vis_fonts = {}
 pcall(function() _vis_fonts.vel = render.load_font("Verdana", 16, "a") end)
 local function _vfont() return _vis_fonts.vel or 5 end
+-- v3.24: premium indicator "pill" — rounded dark bg + colored left accent bar + text.
+-- Replaces the old plain stacked green text (looked cheap). anchor: "c" center on x
+-- (default), "l" left edge at x, "r" right edge at x. Returns width, height.
+local function _vis_pill(x, y, text, col, font, anchor)
+    font = font or 3
+    text = tostring(text)
+    local tw = 0
+    pcall(function() tw = render.measure_text(font, nil, text).x end)
+    if tw <= 0 then tw = #text * 6 end
+    local th, padx, barw = 17, 9, 3
+    local w  = tw + padx * 2 + barw
+    local lx = x
+    if anchor == "c" then lx = x - w / 2
+    elseif anchor == "r" then lx = x - w end
+    pcall(function()
+        render.rect(vector(lx, y), vector(lx + w, y + th), color(13, 14, 18, 205), 4)
+        render.rect(vector(lx + 1, y + 1), vector(lx + 1 + barw, y + th - 1),
+                    color(col.r, col.g, col.b, 255), { 4, 0, 0, 4 })
+        render.text(font, vector(lx + barw + padx, y + 2), col, nil, text)
+    end)
+    return w, th
+end
 g_visual:label(" ")
 g_visual:label(accent .. "  NL Hit Marker Sound / Force Thirdperson / Scope Overlay:")
 g_visual:label(accent .. "  Set those directly in NL Visuals tab (they're combo elements)")
@@ -1670,14 +1692,11 @@ pcall(function()
                     table.insert(indicators, {txt = "FD", col = color(255, 220, 120, 255)})
                 end
             end)
-            -- draw stacked at bottom-center, line height 16
-            local base_y = sy - 110
+            -- v3.24: premium pills, centered, stacked upward from near the bottom
+            local ph = 21
+            local py0 = sy - 95 - #indicators * ph
             for i, ind in ipairs(indicators) do
-                local tw = 0
-                pcall(function() tw = render.measure_text(4, nil, ind.txt).x end)
-                pcall(function()
-                    render.text(4, vector(cx - tw / 2, base_y + (i - 1) * 18), ind.col, nil, ind.txt)
-                end)
+                _vis_pill(cx, py0 + (i - 1) * ph, ind.txt, ind.col, 3, "c")
             end
         end
 
@@ -1841,9 +1860,7 @@ pcall(function()
                 local frac = shown / 60
                 -- low desync = orange (weaker AA), high = accent blue (good spread)
                 local col = color(235, 150, 70, 210):lerp(color(120, 200, 255, 230), frac)
-                local label = string.format("DESYNC %.0f", shown)
-                local tw = #label * 6  -- font-3 ~6px/char
-                render.text(3, vector(cx - tw / 2, cy + 52), col, nil, label)
+                _vis_pill(cx, cy + 46, string.format("DESYNC %.0f", shown), col, 3, "c")
             end)
         end
 
@@ -1865,12 +1882,11 @@ pcall(function()
                 if aa_freestanding and aa_freestanding:get() then add("FS", on) end
                 -- ping-spike warn (high latency)
                 if (perf.ping or 0) > 90 then add("PING", color(255, 200, 60, 235)) end
-                local y = cy - (#tags * 16) / 2
+                -- v3.24: premium pills, right-anchored toward the crosshair, stacked
+                local ph = 21
+                local y0 = cy - (#tags * ph) / 2
                 for i = 1, #tags do
-                    local tg = tags[i]
-                    local tw = #tg.t * 6  -- font-3 ~6px/char
-                    render.text(3, vector(cx - 70 - tw, y), tg.c, nil, tg.t)
-                    y = y + 16
+                    _vis_pill(cx - 58, y0 + (i - 1) * ph, tags[i].t, tags[i].c, 3, "r")
                 end
             end)
         end
