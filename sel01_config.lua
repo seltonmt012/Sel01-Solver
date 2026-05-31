@@ -5,7 +5,7 @@
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Config
 -- @author seltonmt01
--- @version 3.21
+-- @version 3.22
 -- @description Smart freestand (anti-headshot):
 --   * NL freestanding is deterministic — it always picks the same "safe" side, so a
 --     resolver models it and headshots the predictably-exposed side (user report:
@@ -53,7 +53,7 @@
 --     variance for full per-side chaos.
 --   * MAG-JIT indicator added to bottom HvH strip; dumped in v3.8 stats.
 
-local SEL01_CFG_VERSION = "3.21"
+local SEL01_CFG_VERSION = "3.22"
 
 -- DEBUG: print to CSGO console at major load checkpoints. Plain print() bypasses
 -- NL chat (which may not flush before crash) and writes directly to CSGO console.
@@ -79,17 +79,23 @@ local TAB    = "Sel01-Config"
 -- ══════════════════════════════════════════════════════════════════════════
 -- UI GROUPS
 -- ══════════════════════════════════════════════════════════════════════════
--- v3.21: chernobl-style group headers — icon + "Sel01 » Section" with the » divider
--- (\194\187). One-time effect: renaming a group re-keys its elements, so this script's
--- own toggles reset to defaults on the first reload after this update — click a preset
--- (Aggressive) once to restore them. NL ragebot settings are separate and untouched.
-local DIV = " \194\187 "
-local g_main    = ui.create(TAB, ui.get_icon"sliders"    .. "  Sel01" .. DIV .. "Main",      1)
-local g_aa      = ui.create(TAB, ui.get_icon"bolt"       .. "  Sel01" .. DIV .. "Anti-Aim",  1)
-local g_move    = ui.create(TAB, ui.get_icon"feather"    .. "  Sel01" .. DIV .. "Movement",  2)
-local g_visual  = ui.create(TAB, ui.get_icon"eye"        .. "  Sel01" .. DIV .. "Visuals",   2)
-local g_qol     = ui.create(TAB, ui.get_icon"sparkles"   .. "  Sel01" .. DIV .. "Quality of Life", 1)
-local g_info    = ui.create(TAB, ui.get_icon"crosshairs" .. "  Sel01" .. DIV .. "Info",      2)
+-- v3.22: chernobl-style TABS. Multiple distinct ui.create() first-args render as a
+-- horizontal tab bar inside the script's sidebar entry (confirmed via NL docs:
+-- "ui.create(tab, group[, column])" + "ui.sidebar(name, icon)"). ui.sidebar sets the
+-- sidebar entry label + icon. Column 1 = left, 2 = right within each tab.
+-- One-time effect: re-tabbing re-keys UI elements, so this script's own toggles reset
+-- to defaults on the first reload — click a preset (Aggressive) once to restore. NL
+-- ragebot settings are separate and untouched.
+pcall(function() ui.sidebar(TAB, "sliders") end)
+local T_MAIN = ui.get_icon"sliders" .. "  Main"
+local T_AA   = ui.get_icon"bolt"    .. "  Anti-Aim"
+local T_VIS  = ui.get_icon"eye"     .. "  Visuals"
+local g_main    = ui.create(T_MAIN, "Presets",         1)
+local g_qol     = ui.create(T_MAIN, "Quality of Life", 2)
+local g_info    = ui.create(T_MAIN, "Info",            2)
+local g_aa      = ui.create(T_AA,   "Anti-Aim",        1)
+local g_visual  = ui.create(T_VIS,  "Visuals",         1)
+local g_move    = ui.create(T_VIS,  "Movement",        2)
 
 -- Header — v3.21: chernobl-style multi-color welcome (\aDEFAULT resets to white
 -- between accent-colored segments, like "Dear <accent>name<reset>, ...").
