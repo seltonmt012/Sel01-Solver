@@ -5,7 +5,7 @@
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Config
 -- @author seltonmt01
--- @version 3.22
+-- @version 3.23
 -- @description Smart freestand (anti-headshot):
 --   * NL freestanding is deterministic — it always picks the same "safe" side, so a
 --     resolver models it and headshots the predictably-exposed side (user report:
@@ -53,7 +53,7 @@
 --     variance for full per-side chaos.
 --   * MAG-JIT indicator added to bottom HvH strip; dumped in v3.8 stats.
 
-local SEL01_CFG_VERSION = "3.22"
+local SEL01_CFG_VERSION = "3.23"
 
 -- DEBUG: print to CSGO console at major load checkpoints. Plain print() bypasses
 -- NL chat (which may not flush before crash) and writes directly to CSGO console.
@@ -254,7 +254,7 @@ local vis_skeet      = g_visual:switch(accent .. ui.get_icon"bolt"       .. acce
 local vis_netgraph   = g_visual:switch(accent .. ui.get_icon"feather"    .. accent .. "  Netgraph (ping / loss / choke + LC warn)", false)
 local vis_scopefade  = g_visual:switch(accent .. ui.get_icon"eye"        .. accent .. "  Fade own model when scoped", true)
 local vis_sleeves    = g_visual:switch(accent .. ui.get_icon"eye"        .. accent .. "  Remove sleeves (cleaner POV)", false)
-local vis_menublur   = g_visual:switch(accent .. ui.get_icon"eye"        .. accent .. "  Blur behind menu", true)
+local vis_menublur   = g_visual:switch(accent .. ui.get_icon"eye"        .. accent .. "  Blur behind menu", false)
 local vis_custscope  = g_visual:switch(accent .. ui.get_icon"crosshairs" .. accent .. "  Custom scope overlay", false)
 local vis_scope_rot  = g_visual:switch(accent ..                            "      rotate scope 45 deg", false)
 local vis_menuborder = g_visual:switch(accent .. ui.get_icon"sliders"    .. accent .. "  Animated menu border (HSV flow)", true)
@@ -476,7 +476,7 @@ local function _do_apply_preset(name)
         safe_set(vis_netgraph, true)
         safe_set(vis_scopefade, true)
         safe_set(vis_sleeves, true)
-        safe_set(vis_menublur, true)
+        safe_set(vis_menublur, false)   -- v3.23: menu blur OFF by default (user request)
         safe_set(vis_custscope, true)
         safe_set(vis_scope_rot, true)
         safe_set(vis_menuborder, true)
