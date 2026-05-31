@@ -5,7 +5,7 @@
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Config
 -- @author seltonmt01
--- @version 3.25
+-- @version 3.26
 -- @description Smart freestand (anti-headshot):
 --   * NL freestanding is deterministic — it always picks the same "safe" side, so a
 --     resolver models it and headshots the predictably-exposed side (user report:
@@ -53,7 +53,7 @@
 --     variance for full per-side chaos.
 --   * MAG-JIT indicator added to bottom HvH strip; dumped in v3.8 stats.
 
-local SEL01_CFG_VERSION = "3.25"
+local SEL01_CFG_VERSION = "3.26"
 
 -- DEBUG: print to CSGO console at major load checkpoints. Plain print() bypasses
 -- NL chat (which may not flush before crash) and writes directly to CSGO console.
@@ -286,6 +286,29 @@ local function _vis_pill(x, y, text, col, font, anchor)
         render.text(font, vector(lx + barw + padx, y + 2), col, nil, text)
     end)
     return w, th
+end
+-- v3.26: velocity-style "chip" — a colored status square + a readable label box,
+-- the same icon-chip + label-box look as the velocity counter (user-approved).
+-- Replaces the cryptic abbreviation pills (nobody read "FL-VAR"). Pulses with col.a.
+local function _vis_chip(x, y, name, col)
+    local font = 3
+    name = tostring(name)
+    local tw = 0
+    pcall(function() tw = render.measure_text(font, nil, name).x end)
+    if tw <= 0 then tw = #name * 6 end
+    local h, csz, gap, padx = 18, 18, 4, 8
+    local fa = (col.a or 255) / 255
+    local bg = color(13, 14, 18, math.floor(210 * fa))
+    pcall(function()
+        -- status chip (colored square in a dark rounded box)
+        render.rect(vector(x, y), vector(x + csz, y + h), bg, 4)
+        render.rect(vector(x + 4, y + 4), vector(x + csz - 4, y + h - 4), color(col.r, col.g, col.b, col.a or 255), 2)
+        -- label box + readable name
+        local lx, lw = x + csz + gap, tw + padx * 2
+        render.rect(vector(lx, y), vector(lx + lw, y + h), bg, 4)
+        render.text(font, vector(lx + padx, y + 2), color(236, 241, 250, math.floor(255 * fa)), nil, name)
+    end)
+    return h
 end
 g_visual:label(" ")
 g_visual:label(accent .. "  NL Hit Marker Sound / Force Thirdperson / Scope Overlay:")
@@ -1610,86 +1633,70 @@ pcall(function()
         if vis_indicators:get() then
             local indicators = {}
             local aa_on = aa_enable:get()
-            -- DT (Double Tap) — red, highest priority
+            -- v3.26: readable NAMES (not cryptic abbreviations) — each draws as a
+            -- velocity-style chip (status square + label box).
             pcall(function()
                 if nl_refs.rage_dt and nl_refs.rage_dt:get() then
-                    table.insert(indicators, {txt = "DT", col = color(255, 100, 100, 255)})
+                    table.insert(indicators, {txt = "Double Tap", col = color(255, 100, 100, 255)})
                 end
             end)
-            -- HS (Hide Shots) — orange
             pcall(function()
                 if nl_refs.rage_hide and nl_refs.rage_hide:get() then
-                    table.insert(indicators, {txt = "HS", col = color(255, 180, 80, 255)})
+                    table.insert(indicators, {txt = "Hide Shots", col = color(255, 180, 80, 255)})
                 end
             end)
-            -- ON-SHOT — magenta pulse while window active
             if aa_on and aa_onshot:get() and now < aa_state.on_shot_until then
-                local a = pulse_alpha(8)
-                table.insert(indicators, {txt = "ON-SHOT", col = color(255, 80, 200, a)})
+                table.insert(indicators, {txt = "On-Shot AA", col = color(255, 80, 200, pulse_alpha(8))})
             end
-            -- FAKE-DUCK assist active — cyan pulse
             if aa_fd_assist:get() and now < aa_state.fakeduck_until then
-                local a = pulse_alpha(6)
-                table.insert(indicators, {txt = "FD-ASSIST", col = color(80, 220, 255, a)})
+                table.insert(indicators, {txt = "Fakeduck Assist", col = color(80, 220, 255, pulse_alpha(6))})
             end
-            -- AA basic
-            if aa_on then table.insert(indicators, {txt = "AA", col = color(120, 220, 120, 255)}) end
-            -- Manual side L / R from local desync_side combo
+            if aa_on then table.insert(indicators, {txt = "Anti-Aim", col = color(120, 220, 120, 255)}) end
             local mside = aa_desync_side:get()
-            if mside == "Left"  then table.insert(indicators, {txt = "MANUAL L", col = color(255, 230, 80, 255)}) end
-            if mside == "Right" then table.insert(indicators, {txt = "MANUAL R", col = color(80, 200, 255, 255)}) end
-            -- AIR override active when airborne
+            if mside == "Left"  then table.insert(indicators, {txt = "Manual Left",  col = color(255, 230, 80, 255)}) end
+            if mside == "Right" then table.insert(indicators, {txt = "Manual Right", col = color(80, 200, 255, 255)}) end
             if aa_on and aa_air_set:get() then
                 local lp = entity.get_local_player()
                 if lp then
                     local f = 0; pcall(function() f = lp.m_fFlags or 0 end)
                     if bit.band(f, 1) == 0 then
-                        table.insert(indicators, {txt = "AIR", col = color(180, 220, 255, 220)})
+                        table.insert(indicators, {txt = "Air AA", col = color(180, 220, 255, 220)})
                     end
                 end
             end
-            -- Anti-BF variance
             if aa_on and aa_anti_bf:get() then
-                table.insert(indicators, {txt = "ANTI-BF", col = color(200, 180, 255, 220)})
+                table.insert(indicators, {txt = "Anti-Bruteforce", col = color(200, 180, 255, 220)})
             end
-            -- V3.6: DEF (defensive AA on hit-taken — pulse while active window)
             if aa_on and aa_def_on_dmg:get() and now < (aa_state.defensive_until or 0) then
-                local a = pulse_alpha(7)
-                table.insert(indicators, {txt = "DEF", col = color(255, 100, 100, a)})
+                table.insert(indicators, {txt = "Defensive", col = color(255, 100, 100, pulse_alpha(7))})
             end
-            -- V3.6: SW-BOOST (slow-walk boost active — yellow glow)
             if aa_on and aa_slow_boost:get() and nl_refs.aa_slowwalk then
                 local sw = false
                 pcall(function() sw = nl_refs.aa_slowwalk:get() == true end)
                 if sw then
-                    table.insert(indicators, {txt = "SW-BOOST", col = color(255, 220, 80, 255)})
+                    table.insert(indicators, {txt = "Slow-Walk Boost", col = color(255, 220, 80, 255)})
                 end
             end
-            -- V3.6: FL-VAR (fake-lag variance active)
             if aa_on and aa_fl_var:get() and aa_state.fl_active then
-                table.insert(indicators, {txt = "FL-VAR", col = color(180, 180, 220, 220)})
+                table.insert(indicators, {txt = "Fakelag Variance", col = color(180, 180, 220, 220)})
             end
-            -- V3.7: YAW-ROT (yaw-base rotation active)
             if aa_on and aa_yaw_rotate:get() and aa_state.yaw_active then
-                table.insert(indicators, {txt = "YAW-ROT", col = color(140, 220, 200, 220)})
+                table.insert(indicators, {txt = "Yaw Rotate", col = color(140, 220, 200, 220)})
             end
-            -- V3.9: MAG-JIT (per-tick magnitude jitter active)
             if aa_on and aa_mag_jitter:get() then
-                table.insert(indicators, {txt = "MAG-JIT", col = color(200, 160, 220, 220)})
+                table.insert(indicators, {txt = "Mag Jitter", col = color(200, 160, 220, 220)})
             end
-            -- FREE (Freestanding)
             if aa_on and aa_freestanding:get() then
-                table.insert(indicators, {txt = "FREE", col = color(180, 200, 255, 255)})
+                table.insert(indicators, {txt = "Freestanding", col = color(180, 200, 255, 255)})
             end
-            -- Slow Walk / Fake Duck (NL state)
             pcall(function()
                 if nl_refs.aa_slowwalk and nl_refs.aa_slowwalk:get() then
-                    table.insert(indicators, {txt = "SW", col = color(255, 220, 120, 255)})
+                    table.insert(indicators, {txt = "Slow Walk", col = color(255, 220, 120, 255)})
                 end
             end)
             pcall(function()
                 if nl_refs.aa_fakeduck and nl_refs.aa_fakeduck:get() then
-                    table.insert(indicators, {txt = "FD", col = color(255, 220, 120, 255)})
+                    table.insert(indicators, {txt = "Fake Duck", col = color(255, 220, 120, 255)})
                 end
             end)
             -- v3.25: merge NL ragebot state (old skeet panel) + desync into THIS one
@@ -1701,10 +1708,10 @@ pcall(function()
             local function _addnl(t, c) if not seen[t] then indicators[#indicators + 1] = { txt = t, col = c }; seen[t] = true end end
             if vis_skeet:get() then
                 pcall(function()
-                    if nl_refs.rage_dt and nl_refs.rage_dt:get() then _addnl("DT", color(255, 70, 90, 235)) end
-                    if nl_refs.rage_safepoint and tostring(nl_refs.rage_safepoint:get()) == "Force" then _addnl("SAFE", color(143, 194, 21, 235)) end
-                    if nl_refs.rage_bodyaim and tostring(nl_refs.rage_bodyaim:get()) == "Force" then _addnl("BODY", color(143, 194, 21, 235)) end
-                    if (perf.ping or 0) > 90 then _addnl("PING", color(255, 200, 60, 235)) end
+                    if nl_refs.rage_dt and nl_refs.rage_dt:get() then _addnl("Double Tap", color(255, 70, 90, 235)) end
+                    if nl_refs.rage_safepoint and tostring(nl_refs.rage_safepoint:get()) == "Force" then _addnl("Safe Points", color(143, 194, 21, 235)) end
+                    if nl_refs.rage_bodyaim and tostring(nl_refs.rage_bodyaim:get()) == "Force" then _addnl("Body Aim", color(143, 194, 21, 235)) end
+                    if (perf.ping or 0) > 90 then _addnl("Ping Spike", color(255, 200, 60, 235)) end
                 end)
             end
             if vis_desyncpct:get() then
@@ -1715,17 +1722,17 @@ pcall(function()
                             local d = math.min(math.abs(rl - fk) / 2, 60)
                             _vis_state.desync_shown = _vis_state.desync_shown + (d - _vis_state.desync_shown) * 0.06
                             local sh = _vis_state.desync_shown
-                            indicators[#indicators + 1] = { txt = string.format("DESYNC %.0f", sh),
+                            indicators[#indicators + 1] = { txt = string.format("Desync %.0f deg", sh),
                                 col = color(235, 150, 70, 210):lerp(color(120, 200, 255, 230), sh / 60) }
                         end
                     end
                 end)
             end
-            -- single LEFT-EDGE column, vertically centered, out of the way
-            local ph = 20
+            -- v3.26: left-edge column of velocity-style chips (status square + name)
+            local ph = 22
             local y0 = cy - (#indicators * ph) / 2
             for i, ind in ipairs(indicators) do
-                _vis_pill(22, y0 + (i - 1) * ph, ind.txt, ind.col, 3, "l")
+                _vis_chip(22, y0 + (i - 1) * ph, ind.txt, ind.col)
             end
         end
 
