@@ -1,11 +1,11 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-WalkBot                                     ║
--- ║  Version: 1.4                                      ║
+-- ║  Version: 1.5                                      ║
 -- ║  Greedy nav-bot: map + enemy detect, walk-to-foe  ║
 -- ║  by seltonmt01                                     ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-WalkBot
--- @version 1.4
+-- @version 1.5
 -- @author seltonmt01
 -- @description Greedy walk-bot. Detects map + enemies, walks the local player
 --   toward a chosen target using NL movement cmd (move_yaw + forwardmove) with
@@ -19,7 +19,7 @@
 --   entity.get_players(true) (enemies) / entity.get_local_player() / p.m_vecOrigin / p:get_eye_position()
 --   globals.mapname / globals.tickcount / globals.realtime
 
-local SEL01_WB_VERSION = "1.4"
+local SEL01_WB_VERSION = "1.5"
 
 local ffi_ok, ffi = pcall(require, "ffi")
 
@@ -595,82 +595,103 @@ local function nav_read(map)
     return nil, "kernel32 read failed (navs in nl/Sel01-WalkBot/?)"
 end
 
--- parse with a given layout variant; returns areas table + final offset, or errors.
-local function nav_parse_variant(raw, vis_entry, tail_bytes)
+-- SCAN-BASED parser. The documented v16 area layout has a build-specific trailing
+-- block (~99 undocumented bytes/area on this build) that no field-width combo could
+-- account for. But area IDs are sequential (1,2,3,...) and the header+connections parse
+-- cleanly, so we read id+flags+corners+connections (all we need for the A* graph) then
+-- SCAN FORWARD for the next area's header (id == this+1, flags == 0, plausible corner
+-- floats), skipping the unknown trailing bytes entirely. Verified vs de_mirage ground
+-- truth (areas at 311 / 2232 / 6022, ids 1/2/3, sizes 1921/3790/2156).
+local function nav_parse_scan(raw)
     local n = #raw
     local base = ffi.cast("const uint8_t*", raw)
-    local off = 0
-    local function need(k) if off + k > n then error("eof@" .. off) end end
-    local function u8()  need(1); local v = base[off]; off = off + 1; return v end
-    local function u16() need(2); local v = ffi.cast("const uint16_t*", base + off)[0]; off = off + 2; return tonumber(v) end
-    local function u32() need(4); local v = ffi.cast("const uint32_t*", base + off)[0]; off = off + 4; return tonumber(v) end
-    local function f32() need(4); local v = ffi.cast("const float*",    base + off)[0]; off = off + 4; return tonumber(v) end
-    local function skip(k) if k > 0 then need(k); off = off + k end end
+    local function u16(o) return tonumber(ffi.cast("const uint16_t*", base + o)[0]) end
+    local function u32(o) return tonumber(ffi.cast("const uint32_t*", base + o)[0]) end
+    local function f32(o) return tonumber(ffi.cast("const float*",    base + o)[0]) end
 
-    if u32() ~= 0xFEEDFACE then error("bad magic") end
-    local major = u32()
-    local minor = (major >= 10) and u32() or 0
-    skip(4)                                   -- bspSize
-    if major >= 14 then u8() end              -- isAnalyzed
-    local placeCount = u16()
-    for _ = 1, placeCount do local len = u16(); skip(len) end
-    if major >= 12 then u8() end              -- hasUnnamedAreas (verified present in v16)
-    local areaCount = u32()
-    -- sanity: real maps have a few thousand areas (de_mirage = 903). >60000 means the
-    -- alignment is off (the v1.2 bug let 231169 through because the cap was 300000).
-    if areaCount == 0 or areaCount > 60000 then error("bad areaCount " .. areaCount) end
+    if n < 64 or u32(0) ~= 0xFEEDFACE then return nil, "bad magic", 0 end
+    local major = u32(4)
+    local off = 12                                    -- after magic(4) ver(4) minor(4)
+    off = off + 4                                     -- bspSize
+    if major >= 14 then off = off + 1 end             -- isAnalyzed
+    local placeCount = u16(off); off = off + 2
+    for _ = 1, placeCount do off = off + 2 + u16(off) end
+    if major >= 12 then off = off + 1 end             -- hasUnnamedAreas
+    local areaCount = u32(off); off = off + 4
+    if areaCount < 1 or areaCount > 60000 then return nil, "bad areaCount " .. areaCount, 0 end
+
+    -- plausible area header at byte o? flags==0 + >=3 corner floats with |v|>100, none huge
+    local function plaus(o)
+        if o + 40 > n then return false end
+        if u32(o + 4) ~= 0 then return false end
+        local big = 0
+        for k = 0, 5 do
+            local f = f32(o + 8 + 4 * k)
+            if f ~= f then return false end           -- NaN
+            local af = f < 0 and -f or f
+            if af > 6000 then return false end
+            if af > 100 then big = big + 1 end
+        end
+        return big >= 3
+    end
 
     local areas = {}
-    for _ = 1, areaCount do
-        local id = u32()
-        if major <= 8 then u8() elseif major < 13 then u16() else u32() end   -- flags
-        local nwx, nwy, nwz = f32(), f32(), f32()
-        local sex, sey, sez = f32(), f32(), f32()
-        f32(); f32()                                                         -- neZ, swZ
+    local expid = 1
+    for a = 1, areaCount do
+        if u32(off) ~= expid then
+            return areas, string.format("desync @area %d/%d: exp id=%d got=%d off=%d", a, areaCount, expid, u32(off), off), a - 1
+        end
+        local nwx, nwy, nwz = f32(off + 8), f32(off + 12), f32(off + 16)
+        local sex, sey, sez = f32(off + 20), f32(off + 24), f32(off + 28)
+        local h = off + 40
         local conns = {}
-        for _ = 1, 4 do local c = u32(); for _ = 1, c do conns[#conns + 1] = u32() end end
-        local hc = u8(); skip(hc * 17)                                       -- hiding spots
-        if major < 15 then local ac = u8(); skip(ac * 14) end                -- approach (pre-v15)
-        local ec = u32()                                                     -- encounter paths
-        for _ = 1, ec do skip(10); local sc = u8(); skip(sc * 5) end
-        u16()                                                                -- placeId
-        for _ = 1, 2 do local c = u32(); skip(c * 4) end                     -- ladders
-        skip(8)                                                              -- earliest occupy x2
-        if major >= 11 then skip(16) end                                    -- light intensity
-        if major >= 16 then local vc = u32(); skip(vc * vis_entry) end       -- visible areas
-        if major >= 16 then skip(4) end                                     -- inherit visibility
-        skip(tail_bytes)                                                     -- variant trailing
-        areas[id] = { id = id, x = (nwx + sex) * 0.5, y = (nwy + sey) * 0.5,
-                      z = (nwz + sez) * 0.5, nwx = nwx, nwy = nwy, sex = sex, sey = sey,
-                      conns = conns }
+        for _ = 1, 4 do
+            local c = u32(h); h = h + 4
+            if c > 60 then return areas, "bad conn " .. c .. " @area " .. a, a - 1 end
+            for _ = 1, c do conns[#conns + 1] = u32(h); h = h + 4 end
+        end
+        areas[expid] = { id = expid, x = (nwx + sex) * 0.5, y = (nwy + sey) * 0.5,
+                         z = (nwz + sez) * 0.5, conns = conns }
+        if a == areaCount then break end
+        -- scan forward for the next area header
+        local nx = expid + 1
+        local limit = math.min(h + 9000, n - 40)
+        local found = nil
+        local p = h
+        while p < limit do
+            if u32(p) == nx and plaus(p) then found = p; break end
+            p = p + 1
+        end
+        if not found then
+            return areas, string.format("next id=%d not found after off=%d (got %d/%d areas)", nx, h, a, areaCount), a
+        end
+        off = found
+        expid = expid + 1
     end
-    return areas, areaCount, off
+    return areas, nil, areaCount
 end
 
--- try layout variants, accept the one that consumes ~the whole file (self-correct
--- for the few CSGO fields whose width is ambiguous in the docs).
 local function nav_load(map)
     nav = { ok = false, map = map, count = 0, areas = nil, err = "loading" }
     if not (ffi_ok and ffi) then nav.err = "no ffi"; return end
     local raw, how = nav_read(map)
-    if not raw then nav.err = how; return end
-    local n = #raw
-    local best
-    for _, vis in ipairs({ 5, 8 }) do
-        for _, tail in ipairs({ 0, 1 }) do
-            local ok, areas, cnt, off = pcall(nav_parse_variant, raw, vis, tail)
-            if ok and math.abs(off - n) <= 16 then
-                best = { areas = areas, count = cnt, vis = vis, tail = tail, off = off }
-                break
-            end
+    if not raw then nav.err = "read fail: " .. tostring(how); return end
+    local ok, areas, err, cnt = pcall(nav_parse_scan, raw)
+    if not ok then nav.err = "parse crash: " .. tostring(areas); return end
+    cnt = cnt or 0
+    if areas then
+        local got = 0
+        for _ in pairs(areas) do got = got + 1 end
+        nav.areas = areas; nav.count = got
+        if err then
+            nav.err = string.format("PARTIAL %d areas (%dKB) — %s", got, math.floor(#raw / 1024), err)
+            nav.ok = got > 50                       -- usable even if the tail desynced
+        else
+            nav.ok = true
+            nav.err = string.format("ok %d areas (%dKB, %s)", got, math.floor(#raw / 1024), how)
         end
-        if best then break end
-    end
-    if best then
-        nav.ok = true; nav.areas = best.areas; nav.count = best.count
-        nav.err = string.format("ok (%s, vis=%d tail=%d)", how, best.vis, best.tail)
     else
-        nav.err = "parse desync (offsets off) — report so I can fix the layout"
+        nav.err = "parse failed: " .. tostring(err)
     end
 end
 
@@ -762,20 +783,11 @@ local function walkbot_tick(cmd)
             state.tgt_state = mstate
             local visible = has_los(lp, target)
 
-            -- ── FAR (round start): don't peek/jiggle. Just close the distance roughly in
-            -- the enemy's direction (toward A etc). Get fancy only once we're closer. ──
-            if dist > approach_far then
-                local move_yaw = compute_move(lp, lo, dir_yaw(lo, to), now, "APPROACH")
-                local spd = 450; pcall(function() spd = wb_speed:get() end)
-                if state.activity == "APPROACH" then
-                    state.diag = string.format("APPROACH d=%.0f enemy=%s (close distance)", dist, mstate)
-                end
-                pcall(function() cmd.move_yaw = move_yaw; cmd.forwardmove = spd; cmd.sidemove = 0 end)
-                if state.pass_crouch then pcall(function() cmd.in_duck = true end) end
-                if now <= (state.jump_until or 0) then pcall(function() cmd.in_jump = true end) end
-                return
-            end
-
+            -- FAR enemy: do NOT beeline at it (that rams walls + looks dumb at 3k). We
+            -- already stored its position above; fall THROUGH to the ROAM section so we
+            -- walk the learned ROUTE toward the enemy side instead of a straight line.
+            -- Only the close-range engage logic runs here.
+            if dist <= approach_far then
             -- ── HOLD CORNER: behind a corner -> shoulder-peek + wait. Hold LONGER vs a
             -- camper (standing) and basically wait out a pusher (they come to us). ──
             local holdcnr = false; pcall(function() holdcnr = wb_holdcnr and wb_holdcnr:get() end)
@@ -847,6 +859,7 @@ local function walkbot_tick(cmd)
                 pcall(function() cmd.in_jump = true end)
             end
             return
+            end   -- close: if dist <= approach_far (far enemy falls through to ROAM)
         end
     end
 
@@ -859,11 +872,14 @@ local function walkbot_tick(cmd)
     for _, h in pairs(state.enemy_history) do
         if (now - h.t) < 25 and h.t > ht then hgoal, ht = h, h.t end
     end
-    if hgoal then
+    local hdist = hgoal and v_len2d(vector(hgoal.x - lo.x, hgoal.y - lo.y, 0)) or 1e9
+    -- HUNT only when the last-seen enemy is reasonably CLOSE (mid-range). A FAR enemy
+    -- (e.g. 3k at round start) -> walk the learned ROUTE toward them instead of
+    -- beelining across the whole map (that was the "thinks 3k is near" dumbness).
+    if hgoal and hdist < 1500 then
         move_yaw = compute_move(lp, lo, dir_yaw(lo, hgoal), now, "ROAM")
         if state.activity == "ROAM" then
-            state.diag = string.format("HUNT last-seen enemy d=%.0f age=%.0fs",
-                v_len2d(vector(hgoal.x - lo.x, hgoal.y - lo.y, 0)), now - ht)
+            state.diag = string.format("HUNT last-seen enemy d=%.0f age=%.0fs", hdist, now - ht)
         end
     elseif #state.waypoints > 0 then
         local wp = state.waypoints[state.wp_idx] or state.waypoints[1]
