@@ -1,11 +1,11 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 9.60                                   ║
+-- ║  Version: 9.61                                   ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 9.60
+-- @version 9.61
 -- @description Correction side guard + serverfail retry:
 --   * correction/prediction-error misses now check SIDE evidence, not only
 --     magnitude. A BF shot on the unlearned opposite side no longer gets labeled
@@ -73,7 +73,7 @@
 --   * v9.26 drift-bump (alpha 0.55 on 5-10° diff) still handles small shifts.
 --   * v9.29 coach variants carry.
 
-local SEL01_VERSION = "9.60"
+local SEL01_VERSION = "9.61"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -4148,12 +4148,22 @@ local function resolve_player(p)
     -- freeze the classifier for 5s.
     if exp_aa_classify and exp_aa_classify:get() then
         local now_rt = globals.realtime or 0
-        local commit_lock_active = (s.aa_committed_at or 0) > 0 and (now_rt - s.aa_committed_at) < 2.0
+        -- V9.61: sticky classification for well-learned enemies. Once we've HIT an enemy
+        -- 4+ times (real_active), its AA type rarely changes mid-round — reclassifying it
+        -- on borderline yaw_cache noise (eye-aim flicks misread as jitter) just thrashes the
+        -- resolver mode/label every few seconds (logs: idx=5 still+slow enemy flapped
+        -- jitter<->static 6+ times while hitting 4/4). The slow flap dodged the 10s anti-flap
+        -- window. Cold enemies stay responsive (7 evals / 2s); learned ones need 14 evals + 4s
+        -- lock to flip. measured_desync + side adapt independently, so slower aa_type ≠ worse aim.
+        local well_learned = ((s.real_left or 0) + (s.real_right or 0)) >= 4
+        local commit_lock = well_learned and 4.0 or 2.0
+        local need_count  = well_learned and 14 or 7
+        local commit_lock_active = (s.aa_committed_at or 0) > 0 and (now_rt - s.aa_committed_at) < commit_lock
         if s.aa_classify_cd <= 0 and not commit_lock_active then
             local new_type = classify_aa(s)
             if new_type == s.pending_aa_type then
                 s.pending_aa_count = s.pending_aa_count + 1
-                if s.pending_aa_count >= 7 and s.aa_type ~= new_type then
+                if s.pending_aa_count >= need_count and s.aa_type ~= new_type then
                     s.aa_type = new_type
                     s.aa_committed_at = now_rt
                     -- V9.10 anti-flap: track commits in 10s window; freeze 5s if >3
@@ -5438,6 +5448,7 @@ _cs_log_color_raw("V9.50: server-fail filter readout — the V9.49 netcode-miss 
 _cs_log_color_raw("V9.49: confirmed server-fail keeps no longer pollute stats — a correct angle (err~0) the server rejects via a stale backtrack record (high bt, side kept) is netcode, not a resolver miss. It's now excluded from session hit-rate, per-mode stats, per-player rate AND the persistent learned ratio (s.missed still increments so BF cycle + force-baim escalate). Logs: idx=9 fired -21.8° ×3 into bt 20→10→5 err=0 then hit shot 4; idx=4 kept ×3 err=0.3 across Air+Jitter-Cls — these dragged session ~56% when true resolver rate was ~82% and falsely flagged Air as 'weak'. Plus never-hit explore: after 2 consecutive correct-angle keeps on a real_active==0 enemy, flip once to break a frozen wrong-side guess (idx=5 0/2 shot LEFT while passive leaned RIGHT 42.9°); a single real hit disables it.")
 _cs_log_color_raw("V9.43: backtrack-resistance escalates faster — point-blank fakelaggers with correct angle (our=meas, err=0) but server-reject (bt 7-10) now flip the resistant flag after 2 high-bt fails OR one bt>12, instead of 3 (was wasting 2 sure shots). Pairs with v9.40 full-spread multipoint to catch slightly-stale records.")
 _cs_log_color_raw("V9.42: side-flip from SIDE evidence not magnitude error — ack_angle_err is a MAGNITUDE metric (wrong-side miss = small err, magnitude overshoot = large err), so old 'err>5 → flip' flipped the correct side on magnitude misses (idx=4: real 36°L, we 55°L, wrongly flipped R). Now flip only on learned side-conflict or blind first-contact; magnitude misses keep side, BF cycles the magnitude.")
+_cs_log_color_raw("V9.61: sticky AA-classification for well-learned enemies — once we've HIT an enemy 4+ times (real_active), reclassifying its AA type on borderline yaw_cache noise just thrashes the resolver mode/label every few seconds (logs: idx=5 still+slow enemy flapped jitter<->static 6+ times while hitting 4/4; the slow flap dodged the 10s anti-flap window). Cold enemies stay responsive (7 evals / 2s lock); learned ones now need 14 consecutive evals + 4s lock to flip. measured_desync + side adapt independently so slower aa_type ≠ worse aim — pure smoothness. No hit-path change.")
 _cs_log_color_raw("V9.60: 'Air*' no longer pollutes best_mode storage — Air/Air-Alt/Air-CorrFlip are POSITIONAL (enemy airborne), not an AA-pattern, but were saved as best_static/best_switch when an enemy was hit mid-air. The known-player fast-path never uses them (only acts on Static/Jitter) so zero benefit, but intel.mode_match compared the grounded resolve (e.g. Static-Meas) against the stored 'Air' → false mismatch → +15 conf cancel threshold → good shots cancelled on known enemies (logs: idx=3 sw=Air, name_369738400 s=Air). Added '^Air' to the save-filter + the load migration (same V9.0 precedent that dropped BF:/*-Guess). Stats/cancel only, no aim-path change.")
 _cs_log_color_raw("Logging: " .. (log_enabled:get() and ("ON" .. (log_verbose:get() and " (verbose)" or ""))  or "OFF"))
 _cs_log_color_raw("=========================================")
