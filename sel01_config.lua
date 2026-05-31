@@ -5,7 +5,7 @@
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Config
 -- @author seltonmt01
--- @version 3.17
+-- @version 3.18
 -- @description Smart freestand (anti-headshot):
 --   * NL freestanding is deterministic — it always picks the same "safe" side, so a
 --     resolver models it and headshots the predictably-exposed side (user report:
@@ -53,7 +53,7 @@
 --     variance for full per-side chaos.
 --   * MAG-JIT indicator added to bottom HvH strip; dumped in v3.8 stats.
 
-local SEL01_CFG_VERSION = "3.17"
+local SEL01_CFG_VERSION = "3.18"
 
 -- DEBUG: print to CSGO console at major load checkpoints. Plain print() bypasses
 -- NL chat (which may not flush before crash) and writes directly to CSGO console.
@@ -244,7 +244,7 @@ g_visual:label(accent .. "  Set those directly in NL Visuals tab (they're combo 
 -- ══════════════════════════════════════════════════════════════════════════
 g_qol:label(accent .. ui.get_icon"sparkles" .. accent .. "  Quality of Life")
 local qol_clantag    = g_qol:switch("Animated clantag (Sel01 cycle)", false)
-local qol_clantag_st = g_qol:combo("Clantag style", {"Wave", "Spin", "Pulse"}, 1)
+local qol_clantag_st = g_qol:combo("Clantag style", {"Wave", "Spin", "Pulse", "Loading", "Scan", "Glitch", "Arrow", "Rage"}, 1)
 -- V2.0: dropped killsay + autoaccept + buybot — NL has these built-in (Misc tab).
 
 -- ══════════════════════════════════════════════════════════════════════════
@@ -1694,8 +1694,10 @@ pcall(function()
             end
         end
 
-        -- ── CLANTAG UPDATE (cheap, throttled inside) ──
-        update_clantag()
+        -- ── CLANTAG UPDATE ── (v3.18: moved OUT of render → net_update_end below.
+        -- common.set_clan_tag is a game-state write; called from the render/paint
+        -- thread it was silently ignored, so the animated tag never changed. The
+        -- working bloodwings pattern drives it from events.net_update_end.)
 
         -- ── SPECTATOR OVERLAY (left-middle) ──
         if vis_specoverlay:get() and #specs > 0 then
@@ -1722,9 +1724,15 @@ local clantag_phase = 1
 local clantag_last_change = 0
 
 local CLANTAG_FRAMES = {
-    wave  = {"Sel01", "sel01", "SEL01", "sel01", "Sel01"},
-    spin  = {"Sel01 |", "Sel01 /", "Sel01 -", "Sel01 \\"},
-    pulse = {"Sel01", "[Sel01]", "Sel01", "(Sel01)"},
+    wave   = {"Sel01", "sel01", "SEL01", "sel01", "Sel01"},
+    spin   = {"Sel01 |", "Sel01 /", "Sel01 -", "Sel01 \\"},
+    pulse  = {"Sel01", "[Sel01]", "Sel01", "(Sel01)"},
+    -- v3.18: extra themed styles (ASCII-only — clan tags drop most unicode)
+    load   = {"Sel01", "Sel01.", "Sel01..", "Sel01..."},
+    scan   = {">Sel01", ">>Sel01", "Sel01<<", "Sel01<"},
+    glitch = {"Sel01", "5el01", "$el01", "5EL01", "Sel01"},
+    arrow  = {"-> Sel01", "Sel01 <-", "-> Sel01", "Sel01 <-"},
+    rage   = {"Sel01", "Sel01 ez", "Sel01", "Sel01 :)"},
 }
 
 update_clantag = function()
@@ -1734,8 +1742,13 @@ update_clantag = function()
     clantag_last_change = now
     local style = qol_clantag_st:get()
     local frames = CLANTAG_FRAMES.wave
-    if style == "Spin"  then frames = CLANTAG_FRAMES.spin
-    elseif style == "Pulse" then frames = CLANTAG_FRAMES.pulse
+    if     style == "Spin"    then frames = CLANTAG_FRAMES.spin
+    elseif style == "Pulse"   then frames = CLANTAG_FRAMES.pulse
+    elseif style == "Loading" then frames = CLANTAG_FRAMES.load
+    elseif style == "Scan"    then frames = CLANTAG_FRAMES.scan
+    elseif style == "Glitch"  then frames = CLANTAG_FRAMES.glitch
+    elseif style == "Arrow"   then frames = CLANTAG_FRAMES.arrow
+    elseif style == "Rage"    then frames = CLANTAG_FRAMES.rage
     end
     clantag_phase = (clantag_phase % #frames) + 1
     pcall(function()
@@ -1744,8 +1757,16 @@ update_clantag = function()
     end)
 end
 
--- clantag updater is invoked from main events.render handler (single set() call).
--- V1.7: dropped unused _clantag_tick_flag sentinel.
+-- v3.18: clantag is driven from events.net_update_end (the game network tick),
+-- NOT events.render. common.set_clan_tag only takes effect from a game-state
+-- context — the bloodwings reference uses net_update_end (bloodwings_33877:1020).
+-- Throttle (0.4s) + master/toggle gate stay inside update_clantag itself.
+-- NOTE: do NOT add a fallback that calls events.createmove:set here — the config's
+-- createmove_unified is already registered on createmove (line ~1001) and a second
+-- :set would OVERWRITE it, killing AA sync / movement / preset drain. net_update_end
+-- is confirmed present on this NL build (bloodwings drives its clantag from it).
+_hooks_status.clantag = register_first(function() pcall(update_clantag) end,
+                                       "net_update_end", "net_update", "createmove_end")
 
 -- (master-disable handler unified later in shutdown section — clears clantag + overrides)
 
