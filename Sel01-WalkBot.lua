@@ -1,11 +1,11 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-WalkBot                                     ║
--- ║  Version: 1.2                                      ║
+-- ║  Version: 1.3                                      ║
 -- ║  Greedy nav-bot: map + enemy detect, walk-to-foe  ║
 -- ║  by seltonmt01                                     ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-WalkBot
--- @version 1.2
+-- @version 1.3
 -- @author seltonmt01
 -- @description Greedy walk-bot. Detects map + enemies, walks the local player
 --   toward a chosen target using NL movement cmd (move_yaw + forwardmove) with
@@ -19,7 +19,7 @@
 --   entity.get_players(true) (enemies) / entity.get_local_player() / p.m_vecOrigin / p:get_eye_position()
 --   globals.mapname / globals.tickcount / globals.realtime
 
-local SEL01_WB_VERSION = "1.2"
+local SEL01_WB_VERSION = "1.3"
 
 local ffi_ok, ffi = pcall(require, "ffi")
 
@@ -73,7 +73,7 @@ end
 
 local wb_enable, wb_mode, wb_stopdist, wb_jump, wb_probe, wb_speed, wb_hud, wb_debug
 local wb_peekslow, wb_peekrng, wb_slowspd, wb_bhop, wb_clantag, wb_nav
-local wb_holdcnr, wb_holdmin, wb_approach, wb_crouch, wb_autolearn
+local wb_holdcnr, wb_holdmin, wb_approach, wb_crouch, wb_autolearn, wb_primary
 pcall(function()
     wb_enable   = g_main:switch("Enable WalkBot")                 -- the on/off switch (no hotkey)
     wb_mode     = g_main:combo("Target Pick", "Nearest", "Lowest HP", "Most Visible", "Crosshair")
@@ -92,6 +92,7 @@ pcall(function()
     wb_holdcnr  = g_main:switch("Hold Corner (bait the push, don't rush)")
     wb_holdmin  = g_main:slider("Hold Until Enemy Within", 120, 900, 220)
     wb_crouch   = g_main:switch("Crouch When Exposed (enemy behind corner)")
+    wb_primary  = g_main:switch("Auto Primary Weapon (deploy on round start)")
     -- roam: when NO enemy, follow recorded waypoints (walk the route yourself once,
     -- the bot replays it). No waypoints -> wander+avoid so it still explores.
     g_main:button("Record Waypoint (drop my pos)", function() _wb_pending_record = true end)
@@ -110,6 +111,7 @@ pcall(function() if wb_clantag then wb_clantag:set(true) end end)
 pcall(function() if wb_holdcnr then wb_holdcnr:set(true) end end)
 pcall(function() if wb_crouch then wb_crouch:set(true) end end)
 pcall(function() if wb_autolearn then wb_autolearn:set(true) end end)
+pcall(function() if wb_primary then wb_primary:set(true) end end)
 pcall(function() if wb_nav then wb_nav:set(true) end end)
 pcall(function() if wb_hud then wb_hud:set(true) end end)
 
@@ -153,6 +155,8 @@ local state = {
     last_enemy_t = 0,          -- when we last saw an enemy (HUNT freshness)
     learned_count = 0,         -- auto-learned waypoints this session
     enemy_history = {},        -- per-enemy-index last seen {x,y,z,t} (not all visible)
+    pass_crouch  = false,      -- ducking to fit through a low passage (mirage vents etc)
+    wpn_t        = 0,          -- last auto-primary deploy
 }
 -- button -> tick drain flags (module globals: button closures run before `state`
 -- helpers are bound; globals dodge the forward-reference trap, Solver pattern).
@@ -274,6 +278,18 @@ local function probe_clear(lp, lo, yaw_deg, dist)
         return (not res) or (res.fraction or 1) >= 0.99   -- trace fail -> assume clear
     end
     return ray(40) and ray(62)
+end
+
+-- low-passage check: is the way blocked standing but CLEAR when ducked? (mirage CT
+-- connector / window low spots etc). Clear at knee height (z+18) but blocked at body.
+local function crouch_passable(lp, lo, yaw_deg, dist)
+    local rad = math.rad(yaw_deg)
+    local dx, dy = math.cos(rad) * dist, math.sin(rad) * dist
+    local res = nil
+    pcall(function()
+        res = utils.trace_line(vector(lo.x, lo.y, lo.z + 18), vector(lo.x + dx, lo.y + dy, lo.z + 18), lp, PROBE_MASK)
+    end)
+    return (not res) or (res.fraction or 1) >= 0.99      -- knee-level clear -> duckable
 end
 
 -- is the front obstacle LOW enough that a jump clears it? foot blocked (caller knows)
@@ -418,8 +434,15 @@ local function compute_move(lp, lo, want_yaw, now, base_act)
     end
 
     -- LOOK-AHEAD probe further than the side fans, so we turn BEFORE hitting the wall
+    state.pass_crouch = false
     local look = math.min(probe * 2.2, 130)
-    if not probe_clear(lp, lo, want_yaw, look) then
+    if not probe_clear(lp, lo, want_yaw, look) and crouch_passable(lp, lo, want_yaw, probe) then
+        -- blocked standing but clear ducked -> low passage (mirage vent / CT connector
+        -- gap): duck + push straight through instead of avoiding.
+        state.pass_crouch = true
+        state.block = "duck-pass"
+        state.diag = base_act .. " duck-pass (low gap)"
+    elseif not probe_clear(lp, lo, want_yaw, look) then
         state.block = "front"
         local found = false
         local order = state.avoid_dir >= 0 and {1, -1} or {-1, 1}
@@ -556,11 +579,11 @@ local function nav_parse_variant(raw, vis_entry, tail_bytes)
     if major >= 14 then u8() end              -- isAnalyzed
     local placeCount = u16()
     for _ = 1, placeCount do local len = u16(); skip(len) end
+    if major >= 12 then u8() end              -- hasUnnamedAreas (verified present in v16)
     local areaCount = u32()
-    if areaCount == 0 or areaCount > 300000 then
-        off = off - 4; u8(); areaCount = u32()    -- retry past a hasUnnamedAreas byte
-        if areaCount == 0 or areaCount > 300000 then error("bad areaCount " .. areaCount) end
-    end
+    -- sanity: real maps have a few thousand areas (de_mirage = 903). >60000 means the
+    -- alignment is off (the v1.2 bug let 231169 through because the cap was 300000).
+    if areaCount == 0 or areaCount > 60000 then error("bad areaCount " .. areaCount) end
 
     local areas = {}
     for _ = 1, areaCount do
@@ -645,6 +668,18 @@ local function walkbot_tick(cmd)
     pcall(function() now = globals.realtime end)
     pcall(function() state.team = tonumber(lp.m_iTeam) or 0 end)
 
+    -- auto primary weapon: keep the rifle/sniper deployed. "slot1" is a no-op when the
+    -- primary is already out, so it's safe to repeat — covers round-start pistol/knife.
+    do
+        local pon = false; pcall(function() pon = wb_primary and wb_primary:get() end)
+        if pon and (now - (state.wpn_t or 0)) > 1.5 then
+            state.wpn_t = now
+            if not pcall(function() utils.console_exec("slot1") end) then
+                pcall(function() engine.execute_client_cmd("slot1") end)
+            end
+        end
+    end
+
     -- ── drain Record / Clear waypoint buttons + map-change reload ──
     local lo = get_origin(lp)
     if _wb_pending_record then
@@ -701,6 +736,7 @@ local function walkbot_tick(cmd)
                     state.diag = string.format("APPROACH d=%.0f enemy=%s (close distance)", dist, mstate)
                 end
                 pcall(function() cmd.move_yaw = move_yaw; cmd.forwardmove = spd; cmd.sidemove = 0 end)
+                if state.pass_crouch then pcall(function() cmd.in_duck = true end) end
                 if now <= (state.jump_until or 0) then pcall(function() cmd.in_jump = true end) end
                 return
             end
@@ -770,7 +806,7 @@ local function walkbot_tick(cmd)
             local cr_on = false; pcall(function() cr_on = wb_crouch and wb_crouch:get() end)
             state.crouching = cr_on and (not visible) and dist <= peekrng and self_exposed(lp, lo, to)
             pcall(function() cmd.move_yaw = move_yaw; cmd.forwardmove = spd; cmd.sidemove = 0 end)
-            if state.crouching then pcall(function() cmd.in_duck = true end) end
+            if state.crouching or state.pass_crouch then pcall(function() cmd.in_duck = true end) end
             -- no jumping near an enemy; step-up only while still far
             if dist > peekrng and now <= (state.jump_until or 0) then
                 pcall(function() cmd.in_jump = true end)
@@ -807,9 +843,17 @@ local function walkbot_tick(cmd)
         if state.activity == "ROAM" then
             state.diag = string.format("ROAM route wp %d/%d d=%.0f", state.wp_idx, #state.waypoints, d)
         end
+    elseif v_len2d(vector(lo.x, lo.y, 0)) > 600 then
+        -- LEAVE SPAWN: nothing learned yet + no enemy seen. Most CSGO maps are centered
+        -- near world origin, so head toward (0,0) = mid to get OUT of spawn instead of
+        -- circling it. Small position-seeded jitter so a wall doesn't pin us.
+        local jitter = (math.floor(math.abs(lo.x) + now) % 40) - 20
+        move_yaw = compute_move(lp, lo, dir_yaw(lo, { x = 0, y = 0 }) + jitter, now, "WANDER")
+        if state.activity == "WANDER" then
+            state.diag = string.format("LEAVE-SPAWN -> mid d=%.0f", v_len2d(vector(lo.x, lo.y, 0)))
+        end
     else
-        -- wander: nothing known yet (round start, no enemy seen). Hold a heading; repick
-        -- on block / wedge / every ~3s. Deterministic varied turn (no Math.random).
+        -- near mid, nothing known: gentle wander. Repick on block / wedge / every ~3s.
         if (now - (state.wander_t or 0)) > 3.0 or state.block == "boxed" or state.stuck_hard then
             local turn = 90 + (math.floor(math.abs(lo.x) + math.abs(lo.y) + now) % 140)
             state.wander_yaw = norm_ang((state.wander_yaw or 0) + turn)
@@ -817,12 +861,13 @@ local function walkbot_tick(cmd)
         end
         move_yaw = compute_move(lp, lo, state.wander_yaw or 0, now, "WANDER")
         if state.activity == "WANDER" then
-            state.diag = "WANDER (exploring — no route + no enemy seen yet)"
+            state.diag = "WANDER (exploring near mid)"
         end
     end
 
     local spd = 450; pcall(function() spd = wb_speed:get() end)
     pcall(function() cmd.move_yaw = move_yaw; cmd.forwardmove = spd; cmd.sidemove = 0 end)
+    if state.pass_crouch then pcall(function() cmd.in_duck = true end) end
 
     -- ── bunny-hop while travelling (no target only): jump on every ground-touch so
     -- A->B is faster, with a light auto air-strafe to keep speed. Disabled while
