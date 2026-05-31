@@ -1,11 +1,11 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-WalkBot                                     ║
--- ║  Version: 0.4                                      ║
+-- ║  Version: 0.5                                      ║
 -- ║  Greedy nav-bot: map + enemy detect, walk-to-foe  ║
 -- ║  by seltonmt01                                     ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-WalkBot
--- @version 0.4
+-- @version 0.5
 -- @author seltonmt01
 -- @description Greedy walk-bot. Detects map + enemies, walks the local player
 --   toward a chosen target using NL movement cmd (move_yaw + forwardmove) with
@@ -19,7 +19,9 @@
 --   entity.get_players(true) (enemies) / entity.get_local_player() / p.m_vecOrigin / p:get_eye_position()
 --   globals.mapname / globals.tickcount / globals.realtime
 
-local SEL01_WB_VERSION = "0.4"
+local SEL01_WB_VERSION = "0.5"
+
+local ffi_ok, ffi = pcall(require, "ffi")
 
 -- ─── small helpers ───────────────────────────────────────
 local function clamp(v, lo, hi) if v < lo then return lo elseif v > hi then return hi else return v end end
@@ -70,7 +72,7 @@ if not ok_ui or not g_main then
 end
 
 local wb_enable, wb_mode, wb_stopdist, wb_autojump, wb_probe, wb_speed, wb_hud, wb_debug
-local wb_peekslow, wb_peekrng, wb_slowspd, wb_bhop, wb_clantag
+local wb_peekslow, wb_peekrng, wb_slowspd, wb_bhop, wb_clantag, wb_nav
 pcall(function()
     wb_enable   = g_main:switch("Enable WalkBot")                 -- the on/off switch (no hotkey)
     wb_mode     = g_main:combo("Target Pick", "Nearest", "Lowest HP", "Most Visible", "Crosshair")
@@ -89,6 +91,7 @@ pcall(function()
     g_main:button("Clear Waypoints (this map)",    function() _wb_pending_clear  = true end)
     wb_bhop     = g_main:switch("Bunny-Hop on routes (faster A->B, no target only)")
     wb_clantag  = g_main:switch("Clantag 'WalkBot rn' when active")
+    wb_nav      = g_main:switch("Load Nav-Mesh (real map routes — experimental)")
     wb_hud      = g_hud:switch("HUD Overlay")
     wb_debug    = g_hud:switch("Debug Info")
 end)
@@ -331,6 +334,150 @@ local function compute_move(lp, lo, want_yaw, now, base_act)
     return move_yaw
 end
 
+-- ═══ NAV-MESH (CSGO .nav parser) ═════════════════════════
+-- Every official map ships csgo/maps/<map>.nav (the mesh CSGO's own bots use):
+-- magic 0xFEEDFACE, version 16, subversion 1 (verified on this install). We parse
+-- the walkable areas + their connections into a graph. v0.5 = parse + readout only
+-- (prove the bytes line up in-game); v0.6 adds A* + path-following on top.
+local nav = { ok = false, map = nil, count = 0, areas = nil, err = "not loaded" }
+
+-- read the raw .nav bytes. NL files.read base path is unknown across builds, so try
+-- several relative paths; fall back to FFI fopen relative to the game's working dir.
+local function nav_read(map)
+    local tries = {
+        "maps/" .. map .. ".nav",
+        "csgo/maps/" .. map .. ".nav",
+        "../maps/" .. map .. ".nav",
+        "../csgo/maps/" .. map .. ".nav",
+    }
+    for _, p in ipairs(tries) do
+        local data = nil
+        pcall(function() data = files.read(p) end)
+        if data and #data > 64 then return data, "files.read " .. p end
+    end
+    -- FFI fopen fallback (binary), relative to csgo.exe working dir
+    if ffi_ok and ffi then
+        local got = nil
+        pcall(function()
+            pcall(ffi.cdef, [[
+                typedef struct _navFILE _navFILE;
+                _navFILE *fopen(const char *filename, const char *mode);
+                size_t fread(void *ptr, size_t size, size_t count, _navFILE *stream);
+                int fseek(_navFILE *stream, long offset, int origin);
+                long ftell(_navFILE *stream);
+                int fclose(_navFILE *stream);
+            ]])
+            for _, p in ipairs({ "csgo/maps/" .. map .. ".nav", "maps/" .. map .. ".nav" }) do
+                local f = ffi.C.fopen(p, "rb")
+                if f ~= nil then
+                    ffi.C.fseek(f, 0, 2); local sz = ffi.C.ftell(f); ffi.C.fseek(f, 0, 0)
+                    if sz > 64 then
+                        local buf = ffi.new("uint8_t[?]", sz)
+                        local rd = ffi.C.fread(buf, 1, sz, f)
+                        got = ffi.string(buf, rd)
+                    end
+                    ffi.C.fclose(f)
+                    if got then break end
+                end
+            end
+        end)
+        if got and #got > 64 then return got, "ffi fopen" end
+    end
+    return nil, "file not found (files.read + ffi both failed)"
+end
+
+-- parse with a given layout variant; returns areas table + final offset, or errors.
+local function nav_parse_variant(raw, vis_entry, tail_bytes)
+    local n = #raw
+    local base = ffi.cast("const uint8_t*", raw)
+    local off = 0
+    local function need(k) if off + k > n then error("eof@" .. off) end end
+    local function u8()  need(1); local v = base[off]; off = off + 1; return v end
+    local function u16() need(2); local v = ffi.cast("const uint16_t*", base + off)[0]; off = off + 2; return tonumber(v) end
+    local function u32() need(4); local v = ffi.cast("const uint32_t*", base + off)[0]; off = off + 4; return tonumber(v) end
+    local function f32() need(4); local v = ffi.cast("const float*",    base + off)[0]; off = off + 4; return tonumber(v) end
+    local function skip(k) if k > 0 then need(k); off = off + k end end
+
+    if u32() ~= 0xFEEDFACE then error("bad magic") end
+    local major = u32()
+    local minor = (major >= 10) and u32() or 0
+    skip(4)                                   -- bspSize
+    if major >= 14 then u8() end              -- isAnalyzed
+    local placeCount = u16()
+    for _ = 1, placeCount do local len = u16(); skip(len) end
+    local areaCount = u32()
+    if areaCount == 0 or areaCount > 300000 then
+        off = off - 4; u8(); areaCount = u32()    -- retry past a hasUnnamedAreas byte
+        if areaCount == 0 or areaCount > 300000 then error("bad areaCount " .. areaCount) end
+    end
+
+    local areas = {}
+    for _ = 1, areaCount do
+        local id = u32()
+        if major <= 8 then u8() elseif major < 13 then u16() else u32() end   -- flags
+        local nwx, nwy, nwz = f32(), f32(), f32()
+        local sex, sey, sez = f32(), f32(), f32()
+        f32(); f32()                                                         -- neZ, swZ
+        local conns = {}
+        for _ = 1, 4 do local c = u32(); for _ = 1, c do conns[#conns + 1] = u32() end end
+        local hc = u8(); skip(hc * 17)                                       -- hiding spots
+        if major < 15 then local ac = u8(); skip(ac * 14) end                -- approach (pre-v15)
+        local ec = u32()                                                     -- encounter paths
+        for _ = 1, ec do skip(10); local sc = u8(); skip(sc * 5) end
+        u16()                                                                -- placeId
+        for _ = 1, 2 do local c = u32(); skip(c * 4) end                     -- ladders
+        skip(8)                                                              -- earliest occupy x2
+        if major >= 11 then skip(16) end                                    -- light intensity
+        if major >= 16 then local vc = u32(); skip(vc * vis_entry) end       -- visible areas
+        if major >= 16 then skip(4) end                                     -- inherit visibility
+        skip(tail_bytes)                                                     -- variant trailing
+        areas[id] = { id = id, x = (nwx + sex) * 0.5, y = (nwy + sey) * 0.5,
+                      z = (nwz + sez) * 0.5, nwx = nwx, nwy = nwy, sex = sex, sey = sey,
+                      conns = conns }
+    end
+    return areas, areaCount, off
+end
+
+-- try layout variants, accept the one that consumes ~the whole file (self-correct
+-- for the few CSGO fields whose width is ambiguous in the docs).
+local function nav_load(map)
+    nav = { ok = false, map = map, count = 0, areas = nil, err = "loading" }
+    if not (ffi_ok and ffi) then nav.err = "no ffi"; return end
+    local raw, how = nav_read(map)
+    if not raw then nav.err = how; return end
+    local n = #raw
+    local best
+    for _, vis in ipairs({ 5, 8 }) do
+        for _, tail in ipairs({ 0, 1 }) do
+            local ok, areas, cnt, off = pcall(nav_parse_variant, raw, vis, tail)
+            if ok and math.abs(off - n) <= 16 then
+                best = { areas = areas, count = cnt, vis = vis, tail = tail, off = off }
+                break
+            end
+        end
+        if best then break end
+    end
+    if best then
+        nav.ok = true; nav.areas = best.areas; nav.count = best.count
+        nav.err = string.format("ok (%s, vis=%d tail=%d)", how, best.vis, best.tail)
+    else
+        nav.err = "parse desync (offsets off) — report so I can fix the layout"
+    end
+end
+
+-- nearest area center to a world point (linear; only for the v0.5 readout / occasional
+-- repath in v0.6, never per-tick). Returns area, dist2d.
+local function nav_nearest(x, y)
+    if not (nav.ok and nav.areas) then return nil, 0 end
+    local best, bestd
+    for _, a in pairs(nav.areas) do
+        local dx, dy = a.x - x, a.y - y
+        local d = dx * dx + dy * dy
+        if not bestd or d < bestd then best, bestd = a, d end
+    end
+    return best, bestd and math.sqrt(bestd) or 0
+end
+
 -- ─── main movement driver ────────────────────────────────
 local function walkbot_tick(cmd)
     -- single on/off via the switch — no hotkey (user request)
@@ -357,6 +504,10 @@ local function walkbot_tick(cmd)
         state.waypoints = {}; state.wp_idx = 1; wp_save()
     end
     if state.wp_map ~= state.mapname then wp_load(state.mapname) end
+    -- nav-mesh: (re)load on map change when the toggle is on
+    local use_nav = false
+    pcall(function() use_nav = wb_nav and wb_nav:get() end)
+    if use_nav and nav.map ~= state.mapname then nav_load(state.mapname) end
     if not lo then state.activity = "IDLE"; state.diag = "no origin"; return end
 
     state.enemy_count = #get_enemies()
@@ -555,6 +706,13 @@ local function render_hud()
             end)
             render.text(3, vector(x, y), COL.label(), nil, "map_data.shortname: ")
             render.text(3, vector(x + 128, y), COL.val(), nil, raw)
+            -- nav-mesh status
+            y = y + line
+            local navcol = nav.ok and COL.walk() or COL.stuck()
+            render.text(3, vector(x, y), COL.label(), nil, "Nav: ")
+            render.text(3, vector(x + 34, y), navcol, nil,
+                nav.ok and string.format("%d areas  %s", nav.count, tostring(nav.err))
+                       or tostring(nav.err))
         end
     end)
 end
