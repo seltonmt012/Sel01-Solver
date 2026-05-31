@@ -1,11 +1,11 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-WalkBot                                     ║
--- ║  Version: 0.6                                      ║
+-- ║  Version: 0.7                                      ║
 -- ║  Greedy nav-bot: map + enemy detect, walk-to-foe  ║
 -- ║  by seltonmt01                                     ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-WalkBot
--- @version 0.6
+-- @version 0.7
 -- @author seltonmt01
 -- @description Greedy walk-bot. Detects map + enemies, walks the local player
 --   toward a chosen target using NL movement cmd (move_yaw + forwardmove) with
@@ -19,7 +19,7 @@
 --   entity.get_players(true) (enemies) / entity.get_local_player() / p.m_vecOrigin / p:get_eye_position()
 --   globals.mapname / globals.tickcount / globals.realtime
 
-local SEL01_WB_VERSION = "0.6"
+local SEL01_WB_VERSION = "0.7"
 
 local ffi_ok, ffi = pcall(require, "ffi")
 
@@ -137,6 +137,11 @@ local state = {
     peek_phase   = "in",       -- "out" (revealing) / "in" (behind cover)
     peek_phase_t = 0,
     hold_since   = 0,          -- when we started holding (timeout -> push)
+    escape_yaw   = nil,        -- committed hard-escape heading while wedged
+    escape_until = 0,
+    stuck_hard   = false,      -- compute_move sets this when wedged > 1.2s
+    team         = 0,          -- 2 = T, 3 = CT
+    last_enemy_pos = nil,      -- last seen enemy origin (HUNT direction when roaming)
 }
 -- button -> tick drain flags (module globals: button closures run before `state`
 -- helpers are bound; globals dodge the forward-reference trap, Solver pattern).
@@ -238,16 +243,20 @@ local function pick_target(lp)
     return best, best_dist
 end
 
--- trace a short probe from the feet in walk direction; true = clear
+-- probe in walk direction; true = clear. Traces at BODY height (z+40, not knee) so
+-- small steps the game auto-climbs (<=18u) don't false-trigger avoidance, AND at head
+-- height (z+62) so we catch low overhangs. Blocked if either is blocked.
 local function probe_clear(lp, lo, yaw_deg, dist)
     local rad = math.rad(yaw_deg)
-    local ahead = vector(lo.x + math.cos(rad) * dist,
-                         lo.y + math.sin(rad) * dist,
-                         lo.z + 18)               -- knee height so we ignore floor
-    local res = nil
-    pcall(function() res = utils.trace_line(vector(lo.x, lo.y, lo.z + 18), ahead, lp) end)
-    if not res then return true end               -- trace failed -> assume clear, keep moving
-    return (res.fraction or 1) >= 0.99
+    local dx, dy = math.cos(rad) * dist, math.sin(rad) * dist
+    local function ray(h)
+        local res = nil
+        pcall(function()
+            res = utils.trace_line(vector(lo.x, lo.y, lo.z + h), vector(lo.x + dx, lo.y + dy, lo.z + h), lp)
+        end)
+        return (not res) or (res.fraction or 1) >= 0.99   -- trace fail -> assume clear
+    end
+    return ray(40) and ray(62)
 end
 
 -- is the front obstacle LOW enough that a jump clears it? foot blocked (caller knows)
@@ -331,12 +340,26 @@ local function compute_move(lp, lo, want_yaw, now, base_act)
     local move_yaw = want_yaw
     state.activity = base_act
     state.block = "clear"
-    if not probe_clear(lp, lo, want_yaw, probe) then
+    state.stuck_hard = false
+
+    -- if we recently committed a hard-escape heading, KEEP driving it (don't re-decide
+    -- every tick — re-deciding is what makes it dance back and forth into the same wall).
+    if state.escape_yaw and now < (state.escape_until or 0) then
+        state.activity = "STUCK"; state.block = "escape"
+        state.diag = base_act .. " hard-escape (committed)"
+        if aj then state.jump_until = math.max(state.jump_until or 0, now + 0.10) end
+        state.last_origin = lo
+        return state.escape_yaw
+    end
+
+    -- LOOK-AHEAD probe further than the side fans, so we turn BEFORE hitting the wall
+    local look = math.min(probe * 2.2, 130)
+    if not probe_clear(lp, lo, want_yaw, look) then
         state.block = "front"
         local found = false
         local order = state.avoid_dir >= 0 and {1, -1} or {-1, 1}
         for _, s in ipairs(order) do
-            for _, ang in ipairs({25, 50, 75, 100}) do
+            for _, ang in ipairs({20, 40, 60, 80, 105, 135}) do
                 if probe_clear(lp, lo, want_yaw + s * ang, probe) then
                     move_yaw = want_yaw + s * ang; state.avoid_dir = s; found = true; break
                 end
@@ -344,28 +367,42 @@ local function compute_move(lp, lo, want_yaw, now, base_act)
             if found then break end
         end
         if found then
-            state.diag = string.format("%s avoid rot %+.0f", base_act, move_yaw - want_yaw)
+            state.diag = string.format("%s avoid %+.0f", base_act, move_yaw - want_yaw)
         else
             state.block = "boxed"
             if aj and can_step_up(lp, lo, want_yaw, probe) then
                 state.jump_until = now + 0.12; state.activity = "JUMP"; state.block = "step"
-                state.diag = base_act .. " boxed low -> step jump"
+                state.diag = base_act .. " step-up jump"
             else
-                move_yaw = want_yaw + (state.avoid_dir ~= 0 and state.avoid_dir or 1) * 90
-                state.diag = base_act .. " boxed by WALL -> rotate"
+                move_yaw = want_yaw + (state.avoid_dir ~= 0 and state.avoid_dir or 1) * 110
+                state.diag = base_act .. " boxed WALL -> turn"
             end
         end
     end
-    -- stuck breakout (shared across walk + roam + wander)
+
+    -- ESCALATING stuck breakout (shared by walk / roam / wander)
     if state.last_origin then
         local moved = v_len2d(vector(lo.x - state.last_origin.x, lo.y - state.last_origin.y, 0))
         if moved < 1.5 then
-            if state.stuck_since == 0 then state.stuck_since = now
-            elseif (now - state.stuck_since) > 0.35 then
+            if state.stuck_since == 0 then state.stuck_since = now end
+            local dur = now - state.stuck_since
+            if dur > 1.2 then
+                -- WEDGED: commit a back+side escape heading for ~0.8s + jump, and flip the
+                -- preferred avoid side so we don't re-wedge the same way.
+                state.activity = "STUCK"; state.stuck_hard = true; state.block = "wedged"
+                local side = (state.avoid_dir ~= 0 and state.avoid_dir) or 1
+                state.escape_yaw = norm_ang(want_yaw + 160 * side)
+                state.escape_until = now + 0.8
+                state.avoid_dir = -side
+                if aj then state.jump_until = now + 0.18 end
+                state.diag = base_act .. " WEDGED -> hard escape"
+                move_yaw = state.escape_yaw
+                state.stuck_since = now
+            elseif dur > 0.35 then
                 state.activity = "STUCK"
                 move_yaw = want_yaw + (state.avoid_dir ~= 0 and state.avoid_dir or 1) * 90
                 if aj and can_step_up(lp, lo, want_yaw, probe) then state.jump_until = now + 0.15 end
-                state.stuck_since = now
+                state.diag = base_act .. " stuck -> strafe"
             end
         else
             state.stuck_since = 0
@@ -533,6 +570,7 @@ local function walkbot_tick(cmd)
 
     local now = 0
     pcall(function() now = globals.realtime end)
+    pcall(function() state.team = tonumber(lp.m_iTeam) or 0 end)
 
     -- ── drain Record / Clear waypoint buttons + map-change reload ──
     local lo = get_origin(lp)
@@ -560,13 +598,11 @@ local function walkbot_tick(cmd)
         if to then
             pcall(function() state.target_idx = target:get_index() end)
             state.target_dist = dist
-            local los = has_los(lp, target)
             local stop_d = 450; pcall(function() stop_d = wb_stopdist:get() end)
             local peekslow = false; pcall(function() peekslow = wb_peekslow and wb_peekslow:get() end)
             local peekrng = 750; pcall(function() peekrng = wb_peekrng and wb_peekrng:get() end)
-            -- peek-slow zone: VISIBLE enemy in range -> slow-walk + jiggle so their
-            -- resolver misses our moving/desynced model while our ragebot lands.
-            local peek_active = peekslow and los and dist <= peekrng
+            -- remember where the enemy is so ROAM can head toward enemy side later
+            state.last_enemy_pos = {x = to.x, y = to.y, z = to.z}
 
             -- ── HOLD CORNER: bait the push instead of rushing (HvH-correct). Only while
             -- the enemy is still beyond hold-min (hasn't pushed) AND we're behind a
@@ -593,7 +629,7 @@ local function walkbot_tick(cmd)
                             state.diag = string.format("HOLD corner peek=%s side=%d d=%.0f (bait)", state.peek_phase, pside, dist)
                         end
                         pcall(function() cmd.move_yaw = move_yaw; cmd.forwardmove = sw; cmd.sidemove = 0 end)
-                        if now <= (state.jump_until or 0) then pcall(function() cmd.in_jump = true end) end
+                        -- holding a corner near an enemy: never jump
                         state.last_origin = lo
                         return
                     end   -- else: held too long -> fall through and push
@@ -604,15 +640,12 @@ local function walkbot_tick(cmd)
                 state.hold_since = 0
             end
 
-            if not peek_active and dist <= stop_d and los then
-                state.activity = "STOP"; state.block = "clear"
-                state.diag = string.format("in range %.0f + LoS -> hold", dist)
-                state.last_origin = lo
-                return
-            end
-
+            -- NEVER stand still (a stander is the easiest thing to resolve). In fight
+            -- range, strafe-jiggle perpendicular so a round-start / point-blank enemy
+            -- keeps us moving instead of frozen.
             local want_yaw = dir_yaw(lo, to)
-            if peek_active and dist <= stop_d then
+            local close = dist <= stop_d
+            if close then
                 if (now - (state.peek_flip_t or 0)) > 0.30 then
                     state.peek_side = -(state.peek_side or 1); state.peek_flip_t = now
                 end
@@ -620,17 +653,24 @@ local function walkbot_tick(cmd)
             end
 
             local move_yaw = compute_move(lp, lo, want_yaw, now, "WALK")
+            -- slow-walk whenever NEAR a target (peek zone), not just on direct LoS — LoS
+            -- is exactly what you lack while peeking, which is why slow-walk barely fired
+            -- before. Full run only when far.
+            local near = (peekslow and dist <= peekrng) or close
             local spd = 450; pcall(function() spd = wb_speed:get() end)
-            if peek_active then
+            if near then
                 local sw = 110; pcall(function() sw = wb_slowspd:get() end); spd = sw
                 if state.activity == "WALK" or state.activity == "AVOID" then state.activity = "PEEK" end
-                state.diag = string.format("PEEK slow d=%.0f spd=%.0f%s", dist, spd, (dist <= stop_d) and " +jiggle" or "")
+                state.diag = string.format("PEEK slow d=%.0f spd=%.0f%s", dist, spd, close and " +jiggle" or "")
             else
                 state.diag = string.format("engage #%s d=%.0f", tostring(state.target_idx), dist)
             end
             pcall(function() cmd.move_yaw = move_yaw; cmd.forwardmove = spd; cmd.sidemove = 0 end)
-            -- NO bunny-hop while engaging (airborne = can't aim well); only step-up jumps
-            if now <= (state.jump_until or 0) then pcall(function() cmd.in_jump = true end) end
+            -- NO jumping near an enemy (airborne = free frag + can't aim). Only step-up
+            -- jump to clear an obstacle while the enemy is still far (approach).
+            if dist > peekrng and now <= (state.jump_until or 0) then
+                pcall(function() cmd.in_jump = true end)
+            end
             return
         end
     end
@@ -641,7 +681,8 @@ local function walkbot_tick(cmd)
     if #state.waypoints > 0 then
         local wp = state.waypoints[state.wp_idx] or state.waypoints[1]
         local d = v_len2d(vector(wp.x - lo.x, wp.y - lo.y, 0))
-        if d < 90 then            -- reached this waypoint -> advance (loop the route)
+        -- reached it OR can't reach it (wedged) -> advance, so we don't grind a wall
+        if d < 90 or state.stuck_hard then
             state.wp_idx = (state.wp_idx % #state.waypoints) + 1
             wp = state.waypoints[state.wp_idx]
             d = v_len2d(vector(wp.x - lo.x, wp.y - lo.y, 0))
@@ -650,17 +691,25 @@ local function walkbot_tick(cmd)
         if state.activity == "ROAM" then
             state.diag = string.format("ROAM wp %d/%d d=%.0f", state.wp_idx, #state.waypoints, d)
         end
+    elseif state.last_enemy_pos then
+        -- HUNT toward enemy side: no recorded route, but the last enemy we saw marks the
+        -- enemy direction (T -> toward CT, etc). Head there instead of wandering in place.
+        local ep = state.last_enemy_pos
+        move_yaw = compute_move(lp, lo, dir_yaw(lo, ep), now, "ROAM")
+        if state.activity == "ROAM" then
+            state.diag = string.format("HUNT enemy side d=%.0f", v_len2d(vector(ep.x - lo.x, ep.y - lo.y, 0)))
+        end
     else
-        -- wander: hold a heading; repick on block or every ~3s. Deterministic varied
-        -- turn (no Math.random in sandbox) seeded from position + time.
-        if (now - (state.wander_t or 0)) > 3.0 or state.block == "boxed" then
+        -- wander: nothing known yet (round start, no enemy seen). Hold a heading; repick
+        -- on block / wedge / every ~3s. Deterministic varied turn (no Math.random).
+        if (now - (state.wander_t or 0)) > 3.0 or state.block == "boxed" or state.stuck_hard then
             local turn = 90 + (math.floor(math.abs(lo.x) + math.abs(lo.y) + now) % 140)
             state.wander_yaw = norm_ang((state.wander_yaw or 0) + turn)
             state.wander_t = now
         end
         move_yaw = compute_move(lp, lo, state.wander_yaw or 0, now, "WANDER")
         if state.activity == "WANDER" then
-            state.diag = "WANDER (no waypoints — record a route)"
+            state.diag = "WANDER (exploring — no route + no enemy seen yet)"
         end
     end
 
@@ -749,8 +798,9 @@ local function render_hud()
         local line = 16
         render.text(4, vector(x, y), COL.title(), nil, "Sel01-WalkBot v" .. SEL01_WB_VERSION)
         y = y + line
+        local tname = (state.team == 2 and "T") or (state.team == 3 and "CT") or "?"
         render.text(3, vector(x, y), COL.label(), nil, "Map: ")
-        render.text(3, vector(x + 38, y), COL.val(), nil, state.mapname)
+        render.text(3, vector(x + 38, y), COL.val(), nil, state.mapname .. "  [" .. tname .. "]")
         y = y + line
         render.text(3, vector(x, y), COL.label(), nil, "State: ")
         render.text(3, vector(x + 46, y), act_color(state.activity), nil, state.activity)
