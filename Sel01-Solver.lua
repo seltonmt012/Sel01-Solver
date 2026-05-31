@@ -1,11 +1,11 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 9.61                                   ║
+-- ║  Version: 9.62                                   ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 9.61
+-- @version 9.62
 -- @description Correction side guard + serverfail retry:
 --   * correction/prediction-error misses now check SIDE evidence, not only
 --     magnitude. A BF shot on the unlearned opposite side no longer gets labeled
@@ -73,7 +73,7 @@
 --   * v9.26 drift-bump (alpha 0.55 on 5-10° diff) still handles small shifts.
 --   * v9.29 coach variants carry.
 
-local SEL01_VERSION = "9.61"
+local SEL01_VERSION = "9.62"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -3731,6 +3731,14 @@ local function pick_bruteforce_angle(s, anim, eye_yaw, max_desync, p, preset)
        and (s.serverfail_retry_until or 0) >= (globals.tickcount or 0) then
         local side = s.serverfail_retry_side
         local mag = s.serverfail_retry_mag or effective_desync(s, max_desync, side)
+        -- V9.62: USE-SITE guard against a stale/poisoned retry magnitude (V9.44 fixed the
+        -- SETTER; this guards the GETTER). If we hold a learned per-side desync and the
+        -- stored retry mag deviates >15° from it, the stored value is suspect (slot reuse /
+        -- a poisoned value from an earlier engagement) — trust current learning instead.
+        -- Caught idx=11: BF:retry fired -44.5° on a proven 25.4° enemy (learned L=24.9°),
+        -- a 19.6° overshoot whose origin wasn't derivable from the shot's own data.
+        local cur = effective_desync(s, max_desync, side)
+        if cur > 5 and math.abs(mag - cur) > 15 then mag = cur end
         if mag > 58 then mag = 58 end
         if mag >= 5 then
             local result = eye_yaw + mag * side
@@ -5448,6 +5456,7 @@ _cs_log_color_raw("V9.50: server-fail filter readout — the V9.49 netcode-miss 
 _cs_log_color_raw("V9.49: confirmed server-fail keeps no longer pollute stats — a correct angle (err~0) the server rejects via a stale backtrack record (high bt, side kept) is netcode, not a resolver miss. It's now excluded from session hit-rate, per-mode stats, per-player rate AND the persistent learned ratio (s.missed still increments so BF cycle + force-baim escalate). Logs: idx=9 fired -21.8° ×3 into bt 20→10→5 err=0 then hit shot 4; idx=4 kept ×3 err=0.3 across Air+Jitter-Cls — these dragged session ~56% when true resolver rate was ~82% and falsely flagged Air as 'weak'. Plus never-hit explore: after 2 consecutive correct-angle keeps on a real_active==0 enemy, flip once to break a frozen wrong-side guess (idx=5 0/2 shot LEFT while passive leaned RIGHT 42.9°); a single real hit disables it.")
 _cs_log_color_raw("V9.43: backtrack-resistance escalates faster — point-blank fakelaggers with correct angle (our=meas, err=0) but server-reject (bt 7-10) now flip the resistant flag after 2 high-bt fails OR one bt>12, instead of 3 (was wasting 2 sure shots). Pairs with v9.40 full-spread multipoint to catch slightly-stale records.")
 _cs_log_color_raw("V9.42: side-flip from SIDE evidence not magnitude error — ack_angle_err is a MAGNITUDE metric (wrong-side miss = small err, magnitude overshoot = large err), so old 'err>5 → flip' flipped the correct side on magnitude misses (idx=4: real 36°L, we 55°L, wrongly flipped R). Now flip only on learned side-conflict or blind first-contact; magnitude misses keep side, BF cycles the magnitude.")
+_cs_log_color_raw("V9.62: serverfail-retry magnitude USE-SITE guard (V9.44 fixed the setter, this guards the getter) — if the stored serverfail_retry_mag deviates >15° from the CURRENT learned per-side desync, the stored value is suspect (slot reuse / poisoned from an earlier engagement) and the fresh learned magnitude is used instead. Caught idx=11: BF:retry fired -44.5° on a proven 25.4° enemy (learned L=24.9°), a 19.6° overshoot whose origin wasn't derivable from the shot's own data. Free hardening: agrees with stored when sane, overrides only on wild drift.")
 _cs_log_color_raw("V9.61: sticky AA-classification for well-learned enemies — once we've HIT an enemy 4+ times (real_active), reclassifying its AA type on borderline yaw_cache noise just thrashes the resolver mode/label every few seconds (logs: idx=5 still+slow enemy flapped jitter<->static 6+ times while hitting 4/4; the slow flap dodged the 10s anti-flap window). Cold enemies stay responsive (7 evals / 2s lock); learned ones now need 14 consecutive evals + 4s lock to flip. measured_desync + side adapt independently so slower aa_type ≠ worse aim — pure smoothness. No hit-path change.")
 _cs_log_color_raw("V9.60: 'Air*' no longer pollutes best_mode storage — Air/Air-Alt/Air-CorrFlip are POSITIONAL (enemy airborne), not an AA-pattern, but were saved as best_static/best_switch when an enemy was hit mid-air. The known-player fast-path never uses them (only acts on Static/Jitter) so zero benefit, but intel.mode_match compared the grounded resolve (e.g. Static-Meas) against the stored 'Air' → false mismatch → +15 conf cancel threshold → good shots cancelled on known enemies (logs: idx=3 sw=Air, name_369738400 s=Air). Added '^Air' to the save-filter + the load migration (same V9.0 precedent that dropped BF:/*-Guess). Stats/cancel only, no aim-path change.")
 _cs_log_color_raw("Logging: " .. (log_enabled:get() and ("ON" .. (log_verbose:get() and " (verbose)" or ""))  or "OFF"))
