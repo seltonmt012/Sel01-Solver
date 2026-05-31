@@ -1,11 +1,11 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 9.59                                   ║
+-- ║  Version: 9.60                                   ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 9.59
+-- @version 9.60
 -- @description Correction side guard + serverfail retry:
 --   * correction/prediction-error misses now check SIDE evidence, not only
 --     magnitude. A BF shot on the unlearned opposite side no longer gets labeled
@@ -73,7 +73,7 @@
 --   * v9.26 drift-bump (alpha 0.55 on 5-10° diff) still handles small shifts.
 --   * v9.29 coach variants carry.
 
-local SEL01_VERSION = "9.59"
+local SEL01_VERSION = "9.60"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -1687,7 +1687,8 @@ local function learning_load()
                     if type(v) == "string" then
                         if v:find("%-Recall") then v = v:gsub("%-Recall", ""); migrated = migrated + 1 end
                         -- V9.0: drop unreliable fallback modes stored as "best"
-                        if v:find("^BF:") or v:find("%-Guess$") then
+                        -- V9.60: also drop positional "Air*" (see save-filter rationale)
+                        if v:find("^BF:") or v:find("%-Guess$") or v:find("^Air") then
                             v = ""
                             migrated = migrated + 1
                         end
@@ -1782,7 +1783,11 @@ local function learning_update_hit(p, side, desync_value, aa_type, mode)
     if aa_type and mode then
         local clean = tostring(mode):gsub("%+Pred", ""):gsub("%-DefInv", ""):gsub("%-Recall", "")
         -- V9.0: don't save brute-force or guess modes as "best" — they're fallbacks, not patterns
-        local is_fallback = clean:find("^BF:") or clean:find("%-Guess$") or clean == "Init"
+        -- V9.60: also filter "Air*" — Air/Air-Alt/Air-CorrFlip are POSITIONAL (enemy airborne),
+        -- not an AA-pattern. Stored as best_static/best_switch it never triggers the fast-path
+        -- (3400 only acts on Static/Jitter) but DOES break intel.mode_match on grounded resolves
+        -- (4435) → false mismatch → +15 conf cancel threshold → good shots cancelled. Pure liability.
+        local is_fallback = clean:find("^BF:") or clean:find("%-Guess$") or clean:find("^Air") or clean == "Init"
         if not is_fallback then
             local key = "best_" .. tostring(aa_type)
             e[key] = clean
@@ -5433,5 +5438,6 @@ _cs_log_color_raw("V9.50: server-fail filter readout — the V9.49 netcode-miss 
 _cs_log_color_raw("V9.49: confirmed server-fail keeps no longer pollute stats — a correct angle (err~0) the server rejects via a stale backtrack record (high bt, side kept) is netcode, not a resolver miss. It's now excluded from session hit-rate, per-mode stats, per-player rate AND the persistent learned ratio (s.missed still increments so BF cycle + force-baim escalate). Logs: idx=9 fired -21.8° ×3 into bt 20→10→5 err=0 then hit shot 4; idx=4 kept ×3 err=0.3 across Air+Jitter-Cls — these dragged session ~56% when true resolver rate was ~82% and falsely flagged Air as 'weak'. Plus never-hit explore: after 2 consecutive correct-angle keeps on a real_active==0 enemy, flip once to break a frozen wrong-side guess (idx=5 0/2 shot LEFT while passive leaned RIGHT 42.9°); a single real hit disables it.")
 _cs_log_color_raw("V9.43: backtrack-resistance escalates faster — point-blank fakelaggers with correct angle (our=meas, err=0) but server-reject (bt 7-10) now flip the resistant flag after 2 high-bt fails OR one bt>12, instead of 3 (was wasting 2 sure shots). Pairs with v9.40 full-spread multipoint to catch slightly-stale records.")
 _cs_log_color_raw("V9.42: side-flip from SIDE evidence not magnitude error — ack_angle_err is a MAGNITUDE metric (wrong-side miss = small err, magnitude overshoot = large err), so old 'err>5 → flip' flipped the correct side on magnitude misses (idx=4: real 36°L, we 55°L, wrongly flipped R). Now flip only on learned side-conflict or blind first-contact; magnitude misses keep side, BF cycles the magnitude.")
+_cs_log_color_raw("V9.60: 'Air*' no longer pollutes best_mode storage — Air/Air-Alt/Air-CorrFlip are POSITIONAL (enemy airborne), not an AA-pattern, but were saved as best_static/best_switch when an enemy was hit mid-air. The known-player fast-path never uses them (only acts on Static/Jitter) so zero benefit, but intel.mode_match compared the grounded resolve (e.g. Static-Meas) against the stored 'Air' → false mismatch → +15 conf cancel threshold → good shots cancelled on known enemies (logs: idx=3 sw=Air, name_369738400 s=Air). Added '^Air' to the save-filter + the load migration (same V9.0 precedent that dropped BF:/*-Guess). Stats/cancel only, no aim-path change.")
 _cs_log_color_raw("Logging: " .. (log_enabled:get() and ("ON" .. (log_verbose:get() and " (verbose)" or ""))  or "OFF"))
 _cs_log_color_raw("=========================================")
