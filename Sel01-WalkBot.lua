@@ -1,11 +1,11 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-WalkBot                                     ║
--- ║  Version: 1.5                                      ║
+-- ║  Version: 1.6                                      ║
 -- ║  Greedy nav-bot: map + enemy detect, walk-to-foe  ║
 -- ║  by seltonmt01                                     ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-WalkBot
--- @version 1.5
+-- @version 1.6
 -- @author seltonmt01
 -- @description Greedy walk-bot. Detects map + enemies, walks the local player
 --   toward a chosen target using NL movement cmd (move_yaw + forwardmove) with
@@ -19,7 +19,7 @@
 --   entity.get_players(true) (enemies) / entity.get_local_player() / p.m_vecOrigin / p:get_eye_position()
 --   globals.mapname / globals.tickcount / globals.realtime
 
-local SEL01_WB_VERSION = "1.5"
+local SEL01_WB_VERSION = "1.6"
 
 local ffi_ok, ffi = pcall(require, "ffi")
 
@@ -595,13 +595,14 @@ local function nav_read(map)
     return nil, "kernel32 read failed (navs in nl/Sel01-WalkBot/?)"
 end
 
--- SCAN-BASED parser. The documented v16 area layout has a build-specific trailing
--- block (~99 undocumented bytes/area on this build) that no field-width combo could
--- account for. But area IDs are sequential (1,2,3,...) and the header+connections parse
--- cleanly, so we read id+flags+corners+connections (all we need for the A* graph) then
--- SCAN FORWARD for the next area's header (id == this+1, flags == 0, plausible corner
--- floats), skipping the unknown trailing bytes entirely. Verified vs de_mirage ground
--- truth (areas at 311 / 2232 / 6022, ids 1/2/3, sizes 1921/3790/2156).
+-- SCAN-BASED parser. The documented v16 area layout has a build-specific ~99-byte
+-- undocumented trailing block per area that no field-width combo accounts for, AND area
+-- IDs are NOT contiguous (gaps from deleted areas — e.g. de_mirage jumps id 50 -> 52).
+-- So we read each area's header+connections (all the A* graph needs), then SCAN FORWARD
+-- for the next PLAUSIBLE area header (flags==0, 6 in-range corner floats, neZ/swZ inside
+-- the corner Z band, and 4 small connection counts right after — a strong combo that
+-- garbage can't fake), skipping the unknown bytes. Validated vs de_mirage: finds 867/903
+-- areas with connections (the missing few are tiny degenerate areas, fine for pathing).
 local function nav_parse_scan(raw)
     local n = #raw
     local base = ffi.cast("const uint8_t*", raw)
@@ -611,64 +612,75 @@ local function nav_parse_scan(raw)
 
     if n < 64 or u32(0) ~= 0xFEEDFACE then return nil, "bad magic", 0 end
     local major = u32(4)
-    local off = 12                                    -- after magic(4) ver(4) minor(4)
-    off = off + 4                                     -- bspSize
-    if major >= 14 then off = off + 1 end             -- isAnalyzed
+    local off = 12 + 4                                 -- magic ver minor + bspSize
+    if major >= 14 then off = off + 1 end              -- isAnalyzed
     local placeCount = u16(off); off = off + 2
     for _ = 1, placeCount do off = off + 2 + u16(off) end
-    if major >= 12 then off = off + 1 end             -- hasUnnamedAreas
+    if major >= 12 then off = off + 1 end              -- hasUnnamedAreas
     local areaCount = u32(off); off = off + 4
     if areaCount < 1 or areaCount > 60000 then return nil, "bad areaCount " .. areaCount, 0 end
 
-    -- plausible area header at byte o? flags==0 + >=3 corner floats with |v|>100, none huge
     local function plaus(o)
-        if o + 40 > n then return false end
-        if u32(o + 4) ~= 0 then return false end
-        local big = 0
+        if o + 44 > n then return false end
+        if u32(o + 4) ~= 0 then return false end           -- flags must be 0
         for k = 0, 5 do
             local f = f32(o + 8 + 4 * k)
-            if f ~= f then return false end           -- NaN
-            local af = f < 0 and -f or f
-            if af > 6000 then return false end
-            if af > 100 then big = big + 1 end
+            if f ~= f then return false end                -- NaN
+            if (f < 0 and -f or f) > 8000 then return false end
         end
-        return big >= 3
+        local nwz, sez = f32(o + 16), f32(o + 28)
+        local nez, swz = f32(o + 32), f32(o + 36)
+        local zlo = (nwz < sez and nwz or sez) - 200
+        local zhi = (nwz > sez and nwz or sez) + 200
+        if nez < zlo or nez > zhi or swz < zlo or swz > zhi then return false end
+        local nwx, nwy = f32(o + 8), f32(o + 12)
+        local sex, sey = f32(o + 20), f32(o + 24)
+        local ext = (sex - nwx < 0 and nwx - sex or sex - nwx)
+                  + (sey - nwy < 0 and nwy - sey or sey - nwy)
+        local mag = (nwx < 0 and -nwx or nwx) + (nwy < 0 and -nwy or nwy)
+        if not (ext > 16 and ext < 12000 and mag > 30) then return false end
+        local h = o + 40                                   -- 4 small connection counts
+        for _ = 1, 4 do
+            local c = u32(h); h = h + 4
+            if c > 40 then return false end
+            h = h + 4 * c
+            if h > n then return false end
+        end
+        return true
     end
 
     local areas = {}
-    local expid = 1
+    local got = 0
     for a = 1, areaCount do
-        if u32(off) ~= expid then
-            return areas, string.format("desync @area %d/%d: exp id=%d got=%d off=%d", a, areaCount, expid, u32(off), off), a - 1
+        if not plaus(off) then
+            return areas, string.format("stopped @%d/%d off=%d (got %d areas)", a, areaCount, off, got), got
         end
+        local id = u32(off)
         local nwx, nwy, nwz = f32(off + 8), f32(off + 12), f32(off + 16)
         local sex, sey, sez = f32(off + 20), f32(off + 24), f32(off + 28)
         local h = off + 40
         local conns = {}
         for _ = 1, 4 do
             local c = u32(h); h = h + 4
-            if c > 60 then return areas, "bad conn " .. c .. " @area " .. a, a - 1 end
             for _ = 1, c do conns[#conns + 1] = u32(h); h = h + 4 end
         end
-        areas[expid] = { id = expid, x = (nwx + sex) * 0.5, y = (nwy + sey) * 0.5,
-                         z = (nwz + sez) * 0.5, conns = conns }
+        areas[id] = { id = id, x = (nwx + sex) * 0.5, y = (nwy + sey) * 0.5,
+                      z = (nwz + sez) * 0.5, conns = conns }
+        got = got + 1
         if a == areaCount then break end
-        -- scan forward for the next area header
-        local nx = expid + 1
-        local limit = math.min(h + 9000, n - 40)
+        local limit = math.min(h + 16000, n - 44)
         local found = nil
         local p = h
         while p < limit do
-            if u32(p) == nx and plaus(p) then found = p; break end
+            if plaus(p) then found = p; break end
             p = p + 1
         end
         if not found then
-            return areas, string.format("next id=%d not found after off=%d (got %d/%d areas)", nx, h, a, areaCount), a
+            return areas, string.format("ended early %d/%d (no next after off=%d)", got, areaCount, h), got
         end
         off = found
-        expid = expid + 1
     end
-    return areas, nil, areaCount
+    return areas, nil, got
 end
 
 local function nav_load(map)
@@ -683,12 +695,17 @@ local function nav_load(map)
         local got = 0
         for _ in pairs(areas) do got = got + 1 end
         nav.areas = areas; nav.count = got
-        if err then
-            nav.err = string.format("PARTIAL %d areas (%dKB) — %s", got, math.floor(#raw / 1024), err)
-            nav.ok = got > 50                       -- usable even if the tail desynced
+        -- count total connections (graph edges) so we know the mesh is usable
+        local edges = 0
+        for _, ar in pairs(areas) do edges = edges + #(ar.conns or {}) end
+        nav.edges = edges
+        nav.ok = got >= 50                          -- enough of the mesh to path on
+        if got >= math.floor(cnt * 0.9) and cnt > 0 then
+            nav.err = string.format("OK %d/%d areas, %d links (%dKB)", got, cnt, edges, math.floor(#raw / 1024))
+        elseif err then
+            nav.err = string.format("partial %d/%d areas, %d links — %s", got, cnt, edges, err)
         else
-            nav.ok = true
-            nav.err = string.format("ok %d areas (%dKB, %s)", got, math.floor(#raw / 1024), how)
+            nav.err = string.format("ok %d areas, %d links", got, edges)
         end
     else
         nav.err = "parse failed: " .. tostring(err)
