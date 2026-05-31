@@ -1,11 +1,11 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-WalkBot                                     ║
--- ║  Version: 1.3                                      ║
+-- ║  Version: 1.4                                      ║
 -- ║  Greedy nav-bot: map + enemy detect, walk-to-foe  ║
 -- ║  by seltonmt01                                     ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-WalkBot
--- @version 1.3
+-- @version 1.4
 -- @author seltonmt01
 -- @description Greedy walk-bot. Detects map + enemies, walks the local player
 --   toward a chosen target using NL movement cmd (move_yaw + forwardmove) with
@@ -19,7 +19,7 @@
 --   entity.get_players(true) (enemies) / entity.get_local_player() / p.m_vecOrigin / p:get_eye_position()
 --   globals.mapname / globals.tickcount / globals.realtime
 
-local SEL01_WB_VERSION = "1.3"
+local SEL01_WB_VERSION = "1.4"
 
 local ffi_ok, ffi = pcall(require, "ffi")
 
@@ -157,6 +157,7 @@ local state = {
     enemy_history = {},        -- per-enemy-index last seen {x,y,z,t} (not all visible)
     pass_crouch  = false,      -- ducking to fit through a low passage (mirage vents etc)
     wpn_t        = 0,          -- last auto-primary deploy
+    bad_spots    = {},         -- learned stuck spots {x,y} (persisted, avoided)
 }
 -- button -> tick drain flags (module globals: button closures run before `state`
 -- helpers are bound; globals dodge the forward-reference trap, Solver pattern).
@@ -331,6 +332,38 @@ local function wp_load(map)
     end
 end
 
+-- ─── learned bad spots (where we keep getting stuck) — persisted, avoided ───
+local function bad_path(map) return "nl/Sel01-WalkBot/" .. tostring(map or "unknown") .. "_bad.txt" end
+local function bad_save()
+    local lines = {}
+    for _, s in ipairs(state.bad_spots) do lines[#lines + 1] = string.format("%.1f %.1f", s.x, s.y) end
+    pcall(function() files.write(bad_path(state.wp_map), table.concat(lines, "\n")) end)
+end
+local function bad_load(map)
+    state.bad_spots = {}
+    local data = nil
+    pcall(function() data = files.read(bad_path(map)) end)
+    if data then
+        for line in tostring(data):gmatch("[^\r\n]+") do
+            local x, y = line:match("(-?[%d.]+)%s+(-?[%d.]+)")
+            if x then state.bad_spots[#state.bad_spots + 1] = { x = tonumber(x), y = tonumber(y) } end
+        end
+    end
+end
+local function near_bad(x, y, r)
+    for _, s in ipairs(state.bad_spots) do
+        local dx, dy = s.x - x, s.y - y
+        if dx * dx + dy * dy < r * r then return true end
+    end
+    return false
+end
+local function record_bad(lo)
+    if #state.bad_spots >= 120 then return end
+    if near_bad(lo.x, lo.y, 140) then return end          -- already known
+    state.bad_spots[#state.bad_spots + 1] = { x = lo.x, y = lo.y }
+    bad_save()
+end
+
 -- auto-learn the route while travelling: drop a waypoint when we're >220u from every
 -- existing one. Builds + PERSISTS a route over time (survives script restart, no manual
 -- recording needed). Capped so the file can't grow forever.
@@ -342,6 +375,7 @@ local function auto_learn(lo, now, base_act)
     if (now - (state.learn_t or 0)) < 0.6 then return end
     state.learn_t = now
     if #state.waypoints >= 250 then return end
+    if near_bad(lo.x, lo.y, 160) then return end          -- don't memorise a known-bad spot
     local nd = 1e18
     for _, w in ipairs(state.waypoints) do
         local dx, dy = w.x - lo.x, w.y - lo.y
@@ -486,6 +520,7 @@ local function compute_move(lp, lo, want_yaw, now, base_act)
                 state.diag = base_act .. " WEDGED -> hard escape"
                 move_yaw = state.escape_yaw
                 state.stuck_since = now
+                record_bad(lo)                              -- learn: this is a bad spot
             elseif dur > 0.35 then
                 state.activity = "STUCK"
                 move_yaw = want_yaw + (state.avoid_dir ~= 0 and state.avoid_dir or 1) * 90
@@ -690,7 +725,7 @@ local function walkbot_tick(cmd)
         _wb_pending_clear = false
         state.waypoints = {}; state.wp_idx = 1; wp_save()
     end
-    if state.wp_map ~= state.mapname then wp_load(state.mapname) end
+    if state.wp_map ~= state.mapname then wp_load(state.mapname); bad_load(state.mapname) end
     -- nav-mesh: (re)load on map change when the toggle is on
     local use_nav = false
     pcall(function() use_nav = wb_nav and wb_nav:get() end)
