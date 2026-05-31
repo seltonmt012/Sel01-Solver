@@ -1,11 +1,11 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-WalkBot                                     ║
--- ║  Version: 1.0                                      ║
+-- ║  Version: 1.1                                      ║
 -- ║  Greedy nav-bot: map + enemy detect, walk-to-foe  ║
 -- ║  by seltonmt01                                     ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-WalkBot
--- @version 1.0
+-- @version 1.1
 -- @author seltonmt01
 -- @description Greedy walk-bot. Detects map + enemies, walks the local player
 --   toward a chosen target using NL movement cmd (move_yaw + forwardmove) with
@@ -19,7 +19,7 @@
 --   entity.get_players(true) (enemies) / entity.get_local_player() / p.m_vecOrigin / p:get_eye_position()
 --   globals.mapname / globals.tickcount / globals.realtime
 
-local SEL01_WB_VERSION = "1.0"
+local SEL01_WB_VERSION = "1.1"
 
 local ffi_ok, ffi = pcall(require, "ffi")
 
@@ -459,17 +459,51 @@ local nav = { ok = false, map = nil, count = 0, areas = nil, err = "not loaded" 
 -- 'cannot read this file') — so we never touch it. fopen returns NULL on miss, clean.
 -- We pre-copy the maps into nl/Sel01-WalkBot/ (game-root relative) for a guaranteed
 -- readable spot, plus try the live csgo/maps and an absolute install path.
--- We pre-copy the maps into nl/Sel01-WalkBot/ (the NL files base = game root, verified
--- via nl/Sel01-Solver/learned.lua). files.read POPS an error dialog on a MISSING path
--- (the v0.8 crash) — but NOT on a present one, and the copied file IS present, so
--- reading it is safe. ffi.C.fopen is unavailable in the NL sandbox, so files.read is
--- the only working reader. We guard with a presence flag the user can't easily break.
+-- Reading the binary .nav: files.read TRUNCATES at the first null byte (the nav header
+-- has 0x00 at byte 5), and ffi.C.fopen is unavailable in the NL sandbox. So we read via
+-- kernel32 ReadFile (ffi.load works here — the Solver uses it for clipboard). Reads the
+-- full binary, no truncation. Navs are pre-copied into nl/Sel01-WalkBot/.
+local nav_k32, nav_cdef_ok
+if ffi_ok and ffi then
+    nav_cdef_ok = pcall(ffi.cdef, [[
+        void* CreateFileA(const char* name, unsigned long access, unsigned long share, void* sec, unsigned long disp, unsigned long flags, void* templ);
+        int ReadFile(void* h, void* buf, unsigned long nNumberOfBytesToRead, unsigned long* lpNumberOfBytesRead, void* lpOverlapped);
+        unsigned long GetFileSize(void* h, void* lpFileSizeHigh);
+        int CloseHandle(void* h);
+    ]])
+    local ok; ok, nav_k32 = pcall(ffi.load, "kernel32")
+    if not ok then nav_k32 = nil end
+end
+
+local NAV_BASES = {
+    "nl/Sel01-WalkBot/",
+    "E:/SteamLibrary/steamapps/common/Counter-Strike Global Offensive/nl/Sel01-WalkBot/",
+    "csgo/maps/",
+    "E:/SteamLibrary/steamapps/common/Counter-Strike Global Offensive/csgo/maps/",
+}
+
 local function nav_read(map)
-    local path = "nl/Sel01-WalkBot/" .. map .. ".nav"
-    local data = nil
-    local ok = pcall(function() data = files.read(path) end)
-    if ok and data and #data > 64 then return data, "files.read " .. path end
-    return nil, "not found: " .. path .. " (copy <map>.nav into nl/Sel01-WalkBot/)"
+    if not (ffi_ok and ffi and nav_cdef_ok and nav_k32) then return nil, "no ffi/kernel32" end
+    local INVALID = ffi.cast("void*", -1)
+    for _, base in ipairs(NAV_BASES) do
+        local got = nil
+        pcall(function()
+            local h = nav_k32.CreateFileA(base .. map .. ".nav", 0x80000000, 1, nil, 3, 0x80, nil)
+            if h ~= nil and h ~= INVALID then
+                local sz = tonumber(nav_k32.GetFileSize(h, nil)) or 0
+                if sz > 64 and sz < 50000000 then
+                    local buf = ffi.new("uint8_t[?]", sz)
+                    local rd = ffi.new("unsigned long[1]")
+                    if nav_k32.ReadFile(h, buf, sz, rd, nil) ~= 0 then
+                        got = ffi.string(buf, tonumber(rd[0]))
+                    end
+                end
+                nav_k32.CloseHandle(h)
+            end
+        end)
+        if got and #got > 64 then return got, "kernel32 " .. base end
+    end
+    return nil, "kernel32 read failed (navs in nl/Sel01-WalkBot/?)"
 end
 
 -- parse with a given layout variant; returns areas table + final offset, or errors.
