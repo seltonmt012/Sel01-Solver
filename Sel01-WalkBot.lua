@@ -1,11 +1,11 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-WalkBot                                     ║
--- ║  Version: 1.6                                      ║
+-- ║  Version: 1.7                                      ║
 -- ║  Greedy nav-bot: map + enemy detect, walk-to-foe  ║
 -- ║  by seltonmt01                                     ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-WalkBot
--- @version 1.6
+-- @version 1.7
 -- @author seltonmt01
 -- @description Greedy walk-bot. Detects map + enemies, walks the local player
 --   toward a chosen target using NL movement cmd (move_yaw + forwardmove) with
@@ -19,7 +19,7 @@
 --   entity.get_players(true) (enemies) / entity.get_local_player() / p.m_vecOrigin / p:get_eye_position()
 --   globals.mapname / globals.tickcount / globals.realtime
 
-local SEL01_WB_VERSION = "1.6"
+local SEL01_WB_VERSION = "1.7"
 
 local ffi_ok, ffi = pcall(require, "ffi")
 
@@ -158,6 +158,10 @@ local state = {
     pass_crouch  = false,      -- ducking to fit through a low passage (mirage vents etc)
     wpn_t        = 0,          -- last auto-primary deploy
     bad_spots    = {},         -- learned stuck spots {x,y} (persisted, avoided)
+    nav_path     = nil,        -- cached A* route (list of area centers)
+    nav_goal_id  = nil,
+    nav_path_t   = 0,
+    nav_path_len = 0,
 }
 -- button -> tick drain flags (module globals: button closures run before `state`
 -- helpers are bound; globals dodge the forward-reference trap, Solver pattern).
@@ -447,7 +451,7 @@ end
 -- shared: take a desired world yaw, probe-avoid obstacles + handle stuck, return the
 -- adjusted move_yaw. Sets state.activity/block/diag and schedules jumps. base_act is
 -- the activity label this caller wants ("WALK" / "ROAM" / "WANDER").
-local function compute_move(lp, lo, want_yaw, now, base_act)
+local function compute_move(lp, lo, want_yaw, now, base_act, no_stuck)
     local probe = 55
     pcall(function() probe = wb_probe:get() end)
     local aj = true
@@ -502,8 +506,11 @@ local function compute_move(lp, lo, want_yaw, now, base_act)
         end
     end
 
-    -- ESCALATING stuck breakout (shared by walk / roam / wander)
-    if state.last_origin then
+    -- ESCALATING stuck breakout (shared by walk / roam / wander). Skipped when the caller
+    -- is intentionally holding/peeking in place (no_stuck) — that's not being wedged, it's
+    -- a chosen safe position, and flagging it as STUCK made it dance off a good angle.
+    if no_stuck then state.stuck_since = 0 end
+    if state.last_origin and not no_stuck then
         local moved = v_len2d(vector(lo.x - state.last_origin.x, lo.y - state.last_origin.y, 0))
         if moved < 1.5 then
             if state.stuck_since == 0 then state.stuck_since = now end
@@ -725,6 +732,61 @@ local function nav_nearest(x, y)
     return best, bestd and math.sqrt(bestd) or 0
 end
 
+-- A* over the area graph. start/goal = area ids. Returns an ordered list of area
+-- centers {x,y,z} (the route), or nil if unreachable.
+local function nav_astar(startId, goalId)
+    local areas = nav.areas
+    if not (areas and areas[startId] and areas[goalId]) then return nil end
+    if startId == goalId then return { areas[goalId] } end
+    local goal = areas[goalId]
+    local function hcost(a) local dx, dy = a.x - goal.x, a.y - goal.y; return math.sqrt(dx * dx + dy * dy) end
+    local open, came, g, f, closed = { [startId] = true }, {}, { [startId] = 0 }, { [startId] = hcost(areas[startId]) }, {}
+    local guard = 0
+    while next(open) and guard < 6000 do
+        guard = guard + 1
+        local cur, curf
+        for id in pairs(open) do if not curf or f[id] < curf then cur, curf = id, f[id] end end
+        if cur == goalId then
+            local path, c = {}, cur
+            while c do table.insert(path, 1, areas[c]); c = came[c] end
+            return path
+        end
+        open[cur] = nil; closed[cur] = true
+        local ca = areas[cur]
+        for _, nb in ipairs(ca.conns) do
+            local na = areas[nb]
+            if na and not closed[nb] then
+                local dx, dy = ca.x - na.x, ca.y - na.y
+                local tg = g[cur] + math.sqrt(dx * dx + dy * dy)
+                if not g[nb] or tg < g[nb] then
+                    came[nb] = cur; g[nb] = tg; f[nb] = tg + hcost(na); open[nb] = true
+                end
+            end
+        end
+    end
+    return nil
+end
+
+-- direction (deg) to walk toward a world goal, ROUTED through the nav mesh when loaded
+-- (real map paths), else a straight line. Caches the path per goal-area; advances as we
+-- reach each node. This is what turns "beeline into walls" into "follow the map".
+local function nav_dir(lo, gx, gy, now)
+    if not nav.ok then return dir_yaw(lo, { x = gx, y = gy }) end
+    local ga = nav_nearest(gx, gy)
+    local sa = nav_nearest(lo.x, lo.y)
+    if not (ga and sa) then return dir_yaw(lo, { x = gx, y = gy }) end
+    if state.nav_goal_id ~= ga.id or not state.nav_path or (now - (state.nav_path_t or 0)) > 1.5 then
+        state.nav_path = nav_astar(sa.id, ga.id)
+        state.nav_goal_id = ga.id
+        state.nav_path_t = now
+    end
+    local path = state.nav_path
+    if not path or #path == 0 then return dir_yaw(lo, { x = gx, y = gy }) end
+    while #path > 1 and v_len2d(vector(path[1].x - lo.x, path[1].y - lo.y, 0)) < 130 do table.remove(path, 1) end
+    state.nav_path_len = #path
+    return dir_yaw(lo, path[1])
+end
+
 -- ─── main movement driver ────────────────────────────────
 local function walkbot_tick(cmd)
     -- single on/off via the switch — no hotkey (user request)
@@ -823,7 +885,7 @@ local function walkbot_tick(cmd)
                         local yaw = math.rad(dir_yaw(lo, to))
                         local px, py = -math.sin(yaw), math.cos(yaw)
                         local s = (state.peek_phase == "out") and pside or -pside
-                        local move_yaw = compute_move(lp, lo, math.deg(math.atan2(py * s, px * s)), now, "HOLD")
+                        local move_yaw = compute_move(lp, lo, math.deg(math.atan2(py * s, px * s)), now, "HOLD", true)
                         local sw = 110; pcall(function() sw = wb_slowspd:get() end)
                         if state.activity == "HOLD" then
                             state.diag = string.format("HOLD peek=%s side=%d d=%.0f enemy=%s", state.peek_phase, pside, dist, mstate)
@@ -852,7 +914,7 @@ local function walkbot_tick(cmd)
                 want_yaw = want_yaw + (state.peek_side or 1) * 75
             end
 
-            local move_yaw = compute_move(lp, lo, want_yaw, now, "WALK")
+            local move_yaw = compute_move(lp, lo, want_yaw, now, "WALK", close)
             local near = (peekslow and dist <= peekrng) or close
             local spd = 450; pcall(function() spd = wb_speed:get() end)
             if near then
@@ -893,10 +955,13 @@ local function walkbot_tick(cmd)
     -- HUNT only when the last-seen enemy is reasonably CLOSE (mid-range). A FAR enemy
     -- (e.g. 3k at round start) -> walk the learned ROUTE toward them instead of
     -- beelining across the whole map (that was the "thinks 3k is near" dumbness).
-    if hgoal and hdist < 1500 then
-        move_yaw = compute_move(lp, lo, dir_yaw(lo, hgoal), now, "ROAM")
+    if hgoal then
+        -- nav-routed approach to the last-seen enemy (real map path, any distance now
+        -- that A* handles it). Falls back to straight line if nav isn't loaded.
+        move_yaw = compute_move(lp, lo, nav_dir(lo, hgoal.x, hgoal.y, now), now, "ROAM")
         if state.activity == "ROAM" then
-            state.diag = string.format("HUNT last-seen enemy d=%.0f age=%.0fs", hdist, now - ht)
+            state.diag = string.format("HUNT enemy d=%.0f age=%.0fs%s", hdist, now - ht,
+                nav.ok and string.format(" nav(%d)", state.nav_path_len or 0) or " (greedy)")
         end
     elseif #state.waypoints > 0 then
         local wp = state.waypoints[state.wp_idx] or state.waypoints[1]
@@ -915,10 +980,11 @@ local function walkbot_tick(cmd)
         -- LEAVE SPAWN: nothing learned yet + no enemy seen. Most CSGO maps are centered
         -- near world origin, so head toward (0,0) = mid to get OUT of spawn instead of
         -- circling it. Small position-seeded jitter so a wall doesn't pin us.
-        local jitter = (math.floor(math.abs(lo.x) + now) % 40) - 20
-        move_yaw = compute_move(lp, lo, dir_yaw(lo, { x = 0, y = 0 }) + jitter, now, "WANDER")
+        local heading = nav.ok and nav_dir(lo, 0, 0, now) or (dir_yaw(lo, { x = 0, y = 0 }) + (math.floor(math.abs(lo.x) + now) % 40) - 20)
+        move_yaw = compute_move(lp, lo, heading, now, "WANDER")
         if state.activity == "WANDER" then
-            state.diag = string.format("LEAVE-SPAWN -> mid d=%.0f", v_len2d(vector(lo.x, lo.y, 0)))
+            state.diag = string.format("LEAVE-SPAWN -> mid d=%.0f%s", v_len2d(vector(lo.x, lo.y, 0)),
+                nav.ok and string.format(" nav(%d)", state.nav_path_len or 0) or "")
         end
     else
         -- near mid, nothing known: gentle wander. Repick on block / wedge / every ~3s.
