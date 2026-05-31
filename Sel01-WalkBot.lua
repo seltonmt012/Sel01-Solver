@@ -1,11 +1,11 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-WalkBot                                     ║
--- ║  Version: 0.5                                      ║
+-- ║  Version: 0.6                                      ║
 -- ║  Greedy nav-bot: map + enemy detect, walk-to-foe  ║
 -- ║  by seltonmt01                                     ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-WalkBot
--- @version 0.5
+-- @version 0.6
 -- @author seltonmt01
 -- @description Greedy walk-bot. Detects map + enemies, walks the local player
 --   toward a chosen target using NL movement cmd (move_yaw + forwardmove) with
@@ -19,7 +19,7 @@
 --   entity.get_players(true) (enemies) / entity.get_local_player() / p.m_vecOrigin / p:get_eye_position()
 --   globals.mapname / globals.tickcount / globals.realtime
 
-local SEL01_WB_VERSION = "0.5"
+local SEL01_WB_VERSION = "0.6"
 
 local ffi_ok, ffi = pcall(require, "ffi")
 
@@ -73,6 +73,7 @@ end
 
 local wb_enable, wb_mode, wb_stopdist, wb_autojump, wb_probe, wb_speed, wb_hud, wb_debug
 local wb_peekslow, wb_peekrng, wb_slowspd, wb_bhop, wb_clantag, wb_nav
+local wb_holdcnr, wb_holdmin
 pcall(function()
     wb_enable   = g_main:switch("Enable WalkBot")                 -- the on/off switch (no hotkey)
     wb_mode     = g_main:combo("Target Pick", "Nearest", "Lowest HP", "Most Visible", "Crosshair")
@@ -85,6 +86,10 @@ pcall(function()
     wb_peekslow = g_main:switch("Slow-Walk Peek (near visible enemy)")
     wb_peekrng  = g_main:slider("Peek Range (slow-walk under)", 200, 1500, 750)
     wb_slowspd  = g_main:slider("Slow-Walk Speed", 40, 160, 110)
+    -- hold a corner + shoulder-peek + wait for the enemy to push, instead of
+    -- charging straight in (HvH-correct positioning).
+    wb_holdcnr  = g_main:switch("Hold Corner (bait the push, don't rush)")
+    wb_holdmin  = g_main:slider("Hold Until Enemy Within", 120, 900, 350)
     -- roam: when NO enemy, follow recorded waypoints (walk the route yourself once,
     -- the bot replays it). No waypoints -> wander+avoid so it still explores.
     g_main:button("Record Waypoint (drop my pos)", function() _wb_pending_record = true end)
@@ -100,6 +105,7 @@ pcall(function() if wb_autojump then wb_autojump:set(true) end end)
 pcall(function() if wb_peekslow then wb_peekslow:set(true) end end)
 pcall(function() if wb_bhop then wb_bhop:set(true) end end)
 pcall(function() if wb_clantag then wb_clantag:set(true) end end)
+pcall(function() if wb_holdcnr then wb_holdcnr:set(true) end end)
 pcall(function() if wb_hud then wb_hud:set(true) end end)
 
 -- ─── runtime state ───────────────────────────────────────
@@ -127,6 +133,10 @@ local state = {
     clantag_set  = false,      -- current clantag mirror
     bhop_flip_t  = 0,          -- air-strafe side timer (bhop on routes)
     bhop_side    = 1,
+    -- hold-corner / shoulder-peek
+    peek_phase   = "in",       -- "out" (revealing) / "in" (behind cover)
+    peek_phase_t = 0,
+    hold_since   = 0,          -- when we started holding (timeout -> push)
 }
 -- button -> tick drain flags (module globals: button closures run before `state`
 -- helpers are bound; globals dodge the forward-reference trap, Solver pattern).
@@ -277,6 +287,37 @@ local function wp_load(map)
             if x then state.waypoints[#state.waypoints + 1] = {x = tonumber(x), y = tonumber(y), z = tonumber(z)} end
         end
     end
+end
+
+-- corner assessment (trace-based, no nav needed): am I behind a corner relative to
+-- the enemy? Direct eye-line blocked but a sideways-offset line is clear => stepping
+-- to that side reveals them => hold here and shoulder-peek that side. Returns:
+--   "hold_corner", side  -> behind cover, peek toward `side` (1 right / -1 left)
+--   "open", 0            -> no usable corner, fight/approach normally
+local function assess_corner(lp, lo, to)
+    local fe, te = get_eye(lp), get_eye(to)
+    if not fe or not te then return "open", 0 end
+    local direct = false
+    pcall(function()
+        local r = utils.trace_line(fe, te, lp)
+        direct = r and (r.fraction or 0) >= 0.95
+    end)
+    local yaw = math.rad(dir_yaw(lo, to))
+    local px, py = -math.sin(yaw), math.cos(yaw)        -- unit perpendicular to enemy dir
+    local function side_clear(s)
+        local from = vector(lo.x + px * 45 * s, lo.y + py * 45 * s, (fe.z or lo.z + 64))
+        local clear = false
+        pcall(function()
+            local r = utils.trace_line(from, te, lp)
+            clear = r and (r.fraction or 0) >= 0.95
+        end)
+        return clear
+    end
+    if not direct then
+        local cr, cl = side_clear(1), side_clear(-1)
+        if cr or cl then return "hold_corner", (cr and 1 or -1) end
+    end
+    return "open", 0
 end
 
 -- shared: take a desired world yaw, probe-avoid obstacles + handle stuck, return the
@@ -527,6 +568,42 @@ local function walkbot_tick(cmd)
             -- resolver misses our moving/desynced model while our ragebot lands.
             local peek_active = peekslow and los and dist <= peekrng
 
+            -- ── HOLD CORNER: bait the push instead of rushing (HvH-correct). Only while
+            -- the enemy is still beyond hold-min (hasn't pushed) AND we're behind a
+            -- corner (stepping sideways reveals them). Shoulder-peek out/in; ragebot
+            -- fires on the out-phase. Times out after 6s so we don't stall forever. ──
+            local holdcnr = false; pcall(function() holdcnr = wb_holdcnr and wb_holdcnr:get() end)
+            local holdmin = 350; pcall(function() holdmin = wb_holdmin:get() end)
+            if holdcnr and dist > holdmin then
+                local cmode, pside = assess_corner(lp, lo, to)
+                if cmode == "hold_corner" then
+                    if state.hold_since == 0 then state.hold_since = now end
+                    if (now - state.hold_since) < 6.0 then
+                        local dur = (state.peek_phase == "out") and 0.22 or 0.55
+                        if (now - (state.peek_phase_t or 0)) > dur then
+                            state.peek_phase = (state.peek_phase == "out") and "in" or "out"
+                            state.peek_phase_t = now
+                        end
+                        local yaw = math.rad(dir_yaw(lo, to))
+                        local px, py = -math.sin(yaw), math.cos(yaw)
+                        local s = (state.peek_phase == "out") and pside or -pside
+                        local move_yaw = compute_move(lp, lo, math.deg(math.atan2(py * s, px * s)), now, "HOLD")
+                        local sw = 110; pcall(function() sw = wb_slowspd:get() end)
+                        if state.activity == "HOLD" then
+                            state.diag = string.format("HOLD corner peek=%s side=%d d=%.0f (bait)", state.peek_phase, pside, dist)
+                        end
+                        pcall(function() cmd.move_yaw = move_yaw; cmd.forwardmove = sw; cmd.sidemove = 0 end)
+                        if now <= (state.jump_until or 0) then pcall(function() cmd.in_jump = true end) end
+                        state.last_origin = lo
+                        return
+                    end   -- else: held too long -> fall through and push
+                else
+                    state.hold_since = 0
+                end
+            else
+                state.hold_since = 0
+            end
+
             if not peek_active and dist <= stop_d and los then
                 state.activity = "STOP"; state.block = "clear"
                 state.diag = string.format("in range %.0f + LoS -> hold", dist)
@@ -645,6 +722,7 @@ local COL = {
     stop   = function() return color(120, 200, 255, 255) end,
     peek   = function() return color(200, 120, 255, 255) end,
     roam   = function() return color(120, 220, 200, 255) end,
+    hold   = function() return color(255, 160, 60, 255) end,
     idle   = function() return color(150, 150, 150, 255) end,
 }
 local function act_color(a)
@@ -653,6 +731,7 @@ local function act_color(a)
     elseif a == "STUCK" then return COL.stuck()
     elseif a == "STOP" then return COL.stop()
     elseif a == "PEEK" then return COL.peek()
+    elseif a == "HOLD" then return COL.hold()
     elseif a == "ROAM" or a == "WANDER" then return COL.roam()
     else return COL.idle() end
 end
