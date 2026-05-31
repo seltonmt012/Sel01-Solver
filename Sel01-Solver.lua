@@ -1,11 +1,11 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 9.56                                   ║
+-- ║  Version: 9.57                                   ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 9.56
+-- @version 9.57
 -- @description Correction side guard + serverfail retry:
 --   * correction/prediction-error misses now check SIDE evidence, not only
 --     magnitude. A BF shot on the unlearned opposite side no longer gets labeled
@@ -73,7 +73,7 @@
 --   * v9.26 drift-bump (alpha 0.55 on 5-10° diff) still handles small shifts.
 --   * v9.29 coach variants carry.
 
-local SEL01_VERSION = "9.56"
+local SEL01_VERSION = "9.57"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -273,23 +273,30 @@ local session_stats = {
 -- ╚══════════════════════════════════════╝
 local TAB = "Sel01-Solver"
 
-local g_main         = ui.create(TAB, "Main",              1)
-local g_smart        = ui.create(TAB, "Smart Strategy",    1)  -- NEW: combo-driven main controls
-local g_resolver     = ui.create(TAB, "Resolver Core",     2)
-local g_aggro        = ui.create(TAB, "Aggressive Tuning", 2)
-local g_baim         = ui.create(TAB, "Bruteforce / Baim", 2)
-local g_esp          = ui.create(TAB, "ESP / HUD",         1)
-local g_experimental = ui.create(TAB, "Advanced (Fine Control)", 1)
-local g_perf         = ui.create(TAB, "Performance Info",  2)
-local g_logging      = ui.create(TAB, "Logging",           2)
-local g_chat         = ui.create(TAB, "Sel01-Roast (on kill)", 1)
+-- v9.57: chernobl-style group headers — icon + "Sel01 » Section" (\194\187 divider).
+-- One-time effect: renaming a group re-keys its UI elements, so this script's own
+-- toggles reset to defaults on the first reload after this update — click a preset
+-- (SSG-Pro / Aggressive) once to restore. Learned data lives in files, unaffected.
+DIV = " \194\187 "  -- global (no `local`): main chunk is AT the 200-local cap
+local g_main         = ui.create(TAB, ui.get_icon"sliders"    .. "  Sel01" .. DIV .. "Main",              1)
+local g_smart        = ui.create(TAB, ui.get_icon"bolt"       .. "  Sel01" .. DIV .. "Smart Strategy",    1)
+local g_resolver     = ui.create(TAB, ui.get_icon"crosshairs" .. "  Sel01" .. DIV .. "Resolver Core",     2)
+local g_aggro        = ui.create(TAB, ui.get_icon"skull"      .. "  Sel01" .. DIV .. "Aggressive Tuning", 2)
+local g_baim         = ui.create(TAB, ui.get_icon"bullseye"   .. "  Sel01" .. DIV .. "Bruteforce / Baim", 2)
+local g_esp          = ui.create(TAB, ui.get_icon"eye"        .. "  Sel01" .. DIV .. "ESP / HUD",         1)
+local g_experimental = ui.create(TAB, ui.get_icon"feather"    .. "  Sel01" .. DIV .. "Advanced",          1)
+local g_perf         = ui.create(TAB, ui.get_icon"clock"      .. "  Sel01" .. DIV .. "Performance Info",  2)
+local g_logging      = ui.create(TAB, ui.get_icon"user"       .. "  Sel01" .. DIV .. "Logging",           2)
+local g_chat         = ui.create(TAB, ui.get_icon"skull"      .. "  Sel01" .. DIV .. "Sel01-Roast (on kill)", 1)
 -- V9.20: AA Advisor group — global (no `local`) to dodge main-chunk 200-local limit.
 -- Per-enemy AA tuning recommendations based on what the resolver has learned.
-g_advisor = ui.create(TAB, "🎯 AA Advisor (Per-enemy)", 2)
+g_advisor = ui.create(TAB, ui.get_icon"crosshairs" .. "  Sel01" .. DIV .. "AA Advisor (Per-enemy)", 2)
 
--- Header
-g_main:label(accent .. ui.get_icon"user" .. accent .. "  Welcome:  " .. common.get_username())
-g_main:label(accent .. ui.get_icon"sparkles" .. accent .. "  Sel01-Solver v" .. SEL01_VERSION .. " — by seltonmt01")
+-- Header — v9.57: chernobl-style multi-color welcome (\aDEFAULT resets to white).
+_uname = (common and common.get_username and common.get_username()) or "player"  -- global: at local cap
+g_main:label(ui.get_icon"user" .. "  Dear " .. accent .. _uname .. "\aDEFAULT, have a good game!")
+g_main:label(ui.get_icon"sparkles" .. "  Build " .. accent .. "Sel01-Solver" .. "\aDEFAULT  version " .. accent .. SEL01_VERSION .. "\aDEFAULT")
+g_main:label(ui.get_icon"crosshairs" .. "  Resolver by " .. accent .. "seltonmt01" .. "\aDEFAULT")
 g_main:label(" ")
 g_main:label(accent .. ui.get_icon"sliders" .. accent .. "  Quick Presets:")
 
@@ -5406,6 +5413,7 @@ _cs_log_color_raw("V9.45: seed-only keep-side fix — the 'magnitude matched mea
 _cs_log_color_raw("V9.46: teleport-on-peek detection — horizontal origin delta vs max run-speed reveals a blink-peek (lag-switch / fakelag-flush). On detect, time-box 0.4s that disables extrapolation (yaw_rate from before the blink can't predict the landing) + forces full-spread multipoint at close range so NL's stale backtrack record still lands. Reacts on the FIRST peek instead of after 2 misses; never touches side/EMA so v9.45 + learned patterns stay intact.")
 _cs_log_color_raw("V9.47: side-conflict overrides high-bt keep when angle was off — a learned wrong-side shot with a LARGE magnitude error (>10) now flips even under bt>8, because a clean stale-record reject leaves err~0. Old order let bt>8 short-circuit the flip and retry the wrong side (logs: idx=8, 1 R-hit, shot L -21.6 vs meas 39.5 err=17.9 bt=12 — kept L; next real hit confirmed R). err~0 + side-conflict still keeps (switch-stale / v9.42 overshoot / v9.44 locked protected).")
 _cs_log_color_raw("V9.48: alt_side_pick uses REAL-hit dominance when both sides have real hits — the seeded-inclusive sample counts (sl/sr carry passive+seeded entries) mispinned a genuine 50/50 switch enemy. Logs: idx=4 sl=3 sr=1 pinned LEFT for Predicted-Alt but real hits were 1L/1R and the correct side was RIGHT (Predicted-Alt 0/2). Balanced real data now alternates off last_hit_side; one-sided enemies (rr=0) keep the old seeded dom path so streak{L=9 R=0} is unaffected.")
+_cs_log_color_raw("V9.57: cosmetic — chernobl-style menu groups (icon + 'Sel01 \194\187 Section' headers) + multi-color welcome label (username/version in accent). Group rename re-keys UI elements once, so toggles reset on first reload — click a preset to restore. No logic change.")
 _cs_log_color_raw("V9.56: LBY-Snap-Guess miss-flip is now bt/measurement-aware (matches the generic V9.42/V9.47 logic this older branch never got). It used to flip side on err>5, but err=inf when there is no measurement (first contact, measDesync=0) so it flipped blindly on EVERY first-contact miss — and a high bt (>8) is a server stale-record reject, not a side error. Logs: idx=2 our=29 meas=0 err=inf bt=13 flipped to -1 while the generic path KEPT side=1 the same tick (the two handlers disagreed). Now: no measurement + high bt -> keep + retry the guess once, never flip an unconfirmed side.")
 _cs_log_color_raw("V9.55: honest hit-rate — server-fail filter now reuses the ack_serverfail_like signal (err<=5 OR bt>8) the mode-blacklist already trusts, instead of filtering EVERY kept-side miss. A bt=0 keep with a real magnitude error is the resolver's own side-misprediction on a switch/bimodal enemy (logs: idx=1 bimodal L=40°/R=17.5° kept side ×3 at bt=0 err=10-40 — counted as netcode, inflating session 76.5%->96.3%). Those now count; only clean stale-record rejects (bt>8 / err~0) stay excluded. No aim change, stats only.")
 _cs_log_color_raw("V9.54: serverfail-retry magnitude is now PER-SIDE on bimodal enemies — the retry froze the GLOBAL desync EMA (s.measured_desync), but a two-mode enemy (idx=10 L=46.2° R=29.7°, diff 16°) has very different per-side magnitudes and the global average swings mid-round. The kept side then re-fired a wrong magnitude for up to 64 ticks (logs: idx=10 retried 15.7° at a 29.7° R side, err=16). Now mirrors effective_desync's per-side pick (measured_left/right with >=1 real sample). Identical to global on unimodal enemies; strictly more accurate on bimodal.")
