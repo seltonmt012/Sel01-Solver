@@ -8,8 +8,8 @@ Two Neverlose **CSGO** (legacy build, NOT CS2) Lua scripts for HvH / rage play. 
 
 | Script | Role | Working copy | NL load path |
 |---|---|---|---|
-| **Sel01-Solver** (`Sel01-Solver.lua`, ~5200 lines, v9.53) | Resolver: per-player AA learning, JSON export, HUD/ESP overlay + top-right event ticker, FFI clipboard copy-logs, Sel01-Roast chat-spam, AA Advisor (in-menu panel + Coach-chat to CSGO say) | `C:\Users\Seltonmt\Desktop\sazz\aron\ownlua\Sel01-Solver.lua` | `E:\SteamLibrary\steamapps\common\Counter-Strike Global Offensive\nl\scripts\Sel01-Solver_59853.lua` |
-| **Sel01-Config** (`sel01_config.lua`, ~1950 lines, v3.14) | Companion: AA presets (Aggressive/Dynamic/Defensive/Spin), anti-resolver bundle (defensive on hit-taken, slow-walk boost, fake-lag variance, yaw base rotation, side-streak limit, magnitude jitter), anti-HS extras (pitch jitter, move-fakeduck), peek-boost hotkey, comprehensive Dump Debug Stats, hits-taken log with AA-state snapshots, kill/miss/hit event log top-left, watermark + indicators + rotating AA arrow | `C:\Users\Seltonmt\Desktop\sazz\aron\ownlua\sel01_config.lua` | `E:\SteamLibrary\steamapps\common\Counter-Strike Global Offensive\nl\scripts\sel01_config_59908.lua` |
+| **Sel01-Solver** (`Sel01-Solver.lua`, ~5200 lines, v9.59) | Resolver: per-player AA learning, JSON export, HUD/ESP overlay + top-right event ticker, FFI clipboard copy-logs, Sel01-Roast chat-spam, AA Advisor (in-menu panel + Coach-chat to CSGO say) | `C:\Users\Seltonmt\Desktop\sazz\aron\ownlua\Sel01-Solver.lua` | `E:\SteamLibrary\steamapps\common\Counter-Strike Global Offensive\nl\scripts\Sel01-Solver_59853.lua` |
+| **Sel01-Config** (`sel01_config.lua`, ~2000 lines, v3.27) | Companion: AA presets (Aggressive/Dynamic/Defensive/Spin), anti-resolver bundle (defensive on hit-taken, slow-walk boost, fake-lag variance, yaw base rotation, side-streak limit, magnitude jitter), anti-HS extras (pitch jitter, move-fakeduck), peek-boost hotkey, comprehensive Dump Debug Stats, hits-taken log with AA-state snapshots, kill/miss/hit event log top-left, watermark + indicators + rotating AA arrow | `C:\Users\Seltonmt\Desktop\sazz\aron\ownlua\sel01_config.lua` | `E:\SteamLibrary\steamapps\common\Counter-Strike Global Offensive\nl\scripts\sel01_config_59908.lua` |
 
 **Dual-copy rule (MANDATORY).** After every Edit/Write to either working copy, immediately overwrite the matching NL file (same path, no new files, no renames). PowerShell one-liner: `Copy-Item -Force -LiteralPath '<working>' -Destination '<nl-path>'`. The git repo only tracks working copies — the NL copies need the mirror so reload in NL picks up the change.
 
@@ -24,7 +24,7 @@ Solver runtime data (private, gitignored):
 
 Solver architecture + bug history + UI doc lives in `README.md`. NL API docs at `https://docs-csgo.neverlose.cc/readme.md?ask=<keywords>` — consult before guessing API names. Config script has no separate README; this file is canonical.
 
-**Git repo.** Remote: `origin https://github.com/seltonmt012/ownlua.git` (branch `master`). `.gitignore` excludes private data + `.claude/` + `.vscode/`. Auto-commit + push on version bumps per project policy.
+**Git repo.** Remote: `origin https://github.com/seltonmt012/Sel01-Solver.git` (branch `master`). `.gitignore` excludes private data + `.claude/` + `.vscode/`. Auto-commit + push on version bumps per project policy.
 
 ## Verify changes
 
@@ -274,6 +274,11 @@ Always-on features (no toggle):
   - **V9.49 (big stat-accuracy win)** — confirmed server-fail keeps no longer pollute hit-rate stats. A correct-angle miss the server rejects (`do_flip == false` keep branch: high `bt`, `err~0`, side kept) is netcode, not a resolver fault. A `local server_fail_keep` flag set in both the LBY-Snap and generic KEEP branches gates `mode_stats_update` + `record_player_shot` + `learning_update_miss` (mode-blacklist already skipped these since V9.31 — this finished the job). `s.missed` STILL increments so BF-cycle + force-baim escalation advance. New counters `s.serverfail_misses` (per-player) + `sel01_session_serverfails` (session global). Logs: idx=9 fired the same correct -21.8° ×3 into a declining stale record (bt 20→10→5) then hit; these dragged session ~56% when true resolver rate was ~82%. **Also: never-hit explore** — after 2 consecutive correct-angle keeps on a `real_active==0` enemy, flip once to break a frozen wrong-side guess; a single real hit disables it.
   - **V9.50** — surfaced the V9.49 filter: copy-dump prints a 2nd `[SESSION]` line (`N server-fails filtered` + raw pre-filter %); HUD corner shows `Netcode: N server-fails filtered`. Counter clears on Reset Session Stats. Pure observability.
   - **V9.51-V9.53 (on-model ESP)** — moved per-enemy intel ONTO the model. `esp_push_shot(s, kind)` (global helper) called from the `aim_ack` HIT / MISS / `server_fail_keep` paths records `s.last_shot_result` + `s.last_shot_result_time` + a 6-entry `s.shot_history` ring. Three new UI toggles (globals, dodge the 200-local cap): `esp_wedge` / `esp_flash` / `esp_enh`, all default ON in the SSG-Pro preset. Visuals: (A) **desync wedge** — two `render.line`s from the pelvis, white = real `last_eye_yaw`, mode-color = resolved `last_resolved`; (B) **hit/miss flash** — ~0.45s fading box around the model, green=hit/red=miss/blue=server-fail; (C) **netcode tag** — `⚠×N bt pk` (serverfail_misses / backtrack_resistant / tp_peek); (D) **AA-icon** `▬⇄≈⟳`; (E) **shot-dots** — last 6 results as colored squares; (F) ~~side-dom bar~~ (added V9.51, REMOVED V9.53 as redundant). **V9.52** rewrote the label in plain words (too big), **V9.53** shrank back to ONE compact symbol line `⇄ → 29° ★` (font size 3, learn-icon 🔒/★/·, confidence = the bar only). Iterated label legibility per user — keep it ONE short line, symbols not words, no redundant second bar.
+  - **V9.54-V9.59 (recent)**:
+    - **V9.54** — serverfail-retry magnitude PER-SIDE on bimodal enemies. The retry froze the GLOBAL desync EMA; on a two-mode enemy (L=46°/R=30°) the average swings mid-round and the kept side re-fired a wrong magnitude for up to 64 ticks. New `ack_side_measured` (in `aim_ack`) mirrors `effective_desync`'s per-side pick and feeds both `resolver_note_serverfail_retry` callers.
+    - **V9.55 (stat honesty)** — `server_fail_keep` now reuses the existing `ack_serverfail_like` signal (`err<=5 OR bt>8`) the mode-blacklist already trusts, instead of filtering EVERY kept-side miss. A `bt=0` kept-side miss is the resolver's OWN side-misprediction (switch/bimodal), not netcode — it now COUNTS in stats (was inflating session 76.5%→96.3%). No aim change.
+    - **V9.56** — LBY-Snap-Guess miss-flip is bt/measurement-aware (matches the generic V9.42/V9.47 logic it never had). `err` is meaningless without a measurement (first contact, measDesync=0 → err=inf), and `bt>8` is a stale-record reject not a side error: `lby_flip = ack_side_bad or (ack_measured>5 and ack_angle_err>5)`, forced false when `bt>8`. Stops it disagreeing with the generic path the same tick.
+    - **V9.57-V9.59 (UI cosmetics)** — V9.57 chernobl-style group headers + multi-color welcome; **V9.58** split into HORIZONTAL TABS (`Main`/`Resolver`/`ESP+Advisor`/`Advanced`) via distinct `ui.create` first-args + `ui.sidebar(TAB,"crosshairs")`; **V9.59** HUD defaults Top-Left (combo reordered + `apply_preset` forces it). Tab-name strings are GLOBALS (main chunk at the 200-local cap). Re-tabbing/renaming groups re-keys UI elements once → toggles reset on first reload, click a preset to restore.
 
 ## HUD-overlay anatomy
 
@@ -285,7 +290,7 @@ All `render.*` pcall-wrapped. Border via 4 thin rects (avoid uncertain `render.r
 
 ## Git workflow
 
-**Remote**: `origin → https://github.com/seltonmt012/ownlua.git` (branch: `master`). Auto-pushed since V9.6.
+**Remote**: `origin → https://github.com/seltonmt012/Sel01-Solver.git` (branch: `master`). Auto-pushed since V9.6.
 
 **Auto-commit + push policy** (user-explicit V9.6): every version constant bump triggers commit + push. No manual approval needed for these. Each script commits independently. Commit format:
 ```
@@ -308,7 +313,7 @@ git push origin master
 
 If hook failure on commit: investigate root cause, fix, create NEW commit (don't amend — pre-commit hooks fail means commit didn't happen, amend would modify previous one).
 
-## Sel01-Config layout (`sel01_config.lua`, v3.14, ~1950 lines)
+## Sel01-Config layout (`sel01_config.lua`, v3.27, ~2000 lines)
 
 | Section | Purpose |
 |---|---|
@@ -379,6 +384,11 @@ The `Dump Debug Stats` button now emits 9 sections to chat in one click: SESSION
 - **V3.7**: Yaw base rotation + Side-streak limit + YAW-ROT indicator. Defensive AA filtered to bullet-only (hitgroup 1-7); force-fakeduck removed from defensive (was hindering escape during nade hits).
 - **V3.8**: Dump Debug Stats rewritten — 9 sections, includes live NL Ragebot values via `nl_refs[...]:get()`.
 - **V3.9**: Magnitude jitter (per-tick variance, anti-EMA-resolver) + MAG-JIT indicator. Default OFF; combines with anti-BF for full per-side chaos.
+- **V3.10-3.17**: bug-fix batch — kills=0 stat fix, dump read bugs (MinDmg/HitboxSafety paths), Troll/Bait preset (run-in chaos, magnitude jitter + anti-BF on, fix "fake faces enemy" → Yaw Base Backward). `rage_mindmg` re-added READ-ONLY for dump (never written — never-override rule).
+- **V3.18**: animated clantag FIXED — `common.set_clan_tag` is a game-state write, silently ignored from `events.render`; moved to `events.net_update_end` (bloodwings pattern) via `register_first`. NEVER fall back to a `createmove` registration (would clobber `createmove_unified`). + 5 new ASCII clantag styles (Loading/Scan/Glitch/Arrow/Rage).
+- **V3.19-3.20 (visual additions)**: 7 read-only/render features all auto-enabled in Aggressive — desync %, skeet indicator panel, netgraph (`utils.net_channel().latency[1]/.loss[1]/.choke[1]` + `globals.choked_commands` LC warn), model-fade-when-scoped (`events.localplayer_transparency(fn→alpha)` call-form), remove-sleeves (`events.draw_model(fn)→false` on "sleeve"), menu blur, custom scope overlay (Scope-Overlay combo `:override("Remove All")` STRING-only). **V3.20**: premium velocity indicator (frostlive-style: icon box + label box + blur + clipped color-by-% fill bar + smooth fade; loads Verdana 16) + animated HSV menu border (layered frame + `color():as_hsv` flow around `ui.get_position/size`).
+- **V3.21-3.23**: chernobl-style group headers (icon + `Sel01 » Section`) + multi-color welcome → then **V3.22** full horizontal TABS (`Main`/`Anti-Aim`/`Visuals` via distinct `ui.create` first-args + `ui.sidebar(TAB,"sliders")`, left/right columns). **V3.23** menu blur OFF by default. Smoothed the jumpy desync number (EMA, was raw per-tick jitter).
+- **V3.24-3.27 (indicator presentation)**: `_vis_pill` then `_vis_chip` premium pills → consolidated the AA-state strip + skeet panel + desync into ONE deduped list → readable NAMES (not "FL-VAR" abbreviations) → **V3.27** replaced the whole panel with a MINIMAL JAG0YAW-style centered indicator under the crosshair (plain text: `SEL01` title + `- STANDING/MOVING/AIR/CROUCH -` movement + optional `DESYNC NN` + short curated active states; drops always-on noise). User iterated HARD on indicator legibility — keep it minimal, centered, plain.
 
 ### Common Sel01-Config gotchas (each has bitten)
 
@@ -388,6 +398,11 @@ The `Dump Debug Stats` button now emits 9 sections to chat in one click: SESSION
 - **`ui.find` raises popup-dialog on missing paths** (v1.3 incident). Use `pui.find` as primary.
 - **Single `events.render:set`** — registering twice overwrites the first hook. Everything that needs render lives inside the one handler.
 - **Forward-decl `update_clantag`** as `local update_clantag = function() end` BEFORE the render closure, then reassign later. Closures capture the upvalue, not the global.
+- **Horizontal TABS via multiple `ui.create` first-args** (v3.22 / v9.58). `ui.create(tab, group[, column])` — distinct `tab` strings render as a horizontal tab bar inside the script's sidebar entry; `column` 1=left / 2=right. `ui.sidebar(name, icon_name)` sets the sidebar entry label + icon. Renaming a tab OR group RE-KEYS its elements (NL persists by path string) → the script's own toggles reset to defaults ONCE on the next reload; tell the user to click a preset to restore. Tab-name strings in the Solver must be GLOBALS (main chunk at the 200-local cap).
+- **Game-state writes are ignored from the render thread** (v3.18). `common.set_clan_tag` (and similar) only take effect from a game-logic context — drive them from `events.net_update_end` (bloodwings pattern, registered via `register_first`), NEVER a second `events.createmove:set` (clobbers `createmove_unified`).
+- **Return-value events use the CALL form, not `:set`** — `events.localplayer_transparency(fn)` where `fn` returns the alpha (0-255), and `events.draw_model(fn)` where `fn` returns `false` to skip a model (e.g. `m.name:find("sleeve")`). pcall-wrap; these are separate from the single render handler.
+- **Verified render/color API on this NL build** (use freely, still pcall for version variance): `render.rect(p1,p2,col, radius|{tl,tr,br,bl})` (4th-arg rounding), `render.blur(p1,p2,strength,alpha,radius)`, `render.push_clip_rect(p1,p2)`/`pop_clip_rect`, `render.gradient(p1,p2,c1,c2,c3,c4)`, `render.push_rotation(deg,centerVec)`/`pop_rotation`, `render.measure_text(font,flags,text)→vector`, `render.load_font(name,size,flags)`, `color():as_hsv(h,s,v)`, `color():lerp(other,frac)`, `color:alpha_modulate(f)`, `ui.get_alpha/get_position/get_size/get_icon/get_mouse_position`, `utils.net_channel().latency[1]/.loss[1]/.choke[1]`, `globals.choked_commands`. `rage.antiaim:get_rotation(true)` = fake yaw, `:get_rotation()` = real yaw (desync delta = `|real-fake|/2`).
+- **On-screen indicator design: minimal + centered, plain text** (v3.27, user iterated hard). JAG0YAW-style under-crosshair stack (title + movement state + few active states) beats big chip panels / left columns / cryptic abbreviations. Use readable names, smooth jumpy values (EMA), keep always-on internal states OFF the HUD.
 
 ## Common mistakes to avoid
 
