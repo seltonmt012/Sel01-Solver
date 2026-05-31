@@ -1,11 +1,11 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 9.58                                   ║
+-- ║  Version: 9.59                                   ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 9.58
+-- @version 9.59
 -- @description Correction side guard + serverfail retry:
 --   * correction/prediction-error misses now check SIDE evidence, not only
 --     magnitude. A BF shot on the unlearned opposite side no longer gets labeled
@@ -73,7 +73,7 @@
 --   * v9.26 drift-bump (alpha 0.55 on 5-10° diff) still handles small shifts.
 --   * v9.29 coach variants carry.
 
-local SEL01_VERSION = "9.58"
+local SEL01_VERSION = "9.59"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -383,8 +383,9 @@ local esp_master       = g_esp:switch(accent .. ui.get_icon"bullseye"  .. accent
 local esp_show_labels  = g_esp:switch(accent .. ui.get_icon"crosshairs".. accent .. "  Show Enemy Labels (mode/side/desync)", true)
 local esp_show_confbar = g_esp:switch(accent .. ui.get_icon"sliders"   .. accent .. "  Show Confidence Bar", true)
 local esp_show_hud     = g_esp:switch(accent .. ui.get_icon"sparkles"  .. accent .. "  Show HUD Corner Panel",  true)
+-- v9.59: Top-Left listed first = the combo default (fresh installs start Top-Left)
 local esp_hud_pos      = g_esp:combo (accent .. ui.get_icon"clock"     .. accent .. "  HUD Position",
-                                      "Bottom-Left", "Bottom-Right", "Top-Left", "Top-Right")
+                                      "Top-Left", "Bottom-Left", "Bottom-Right", "Top-Right")
 local esp_throttle_hz  = g_esp:slider(accent .. ui.get_icon"bolt"      .. accent .. "  ESP Refresh Rate (Hz)", 5, 30, 10)
 local esp_label_color  = g_esp:color_picker(accent .. ui.get_icon"feather" .. accent .. "  Label Default Color", color(255, 255, 255, 255))
 g_esp:label(accent .. ui.get_icon"link-slash" .. accent .. "  Mode colors auto: green=Meas, yellow=Predict, red=BF, cyan=LBY")
@@ -1890,6 +1891,8 @@ local function safe_set(ctrl, val)
 end
 
 local function apply_preset(name)
+    -- v9.59: every preset forces HUD position Top-Left (user default)
+    safe_set(esp_hud_pos, "Top-Left")
     if name == "aggressive" then
         safe_set(resolver.enable,    true)
         safe_set(resolver_mode,      "Aggressive")
