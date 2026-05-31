@@ -5,7 +5,7 @@
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Config
 -- @author seltonmt01
--- @version 3.24
+-- @version 3.25
 -- @description Smart freestand (anti-headshot):
 --   * NL freestanding is deterministic — it always picks the same "safe" side, so a
 --     resolver models it and headshots the predictably-exposed side (user report:
@@ -53,7 +53,7 @@
 --     variance for full per-side chaos.
 --   * MAG-JIT indicator added to bottom HvH strip; dumped in v3.8 stats.
 
-local SEL01_CFG_VERSION = "3.24"
+local SEL01_CFG_VERSION = "3.25"
 
 -- DEBUG: print to CSGO console at major load checkpoints. Plain print() bypasses
 -- NL chat (which may not flush before crash) and writes directly to CSGO console.
@@ -1692,11 +1692,40 @@ pcall(function()
                     table.insert(indicators, {txt = "FD", col = color(255, 220, 120, 255)})
                 end
             end)
-            -- v3.24: premium pills, centered, stacked upward from near the bottom
-            local ph = 21
-            local py0 = sy - 95 - #indicators * ph
+            -- v3.25: merge NL ragebot state (old skeet panel) + desync into THIS one
+            -- list, deduped, and draw ONE left-edge column — keeps it all out of the
+            -- crosshair + weapon view. Was two center clusters that blocked the screen
+            -- and duplicated DT. The separate skeet + desync draws were removed below.
+            local seen = {}
+            for _, ii in ipairs(indicators) do seen[ii.txt] = true end
+            local function _addnl(t, c) if not seen[t] then indicators[#indicators + 1] = { txt = t, col = c }; seen[t] = true end end
+            if vis_skeet:get() then
+                pcall(function()
+                    if nl_refs.rage_dt and nl_refs.rage_dt:get() then _addnl("DT", color(255, 70, 90, 235)) end
+                    if nl_refs.rage_safepoint and tostring(nl_refs.rage_safepoint:get()) == "Force" then _addnl("SAFE", color(143, 194, 21, 235)) end
+                    if nl_refs.rage_bodyaim and tostring(nl_refs.rage_bodyaim:get()) == "Force" then _addnl("BODY", color(143, 194, 21, 235)) end
+                    if (perf.ping or 0) > 90 then _addnl("PING", color(255, 200, 60, 235)) end
+                end)
+            end
+            if vis_desyncpct:get() then
+                pcall(function()
+                    if rage and rage.antiaim and rage.antiaim.get_rotation then
+                        local fk, rl = rage.antiaim:get_rotation(true), rage.antiaim:get_rotation()
+                        if fk and rl then
+                            local d = math.min(math.abs(rl - fk) / 2, 60)
+                            _vis_state.desync_shown = _vis_state.desync_shown + (d - _vis_state.desync_shown) * 0.06
+                            local sh = _vis_state.desync_shown
+                            indicators[#indicators + 1] = { txt = string.format("DESYNC %.0f", sh),
+                                col = color(235, 150, 70, 210):lerp(color(120, 200, 255, 230), sh / 60) }
+                        end
+                    end
+                end)
+            end
+            -- single LEFT-EDGE column, vertically centered, out of the way
+            local ph = 20
+            local y0 = cy - (#indicators * ph) / 2
             for i, ind in ipairs(indicators) do
-                _vis_pill(cx, py0 + (i - 1) * ph, ind.txt, ind.col, 3, "c")
+                _vis_pill(22, y0 + (i - 1) * ph, ind.txt, ind.col, 3, "l")
             end
         end
 
@@ -1842,54 +1871,10 @@ pcall(function()
             end)
         end
 
-        -- ── v3.21: DESYNC indicator (real vs fake yaw). SMOOTHED + labeled + moved
-        --    out of dead-center. The raw value jumps every tick because magnitude
-        --    jitter randomizes the desync 35-58° on purpose — a bare jumping "14"
-        --    under the crosshair looked broken. Now it lerps to a stable average,
-        --    reads as "DESYNC 21" with an arrow, sits lower + smaller, not red. ──
-        if vis_desyncpct:get() then
-            pcall(function()
-                if not (rage and rage.antiaim and rage.antiaim.get_rotation) then return end
-                local fake = rage.antiaim:get_rotation(true)
-                local real = rage.antiaim:get_rotation()
-                if not (fake and real) then return end
-                local delta = math.min(math.abs(real - fake) / 2, 60)
-                -- heavy smoothing kills the per-tick jitter jump
-                _vis_state.desync_shown = _vis_state.desync_shown + (delta - _vis_state.desync_shown) * 0.06
-                local shown = _vis_state.desync_shown
-                local frac = shown / 60
-                -- low desync = orange (weaker AA), high = accent blue (good spread)
-                local col = color(235, 150, 70, 210):lerp(color(120, 200, 255, 230), frac)
-                _vis_pill(cx, cy + 46, string.format("DESYNC %.0f", shown), col, 3, "c")
-            end)
-        end
-
-        -- ── v3.19: SKEET INDICATOR PANEL (active NL features, stacked left of xhair) ──
-        if vis_skeet:get() then
-            pcall(function()
-                local lp = entity.get_local_player()
-                if not (lp and lp:is_alive()) then return end
-                local tags = {}
-                local function add(t, c) tags[#tags + 1] = { t = t, c = c } end
-                local on = color(143, 194, 21, 235)   -- green = active
-                local hot = color(255, 70, 90, 235)   -- red = DT / exploit
-                if nl_refs.rage_dt      and nl_refs.rage_dt:get()    then add("DT", hot) end
-                if nl_refs.rage_hide    and nl_refs.rage_hide:get()  then add("OSAA", on) end
-                if nl_refs.aa_fakeduck  and nl_refs.aa_fakeduck:get()then add("DUCK", on) end
-                if nl_refs.aa_slowwalk  and nl_refs.aa_slowwalk:get()then add("SW", on) end
-                if nl_refs.rage_safepoint and tostring(nl_refs.rage_safepoint:get()) == "Force" then add("SAFE", on) end
-                if nl_refs.rage_bodyaim   and tostring(nl_refs.rage_bodyaim:get())   == "Force" then add("BODY", on) end
-                if aa_freestanding and aa_freestanding:get() then add("FS", on) end
-                -- ping-spike warn (high latency)
-                if (perf.ping or 0) > 90 then add("PING", color(255, 200, 60, 235)) end
-                -- v3.24: premium pills, right-anchored toward the crosshair, stacked
-                local ph = 21
-                local y0 = cy - (#tags * ph) / 2
-                for i = 1, #tags do
-                    _vis_pill(cx - 58, y0 + (i - 1) * ph, tags[i].t, tags[i].c, 3, "r")
-                end
-            end)
-        end
+        -- v3.25: the standalone DESYNC indicator + SKEET panel were merged into the
+        -- single left-edge state column (built in the indicators block above) so they
+        -- no longer clutter the crosshair / center. Toggles vis_desyncpct + vis_skeet
+        -- still gate their entries there.
 
         -- ── v3.19: NETGRAPH (ping / loss / choke + lag-comp warn, bottom-left) ──
         if vis_netgraph:get() and globals.is_in_game then
