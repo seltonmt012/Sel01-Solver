@@ -1,11 +1,11 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-WalkBot                                     ║
--- ║  Version: 1.1                                      ║
+-- ║  Version: 1.2                                      ║
 -- ║  Greedy nav-bot: map + enemy detect, walk-to-foe  ║
 -- ║  by seltonmt01                                     ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-WalkBot
--- @version 1.1
+-- @version 1.2
 -- @author seltonmt01
 -- @description Greedy walk-bot. Detects map + enemies, walks the local player
 --   toward a chosen target using NL movement cmd (move_yaw + forwardmove) with
@@ -19,7 +19,7 @@
 --   entity.get_players(true) (enemies) / entity.get_local_player() / p.m_vecOrigin / p:get_eye_position()
 --   globals.mapname / globals.tickcount / globals.realtime
 
-local SEL01_WB_VERSION = "1.1"
+local SEL01_WB_VERSION = "1.2"
 
 local ffi_ok, ffi = pcall(require, "ffi")
 
@@ -71,15 +71,15 @@ if not ok_ui or not g_main then
     pcall(function() g_hud  = g_main end)
 end
 
-local wb_enable, wb_mode, wb_stopdist, wb_autojump, wb_probe, wb_speed, wb_hud, wb_debug
+local wb_enable, wb_mode, wb_stopdist, wb_jump, wb_probe, wb_speed, wb_hud, wb_debug
 local wb_peekslow, wb_peekrng, wb_slowspd, wb_bhop, wb_clantag, wb_nav
-local wb_holdcnr, wb_holdmin, wb_approach, wb_crouch
+local wb_holdcnr, wb_holdmin, wb_approach, wb_crouch, wb_autolearn
 pcall(function()
     wb_enable   = g_main:switch("Enable WalkBot")                 -- the on/off switch (no hotkey)
     wb_mode     = g_main:combo("Target Pick", "Nearest", "Lowest HP", "Most Visible", "Crosshair")
     wb_stopdist = g_main:slider("Stop Distance", 80, 2000, 450)
     wb_speed    = g_main:slider("Move Speed", 50, 450, 450)
-    wb_autojump = g_main:switch("Auto-Jump Obstacles (only when step-up clears)")
+    wb_jump     = g_main:switch("Allow Jumping (OFF = never jumps — recommended)")
     wb_probe    = g_main:slider("Obstacle Probe (units)", 20, 140, 55)
     -- peek slow-walk: when a visible enemy is near, slow-walk + jiggle so their
     -- resolver misses our moving/desynced model while our ragebot lands.
@@ -96,6 +96,7 @@ pcall(function()
     -- the bot replays it). No waypoints -> wander+avoid so it still explores.
     g_main:button("Record Waypoint (drop my pos)", function() _wb_pending_record = true end)
     g_main:button("Clear Waypoints (this map)",    function() _wb_pending_clear  = true end)
+    wb_autolearn = g_main:switch("Auto-Learn Route (remembers across restart)")
     wb_bhop     = g_main:switch("Bunny-Hop on routes (faster A->B, no target only)")
     wb_clantag  = g_main:switch("Clantag 'WalkBot rn' when active")
     wb_nav      = g_main:switch("Load Nav-Mesh (real map routes — experimental)")
@@ -103,12 +104,13 @@ pcall(function()
     wb_debug    = g_hud:switch("Debug Info")
 end)
 -- sensible defaults (switches default off; flip the ones we want on)
-pcall(function() if wb_autojump then wb_autojump:set(true) end end)
 pcall(function() if wb_peekslow then wb_peekslow:set(true) end end)
 pcall(function() if wb_bhop then wb_bhop:set(true) end end)
 pcall(function() if wb_clantag then wb_clantag:set(true) end end)
 pcall(function() if wb_holdcnr then wb_holdcnr:set(true) end end)
 pcall(function() if wb_crouch then wb_crouch:set(true) end end)
+pcall(function() if wb_autolearn then wb_autolearn:set(true) end end)
+pcall(function() if wb_nav then wb_nav:set(true) end end)
 pcall(function() if wb_hud then wb_hud:set(true) end end)
 
 -- ─── runtime state ───────────────────────────────────────
@@ -147,6 +149,10 @@ local state = {
     last_enemy_pos = nil,      -- last seen enemy origin (HUNT direction when roaming)
     tgt_state    = "?",        -- target motion: stand / push / move
     crouching    = false,      -- crouch-when-exposed active (HUD)
+    learn_t      = 0,          -- last auto-learn waypoint drop
+    last_enemy_t = 0,          -- when we last saw an enemy (HUNT freshness)
+    learned_count = 0,         -- auto-learned waypoints this session
+    enemy_history = {},        -- per-enemy-index last seen {x,y,z,t} (not all visible)
 }
 -- button -> tick drain flags (module globals: button closures run before `state`
 -- helpers are bound; globals dodge the forward-reference trap, Solver pattern).
@@ -309,6 +315,30 @@ local function wp_load(map)
     end
 end
 
+-- auto-learn the route while travelling: drop a waypoint when we're >220u from every
+-- existing one. Builds + PERSISTS a route over time (survives script restart, no manual
+-- recording needed). Capped so the file can't grow forever.
+local function auto_learn(lo, now, base_act)
+    if not (base_act == "ROAM" or base_act == "WANDER" or base_act == "APPROACH") then return end
+    local on = false
+    pcall(function() on = wb_autolearn and wb_autolearn:get() end)
+    if not on then return end
+    if (now - (state.learn_t or 0)) < 0.6 then return end
+    state.learn_t = now
+    if #state.waypoints >= 250 then return end
+    local nd = 1e18
+    for _, w in ipairs(state.waypoints) do
+        local dx, dy = w.x - lo.x, w.y - lo.y
+        local d = dx * dx + dy * dy
+        if d < nd then nd = d end
+    end
+    if nd > 220 * 220 then
+        state.waypoints[#state.waypoints + 1] = { x = lo.x, y = lo.y, z = lo.z }
+        state.learned_count = (state.learned_count or 0) + 1
+        wp_save()                                       -- persist immediately
+    end
+end
+
 -- corner assessment (trace-based, no nav needed): am I behind a corner relative to
 -- the enemy? Direct eye-line blocked but a sideways-offset line is clear => stepping
 -- to that side reveals them => hold here and shoulder-peek that side. Returns:
@@ -371,7 +401,7 @@ local function compute_move(lp, lo, want_yaw, now, base_act)
     local probe = 55
     pcall(function() probe = wb_probe:get() end)
     local aj = true
-    pcall(function() aj = wb_autojump and wb_autojump:get() end)
+    pcall(function() aj = wb_jump and wb_jump:get() end)
     local move_yaw = want_yaw
     state.activity = base_act
     state.block = "clear"
@@ -444,6 +474,7 @@ local function compute_move(lp, lo, want_yaw, now, base_act)
         end
     end
     state.last_origin = lo
+    auto_learn(lo, now, base_act)
     return move_yaw
 end
 
@@ -631,7 +662,17 @@ local function walkbot_tick(cmd)
     if use_nav and nav.map ~= state.mapname then nav_load(state.mapname) end
     if not lo then state.activity = "IDLE"; state.diag = "no origin"; return end
 
-    state.enemy_count = #get_enemies()
+    local enemies = get_enemies()
+    state.enemy_count = #enemies
+    -- enemy HISTORY: remember where each enemy was last seen (not all are visible at
+    -- once). Used to HUNT toward the freshest memory when nobody is currently pickable.
+    for _, e in ipairs(enemies) do
+        local eo = get_origin(e)
+        if eo then
+            local idx = 0; pcall(function() idx = e:get_index() end)
+            state.enemy_history[idx] = { x = eo.x, y = eo.y, z = eo.z, t = now }
+        end
+    end
     local target, dist = pick_target(lp)
 
     -- ════════ ENGAGE: we have a target ════════
@@ -742,7 +783,18 @@ local function walkbot_tick(cmd)
     state.target_idx = nil
     state.crouching = false
     local move_yaw
-    if #state.waypoints > 0 then
+    -- freshest enemy memory (seen < 25s ago) — priority: go where an enemy actually was.
+    local hgoal, ht = nil, 0
+    for _, h in pairs(state.enemy_history) do
+        if (now - h.t) < 25 and h.t > ht then hgoal, ht = h, h.t end
+    end
+    if hgoal then
+        move_yaw = compute_move(lp, lo, dir_yaw(lo, hgoal), now, "ROAM")
+        if state.activity == "ROAM" then
+            state.diag = string.format("HUNT last-seen enemy d=%.0f age=%.0fs",
+                v_len2d(vector(hgoal.x - lo.x, hgoal.y - lo.y, 0)), now - ht)
+        end
+    elseif #state.waypoints > 0 then
         local wp = state.waypoints[state.wp_idx] or state.waypoints[1]
         local d = v_len2d(vector(wp.x - lo.x, wp.y - lo.y, 0))
         -- reached it OR can't reach it (wedged) -> advance, so we don't grind a wall
@@ -753,15 +805,7 @@ local function walkbot_tick(cmd)
         end
         move_yaw = compute_move(lp, lo, dir_yaw(lo, wp), now, "ROAM")
         if state.activity == "ROAM" then
-            state.diag = string.format("ROAM wp %d/%d d=%.0f", state.wp_idx, #state.waypoints, d)
-        end
-    elseif state.last_enemy_pos then
-        -- HUNT toward enemy side: no recorded route, but the last enemy we saw marks the
-        -- enemy direction (T -> toward CT, etc). Head there instead of wandering in place.
-        local ep = state.last_enemy_pos
-        move_yaw = compute_move(lp, lo, dir_yaw(lo, ep), now, "ROAM")
-        if state.activity == "ROAM" then
-            state.diag = string.format("HUNT enemy side d=%.0f", v_len2d(vector(ep.x - lo.x, ep.y - lo.y, 0)))
+            state.diag = string.format("ROAM route wp %d/%d d=%.0f", state.wp_idx, #state.waypoints, d)
         end
     else
         -- wander: nothing known yet (round start, no enemy seen). Hold a heading; repick
@@ -784,23 +828,25 @@ local function walkbot_tick(cmd)
     -- A->B is faster, with a light auto air-strafe to keep speed. Disabled while
     -- engaging (you can't aim mid-air). Suppressed when wedged (STUCK) so we don't
     -- bhop into a wall forever. ──
+    -- jumping master gate: bhop + step-up jumps only when Allow Jumping is on (default
+    -- OFF -> bot never jumps, per request).
+    local jump_ok = false
+    pcall(function() jump_ok = wb_jump and wb_jump:get() end)
     local bhop = false
     pcall(function() bhop = wb_bhop and wb_bhop:get() end)
-    if bhop and state.activity ~= "STUCK" then
+    if jump_ok and bhop and state.activity ~= "STUCK" then
         local onground = true
         pcall(function() onground = bit.band(tonumber(lp.m_fFlags) or 1, 1) == 1 end)
         if onground then
             pcall(function() cmd.in_jump = true end)
         else
-            -- air-strafe: zig-zag sidemove (~4x/sec) keeps the strafe sync alive while
-            -- move_yaw stays on the route -> nets forward, builds a little speed.
             if (now - (state.bhop_flip_t or 0)) > 0.25 then
                 state.bhop_side = -(state.bhop_side or 1); state.bhop_flip_t = now
             end
             pcall(function() cmd.sidemove = (state.bhop_side or 1) * 450 end)
         end
-    elseif now <= (state.jump_until or 0) then
-        pcall(function() cmd.in_jump = true end)   -- step-up jump when bhop off
+    elseif jump_ok and now <= (state.jump_until or 0) then
+        pcall(function() cmd.in_jump = true end)
     end
 end
 
