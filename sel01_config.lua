@@ -5,7 +5,7 @@
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Config
 -- @author seltonmt01
--- @version 3.20
+-- @version 3.21
 -- @description Smart freestand (anti-headshot):
 --   * NL freestanding is deterministic — it always picks the same "safe" side, so a
 --     resolver models it and headshots the predictably-exposed side (user report:
@@ -53,7 +53,7 @@
 --     variance for full per-side chaos.
 --   * MAG-JIT indicator added to bottom HvH strip; dumped in v3.8 stats.
 
-local SEL01_CFG_VERSION = "3.20"
+local SEL01_CFG_VERSION = "3.21"
 
 -- DEBUG: print to CSGO console at major load checkpoints. Plain print() bypasses
 -- NL chat (which may not flush before crash) and writes directly to CSGO console.
@@ -79,16 +79,24 @@ local TAB    = "Sel01-Config"
 -- ══════════════════════════════════════════════════════════════════════════
 -- UI GROUPS
 -- ══════════════════════════════════════════════════════════════════════════
-local g_main    = ui.create(TAB, "Main",          1)
-local g_aa      = ui.create(TAB, "Anti-Aim",      1)
-local g_move    = ui.create(TAB, "Movement",      2)
-local g_visual  = ui.create(TAB, "Visuals",       2)
-local g_qol     = ui.create(TAB, "Quality of Life", 1)
-local g_info    = ui.create(TAB, "Info",          2)
+-- v3.21: chernobl-style group headers — icon + "Sel01 » Section" with the » divider
+-- (\194\187). One-time effect: renaming a group re-keys its elements, so this script's
+-- own toggles reset to defaults on the first reload after this update — click a preset
+-- (Aggressive) once to restore them. NL ragebot settings are separate and untouched.
+local DIV = " \194\187 "
+local g_main    = ui.create(TAB, ui.get_icon"sliders"    .. "  Sel01" .. DIV .. "Main",      1)
+local g_aa      = ui.create(TAB, ui.get_icon"bolt"       .. "  Sel01" .. DIV .. "Anti-Aim",  1)
+local g_move    = ui.create(TAB, ui.get_icon"feather"    .. "  Sel01" .. DIV .. "Movement",  2)
+local g_visual  = ui.create(TAB, ui.get_icon"eye"        .. "  Sel01" .. DIV .. "Visuals",   2)
+local g_qol     = ui.create(TAB, ui.get_icon"sparkles"   .. "  Sel01" .. DIV .. "Quality of Life", 1)
+local g_info    = ui.create(TAB, ui.get_icon"crosshairs" .. "  Sel01" .. DIV .. "Info",      2)
 
--- Header
-g_main:label(accent .. ui.get_icon"user"     .. accent .. "  Welcome:  " .. common.get_username())
-g_main:label(accent .. ui.get_icon"sparkles" .. accent .. "  Sel01-Config v" .. SEL01_CFG_VERSION .. " — companion to Sel01-Solver")
+-- Header — v3.21: chernobl-style multi-color welcome (\aDEFAULT resets to white
+-- between accent-colored segments, like "Dear <accent>name<reset>, ...").
+local _uname = (common and common.get_username and common.get_username()) or "player"
+g_main:label(ui.get_icon"user" .. "  Dear " .. accent .. _uname .. "\aDEFAULT, have a good game!")
+g_main:label(ui.get_icon"sparkles" .. "  Build " .. accent .. "Sel01-Config" .. "\aDEFAULT  version " .. accent .. SEL01_CFG_VERSION .. "\aDEFAULT")
+g_main:label(ui.get_icon"bolt" .. "  Companion to " .. accent .. "Sel01-Solver" .. "\aDEFAULT (resolver)")
 g_main:label(" ")
 g_main:label(accent .. ui.get_icon"sliders"  .. accent .. "  Playstyle Presets:")
 
@@ -246,7 +254,7 @@ local vis_scope_rot  = g_visual:switch(accent ..                            "   
 local vis_menuborder = g_visual:switch(accent .. ui.get_icon"sliders"    .. accent .. "  Animated menu border (HSV flow)", true)
 -- v3.19: smoothing/animation state for the new render features (single table to dodge
 -- any main-chunk local-count pressure). Mutated only from events.render.
-local _vis_state = { scope_gap = 0, scope_size = 0, model_alpha = 255, vel_a = 0 }
+local _vis_state = { scope_gap = 0, scope_size = 0, model_alpha = 255, vel_a = 0, desync_shown = 0 }
 -- v3.20: premium fonts (loaded once). Fall back to built-in int font 5 if load fails.
 local _vis_fonts = {}
 pcall(function() _vis_fonts.vel = render.load_font("Verdana", 16, "a") end)
@@ -1809,7 +1817,11 @@ pcall(function()
             end)
         end
 
-        -- ── v3.19: DESYNC DELTA % (real vs fake yaw, near crosshair) ──
+        -- ── v3.21: DESYNC indicator (real vs fake yaw). SMOOTHED + labeled + moved
+        --    out of dead-center. The raw value jumps every tick because magnitude
+        --    jitter randomizes the desync 35-58° on purpose — a bare jumping "14"
+        --    under the crosshair looked broken. Now it lerps to a stable average,
+        --    reads as "DESYNC 21" with an arrow, sits lower + smaller, not red. ──
         if vis_desyncpct:get() then
             pcall(function()
                 if not (rage and rage.antiaim and rage.antiaim.get_rotation) then return end
@@ -1817,11 +1829,15 @@ pcall(function()
                 local real = rage.antiaim:get_rotation()
                 if not (fake and real) then return end
                 local delta = math.min(math.abs(real - fake) / 2, 60)
-                local frac = delta / 60
-                local col = color(255, 60, 60, 235):lerp(color(120, 230, 120, 235), frac)
-                local txt = string.format("%.0f", delta)
-                local tw = #txt * 7  -- font-4 ~7px/char (config avoids measure_text)
-                render.text(4, vector(cx - tw / 2, cy + 26), col, nil, txt)
+                -- heavy smoothing kills the per-tick jitter jump
+                _vis_state.desync_shown = _vis_state.desync_shown + (delta - _vis_state.desync_shown) * 0.06
+                local shown = _vis_state.desync_shown
+                local frac = shown / 60
+                -- low desync = orange (weaker AA), high = accent blue (good spread)
+                local col = color(235, 150, 70, 210):lerp(color(120, 200, 255, 230), frac)
+                local label = string.format("DESYNC %.0f", shown)
+                local tw = #label * 6  -- font-3 ~6px/char
+                render.text(3, vector(cx - tw / 2, cy + 52), col, nil, label)
             end)
         end
 
