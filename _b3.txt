@@ -1,0 +1,134 @@
+===== [medium] bug | SOLVER =====
+LINE: confidence() std-dev block: 1330-1341 (n>=3 branch). Identical flaw duplicated in resolve_stddev() at 3896-3907.
+TITLE: confidence() std-dev of recent_resolved averages raw angles without wrap handling — fake huge stddev near ±180
+FIX: Apply a reference-angle circular spread at BOTH sites (the finding only fixed one). Pure Lua, no NL API, no new top-level local (edits sit inside existing function bodies), respects all 13 hard constraints — does not touch hc/mindmg/hitbox/safepoint/cmd/combos/hotkeys.
+
+confidence() — replace lines 1331-1339 inner block:
+    local ref = s.recent_resolved[1].a
+    local sumd = 0
+    for _, r in ipairs(s.recent_resolved) do sumd = sumd + NormalizeAngle(r.a - ref) end
+    local mean_off = sumd / n
+    local sq = 0
+    for _, r in ipairs(s.recent_resolved) do
+        local d = NormalizeAngle(r.a - ref) - mean_off
+        sq = sq + d * d
+    end
+    local sd = math.sqrt(sq / n)
+    sd_score = math.max(0, 30 - sd)
+
+resolve_stddev() — replace lines 3899-3906 identically:
+    local ref = s.recent_resolved[1].a
+    local sumd = 0
+    for _, r in ipairs(s.recent_resolved) do sumd = sumd + NormalizeAngle(r.a - ref) end
+    local mean_off = sumd / n
+    local sq_sum = 0
+    for _, r in ipairs(s.recent_resolved) do
+        local d = NormalizeAngle(r.a - ref) - mean_off
+        sq_sum = sq_sum + d * d
+    end
+    return math.sqrt(sq_sum / n)
+
+`s.recent_resolved` is guaranteed non-empty at both sites (confidence guards `n >= 3`, resolve_stddev guards `n < 3 then return 0`), so `[1].a` is safe. After editing: run `luac -p resolverv2_35544.lua` and dual-copy to the NL path. Bump SEL01_VERSION (constant + @version header + 3 visible mentions) per project policy.
+
+===== [medium] new-method | SOLVER =====
+LINE: 3281-3350 (function), exact issue at 3303 (idx = ((s.missed-1) % #bf_list)+1); default dynamic list at 2809
+TITLE: Thompson-sampling / observed-frequency brute-force ordering instead of fixed cyclic angle list
+FIX: SAFE and implementable on the NL API with existing fields — it's pure goal_feet_yaw angle math, touches no banned surface (no ragebot HC/MinDmg/Hitbox/SafePoints override, no cmd userdata write, no combo/hotkey override, no enemy-entity reads in weapon_fire/player_hurt). Refinements: (1) DROP the "pose-param-11 sign FIRST" side-ordering — no pose-param/FFI for it exists in this file (grep found zero m_flPoseParameter usage); use the existing last_hit_side + alt_side_pick(s) dom logic for side ordering instead. (2) Build the candidate magnitude set per-call from {measured_left, measured_right, measured_desync, def_delta (when def_samples>=1 && def_delta>10), adaptive_guess_mag(), 58} and SORT by score = samples-on-that-bucket + small session-frequency weight, greedy (most-probable FIRST). Keep exploration MINIMAL (one math.random draw at recompute time only, small weight) so it doesn't regress the greedy front-load — and crucially seed it once per miss-count change, NOT per frame. (3) MUST preserve the existing bf_cache invalidation (3284-3288, keyed on s.missed + 20deg eye-drift) so the sort runs once per miss-count change, never 64x/sec — re-sorting per frame would thrash the resolved angle. (4) Fold the def-AA fingerprint and effective_desync logic INTO the scored set rather than deleting them, so V9.5 def-AA handling isn't lost. (5) Map each chosen {side,mag} directly to `result = eye_yaw + mag*side` and set s.mode = "BF:meas"/"BF:freq"/"BF:explore"; BF:* is already filtered from best_mode storage (CLAUDE.md V9.0) so these synthetic labels are safe and keep stats coherent. (6) Implement the helper as a MODULE GLOBAL (no `local`) — main chunk is at the 200-local cap (co
+
+===== [medium] aa-improvement | CONFIG =====
+LINE: sel01_config.lua 585-597 (anti-BF block 586-592, clamp 594-595); resolver per-side EMA 2569-2605, global EMA/drift 2548-2562, adaptive_guess_mag 957-975
+TITLE: Correlated (anti-median) per-side jitter: ramp + reflect instead of independent uniform noise
+FIX: Add an opt-in correlated/asymmetric jitter mode that REPLACES (not stacks on) the symmetric draw at 591-592 when enabled — stacking a second random layer just reintroduces averaging. Concretely:
+
+1. UI (near line 140, top-level locals so the aa_periodic_sync closure at ~500 captures them after decl — respects forward-decl constraint 12, and config is well under the 200-local cap so plain `local` is fine):
+   `local aa_corr_jitter = g_aa:switch("Correlated jitter (anti-median)", false)`
+   `local aa_corr_mode   = g_aa:combo("  └ Pattern", {"Sawtooth ramp","Anti-phase L/R"})`
+   `local aa_corr_amp    = g_aa:slider("  └ Amplitude (deg)", 5, 38, 20)`
+   `local aa_corr_step   = g_aa:slider("  └ Ramp step (deg/sync)", 2, 20, 8)`
+   (4-arg slider only — constraint 8; combo :get() compared as STRING below.)
+
+2. State: add a module-level accumulator advanced ONCE PER EXECUTED SYNC, i.e. AFTER the line-514 throttle gate (`if tick - aa_periodic_last_tick < 4 then return end`), not on raw tick — otherwise the ramp speed depends on how often the gate passes. e.g. `aa_corr_phase = (aa_corr_phase or 0) + 1` placed right after line 515.
+
+3. Replace the 586-592 branch with a mode switch:
+   if aa_corr_jitter:get() then
+     local base = lim
+     if aa_corr_mode:get() == "Sawtooth ramp" then
+       local span = math.max(1, aa_corr_amp:get())
+       local step = aa_corr_step:get()
+       local ramp = (aa_corr_phase * step) % span
+       l_lim = base + ramp; r_lim = base + ramp
+     else -- "Anti-phase L/R"
+       local amp = aa_corr_amp:get()
+       local s = math.sin(aa_corr_phase * 0.6)  -- phase in radians, no tick math needed
+       l_lim = base + amp * s; r_lim = base - amp * s
+     en
+
+===== [low] bug | SOLVER =====
+LINE: 2507-2524 (selection + consume), 3792-3802 (push + ring cap), full MISS branch 2380-2494 (no drain)
+TITLE: Snapshot matching has no time-window guard — a stale snapshot from a prior engagement can be matched to the current ack
+FIX: Adopt the fix but make it clock-safe so it never silently rejects a CORRECT fresh match when event.tick is on a different scale than the stored client tick. Two pure-Lua changes, no NL API, no ragebot/cmd/AA touch — respects all 13 constraints:
+
+1) Drain at push time using the SAME clock that is stored (globals.tickcount), in push_shot_snapshot before the >8 cap (line ~3801):
+   local now_t = globals.tickcount or 0
+   while #s.shot_snapshots > 0 and (now_t - (s.shot_snapshots[1].tick or 0)) > 64 do
+       table.remove(s.shot_snapshots, 1)
+   end
+This prunes entries older than ~1s @64 regardless of HIT/miss, killing the cross-engagement carryover at the source.
+
+2) In the aim_ack HIT picker (lines 2509-2523), apply the window ONLY against the client-clock fallback to avoid mixed-clock false rejects. Prefer the client tick for matching since snapshots store client tick:
+   local target_tick = globals.tickcount or 0   -- match same clock as snap.tick
+   local best, best_diff = nil, math.huge
+   for _, snap in ipairs(s.shot_snapshots) do
+       local diff = math.abs((snap.tick or 0) - target_tick)
+       if diff < best_diff then best, best_diff = snap, diff end
+   end
+   if best and best_diff <= 64 then
+       src_eye, src_res = best.eye_yaw, best.resolved
+       ... (keep verbose log + consume loop unchanged)
+   end
+   -- when best_diff > 64 (or no snapshot): src_eye/src_res keep the line-2506
+   -- defaults s.last_eye_yaw / s.last_resolved → NO regression, identical to
+   -- the pre-snapshot behavior.
+
+Notes: (a) using globals.tickcount for target_tick instead of event.tick removes the mixed-clock hazard entirely and matches the stored snap.tick units; if you want to keep e
+
+===== [low] bug | SOLVER =====
+LINE: 3506-3543 (air-branch early-return at 3539-3542); ground push at 3632-3634; resolve_stddev at 3896-3907; cancel-conf gate at 4072-4124 (resolve_stddev call 4073
+TITLE: Air-branch never pushes to recent_resolved, so cancel-conf stddev gate uses stale ground data on airborne enemies
+FIX: The proposed fix is correct and safe — verified all referenced names exist in scope: tick_cache.curtime (used at 3419/3632), NormalizeAngle (used at 3541), s.recent_resolved (init at 2285). It mirrors the ground path (3632-3634) verbatim, adds no NL API call, and the `local now_ct` lives inside the air `if`-block scope so it does NOT add a main-chunk local (constraint #7 unaffected — the ground path already declares its own now_ct in a separate scope, no conflict). Apply exactly as proposed, inserting between line 3540 and 3541:\n\n    s.last_eye_yaw  = anim.m_flEyeYaw\n    s.last_resolved = server_yaw\n    local now_ct = tick_cache.curtime or 0\n    table.insert(s.recent_resolved, {a = server_yaw, t = now_ct})\n    while #s.recent_resolved > 5 do table.remove(s.recent_resolved, 1) end\n    anim.m_flGoalFeetYaw = NormalizeAngle(server_yaw)\n    return\n\nOptional hardening: this also makes confidence()'s sd_score reflect air-angle volatility, which may slightly lower conf during jump windows — that is arguably more correct (we are genuinely less certain in air), and touches no ragebot/mindmg/hitbox/AA override, so it respects all 13 hard constraints. After editing, run `luac -p resolverv2_35544.lua`, bump SEL01_VERSION (constant + @version header + 3 visible mentions), then dual-copy to the NL path.
+
+===== [low] bug | SOLVER =====
+LINE: 1638-1639 (dom calc); passive writers at 3682-3683 + 3684-3687; boot at 3443-3444
+TITLE: learning_update_hit dominant-side calc uses raw e.sl/e.sr which include passive-seeded counts → dom can be set from non-hit data
+FIX: The proposed fix is safe and respects all 13 hard constraints (pure data-model change: no NL API, no override/cmd/combo/hotkey writes, no menu callbacks, no sandbox violations). Implement as: in learning_update_hit (after 1631/1634) increment hit-only counters `e.hsr = (e.hsr or 0)+1` / `e.hsl = (e.hsl or 0)+1`; change the dom calc at 1638-1639 to read those — `if (e.hsr or 0) > (e.hsl or 0) + 3 then e.dom = 1 elseif (e.hsl or 0) > (e.hsr or 0) + 3 then e.dom = -1 end`. Leave e.sl/e.sr for EMA + boot sample-count as-is. Migration: no explicit defaulting needed in learning_load since `(e.hsr or 0)` handles missing fields (Lua reads nil → 0); the existing migrate loop need not change. ALSO remove or gate the passive dom-set at 3684-3687 so passive cannot seed dom at all (otherwise that path still bypasses the hit-only counters) — change it to leave e.dom = 0 for purely passive entries, letting the >=5 boot gate + first real hit establish dom. Remember the dual-copy mirror to the NL path and a SEL01_VERSION bump per project policy. Given practical impact is low (threshold + boot gate already neutralize the cited regression), this is a nice-to-have hardening rather than a fix for an active misbehavior.
+
+===== [low] bug | SOLVER =====
+LINE: 3443-3457 (boot site); learning_load 1533-1567; pcall guard 3824; entry creators 1624 + 3676
+TITLE: LearnedModel boot does unguarded arithmetic on lrn.sl/lrn.sr/lrn.dl/lrn.dr — nil from a partial/old .lua or hand-edited entry silently aborts the resolve
+FIX: Add nil-coalescing at the boot site (lines 3443-3457). Replace:\n```\nif lrn and (lrn.sl + lrn.sr) >= 5 then\n    if lrn.dom ~= 0 then s.last_hit_side = lrn.dom end\n    if lrn.sl >= 2 and lrn.dl > 0 then ... end\n    if lrn.sr >= 2 and lrn.dr > 0 then ... end\n    if s.measured_desync == 0 then\n        local total = lrn.sl + lrn.sr\n        s.measured_desync = (lrn.dl * lrn.sl + lrn.dr * lrn.sr) / total\n```\nwith:\n```\nif lrn then\n    local sl, sr = lrn.sl or 0, lrn.sr or 0\n    local dl, dr = lrn.dl or 0, lrn.dr or 0\n    if (sl + sr) >= 5 then\n        if (lrn.dom or 0) ~= 0 then s.last_hit_side = lrn.dom end\n        if sl >= 2 and dl > 0 then s.measured_left = dl; s.samples_left = math.min(sl,10) end\n        if sr >= 2 and dr > 0 then s.measured_right = dr; s.samples_right = math.min(sr,10) end\n        if s.measured_desync == 0 then\n            local total = sl + sr\n            if total > 0 then\n                s.measured_desync = (dl * sl + dr * dr ~= nil and dl * sl + dr * sr or 0) / total -- (use dl*sl+dr*sr)\n                s.desync_samples = math.min(total, 10)\n            end\n        end\n        ... (boot_best_modes + throttled log unchanged; log args also use lrn.hits or 0 which is already guarded)\n    end\nend\n```\nKeep it simple — the cleanest form: at the top of the block do `local sl,sr,dl,dr = lrn.sl or 0, lrn.sr or 0, lrn.dl or 0, lrn.dr or 0` and use those locals everywhere below, guard `lrn.dom or 0`, and wrap the division in `if total > 0`. EQUALLY GOOD ALTERNATIVE (preferred, fixes the root cause once instead of one call-site): normalize every entry inside learning_load's migration loop (lines 1544-1557) by adding `e.dl = e.dl or 0; e.
+
+===== [low] bug | SOLVER =====
+LINE: 965-975 (push filter at 959; HIT-derived `actual` gate at 2536-2537)
+TITLE: adaptive_guess_mag median picks the upper-middle element and clamps the RETURNED median instead of clamping inputs, biasing the guess magnitude high on small/odd samples
+FIX: Tighten ONLY the upper push bound to the realistic max-desync band so >58° reads never enter the median ring; keep the lower bound permissive (do NOT raise it to 15 as proposed — legitimate ~10-14° low-desync enemies exist and would be discarded, losing real lobby signal; the output clamp at 20 already floors the guess). At line 959 change `if not v or v < 5 or v > 65 then return end` to `if not v or v < 5 or v > 58 then return end`. This aligns the ring contents with the [20,58] output clamp so a high-desync read can no longer pull the median above the band. The even-count two-central-average tweak is optional and not worth the extra locals/code given the 200-local pressure — skip it; the lower-median already biases slightly LOW, not high, so it does not warrant change. Pure math, no NL API, touches no mindmg/hitchance/hitbox/cmd/combo/hotkey — violates none of the hard constraints. Per dual-copy + version-bump rules, bump SEL01_VERSION and mirror to the NL path after editing.
+
+===== [medium] new-method | SOLVER =====
+LINE: read site GetAnimStateCached at 3354-3366 (confirmed); air-branch resolve_player 3504-3543 (confirmed, Air-Guess at 3535); _pick_first_shot_impl 2866-3259 (Stat
+TITLE: Pose-parameter-11 direct desync read (animated body-yaw side+magnitude WITHOUT shooting)
+FIX: Implement ONLY the finding's secondary use, gated behind a NEW off-by-default toggle for A/B testing (not on-by-default — the on-by-default primary branch is what makes it unsafe):
+
+1. Add global helper (no `local`, respects cap-7):
+   function read_pose_desync(p)
+     local ok, v = pcall(function() return p.m_flPoseParameter[11] end)
+     if not ok or type(v) ~= "number" then return nil end
+     local deg = v * 120 - 60
+     if math.abs(deg) < 3 or math.abs(deg) > 62 then return nil end
+     return deg   -- + = right, - = left
+   end
+   Forward-decl as a module global BEFORE any callback that names it (constraint 12) — but since it's only called from resolve_player/_pick_first_shot_impl (not UI callbacks), defining it above resolve_player is sufficient.
+
+2. Add UI: `pose_read_tog` switch, DEFAULT OFF, in an experimental group. Pcall the :get().
+
+3. Use it ONLY where the current code blind-guesses the SIDE (do NOT add a primary PoseRead resolve branch, do NOT bypass the EMA): in Static-Guess (3094), Networked-Guess (3116 & 3232), LBY-Snap-Guess (3135), Air-Guess (3535), and the final fall-through (3239-3255) — when `pose_read_tog:get()` AND read_pose_desync(p) returns non-nil AND |that| is within a sane band, set `side = pose_deg >= 0 and 1 or -1` INSTEAD of the `last_hit_side or 1` coin-flip. Keep adaptive_guess_mag() (or measured) for the MAGNITUDE — pose-11 magnitude is unreliable on networked enemies, only the SIGN is worth using as a tiebreaker. Keep last_hit_side as fallback when read fails or toggle off.
+
+4. Optional cross-check (not a hard override): in aim_ack after computing `actual`, if read_pose_desync sign disagrees with hit_side for 2+ consecutive shots, log

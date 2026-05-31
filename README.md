@@ -20,7 +20,7 @@ Neverlose's own events/UI — never directly.
 
 | Script | Role |
 |---|---|
-| **Sel01-Solver** (`resolverv2_35544.lua`, ~5200 lines) | The resolver: per-player AA learning, persistent JSON/Lua store, HUD + on-model ESP, event ticker, AA Advisor (in-menu + coach-chat), Sel01-Roast kill-chat. |
+| **Sel01-Solver** (`Sel01-Solver.lua`, ~5200 lines) | The resolver: per-player AA learning, persistent JSON/Lua store, HUD + on-model ESP, event ticker, AA Advisor (in-menu + coach-chat), Sel01-Roast kill-chat. |
 | **Sel01-Config** (`sel01_config.lua`, ~1950 lines) | Companion: AA presets, an anti-resolver bundle (defensive-on-hit, fake-lag variance, magnitude jitter, side-streak limiting), watermark + indicators, debug dumps. |
 
 ---
@@ -149,7 +149,7 @@ No test infrastructure — runtime errors only surface on reload in Neverlose.
 Bytecode-compile each script before loading:
 
 ```bash
-luac -p resolverv2_35544.lua    # resolver
+luac -p Sel01-Solver.lua    # resolver
 luac -p sel01_config.lua        # config
 ```
 
@@ -187,7 +187,7 @@ Learned data is per-user and never committed:
 
 ## Files
 
-- `resolverv2_35544.lua` — the resolver
+- `Sel01-Solver.lua` — the resolver
 - `sel01_config.lua` — the companion config
 - `CLAUDE.md` — full architecture, bug history, and Neverlose-API notes
 - `README.md` — this file

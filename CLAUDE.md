@@ -8,7 +8,7 @@ Two Neverlose **CSGO** (legacy build, NOT CS2) Lua scripts for HvH / rage play. 
 
 | Script | Role | Working copy | NL load path |
 |---|---|---|---|
-| **Sel01-Solver** (`resolverv2_35544.lua`, ~5200 lines, v9.53) | Resolver: per-player AA learning, JSON export, HUD/ESP overlay + top-right event ticker, FFI clipboard copy-logs, Sel01-Roast chat-spam, AA Advisor (in-menu panel + Coach-chat to CSGO say) | `C:\Users\Seltonmt\Desktop\sazz\aron\ownlua\resolverv2_35544.lua` | `E:\SteamLibrary\steamapps\common\Counter-Strike Global Offensive\nl\scripts\Sel01-Solver_59853.lua` |
+| **Sel01-Solver** (`Sel01-Solver.lua`, ~5200 lines, v9.53) | Resolver: per-player AA learning, JSON export, HUD/ESP overlay + top-right event ticker, FFI clipboard copy-logs, Sel01-Roast chat-spam, AA Advisor (in-menu panel + Coach-chat to CSGO say) | `C:\Users\Seltonmt\Desktop\sazz\aron\ownlua\Sel01-Solver.lua` | `E:\SteamLibrary\steamapps\common\Counter-Strike Global Offensive\nl\scripts\Sel01-Solver_59853.lua` |
 | **Sel01-Config** (`sel01_config.lua`, ~1950 lines, v3.14) | Companion: AA presets (Aggressive/Dynamic/Defensive/Spin), anti-resolver bundle (defensive on hit-taken, slow-walk boost, fake-lag variance, yaw base rotation, side-streak limit, magnitude jitter), anti-HS extras (pitch jitter, move-fakeduck), peek-boost hotkey, comprehensive Dump Debug Stats, hits-taken log with AA-state snapshots, kill/miss/hit event log top-left, watermark + indicators + rotating AA arrow | `C:\Users\Seltonmt\Desktop\sazz\aron\ownlua\sel01_config.lua` | `E:\SteamLibrary\steamapps\common\Counter-Strike Global Offensive\nl\scripts\sel01_config_59908.lua` |
 
 **Dual-copy rule (MANDATORY).** After every Edit/Write to either working copy, immediately overwrite the matching NL file (same path, no new files, no renames). PowerShell one-liner: `Copy-Item -Force -LiteralPath '<working>' -Destination '<nl-path>'`. The git repo only tracks working copies — the NL copies need the mirror so reload in NL picks up the change.
@@ -29,7 +29,7 @@ Solver architecture + bug history + UI doc lives in `README.md`. NL API docs at 
 ## Verify changes
 
 ```powershell
-luac -p resolverv2_35544.lua    # resolver
+luac -p Sel01-Solver.lua    # resolver
 luac -p sel01_config.lua        # config
 ```
 
@@ -117,7 +117,7 @@ luac -p sel01_config.lua        # config
 
 **`utils.console_exec("say <text>")`** is the working pattern for sending CSGO chat messages from Lua (Sel01-Roast since v8, Coach-chat send-to-chat since v9.26). Length limit ~127 chars per say. Strip embedded `"` defensively. `engine.execute_client_cmd` is the fallback when `utils.console_exec` isn't exposed.
 
-## File layout (resolverv2_35544.lua, ~5200 lines)
+## File layout (Sel01-Solver.lua, ~5200 lines)
 
 Line numbers are approximate — they drift as features are added. Use `Grep` to find a specific function. The shape of the file is:
 
@@ -297,7 +297,7 @@ Sel01-Config vX.Y — <short summary>      (for config bumps)
 Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
 ```
 
-**Dual-copy reminder.** Every edit to `resolverv2_35544.lua` OR `sel01_config.lua` must also overwrite the matching NL file. NEVER create new files in the NL folder — only `Copy-Item -Force` over the existing ones. Working copy is the source of truth tracked by git; NL copy is the one NL reloads from.
+**Dual-copy reminder.** Every edit to `Sel01-Solver.lua` OR `sel01_config.lua` must also overwrite the matching NL file. NEVER create new files in the NL folder — only `Copy-Item -Force` over the existing ones. Working copy is the source of truth tracked by git; NL copy is the one NL reloads from.
 
 `.gitignore` excludes private data (`learned.lua/json/last_logs.txt/logo.png`, `.claude/`, `.vscode/`).
 
