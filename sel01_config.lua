@@ -5,7 +5,7 @@
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Config
 -- @author seltonmt01
--- @version 3.19
+-- @version 3.20
 -- @description Smart freestand (anti-headshot):
 --   * NL freestanding is deterministic — it always picks the same "safe" side, so a
 --     resolver models it and headshots the predictably-exposed side (user report:
@@ -53,7 +53,7 @@
 --     variance for full per-side chaos.
 --   * MAG-JIT indicator added to bottom HvH strip; dumped in v3.8 stats.
 
-local SEL01_CFG_VERSION = "3.19"
+local SEL01_CFG_VERSION = "3.20"
 
 -- DEBUG: print to CSGO console at major load checkpoints. Plain print() bypasses
 -- NL chat (which may not flush before crash) and writes directly to CSGO console.
@@ -243,9 +243,14 @@ local vis_sleeves    = g_visual:switch(accent .. ui.get_icon"eye"        .. acce
 local vis_menublur   = g_visual:switch(accent .. ui.get_icon"eye"        .. accent .. "  Blur behind menu", true)
 local vis_custscope  = g_visual:switch(accent .. ui.get_icon"crosshairs" .. accent .. "  Custom scope overlay", false)
 local vis_scope_rot  = g_visual:switch(accent ..                            "      rotate scope 45 deg", false)
+local vis_menuborder = g_visual:switch(accent .. ui.get_icon"sliders"    .. accent .. "  Animated menu border (HSV flow)", true)
 -- v3.19: smoothing/animation state for the new render features (single table to dodge
 -- any main-chunk local-count pressure). Mutated only from events.render.
-local _vis_state = { scope_gap = 0, scope_size = 0, model_alpha = 255 }
+local _vis_state = { scope_gap = 0, scope_size = 0, model_alpha = 255, vel_a = 0 }
+-- v3.20: premium fonts (loaded once). Fall back to built-in int font 5 if load fails.
+local _vis_fonts = {}
+pcall(function() _vis_fonts.vel = render.load_font("Verdana", 16, "a") end)
+local function _vfont() return _vis_fonts.vel or 5 end
 g_visual:label(" ")
 g_visual:label(accent .. "  NL Hit Marker Sound / Force Thirdperson / Scope Overlay:")
 g_visual:label(accent .. "  Set those directly in NL Visuals tab (they're combo elements)")
@@ -451,6 +456,16 @@ local function _do_apply_preset(name)
         safe_set(vis_dmgind, true)
         safe_set(vis_specoverlay, true)
         safe_set(qol_clantag, true)
+        -- v3.19/3.20 visuals — ALL ON in Aggressive so the user can test without toggling
+        safe_set(vis_desyncpct, true)
+        safe_set(vis_skeet, true)
+        safe_set(vis_netgraph, true)
+        safe_set(vis_scopefade, true)
+        safe_set(vis_sleeves, true)
+        safe_set(vis_menublur, true)
+        safe_set(vis_custscope, true)
+        safe_set(vis_scope_rot, true)
+        safe_set(vis_menuborder, true)
         _safe_step("nl aa_enabled",     function() nl_override(nl_refs.aa_enabled, true) end)
         _safe_step("nl aa_freestand",   function() nl_override(nl_refs.aa_freestand, true) end)
         _safe_step("nl aa_avoidbk",     function() nl_override(nl_refs.aa_avoidbackstab, true) end)
@@ -1398,6 +1413,36 @@ pcall(function()
             end)
         end
 
+        -- ── v3.20: ANIMATED MENU BORDER (bettervisal-style layered frame + HSV flow) ──
+        if vis_menuborder:get() then
+            pcall(function()
+                local a = ui.get_alpha and ui.get_alpha() or 0
+                if not a or a <= 0 then return end
+                local pos, sz = ui.get_position(), ui.get_size()
+                if not (pos and sz) then return end
+                local p2 = vector(pos.x + sz.x, pos.y + sz.y)
+                local A = math.floor(a * 255)
+                -- layered dark frame (exact bettervisal layering for the "premium" depth)
+                render.rect(vector(pos.x - 7, pos.y - 9), vector(p2.x + 7, p2.y + 7), color(12, 12, 12, A))
+                render.rect(vector(pos.x - 6, pos.y - 8), vector(p2.x + 6, p2.y + 6), color(60, 60, 60, A))
+                render.rect(vector(pos.x - 5, pos.y - 7), vector(p2.x + 5, p2.y + 5), color(40, 40, 40, A))
+                render.rect(vector(pos.x - 2, pos.y - 4), vector(p2.x + 2, p2.y + 2), color(60, 60, 60, A))
+                render.rect(vector(pos.x - 1, pos.y - 3), vector(p2.x + 1, p2.y + 1), color(12, 12, 12, A))
+                -- flowing HSV gradient on the outer accent edge (pcall: as_hsv build-variant)
+                pcall(function()
+                    local h = (globals.realtime or 0) * 0.10
+                    local c1 = color():as_hsv((h) % 1, 0.65, 1.0);        c1.a = A
+                    local c2 = color():as_hsv((h + 0.5) % 1, 0.65, 1.0);  c2.a = A
+                    local ox1, oy1 = pos.x - 6, pos.y - 8
+                    local ox2, oy2 = p2.x + 6, p2.y + 6
+                    render.gradient(vector(ox1, oy1), vector(ox2, oy1 + 2), c1, c2, c1, c2)            -- top
+                    render.gradient(vector(ox1, oy2 - 2), vector(ox2, oy2), c2, c1, c2, c1)            -- bottom
+                    render.gradient(vector(ox1, oy1), vector(ox1 + 2, oy2), c1, c1, c2, c2)            -- left
+                    render.gradient(vector(ox2 - 2, oy1), vector(ox2, oy2), c2, c2, c1, c1)            -- right
+                end)
+            end)
+        end
+
         -- ── HIT-MARKER (4 short diagonal lines around crosshair, fade) ──
         if vis_hitmarker:get() then
             local age = now - hitmark_time
@@ -1622,32 +1667,53 @@ pcall(function()
             end
         end
 
-        -- ── VELOCITY WARNING (red pulse when slow-walk or fake-duck needs it) ──
+        -- ── VELOCITY INDICATOR (v3.20: frostlive-style — icon box + label box +
+        --    blur backdrop + clipped color-by-% fill bar + smooth fade) ──
         if vis_velwarn:get() then
-            local lp = entity.get_local_player()
-            if lp and lp:is_alive() then
-                local warn_text = nil
-                pcall(function()
-                    local v = lp.m_vecVelocity
-                    local sp = math.sqrt((v.x or 0)^2 + (v.y or 0)^2)
-                    -- read NL slow-walk + fake-duck state
-                    local sw_on, fd_on = false, false
-                    if nl_refs.aa_slowwalk then sw_on = nl_refs.aa_slowwalk:get() == true end
-                    if nl_refs.aa_fakeduck then fd_on = nl_refs.aa_fakeduck:get() == true end
-                    -- Warn if moving too fast while slow-walk should be active
-                    if sw_on and sp > 90 then warn_text = "STOP / SLOW WALK"
-                    elseif fd_on and sp > 90 then warn_text = "STOP / FAKE DUCK"
-                    end
-                end)
-                if warn_text then
-                    local a = pulse_alpha(VELWARN_PULSE_HZ)
-                    local tw = 0
-                    pcall(function() tw = render.measure_text(5, nil, warn_text).x end)
-                    pcall(function()
-                        render.text(5, vector(cx - tw / 2, cy + 40), color(255, 60, 60, a), nil, warn_text)
-                    end)
-                end
-            end
+            pcall(function()
+                local lp = entity.get_local_player()
+                local alive = lp and lp:is_alive()
+                local vmod = (alive and (lp.m_flVelocityModifier or 1)) or 1
+                local menu_open = ui.get_alpha and ui.get_alpha() > 0
+                -- show when actually slowed, or as a live preview while the menu is open
+                local want = (vmod < 1) or menu_open
+                _vis_state.vel_a = _vis_state.vel_a + ((want and 1 or 0) - _vis_state.vel_a) * 0.12
+                local a = _vis_state.vel_a
+                if a <= 0.02 then return end
+                if (vmod >= 1) and menu_open then vmod = math.min(1, (globals.tickcount % 200) / 150) end
+                local A   = math.floor(255 * a)
+                local fnt = _vfont()
+                local rad = 8
+                local label = "velocity   " .. string.format("%d%%", math.floor(vmod * 100))
+                local icon  = ui.get_icon("triangle-exclamation")
+                local bg    = color(14, 14, 18, math.floor(150 * a))
+                -- color by remaining speed: red <33%, orange <50%, accent >50%
+                local bar = (vmod <= 0.33) and color(230, 110, 110)
+                         or (vmod <= 0.5)  and color(235, 175, 110)
+                         or color(120, 200, 255)
+                bar.a = A
+                local isz = vector(34, 34)
+                local lw  = render.measure_text(fnt, nil, label).x + 22
+                local box = vector(lw, 34)
+                local base = vector(cx - (isz.x + 6 + box.x) / 2, sy * 0.18)
+                -- icon box
+                render.blur(base, base + isz, 2, a, rad)
+                render.rect(base, base + isz, bg, rad)
+                local iw = render.measure_text(fnt, nil, icon)
+                render.text(fnt, base + (isz - iw) / 2, color(bar.r, bar.g, bar.b, A), nil, icon)
+                -- label box
+                local lb = base + vector(isz.x + 6, 0)
+                render.blur(lb, lb + box, 2, a, rad)
+                render.rect(lb, lb + box, bg, rad)
+                local tw = render.measure_text(fnt, nil, label)
+                render.text(fnt, lb + vector(11, (box.y - tw.y) / 2), color(255, 255, 255, A), nil, label)
+                -- clipped fill bar along the bottom
+                local bh = 4
+                local by = lb + vector(0, box.y - bh)
+                render.push_clip_rect(by, vector(by.x + box.x * vmod, by.y + bh))
+                render.rect(by, by + vector(box.x, bh), bar, { 0, 0, rad, rad })
+                render.pop_clip_rect()
+            end)
         end
 
         -- ── V2.9: EVENT LOG (top-left) — HITS + MISSES + KILLS unified ──
