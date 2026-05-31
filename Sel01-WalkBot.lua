@@ -1,11 +1,11 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-WalkBot                                     ║
--- ║  Version: 0.2                                      ║
+-- ║  Version: 0.3                                      ║
 -- ║  Greedy nav-bot: map + enemy detect, walk-to-foe  ║
 -- ║  by seltonmt01                                     ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-WalkBot
--- @version 0.2
+-- @version 0.3
 -- @author seltonmt01
 -- @description Greedy walk-bot. Detects map + enemies, walks the local player
 --   toward a chosen target using NL movement cmd (move_yaw + forwardmove) with
@@ -19,7 +19,7 @@
 --   entity.get_players(true) (enemies) / entity.get_local_player() / p.m_vecOrigin / p:get_eye_position()
 --   globals.mapname / globals.tickcount / globals.realtime
 
-local SEL01_WB_VERSION = "0.2"
+local SEL01_WB_VERSION = "0.3"
 
 -- ─── small helpers ───────────────────────────────────────
 local function clamp(v, lo, hi) if v < lo then return lo elseif v > hi then return hi else return v end end
@@ -70,6 +70,7 @@ if not ok_ui or not g_main then
 end
 
 local wb_enable, wb_mode, wb_stopdist, wb_autojump, wb_probe, wb_speed, wb_hud, wb_debug
+local wb_peekslow, wb_peekrng, wb_slowspd
 pcall(function()
     wb_enable   = g_main:switch("Enable WalkBot")                 -- the on/off switch (no hotkey)
     wb_mode     = g_main:combo("Target Pick", "Nearest", "Lowest HP", "Most Visible", "Crosshair")
@@ -77,11 +78,17 @@ pcall(function()
     wb_speed    = g_main:slider("Move Speed", 50, 450, 450)
     wb_autojump = g_main:switch("Auto-Jump Obstacles (only when step-up clears)")
     wb_probe    = g_main:slider("Obstacle Probe (units)", 20, 140, 55)
+    -- peek slow-walk: when a visible enemy is near, slow-walk + jiggle so their
+    -- resolver misses our moving/desynced model while our ragebot lands.
+    wb_peekslow = g_main:switch("Slow-Walk Peek (near visible enemy)")
+    wb_peekrng  = g_main:slider("Peek Range (slow-walk under)", 200, 1500, 750)
+    wb_slowspd  = g_main:slider("Slow-Walk Speed", 40, 160, 110)
     wb_hud      = g_hud:switch("HUD Overlay")
     wb_debug    = g_hud:switch("Debug Info")
 end)
 -- sensible defaults (switches default off; flip the ones we want on)
 pcall(function() if wb_autojump then wb_autojump:set(true) end end)
+pcall(function() if wb_peekslow then wb_peekslow:set(true) end end)
 pcall(function() if wb_hud then wb_hud:set(true) end end)
 
 -- ─── runtime state ───────────────────────────────────────
@@ -98,6 +105,8 @@ local state = {
     diag         = "init",     -- debug: why we are / aren't moving
     enemy_count  = 0,
     block        = "clear",    -- clear / front / boxed / wall
+    peek_flip_t  = 0,          -- slow-walk strafe-jiggle timer
+    peek_side    = 1,          -- current jiggle side
 }
 
 -- ─── helpers needing NL API (all pcall-guarded for version variance) ──
@@ -251,10 +260,21 @@ local function walkbot_tick(cmd)
     local to = get_origin(target)
     if not lo or not to then state.activity = "IDLE"; state.diag = "missing origin"; return end
 
-    -- STOP condition: within stop distance AND we can see them (let the fight happen)
+    local los = has_los(lp, target)
     local stop_d = 450
     pcall(function() stop_d = wb_stopdist:get() end)
-    if dist <= stop_d and has_los(lp, target) then
+    local peekslow = false
+    pcall(function() peekslow = wb_peekslow and wb_peekslow:get() end)
+    local peekrng = 750
+    pcall(function() peekrng = wb_peekrng and wb_peekrng:get() end)
+    -- peek-slow zone: a VISIBLE enemy within peek range. We slow-walk (+ strafe
+    -- jiggle at close range) so their resolver misses our moving / desynced model
+    -- while our ragebot lands. This intentionally OVERRIDES the hard STOP — standing
+    -- still is the easiest thing to resolve, so we keep micro-moving instead.
+    local peek_active = peekslow and los and dist <= peekrng
+
+    -- hard STOP only when peek-slow is OFF (legacy behaviour)
+    if not peek_active and dist <= stop_d and los then
         state.activity = "STOP"; state.block = "clear"
         state.diag = string.format("in range %.0f<=%.0f + LoS -> holding", dist, stop_d)
         state.last_origin = lo
@@ -263,6 +283,15 @@ local function walkbot_tick(cmd)
 
     -- desired walk direction (world)
     local want_yaw = dir_yaw(lo, to)
+    -- close + peeking: strafe-jiggle sideways instead of walking into them; flip
+    -- side ~3x/sec so the magnitude/side the enemy resolver sees keeps changing.
+    if peek_active and dist <= stop_d then
+        if (now - (state.peek_flip_t or 0)) > 0.30 then
+            state.peek_side = -(state.peek_side or 1)
+            state.peek_flip_t = now
+        end
+        want_yaw = want_yaw + (state.peek_side or 1) * 75
+    end
 
     -- ── obstacle avoidance: probe straight, then fan out ──
     local probe = 55
@@ -329,9 +358,20 @@ local function walkbot_tick(cmd)
     end
     state.last_origin = lo
 
-    -- ── write movement to the user command ──
+    -- ── speed: full run, or slow-walk inside the peek zone ──
     local spd = 450
     pcall(function() spd = wb_speed:get() end)
+    if peek_active then
+        local sw = 110
+        pcall(function() sw = wb_slowspd:get() end)
+        spd = sw
+        -- show PEEK unless a more urgent state (STUCK/JUMP) is active
+        if state.activity == "WALK" or state.activity == "AVOID" then state.activity = "PEEK" end
+        state.diag = string.format("PEEK slow-walk d=%.0f spd=%.0f%s", dist, spd,
+            (dist <= stop_d) and " +jiggle" or "")
+    end
+
+    -- ── write movement to the user command ──
     pcall(function()
         cmd.move_yaw   = move_yaw
         cmd.forwardmove = spd
@@ -354,6 +394,7 @@ local COL = {
     avoid  = function() return color(255, 200, 90, 255) end,
     stuck  = function() return color(255, 110, 110, 255) end,
     stop   = function() return color(120, 200, 255, 255) end,
+    peek   = function() return color(200, 120, 255, 255) end,
     idle   = function() return color(150, 150, 150, 255) end,
 }
 local function act_color(a)
@@ -361,6 +402,7 @@ local function act_color(a)
     elseif a == "AVOID" or a == "JUMP" then return COL.avoid()
     elseif a == "STUCK" then return COL.stuck()
     elseif a == "STOP" then return COL.stop()
+    elseif a == "PEEK" then return COL.peek()
     else return COL.idle() end
 end
 
