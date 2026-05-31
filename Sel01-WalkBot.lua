@@ -1,11 +1,11 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-WalkBot                                     ║
--- ║  Version: 0.3                                      ║
+-- ║  Version: 0.4                                      ║
 -- ║  Greedy nav-bot: map + enemy detect, walk-to-foe  ║
 -- ║  by seltonmt01                                     ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-WalkBot
--- @version 0.3
+-- @version 0.4
 -- @author seltonmt01
 -- @description Greedy walk-bot. Detects map + enemies, walks the local player
 --   toward a chosen target using NL movement cmd (move_yaw + forwardmove) with
@@ -19,7 +19,7 @@
 --   entity.get_players(true) (enemies) / entity.get_local_player() / p.m_vecOrigin / p:get_eye_position()
 --   globals.mapname / globals.tickcount / globals.realtime
 
-local SEL01_WB_VERSION = "0.3"
+local SEL01_WB_VERSION = "0.4"
 
 -- ─── small helpers ───────────────────────────────────────
 local function clamp(v, lo, hi) if v < lo then return lo elseif v > hi then return hi else return v end end
@@ -70,7 +70,7 @@ if not ok_ui or not g_main then
 end
 
 local wb_enable, wb_mode, wb_stopdist, wb_autojump, wb_probe, wb_speed, wb_hud, wb_debug
-local wb_peekslow, wb_peekrng, wb_slowspd
+local wb_peekslow, wb_peekrng, wb_slowspd, wb_bhop, wb_clantag
 pcall(function()
     wb_enable   = g_main:switch("Enable WalkBot")                 -- the on/off switch (no hotkey)
     wb_mode     = g_main:combo("Target Pick", "Nearest", "Lowest HP", "Most Visible", "Crosshair")
@@ -83,12 +83,20 @@ pcall(function()
     wb_peekslow = g_main:switch("Slow-Walk Peek (near visible enemy)")
     wb_peekrng  = g_main:slider("Peek Range (slow-walk under)", 200, 1500, 750)
     wb_slowspd  = g_main:slider("Slow-Walk Speed", 40, 160, 110)
+    -- roam: when NO enemy, follow recorded waypoints (walk the route yourself once,
+    -- the bot replays it). No waypoints -> wander+avoid so it still explores.
+    g_main:button("Record Waypoint (drop my pos)", function() _wb_pending_record = true end)
+    g_main:button("Clear Waypoints (this map)",    function() _wb_pending_clear  = true end)
+    wb_bhop     = g_main:switch("Bunny-Hop on routes (faster A->B, no target only)")
+    wb_clantag  = g_main:switch("Clantag 'WalkBot rn' when active")
     wb_hud      = g_hud:switch("HUD Overlay")
     wb_debug    = g_hud:switch("Debug Info")
 end)
 -- sensible defaults (switches default off; flip the ones we want on)
 pcall(function() if wb_autojump then wb_autojump:set(true) end end)
 pcall(function() if wb_peekslow then wb_peekslow:set(true) end end)
+pcall(function() if wb_bhop then wb_bhop:set(true) end end)
+pcall(function() if wb_clantag then wb_clantag:set(true) end end)
 pcall(function() if wb_hud then wb_hud:set(true) end end)
 
 -- ─── runtime state ───────────────────────────────────────
@@ -107,7 +115,20 @@ local state = {
     block        = "clear",    -- clear / front / boxed / wall
     peek_flip_t  = 0,          -- slow-walk strafe-jiggle timer
     peek_side    = 1,          -- current jiggle side
+    -- roam / waypoints
+    waypoints    = {},         -- list of {x,y,z} for the current map
+    wp_idx       = 1,          -- current patrol index
+    wp_map       = nil,        -- map the loaded waypoints belong to
+    wander_yaw   = 0,          -- heading while wandering (no waypoints)
+    wander_t     = 0,          -- last wander redirect time
+    clantag_set  = false,      -- current clantag mirror
+    bhop_flip_t  = 0,          -- air-strafe side timer (bhop on routes)
+    bhop_side    = 1,
 }
+-- button -> tick drain flags (module globals: button closures run before `state`
+-- helpers are bound; globals dodge the forward-reference trap, Solver pattern).
+_wb_pending_record = false
+_wb_pending_clear  = false
 
 -- ─── helpers needing NL API (all pcall-guarded for version variance) ──
 local function get_lp()
@@ -230,6 +251,86 @@ local function can_step_up(lp, lo, yaw_deg, dist)
     return (res.fraction or 1) >= 0.99              -- clear up high => step-up jumpable
 end
 
+-- ─── waypoints (per-map, persisted via NL files API) ─────
+local function wp_path(map) return "nl/Sel01-WalkBot/" .. tostring(map or "unknown") .. ".txt" end
+
+local function wp_save()
+    local lines = {}
+    for _, w in ipairs(state.waypoints) do
+        lines[#lines + 1] = string.format("%.1f %.1f %.1f", w.x, w.y, w.z)
+    end
+    pcall(function() files.write(wp_path(state.wp_map), table.concat(lines, "\n")) end)
+end
+
+local function wp_load(map)
+    state.waypoints = {}
+    state.wp_idx = 1
+    state.wp_map = map
+    local data = nil
+    pcall(function() data = files.read(wp_path(map)) end)
+    if data then
+        for line in tostring(data):gmatch("[^\r\n]+") do
+            local x, y, z = line:match("(-?[%d.]+)%s+(-?[%d.]+)%s+(-?[%d.]+)")
+            if x then state.waypoints[#state.waypoints + 1] = {x = tonumber(x), y = tonumber(y), z = tonumber(z)} end
+        end
+    end
+end
+
+-- shared: take a desired world yaw, probe-avoid obstacles + handle stuck, return the
+-- adjusted move_yaw. Sets state.activity/block/diag and schedules jumps. base_act is
+-- the activity label this caller wants ("WALK" / "ROAM" / "WANDER").
+local function compute_move(lp, lo, want_yaw, now, base_act)
+    local probe = 55
+    pcall(function() probe = wb_probe:get() end)
+    local aj = true
+    pcall(function() aj = wb_autojump and wb_autojump:get() end)
+    local move_yaw = want_yaw
+    state.activity = base_act
+    state.block = "clear"
+    if not probe_clear(lp, lo, want_yaw, probe) then
+        state.block = "front"
+        local found = false
+        local order = state.avoid_dir >= 0 and {1, -1} or {-1, 1}
+        for _, s in ipairs(order) do
+            for _, ang in ipairs({25, 50, 75, 100}) do
+                if probe_clear(lp, lo, want_yaw + s * ang, probe) then
+                    move_yaw = want_yaw + s * ang; state.avoid_dir = s; found = true; break
+                end
+            end
+            if found then break end
+        end
+        if found then
+            state.diag = string.format("%s avoid rot %+.0f", base_act, move_yaw - want_yaw)
+        else
+            state.block = "boxed"
+            if aj and can_step_up(lp, lo, want_yaw, probe) then
+                state.jump_until = now + 0.12; state.activity = "JUMP"; state.block = "step"
+                state.diag = base_act .. " boxed low -> step jump"
+            else
+                move_yaw = want_yaw + (state.avoid_dir ~= 0 and state.avoid_dir or 1) * 90
+                state.diag = base_act .. " boxed by WALL -> rotate"
+            end
+        end
+    end
+    -- stuck breakout (shared across walk + roam + wander)
+    if state.last_origin then
+        local moved = v_len2d(vector(lo.x - state.last_origin.x, lo.y - state.last_origin.y, 0))
+        if moved < 1.5 then
+            if state.stuck_since == 0 then state.stuck_since = now
+            elseif (now - state.stuck_since) > 0.35 then
+                state.activity = "STUCK"
+                move_yaw = want_yaw + (state.avoid_dir ~= 0 and state.avoid_dir or 1) * 90
+                if aj and can_step_up(lp, lo, want_yaw, probe) then state.jump_until = now + 0.15 end
+                state.stuck_since = now
+            end
+        else
+            state.stuck_since = 0
+        end
+    end
+    state.last_origin = lo
+    return move_yaw
+end
+
 -- ─── main movement driver ────────────────────────────────
 local function walkbot_tick(cmd)
     -- single on/off via the switch — no hotkey (user request)
@@ -245,145 +346,142 @@ local function walkbot_tick(cmd)
     local now = 0
     pcall(function() now = globals.realtime end)
 
+    -- ── drain Record / Clear waypoint buttons + map-change reload ──
+    local lo = get_origin(lp)
+    if _wb_pending_record then
+        _wb_pending_record = false
+        if lo then state.waypoints[#state.waypoints + 1] = {x = lo.x, y = lo.y, z = lo.z}; wp_save() end
+    end
+    if _wb_pending_clear then
+        _wb_pending_clear = false
+        state.waypoints = {}; state.wp_idx = 1; wp_save()
+    end
+    if state.wp_map ~= state.mapname then wp_load(state.mapname) end
+    if not lo then state.activity = "IDLE"; state.diag = "no origin"; return end
+
     state.enemy_count = #get_enemies()
     local target, dist = pick_target(lp)
-    if not target then
-        state.activity = "NO-TARGET"; state.target_idx = nil
-        state.diag = (state.enemy_count == 0) and "no enemies alive/non-dormant"
-                     or "enemies exist but none pickable (no origin?)"
-        return
-    end
-    pcall(function() state.target_idx = target:get_index() end)
-    state.target_dist = dist
 
-    local lo = get_origin(lp)
-    local to = get_origin(target)
-    if not lo or not to then state.activity = "IDLE"; state.diag = "missing origin"; return end
+    -- ════════ ENGAGE: we have a target ════════
+    if target then
+        local to = get_origin(target)
+        if to then
+            pcall(function() state.target_idx = target:get_index() end)
+            state.target_dist = dist
+            local los = has_los(lp, target)
+            local stop_d = 450; pcall(function() stop_d = wb_stopdist:get() end)
+            local peekslow = false; pcall(function() peekslow = wb_peekslow and wb_peekslow:get() end)
+            local peekrng = 750; pcall(function() peekrng = wb_peekrng and wb_peekrng:get() end)
+            -- peek-slow zone: VISIBLE enemy in range -> slow-walk + jiggle so their
+            -- resolver misses our moving/desynced model while our ragebot lands.
+            local peek_active = peekslow and los and dist <= peekrng
 
-    local los = has_los(lp, target)
-    local stop_d = 450
-    pcall(function() stop_d = wb_stopdist:get() end)
-    local peekslow = false
-    pcall(function() peekslow = wb_peekslow and wb_peekslow:get() end)
-    local peekrng = 750
-    pcall(function() peekrng = wb_peekrng and wb_peekrng:get() end)
-    -- peek-slow zone: a VISIBLE enemy within peek range. We slow-walk (+ strafe
-    -- jiggle at close range) so their resolver misses our moving / desynced model
-    -- while our ragebot lands. This intentionally OVERRIDES the hard STOP — standing
-    -- still is the easiest thing to resolve, so we keep micro-moving instead.
-    local peek_active = peekslow and los and dist <= peekrng
-
-    -- hard STOP only when peek-slow is OFF (legacy behaviour)
-    if not peek_active and dist <= stop_d and los then
-        state.activity = "STOP"; state.block = "clear"
-        state.diag = string.format("in range %.0f<=%.0f + LoS -> holding", dist, stop_d)
-        state.last_origin = lo
-        return
-    end
-
-    -- desired walk direction (world)
-    local want_yaw = dir_yaw(lo, to)
-    -- close + peeking: strafe-jiggle sideways instead of walking into them; flip
-    -- side ~3x/sec so the magnitude/side the enemy resolver sees keeps changing.
-    if peek_active and dist <= stop_d then
-        if (now - (state.peek_flip_t or 0)) > 0.30 then
-            state.peek_side = -(state.peek_side or 1)
-            state.peek_flip_t = now
-        end
-        want_yaw = want_yaw + (state.peek_side or 1) * 75
-    end
-
-    -- ── obstacle avoidance: probe straight, then fan out ──
-    local probe = 55
-    pcall(function() probe = wb_probe:get() end)
-    local move_yaw = want_yaw
-    state.activity = "WALK"; state.block = "clear"
-    state.diag = string.format("walk #%s d=%.0f yaw=%.0f", tostring(state.target_idx), dist, want_yaw)
-    local aj = true
-    pcall(function() aj = wb_autojump and wb_autojump:get() end)
-    if not probe_clear(lp, lo, want_yaw, probe) then
-        state.activity = "AVOID"; state.block = "front"
-        -- try increasing rotations both sides, prefer last successful side (hysteresis)
-        local found = false
-        local order = state.avoid_dir >= 0 and {1, -1} or {-1, 1}
-        for _, s in ipairs(order) do
-            for _, ang in ipairs({25, 50, 75, 100}) do
-                if probe_clear(lp, lo, want_yaw + s * ang, probe) then
-                    move_yaw = want_yaw + s * ang
-                    state.avoid_dir = s
-                    found = true
-                    break
-                end
+            if not peek_active and dist <= stop_d and los then
+                state.activity = "STOP"; state.block = "clear"
+                state.diag = string.format("in range %.0f + LoS -> hold", dist)
+                state.last_origin = lo
+                return
             end
-            if found then break end
-        end
-        if found then
-            state.diag = string.format("avoid: rotated %+.0f around front block", move_yaw - want_yaw)
-        else
-            -- fully boxed in front: jump ONLY if it's a step/box (head-height clears).
-            -- A tall wall stays "wall" and we DON'T waste a jump (the old code jumped
-            -- on every boxed-in tick even against full walls).
-            state.block = "boxed"
-            if aj and can_step_up(lp, lo, want_yaw, probe) then
-                state.jump_until = now + 0.12; state.activity = "JUMP"
-                state.block = "step"; state.diag = "boxed but low -> step-up jump"
+
+            local want_yaw = dir_yaw(lo, to)
+            if peek_active and dist <= stop_d then
+                if (now - (state.peek_flip_t or 0)) > 0.30 then
+                    state.peek_side = -(state.peek_side or 1); state.peek_flip_t = now
+                end
+                want_yaw = want_yaw + (state.peek_side or 1) * 75
+            end
+
+            local move_yaw = compute_move(lp, lo, want_yaw, now, "WALK")
+            local spd = 450; pcall(function() spd = wb_speed:get() end)
+            if peek_active then
+                local sw = 110; pcall(function() sw = wb_slowspd:get() end); spd = sw
+                if state.activity == "WALK" or state.activity == "AVOID" then state.activity = "PEEK" end
+                state.diag = string.format("PEEK slow d=%.0f spd=%.0f%s", dist, spd, (dist <= stop_d) and " +jiggle" or "")
             else
-                state.diag = "boxed by a WALL (no jump; rotating to escape)"
-                move_yaw = want_yaw + (state.avoid_dir ~= 0 and state.avoid_dir or 1) * 90
+                state.diag = string.format("engage #%s d=%.0f", tostring(state.target_idx), dist)
             end
+            pcall(function() cmd.move_yaw = move_yaw; cmd.forwardmove = spd; cmd.sidemove = 0 end)
+            -- NO bunny-hop while engaging (airborne = can't aim well); only step-up jumps
+            if now <= (state.jump_until or 0) then pcall(function() cmd.in_jump = true end) end
+            return
         end
     end
 
-    -- ── stuck detection: barely moved while trying to walk ──
-    if state.last_origin then
-        local moved = v_len2d(vector(lo.x - state.last_origin.x, lo.y - state.last_origin.y, 0))
-        if moved < 1.5 then
-            if state.stuck_since == 0 then state.stuck_since = now
-            elseif (now - state.stuck_since) > 0.35 then
-                state.activity = "STUCK"
-                -- breakout: strafe hard sideways. Jump ONLY if a step-up actually
-                -- clears (don't bunny-hop against a wall we're wedged on).
-                move_yaw = want_yaw + (state.avoid_dir ~= 0 and state.avoid_dir or 1) * 90
-                if aj and can_step_up(lp, lo, want_yaw, probe) then
-                    state.jump_until = now + 0.15
-                    state.diag = "stuck -> step-up jump + strafe"
-                else
-                    state.diag = "stuck -> strafe breakout (no jump, not a step)"
-                end
-                state.stuck_since = now      -- re-arm so we keep nudging
-            end
+    -- ════════ ROAM: no target -> patrol waypoints, else wander ════════
+    state.target_idx = nil
+    local move_yaw
+    if #state.waypoints > 0 then
+        local wp = state.waypoints[state.wp_idx] or state.waypoints[1]
+        local d = v_len2d(vector(wp.x - lo.x, wp.y - lo.y, 0))
+        if d < 90 then            -- reached this waypoint -> advance (loop the route)
+            state.wp_idx = (state.wp_idx % #state.waypoints) + 1
+            wp = state.waypoints[state.wp_idx]
+            d = v_len2d(vector(wp.x - lo.x, wp.y - lo.y, 0))
+        end
+        move_yaw = compute_move(lp, lo, dir_yaw(lo, wp), now, "ROAM")
+        if state.activity == "ROAM" then
+            state.diag = string.format("ROAM wp %d/%d d=%.0f", state.wp_idx, #state.waypoints, d)
+        end
+    else
+        -- wander: hold a heading; repick on block or every ~3s. Deterministic varied
+        -- turn (no Math.random in sandbox) seeded from position + time.
+        if (now - (state.wander_t or 0)) > 3.0 or state.block == "boxed" then
+            local turn = 90 + (math.floor(math.abs(lo.x) + math.abs(lo.y) + now) % 140)
+            state.wander_yaw = norm_ang((state.wander_yaw or 0) + turn)
+            state.wander_t = now
+        end
+        move_yaw = compute_move(lp, lo, state.wander_yaw or 0, now, "WANDER")
+        if state.activity == "WANDER" then
+            state.diag = "WANDER (no waypoints — record a route)"
+        end
+    end
+
+    local spd = 450; pcall(function() spd = wb_speed:get() end)
+    pcall(function() cmd.move_yaw = move_yaw; cmd.forwardmove = spd; cmd.sidemove = 0 end)
+
+    -- ── bunny-hop while travelling (no target only): jump on every ground-touch so
+    -- A->B is faster, with a light auto air-strafe to keep speed. Disabled while
+    -- engaging (you can't aim mid-air). Suppressed when wedged (STUCK) so we don't
+    -- bhop into a wall forever. ──
+    local bhop = false
+    pcall(function() bhop = wb_bhop and wb_bhop:get() end)
+    if bhop and state.activity ~= "STUCK" then
+        local onground = true
+        pcall(function() onground = bit.band(tonumber(lp.m_fFlags) or 1, 1) == 1 end)
+        if onground then
+            pcall(function() cmd.in_jump = true end)
         else
-            state.stuck_since = 0
+            -- air-strafe: zig-zag sidemove (~4x/sec) keeps the strafe sync alive while
+            -- move_yaw stays on the route -> nets forward, builds a little speed.
+            if (now - (state.bhop_flip_t or 0)) > 0.25 then
+                state.bhop_side = -(state.bhop_side or 1); state.bhop_flip_t = now
+            end
+            pcall(function() cmd.sidemove = (state.bhop_side or 1) * 450 end)
         end
-    end
-    state.last_origin = lo
-
-    -- ── speed: full run, or slow-walk inside the peek zone ──
-    local spd = 450
-    pcall(function() spd = wb_speed:get() end)
-    if peek_active then
-        local sw = 110
-        pcall(function() sw = wb_slowspd:get() end)
-        spd = sw
-        -- show PEEK unless a more urgent state (STUCK/JUMP) is active
-        if state.activity == "WALK" or state.activity == "AVOID" then state.activity = "PEEK" end
-        state.diag = string.format("PEEK slow-walk d=%.0f spd=%.0f%s", dist, spd,
-            (dist <= stop_d) and " +jiggle" or "")
-    end
-
-    -- ── write movement to the user command ──
-    pcall(function()
-        cmd.move_yaw   = move_yaw
-        cmd.forwardmove = spd
-        cmd.sidemove    = 0
-    end)
-    -- jump window
-    if now <= (state.jump_until or 0) then
-        pcall(function() cmd.in_jump = true end)
+    elseif now <= (state.jump_until or 0) then
+        pcall(function() cmd.in_jump = true end)   -- step-up jump when bhop off
     end
 end
 
 pcall(function() events.createmove:set(walkbot_tick) end)
+
+-- ─── clantag while active ────────────────────────────────
+-- set_clan_tag is a game-state write -> only takes effect from net_update_end
+-- (the render thread silently drops it; bloodwings pattern). Only writes on change.
+local function update_clantag()
+    local want = ""
+    local on, tagon = false, false
+    pcall(function() on = wb_enable and wb_enable:get() end)
+    pcall(function() tagon = wb_clantag and wb_clantag:get() end)
+    if on and tagon then want = "WalkBot rn" end
+    if want ~= state.clantag_set then
+        pcall(function() common.set_clan_tag(want) end)
+        state.clantag_set = want
+    end
+end
+if not pcall(function() events.net_update_end:set(update_clantag) end) then
+    pcall(function() events.net_update_end(update_clantag) end)
+end
 
 -- ─── HUD ─────────────────────────────────────────────────
 local COL = {
@@ -395,6 +493,7 @@ local COL = {
     stuck  = function() return color(255, 110, 110, 255) end,
     stop   = function() return color(120, 200, 255, 255) end,
     peek   = function() return color(200, 120, 255, 255) end,
+    roam   = function() return color(120, 220, 200, 255) end,
     idle   = function() return color(150, 150, 150, 255) end,
 }
 local function act_color(a)
@@ -403,6 +502,7 @@ local function act_color(a)
     elseif a == "STUCK" then return COL.stuck()
     elseif a == "STOP" then return COL.stop()
     elseif a == "PEEK" then return COL.peek()
+    elseif a == "ROAM" or a == "WANDER" then return COL.roam()
     else return COL.idle() end
 end
 
@@ -432,6 +532,10 @@ local function render_hud()
         else
             render.text(3, vector(x, y), COL.label(), nil, "Target: none")
         end
+        y = y + line
+        render.text(3, vector(x, y), COL.label(), nil, "Waypoints: ")
+        render.text(3, vector(x + 72, y), COL.val(), nil,
+            string.format("%d  (idx %d)", #state.waypoints, state.wp_idx or 0))
         -- ── debug block: WHY it is / isn't doing what it's doing ──
         if dbg then
             y = y + line + 4
@@ -459,8 +563,10 @@ pcall(function() events.render:set(render_hud) end)
 -- ─── shutdown ────────────────────────────────────────────
 pcall(function()
     events.shutdown:set(function()
+        pcall(function() common.set_clan_tag("") end)   -- restore tag
         pcall(function() events.createmove:unset() end)
         pcall(function() events.render:unset() end)
+        pcall(function() events.net_update_end:unset() end)
     end)
 end)
 
@@ -469,7 +575,9 @@ local function log(t) pcall(function() print(t) end) end
 log("==============================================")
 log("Sel01-WalkBot v" .. SEL01_WB_VERSION .. " loaded — by seltonmt01")
 log("Map: " .. safe_mapname())
-log("Greedy MVP: walk-to-enemy + trace avoidance + auto-jump.")
-log("Toggle 'Enable WalkBot' switch to activate (no hotkey). Debug Info switch shows why.")
+log("Greedy bot: engage enemies (slow-walk peek) OR roam routes when none.")
+log("No target -> patrol recorded Waypoints (bunny-hop) or wander+avoid if none.")
+log("Record a route: walk it yourself, tap 'Record Waypoint' at each spot.")
+log("Toggle 'Enable WalkBot' to activate (no hotkey). Debug Info shows why.")
 log("Aiming stays with ragebot — this drives MOVEMENT only.")
 log("==============================================")
