@@ -25,3 +25,7 @@ TODO.local.md
 
 # Claude memory (per-user)
 .claude/
+
+# tooling / stray
+.serena/
+_b3.txt
