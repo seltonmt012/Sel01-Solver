@@ -5,7 +5,7 @@
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Config
 -- @author seltonmt01
--- @version 3.18
+-- @version 3.19
 -- @description Smart freestand (anti-headshot):
 --   * NL freestanding is deterministic — it always picks the same "safe" side, so a
 --     resolver models it and headshots the predictably-exposed side (user report:
@@ -53,7 +53,7 @@
 --     variance for full per-side chaos.
 --   * MAG-JIT indicator added to bottom HvH strip; dumped in v3.8 stats.
 
-local SEL01_CFG_VERSION = "3.18"
+local SEL01_CFG_VERSION = "3.19"
 
 -- DEBUG: print to CSGO console at major load checkpoints. Plain print() bypasses
 -- NL chat (which may not flush before crash) and writes directly to CSGO console.
@@ -234,6 +234,19 @@ local vis_keybinds   = g_visual:switch(accent .. ui.get_icon"user"       .. acce
 local vis_dmgind     = g_visual:switch(accent .. ui.get_icon"skull"      .. accent .. "  Damage popup (-X HP on enemy)", true)
 local vis_specoverlay= g_visual:switch(accent .. ui.get_icon"eye"        .. accent .. "  Spectator overlay", true)
 g_visual:label(" ")
+g_visual:label(accent .. ui.get_icon"sliders" .. accent .. "  v3.19 extras (read-only / render):")
+local vis_desyncpct  = g_visual:switch(accent .. ui.get_icon"bolt"       .. accent .. "  Desync delta % (real vs fake yaw)", true)
+local vis_skeet      = g_visual:switch(accent .. ui.get_icon"bolt"       .. accent .. "  Skeet indicator panel (DT/FS/SAFE/BODY/MD/DUCK)", false)
+local vis_netgraph   = g_visual:switch(accent .. ui.get_icon"feather"    .. accent .. "  Netgraph (ping / loss / choke + LC warn)", false)
+local vis_scopefade  = g_visual:switch(accent .. ui.get_icon"eye"        .. accent .. "  Fade own model when scoped", true)
+local vis_sleeves    = g_visual:switch(accent .. ui.get_icon"eye"        .. accent .. "  Remove sleeves (cleaner POV)", false)
+local vis_menublur   = g_visual:switch(accent .. ui.get_icon"eye"        .. accent .. "  Blur behind menu", true)
+local vis_custscope  = g_visual:switch(accent .. ui.get_icon"crosshairs" .. accent .. "  Custom scope overlay", false)
+local vis_scope_rot  = g_visual:switch(accent ..                            "      rotate scope 45 deg", false)
+-- v3.19: smoothing/animation state for the new render features (single table to dodge
+-- any main-chunk local-count pressure). Mutated only from events.render.
+local _vis_state = { scope_gap = 0, scope_size = 0, model_alpha = 255 }
+g_visual:label(" ")
 g_visual:label(accent .. "  NL Hit Marker Sound / Force Thirdperson / Scope Overlay:")
 g_visual:label(accent .. "  Set those directly in NL Visuals tab (they're combo elements)")
 -- V1.7: self-glow toggle dropped — NL glow is a multi-value combo, our :override(true)
@@ -355,6 +368,11 @@ pcall(function()
     -- Visuals
     nl_refs.vis_viewmodel    = nl_find_safe("Visuals", "World", "Main", "Override Zoom", "Force Viewmodel")
     nl_refs.vis_removals     = nl_find_safe("Visuals", "World", "Main", "Removals")
+    -- v3.19: Scope Overlay ref ONLY for custom-scope. It IS a combo, so the only safe
+    -- writes are STRING overrides — :override("Remove All") to hide NL's scope and
+    -- :override() to clear. NEVER :override(bool) on it (v2.2 segfault). Read by the
+    -- custom-scope render block (nyanza / externalapaha use this exact pattern).
+    nl_refs.vis_scope_ovl    = nl_find_safe("Visuals", "World", "Main", "Override Zoom", "Scope Overlay")
     -- V2.2: vis_hitmark_snd / vis_thirdperson / vis_scope_ovl / vis_self_chams / vis_self_glow
     -- refs removed — they are combo elements and :override(bool) on a combo segfaults.
     -- vis_thirdperson + vis_scope_ovl were referenced via separate lookups elsewhere; same fate.
@@ -1370,6 +1388,16 @@ pcall(function()
         local now = globals.realtime or 0
         local cx, cy = sx / 2, sy / 2
 
+        -- ── v3.19: BLUR BEHIND MENU (only while menu visible) ──
+        if vis_menublur:get() then
+            pcall(function()
+                local a = ui.get_alpha and ui.get_alpha() or 0
+                if a and a > 0.01 then
+                    render.blur(vector(0, 0), render.screen_size(), 4, a)
+                end
+            end)
+        end
+
         -- ── HIT-MARKER (4 short diagonal lines around crosshair, fade) ──
         if vis_hitmarker:get() then
             local age = now - hitmark_time
@@ -1714,8 +1742,135 @@ pcall(function()
                 end
             end)
         end
+
+        -- ── v3.19: DESYNC DELTA % (real vs fake yaw, near crosshair) ──
+        if vis_desyncpct:get() then
+            pcall(function()
+                if not (rage and rage.antiaim and rage.antiaim.get_rotation) then return end
+                local fake = rage.antiaim:get_rotation(true)
+                local real = rage.antiaim:get_rotation()
+                if not (fake and real) then return end
+                local delta = math.min(math.abs(real - fake) / 2, 60)
+                local frac = delta / 60
+                local col = color(255, 60, 60, 235):lerp(color(120, 230, 120, 235), frac)
+                local txt = string.format("%.0f", delta)
+                local tw = #txt * 7  -- font-4 ~7px/char (config avoids measure_text)
+                render.text(4, vector(cx - tw / 2, cy + 26), col, nil, txt)
+            end)
+        end
+
+        -- ── v3.19: SKEET INDICATOR PANEL (active NL features, stacked left of xhair) ──
+        if vis_skeet:get() then
+            pcall(function()
+                local lp = entity.get_local_player()
+                if not (lp and lp:is_alive()) then return end
+                local tags = {}
+                local function add(t, c) tags[#tags + 1] = { t = t, c = c } end
+                local on = color(143, 194, 21, 235)   -- green = active
+                local hot = color(255, 70, 90, 235)   -- red = DT / exploit
+                if nl_refs.rage_dt      and nl_refs.rage_dt:get()    then add("DT", hot) end
+                if nl_refs.rage_hide    and nl_refs.rage_hide:get()  then add("OSAA", on) end
+                if nl_refs.aa_fakeduck  and nl_refs.aa_fakeduck:get()then add("DUCK", on) end
+                if nl_refs.aa_slowwalk  and nl_refs.aa_slowwalk:get()then add("SW", on) end
+                if nl_refs.rage_safepoint and tostring(nl_refs.rage_safepoint:get()) == "Force" then add("SAFE", on) end
+                if nl_refs.rage_bodyaim   and tostring(nl_refs.rage_bodyaim:get())   == "Force" then add("BODY", on) end
+                if aa_freestanding and aa_freestanding:get() then add("FS", on) end
+                -- ping-spike warn (high latency)
+                if (perf.ping or 0) > 90 then add("PING", color(255, 200, 60, 235)) end
+                local y = cy - (#tags * 16) / 2
+                for i = 1, #tags do
+                    local tg = tags[i]
+                    local tw = #tg.t * 6  -- font-3 ~6px/char
+                    render.text(3, vector(cx - 70 - tw, y), tg.c, nil, tg.t)
+                    y = y + 16
+                end
+            end)
+        end
+
+        -- ── v3.19: NETGRAPH (ping / loss / choke + lag-comp warn, bottom-left) ──
+        if vis_netgraph:get() and globals.is_in_game then
+            pcall(function()
+                local nc = utils.net_channel and utils.net_channel()
+                if not nc then return end
+                local ping  = math.floor(math.min(999, (nc.latency and nc.latency[1] or 0) * 1000))
+                local loss  = nc.loss  and nc.loss[1]  or 0
+                local choke = nc.choke and math.floor(nc.choke[1] or 0) or 0
+                local gx, gy = 20, sy - 96
+                local function line(i, txt, c) render.text(3, vector(gx, gy + i * 13), c, nil, txt) end
+                local white = color(210, 220, 235, 240)
+                line(0, "ping:  " .. ping .. "ms",  ping > 120 and color(255, 120, 60, 240) or white)
+                line(1, "loss:  " .. loss .. "%",   loss > 0 and color(255, 120, 60, 240) or white)
+                line(2, "choke: " .. choke .. "%",  choke > 0 and color(255, 200, 60, 240) or white)
+                -- lag-comp warn: heavy choke = packets held = LC likely breaking
+                local ck = globals.choked_commands or 0
+                if ck >= 6 then
+                    line(3, "LC: BREAKING (" .. ck .. ")", color(255, 70, 90, 240))
+                else
+                    line(3, "LC: ok", color(143, 194, 21, 240))
+                end
+            end)
+        end
+
+        -- ── v3.19: CUSTOM SCOPE OVERLAY (replaces NL scope lines while scoped) ──
+        if vis_custscope:get() then
+            pcall(function()
+                local lp = entity.get_local_player()
+                local scoped = lp and lp.m_bIsScoped
+                if nl_refs.vis_scope_ovl then nl_refs.vis_scope_ovl:override("Remove All") end
+                if not scoped then return end
+                local ft = (globals.frametime or 0.016) * 14
+                _vis_state.scope_gap  = _vis_state.scope_gap  + (10 - _vis_state.scope_gap)  * math.min(ft, 1)
+                _vis_state.scope_size = _vis_state.scope_size + (26 - _vis_state.scope_size) * math.min(ft, 1)
+                local g, s = _vis_state.scope_gap, _vis_state.scope_size
+                local main = color(120, 200, 255, 235)
+                local edge = color(120, 200, 255, 40)
+                if vis_scope_rot:get() then render.push_rotation(45, vector(cx, cy)) end
+                render.gradient(vector(cx, cy - g - s), vector(cx + 1, cy - g), edge, edge, main, main)
+                render.gradient(vector(cx, cy + g + 1), vector(cx + 1, cy + g + s), main, main, edge, edge)
+                render.gradient(vector(cx - g - s, cy), vector(cx - g, cy + 1), edge, main, edge, main)
+                render.gradient(vector(cx + g + 1, cy), vector(cx + g + s, cy + 1), main, edge, main, edge)
+                if vis_scope_rot:get() then render.pop_rotation() end
+            end)
+        elseif nl_refs.vis_scope_ovl then
+            pcall(function() nl_refs.vis_scope_ovl:override() end)  -- restore NL scope when off
+        end
     end)
 end)
+
+-- ══════════════════════════════════════════════════════════════════════════
+-- v3.19: LOCAL-MODEL EVENTS (separate from render — return-value events)
+-- common pattern from gazolina (events.draw_model / events.localplayer_transparency
+-- call form) + nyanza. These are NOT events.render and NOT createmove, so no clash
+-- with the single render handler or createmove_unified.
+-- ══════════════════════════════════════════════════════════════════════════
+do
+    -- Fade own model when scoped (returns the alpha NL applies to the local player).
+    local ok = pcall(function()
+        events.localplayer_transparency(function()
+            if not (enable_master:get() and vis_scopefade:get()) then return 255 end
+            local lp = entity.get_local_player()
+            local scoped = lp and (lp.m_bIsScoped or lp.m_bResumeZoom)
+            local target = scoped and 70 or 255
+            local a = _vis_state.model_alpha or 255
+            local step = 12
+            if a < target then a = math.min(a + step, target)
+            elseif a > target then a = math.max(a - step, target) end
+            _vis_state.model_alpha = a
+            return a
+        end)
+    end)
+    _hooks_status.model_fade = ok and "localplayer_transparency" or nil
+
+    -- Remove sleeves (return false to skip rendering a sleeve model).
+    local ok2 = pcall(function()
+        events.draw_model(function(m)
+            if not (enable_master:get() and vis_sleeves:get()) then return true end
+            if m and m.name and tostring(m.name):find("sleeve") then return false end
+            return true
+        end)
+    end)
+    _hooks_status.remove_sleeves = ok2 and "draw_model" or nil
+end
 
 -- ══════════════════════════════════════════════════════════════════════════
 -- QoL — animated clantag, kill-say, auto-accept
