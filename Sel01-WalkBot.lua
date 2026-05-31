@@ -1,11 +1,11 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-WalkBot                                     ║
--- ║  Version: 0.1                                      ║
+-- ║  Version: 0.2                                      ║
 -- ║  Greedy nav-bot: map + enemy detect, walk-to-foe  ║
 -- ║  by seltonmt01                                     ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-WalkBot
--- @version 0.1
+-- @version 0.2
 -- @author seltonmt01
 -- @description Greedy walk-bot. Detects map + enemies, walks the local player
 --   toward a chosen target using NL movement cmd (move_yaw + forwardmove) with
@@ -19,7 +19,7 @@
 --   entity.get_players(true) (enemies) / entity.get_local_player() / p.m_vecOrigin / p:get_eye_position()
 --   globals.mapname / globals.tickcount / globals.realtime
 
-local SEL01_WB_VERSION = "0.1"
+local SEL01_WB_VERSION = "0.2"
 
 -- ─── small helpers ───────────────────────────────────────
 local function clamp(v, lo, hi) if v < lo then return lo elseif v > hi then return hi else return v end end
@@ -40,7 +40,17 @@ local function norm_ang(a)
     return a
 end
 
+-- map name: NL exposes it via common.get_map_data() (.shortname e.g. "de_mirage"),
+-- NOT globals.mapname (which is nil on this build — that was the "doesn't detect
+-- mirage" bug). Returns nil when no map is loaded (menu / loading).
 local function safe_mapname()
+    local md = nil
+    pcall(function() md = common.get_map_data() end)
+    if md then
+        local n = md.shortname or md.map or md.name
+        if n and n ~= "" then return tostring(n) end
+    end
+    -- fallback: some builds still carry globals.mapname
     local ok, m = pcall(function() return globals.mapname end)
     if ok and m and m ~= "" then return tostring(m) end
     return "unknown"
@@ -59,16 +69,16 @@ if not ok_ui or not g_main then
     pcall(function() g_hud  = g_main end)
 end
 
-local wb_enable, wb_hotkey, wb_mode, wb_stopdist, wb_autojump, wb_probe, wb_speed, wb_hud
+local wb_enable, wb_mode, wb_stopdist, wb_autojump, wb_probe, wb_speed, wb_hud, wb_debug
 pcall(function()
-    wb_enable   = g_main:switch("Enable WalkBot")
-    wb_hotkey   = g_main:hotkey("Walk Hotkey (set mode = Always for always-on)")
+    wb_enable   = g_main:switch("Enable WalkBot")                 -- the on/off switch (no hotkey)
     wb_mode     = g_main:combo("Target Pick", "Nearest", "Lowest HP", "Most Visible", "Crosshair")
     wb_stopdist = g_main:slider("Stop Distance", 80, 2000, 450)
     wb_speed    = g_main:slider("Move Speed", 50, 450, 450)
-    wb_autojump = g_main:switch("Auto-Jump Obstacles")
+    wb_autojump = g_main:switch("Auto-Jump Obstacles (only when step-up clears)")
     wb_probe    = g_main:slider("Obstacle Probe (units)", 20, 140, 55)
     wb_hud      = g_hud:switch("HUD Overlay")
+    wb_debug    = g_hud:switch("Debug Info")
 end)
 -- sensible defaults (switches default off; flip the ones we want on)
 pcall(function() if wb_autojump then wb_autojump:set(true) end end)
@@ -85,6 +95,9 @@ local state = {
     stuck_since  = 0,
     avoid_dir    = 0,          -- last avoidance rotation sign (-1/0/1) for hysteresis
     jump_until   = 0,
+    diag         = "init",     -- debug: why we are / aren't moving
+    enemy_count  = 0,
+    block        = "clear",    -- clear / front / boxed / wall
 }
 
 -- ─── helpers needing NL API (all pcall-guarded for version variance) ──
@@ -194,29 +207,41 @@ local function probe_clear(lp, lo, yaw_deg, dist)
     return (res.fraction or 1) >= 0.99
 end
 
+-- is the front obstacle LOW enough that a jump clears it? foot blocked (caller knows)
+-- + head-height path clear => it's a box/step/crate, jumping helps. Both blocked =>
+-- a tall wall, jumping is pointless (was the "jumps where stuck" complaint).
+local function can_step_up(lp, lo, yaw_deg, dist)
+    local rad = math.rad(yaw_deg)
+    local fx, fy = math.cos(rad) * dist, math.sin(rad) * dist
+    local hi_from = vector(lo.x, lo.y, lo.z + 50)   -- ~jump apex height
+    local hi_to   = vector(lo.x + fx, lo.y + fy, lo.z + 50)
+    local res = nil
+    pcall(function() res = utils.trace_line(hi_from, hi_to, lp) end)
+    if not res then return false end                -- unknown -> don't waste a jump
+    return (res.fraction or 1) >= 0.99              -- clear up high => step-up jumpable
+end
+
 -- ─── main movement driver ────────────────────────────────
 local function walkbot_tick(cmd)
+    -- single on/off via the switch — no hotkey (user request)
     local on = false
     pcall(function() on = wb_enable and wb_enable:get() end)
-    if not on then state.activity = "IDLE"; return end
+    if not on then state.activity = "IDLE"; state.diag = "disabled (switch off)"; return end
 
-    -- hotkey: NL's hotkey widget carries its own mode (Always / On-hold / Toggle / Off)
-    -- chosen in the menu, so :get() already returns the correct active state. For
-    -- always-on, set the hotkey's mode to "Always" in the menu. Default empty = off.
-    local hk_held = false
-    pcall(function() if wb_hotkey then hk_held = wb_hotkey:get() end end)
-    if not hk_held then state.activity = "IDLE"; return end
+    state.mapname = safe_mapname()
 
     local lp = get_lp()
-    if not lp then state.activity = "IDLE"; return end
-    state.mapname = safe_mapname()
+    if not lp then state.activity = "IDLE"; state.diag = "no local player / dead"; return end
 
     local now = 0
     pcall(function() now = globals.realtime end)
 
+    state.enemy_count = #get_enemies()
     local target, dist = pick_target(lp)
     if not target then
         state.activity = "NO-TARGET"; state.target_idx = nil
+        state.diag = (state.enemy_count == 0) and "no enemies alive/non-dormant"
+                     or "enemies exist but none pickable (no origin?)"
         return
     end
     pcall(function() state.target_idx = target:get_index() end)
@@ -224,13 +249,14 @@ local function walkbot_tick(cmd)
 
     local lo = get_origin(lp)
     local to = get_origin(target)
-    if not lo or not to then state.activity = "IDLE"; return end
+    if not lo or not to then state.activity = "IDLE"; state.diag = "missing origin"; return end
 
     -- STOP condition: within stop distance AND we can see them (let the fight happen)
     local stop_d = 450
     pcall(function() stop_d = wb_stopdist:get() end)
     if dist <= stop_d and has_los(lp, target) then
-        state.activity = "STOP"
+        state.activity = "STOP"; state.block = "clear"
+        state.diag = string.format("in range %.0f<=%.0f + LoS -> holding", dist, stop_d)
         state.last_origin = lo
         return
     end
@@ -242,9 +268,12 @@ local function walkbot_tick(cmd)
     local probe = 55
     pcall(function() probe = wb_probe:get() end)
     local move_yaw = want_yaw
-    state.activity = "WALK"
+    state.activity = "WALK"; state.block = "clear"
+    state.diag = string.format("walk #%s d=%.0f yaw=%.0f", tostring(state.target_idx), dist, want_yaw)
+    local aj = true
+    pcall(function() aj = wb_autojump and wb_autojump:get() end)
     if not probe_clear(lp, lo, want_yaw, probe) then
-        state.activity = "AVOID"
+        state.activity = "AVOID"; state.block = "front"
         -- try increasing rotations both sides, prefer last successful side (hysteresis)
         local found = false
         local order = state.avoid_dir >= 0 and {1, -1} or {-1, 1}
@@ -259,11 +288,20 @@ local function walkbot_tick(cmd)
             end
             if found then break end
         end
-        if not found then
-            -- fully boxed in front -> jump it (likely a low ledge / box / stairs)
-            local aj = true
-            pcall(function() aj = wb_autojump and wb_autojump:get() end)
-            if aj then state.jump_until = now + 0.12; state.activity = "JUMP" end
+        if found then
+            state.diag = string.format("avoid: rotated %+.0f around front block", move_yaw - want_yaw)
+        else
+            -- fully boxed in front: jump ONLY if it's a step/box (head-height clears).
+            -- A tall wall stays "wall" and we DON'T waste a jump (the old code jumped
+            -- on every boxed-in tick even against full walls).
+            state.block = "boxed"
+            if aj and can_step_up(lp, lo, want_yaw, probe) then
+                state.jump_until = now + 0.12; state.activity = "JUMP"
+                state.block = "step"; state.diag = "boxed but low -> step-up jump"
+            else
+                state.diag = "boxed by a WALL (no jump; rotating to escape)"
+                move_yaw = want_yaw + (state.avoid_dir ~= 0 and state.avoid_dir or 1) * 90
+            end
         end
     end
 
@@ -274,11 +312,15 @@ local function walkbot_tick(cmd)
             if state.stuck_since == 0 then state.stuck_since = now
             elseif (now - state.stuck_since) > 0.35 then
                 state.activity = "STUCK"
-                -- breakout: jump + shove sideways for a few ticks
-                local aj = true
-                pcall(function() aj = wb_autojump and wb_autojump:get() end)
-                if aj then state.jump_until = now + 0.15 end
+                -- breakout: strafe hard sideways. Jump ONLY if a step-up actually
+                -- clears (don't bunny-hop against a wall we're wedged on).
                 move_yaw = want_yaw + (state.avoid_dir ~= 0 and state.avoid_dir or 1) * 90
+                if aj and can_step_up(lp, lo, want_yaw, probe) then
+                    state.jump_until = now + 0.15
+                    state.diag = "stuck -> step-up jump + strafe"
+                else
+                    state.diag = "stuck -> strafe breakout (no jump, not a step)"
+                end
                 state.stuck_since = now      -- re-arm so we keep nudging
             end
         else
@@ -323,15 +365,15 @@ local function act_color(a)
 end
 
 local function render_hud()
-    local on, show = false, false
-    pcall(function() on = wb_enable and wb_enable:get() end)
+    local show, dbg = false, false
     pcall(function() show = wb_hud and wb_hud:get() end)
-    if not (on and show) then return end
+    pcall(function() dbg  = wb_debug and wb_debug:get() end)
+    if not (show or dbg) then return end
 
     pcall(function()
         local ss = render.screen_size()
         local x = 18
-        local y = math.floor(ss.y * 0.55)
+        local y = math.floor(ss.y * 0.52)
         local line = 16
         render.text(4, vector(x, y), COL.title(), nil, "Sel01-WalkBot v" .. SEL01_WB_VERSION)
         y = y + line
@@ -347,6 +389,26 @@ local function render_hud()
                 string.format("#%d  %.0fu", state.target_idx, state.target_dist))
         else
             render.text(3, vector(x, y), COL.label(), nil, "Target: none")
+        end
+        -- ── debug block: WHY it is / isn't doing what it's doing ──
+        if dbg then
+            y = y + line + 4
+            render.text(3, vector(x, y), COL.title(), nil, "── debug ──")
+            y = y + line
+            render.text(3, vector(x, y), COL.label(), nil,
+                string.format("enemies: %d   block: %s", state.enemy_count or 0, state.block or "-"))
+            y = y + line
+            render.text(3, vector(x, y), COL.label(), nil, "why: ")
+            render.text(3, vector(x + 32, y), act_color(state.activity), nil, tostring(state.diag))
+            y = y + line
+            -- raw map data so a mis-detect is visible
+            local raw = "nil"
+            pcall(function()
+                local md = common.get_map_data()
+                if md then raw = tostring(md.shortname or md.map or md.name or "?") end
+            end)
+            render.text(3, vector(x, y), COL.label(), nil, "map_data.shortname: ")
+            render.text(3, vector(x + 128, y), COL.val(), nil, raw)
         end
     end)
 end
@@ -366,6 +428,6 @@ log("==============================================")
 log("Sel01-WalkBot v" .. SEL01_WB_VERSION .. " loaded — by seltonmt01")
 log("Map: " .. safe_mapname())
 log("Greedy MVP: walk-to-enemy + trace avoidance + auto-jump.")
-log("Set 'Walk Hotkey' mode to Always (or bind a hold key) to activate.")
+log("Toggle 'Enable WalkBot' switch to activate (no hotkey). Debug Info switch shows why.")
 log("Aiming stays with ragebot — this drives MOVEMENT only.")
 log("==============================================")
