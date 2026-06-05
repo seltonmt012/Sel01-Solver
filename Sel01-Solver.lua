@@ -1,11 +1,11 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 9.62                                   ║
+-- ║  Version: 9.63                                   ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 9.62
+-- @version 9.63
 -- @description Correction side guard + serverfail retry:
 --   * correction/prediction-error misses now check SIDE evidence, not only
 --     magnitude. A BF shot on the unlearned opposite side no longer gets labeled
@@ -73,7 +73,7 @@
 --   * v9.26 drift-bump (alpha 0.55 on 5-10° diff) still handles small shifts.
 --   * v9.29 coach variants carry.
 
-local SEL01_VERSION = "9.62"
+local SEL01_VERSION = "9.63"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -1659,11 +1659,20 @@ end
 
 -- V8.3: manual JSON export button (placed here because closure needs learning_export_json defined)
 local log_export_json = g_logging:button("💾 Export Learning → JSON", function()
+    -- V9.63: ALSO write learned.lua here. learning_load() ONLY reads learned.lua —
+    -- learned.json is a human/backup file that is NEVER loaded back. Users hit Export
+    -- expecting it to be the save, restarted, and saw "nothing loaded" because the
+    -- loadable file was never refreshed by this button. serialize_model + LEARNING_FILE
+    -- are both defined above; write the loadable copy too so Export == persist.
+    pcall(function()
+        files.create_folder("nl/Sel01-Solver/")
+        files.write(LEARNING_FILE, serialize_model(LearnedModel))
+    end)
     local ok, payload = learning_export_json()
     if ok then
         local count = 0
         for _ in pairs(LearnedModel) do count = count + 1 end
-        _cs_log_color_raw(string.format("💾 Exported %d players + session stats → %s (%d bytes)",
+        _cs_log_color_raw(string.format("💾 Exported %d players → learned.lua (loadable) + %s (%d bytes)",
             count, JSON_FILE, payload and #payload or 0))
     else
         _cs_log_color_raw("⚠ JSON export failed: " .. tostring(payload))
@@ -2747,7 +2756,20 @@ events.aim_ack:set(function(event)
             -- 1 R-hit, shot L -21.6 vs meas 39.5, err=17.9 bt=12 — kept L, next real hit
             -- confirmed R). err~0 + side-conflict stays kept (could be a switch enemy whose
             -- learned side is stale, and v9.42 magnitude-overshoot / v9.44 locked cases).
-            if ack_side_bad and (ack_measured <= 5 or ack_angle_err > 10) then do_flip = true
+            -- V9.63: confirmed TWO-SIDE switcher guard. When the enemy has real hits on
+            -- BOTH sides (switch-AA that genuinely alternates) OR the bimodal flag is set,
+            -- the per-side sample dominance that drives `ack_side_bad` is NOISE — the side
+            -- history flips every shot, so flipping on it corrupts last_hit_side / dom and
+            -- chases the enemy's own alternation (logs: idx=3 aa=switch hit -45°L then +24°R;
+            -- side_bad fired off the stale L-lead and the resolver oscillated 60% miss).
+            -- On these, treat the miss as a MAGNITUDE problem: KEEP the shot side and let
+            -- the BF cycle (now a real L/R sweep, V9.63) cover both — never flip on a clean
+            -- low-error/high-bt reject. First contact (one side empty) still explores below.
+            local two_side_switcher = (real_active >= 2 and (s.real_left or 0) >= 1
+                                       and (s.real_right or 0) >= 1)
+                                      or (s.bimodal == true)
+            if two_side_switcher and (ack_angle_err <= 10 or bt > 8) then do_flip = false
+            elseif ack_side_bad and (ack_measured <= 5 or ack_angle_err > 10) then do_flip = true
             elseif bt > 8 then do_flip = false
             elseif ack_side_bad then do_flip = true
             elseif ack_measured > 5 and (real_active >= 1 or bt > 6) then do_flip = false
@@ -3772,7 +3794,16 @@ local function pick_bruteforce_angle(s, anim, eye_yaw, max_desync, p, preset)
     local kind_side
     if     kind == "desync"  or kind == "+58" or kind == "+45" or kind == "+35" or kind == "+29" or kind == "+20" or kind == "+15" then kind_side = 1
     elseif kind == "-desync" or kind == "-58" or kind == "-45" or kind == "-35" or kind == "-29" or kind == "-20" or kind == "-15" then kind_side = -1
-    elseif kind == "opposite" then kind_side = s.last_hit_side ~= 0 and -s.last_hit_side or 1
+    elseif kind == "opposite" then
+        -- V9.63: "opposite" must invert the side WE JUST SHOT (last_shot_side), not
+        -- -last_hit_side. On a switcher a correction-flip sets last_hit_side to the
+        -- believed-correct side; the old `-last_hit_side` then shot straight back onto
+        -- the just-tried wrong side and the next ack flipped again → L/R lock-loop
+        -- (logs: idx=3 Recall +41.9 MISS→flip L, BF:opposite +24.4 R again, +58 R again,
+        -- all while the enemy sat on R). Keying off last_shot_side makes opposite a real
+        -- alternation: shot R → try L → shot L → try R, so BF actually sweeps both sides.
+        kind_side = s.last_shot_side ~= 0 and -s.last_shot_side
+                    or (s.last_hit_side ~= 0 and -s.last_hit_side or 1)
     end
     local desync = effective_desync(s, max_desync, kind_side)
 
@@ -5384,6 +5415,16 @@ end)
 -- V4: load persistent learning model on script start, then cleanup
 learning_load()
 pcall(learning_cleanup)
+-- V9.63: surface the load result ON SCREEN (event ticker + multi-fallback console),
+-- not only the console line that scrolls past. User reported "doesn't look like it
+-- reloaded" — the load worked, the confirmation was just invisible with console closed.
+pcall(function()
+    local _lc = 0
+    for _ in pairs(LearnedModel) do _lc = _lc + 1 end
+    if cs_event_info then
+        cs_event_info(string.format("Persistent model loaded: %d players", _lc))
+    end
+end)
 
 _cs_log_color_raw("=========================================")
 _cs_log_color_raw("Sel01-Solver v" .. SEL01_VERSION .. " loaded — by seltonmt01")
@@ -5456,6 +5497,7 @@ _cs_log_color_raw("V9.50: server-fail filter readout — the V9.49 netcode-miss 
 _cs_log_color_raw("V9.49: confirmed server-fail keeps no longer pollute stats — a correct angle (err~0) the server rejects via a stale backtrack record (high bt, side kept) is netcode, not a resolver miss. It's now excluded from session hit-rate, per-mode stats, per-player rate AND the persistent learned ratio (s.missed still increments so BF cycle + force-baim escalate). Logs: idx=9 fired -21.8° ×3 into bt 20→10→5 err=0 then hit shot 4; idx=4 kept ×3 err=0.3 across Air+Jitter-Cls — these dragged session ~56% when true resolver rate was ~82% and falsely flagged Air as 'weak'. Plus never-hit explore: after 2 consecutive correct-angle keeps on a real_active==0 enemy, flip once to break a frozen wrong-side guess (idx=5 0/2 shot LEFT while passive leaned RIGHT 42.9°); a single real hit disables it.")
 _cs_log_color_raw("V9.43: backtrack-resistance escalates faster — point-blank fakelaggers with correct angle (our=meas, err=0) but server-reject (bt 7-10) now flip the resistant flag after 2 high-bt fails OR one bt>12, instead of 3 (was wasting 2 sure shots). Pairs with v9.40 full-spread multipoint to catch slightly-stale records.")
 _cs_log_color_raw("V9.42: side-flip from SIDE evidence not magnitude error — ack_angle_err is a MAGNITUDE metric (wrong-side miss = small err, magnitude overshoot = large err), so old 'err>5 → flip' flipped the correct side on magnitude misses (idx=4: real 36°L, we 55°L, wrongly flipped R). Now flip only on learned side-conflict or blind first-contact; magnitude misses keep side, BF cycles the magnitude.")
+_cs_log_color_raw("V9.63: two-side switcher fixes — (A) BF 'opposite' now inverts the side WE JUST SHOT (last_shot_side) not -last_hit_side, so after a correction-flip BF genuinely alternates L/R/L/R and sweeps both sides instead of locking back onto the just-tried wrong side (logs: idx=3 Recall +41.9 MISS→flip L, then BF:opposite +24.4 R again, +58 R again, all while enemy sat on R → 60% miss). (B) confirmed two-side switcher / bimodal enemies (real hits BOTH sides OR s.bimodal) treat a low-error / high-bt miss as a MAGNITUDE problem: KEEP the shot side + let the BF sweep cover both, never flip on the noisy per-side sample lead that flips every shot. (C) PERSIST: Export button now ALSO writes learned.lua (the ONLY file load reads — learned.json was never loaded back, so Export-then-restart looked like it didn't reload). Load result now shows on the event ticker too, not just the console line that scrolls past.")
 _cs_log_color_raw("V9.62: serverfail-retry magnitude USE-SITE guard (V9.44 fixed the setter, this guards the getter) — if the stored serverfail_retry_mag deviates >15° from the CURRENT learned per-side desync, the stored value is suspect (slot reuse / poisoned from an earlier engagement) and the fresh learned magnitude is used instead. Caught idx=11: BF:retry fired -44.5° on a proven 25.4° enemy (learned L=24.9°), a 19.6° overshoot whose origin wasn't derivable from the shot's own data. Free hardening: agrees with stored when sane, overrides only on wild drift.")
 _cs_log_color_raw("V9.61: sticky AA-classification for well-learned enemies — once we've HIT an enemy 4+ times (real_active), reclassifying its AA type on borderline yaw_cache noise just thrashes the resolver mode/label every few seconds (logs: idx=5 still+slow enemy flapped jitter<->static 6+ times while hitting 4/4; the slow flap dodged the 10s anti-flap window). Cold enemies stay responsive (7 evals / 2s lock); learned ones now need 14 consecutive evals + 4s lock to flip. measured_desync + side adapt independently so slower aa_type ≠ worse aim — pure smoothness. No hit-path change.")
 _cs_log_color_raw("V9.60: 'Air*' no longer pollutes best_mode storage — Air/Air-Alt/Air-CorrFlip are POSITIONAL (enemy airborne), not an AA-pattern, but were saved as best_static/best_switch when an enemy was hit mid-air. The known-player fast-path never uses them (only acts on Static/Jitter) so zero benefit, but intel.mode_match compared the grounded resolve (e.g. Static-Meas) against the stored 'Air' → false mismatch → +15 conf cancel threshold → good shots cancelled on known enemies (logs: idx=3 sw=Air, name_369738400 s=Air). Added '^Air' to the save-filter + the load migration (same V9.0 precedent that dropped BF:/*-Guess). Stats/cancel only, no aim-path change.")
