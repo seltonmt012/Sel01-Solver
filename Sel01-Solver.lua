@@ -5,7 +5,7 @@
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 9.63
+-- @version 9.64
 -- @description Correction side guard + serverfail retry:
 --   * correction/prediction-error misses now check SIDE evidence, not only
 --     magnitude. A BF shot on the unlearned opposite side no longer gets labeled
@@ -73,7 +73,7 @@
 --   * v9.26 drift-bump (alpha 0.55 on 5-10° diff) still handles small shifts.
 --   * v9.29 coach variants carry.
 
-local SEL01_VERSION = "9.63"
+local SEL01_VERSION = "9.64"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -2614,7 +2614,6 @@ events.aim_ack:set(function(event)
         local ack_delta = NormalizeAngle((s.last_resolved or 0) - (s.last_eye_yaw or 0))
         local ack_shot_side = s.last_shot_side ~= 0 and s.last_shot_side or resolver_shot_side_from_delta(ack_delta)
         local ack_measured = s.measured_desync or 0
-        local ack_angle_err = ack_measured > 5 and math.abs(math.abs(ack_delta) - ack_measured) or math.huge
         -- V9.54: side-aware measured for the serverfail-retry magnitude. The retry
         -- (resolver_note_serverfail_retry below) used to freeze the GLOBAL EMA
         -- (ack_measured = s.measured_desync). On a BIMODAL enemy the two sides have
@@ -2624,6 +2623,7 @@ events.aim_ack:set(function(event)
         -- effective_desync already picks per-side correctly — mirror that here so the
         -- retry shoots the side we actually fired. Identical to global on unimodal
         -- (both per-side EMAs ~= global), strictly more accurate on bimodal.
+        -- V9.64: computed BEFORE ack_angle_err — see below.
         local ack_side_measured = ack_measured
         if exp_perside_desync and exp_perside_desync:get() then
             if ack_shot_side > 0 and (s.samples_right or 0) >= 1 and (s.measured_right or 0) > 5 then
@@ -2632,10 +2632,20 @@ events.aim_ack:set(function(event)
                 ack_side_measured = s.measured_left
             end
         end
+        -- V9.64: ack_angle_err references the PER-SIDE magnitude we actually fired, not
+        -- the GLOBAL EMA. The resolver + serverfail-retry both shoot effective_desync
+        -- (per-side); comparing our |delta| to the blended global average faked a large
+        -- err on asymmetric enemies and mislabelled a clean server-fail as a real miss
+        -- (logs: idx=1 fired its learned R-side 40.8° = exactly the R EMA, but err was
+        -- computed vs global 31.2 → err 9.6 → first miss counted + mode-blacklisted,
+        -- when we shot our learned magnitude on-target and the server rejected it).
+        -- Unimodal: ack_side_measured ~= global, so err is unchanged.
+        local ack_angle_err = ack_side_measured > 5
+                              and math.abs(math.abs(ack_delta) - ack_side_measured) or math.huge
         local ack_side_bad = resolver_side_conflicts(s, ack_shot_side)
         local ack_resolverish = ack_reason == "correction" or ack_reason == "prediction error" or ack_reason == "prediction_error"
         local ack_serverfail_like = ack_resolverish and ack_shot_side ~= 0 and not ack_side_bad
-                                     and ((ack_measured > 5 and ack_angle_err <= 5) or bt > 8)
+                                     and ((ack_side_measured > 5 and ack_angle_err <= 5) or bt > 8)
         -- V9.49: a CONFIRMED server-fail keep (correct angle, high bt, side kept) is not
         -- a resolver fault. Logs showed these polluting the headline hit-rate badly:
         -- idx=9 fired the SAME correct -21.8° three times into a declining stale record
@@ -2716,7 +2726,7 @@ events.aim_ack:set(function(event)
                 resolver_note_serverfail_retry(s, ack_shot_side, (ack_side_measured > 5 and ack_side_measured) or math.abs(ack_delta))
                 server_fail_keep = ack_serverfail_like  -- V9.55: only filter GENUINE netcode (err<=5 or bt>8); a bt=0 side-miss is our fault, count it
                 cs_log_verbose("LBY-Snap miss KEEP idx=%d our_delta=%.1f measDsync=%.1f err=%.1f (server-side fail, retry side=%d)",
-                               Ent:get_index(), ack_delta, ack_measured, ack_angle_err, ack_shot_side)
+                               Ent:get_index(), ack_delta, ack_side_measured, ack_angle_err, ack_shot_side)
             end
         end
         -- V7.8 + V8.2: correction-miss → wrong side picked. Track + flip immediately.
@@ -2838,7 +2848,7 @@ events.aim_ack:set(function(event)
                 resolver_note_serverfail_retry(s, ack_shot_side, (ack_side_measured > 5 and ack_side_measured) or math.abs(ack_delta))
                 server_fail_keep = ack_serverfail_like  -- V9.55: only filter GENUINE netcode (err<=5 or bt>8); a bt=0 side-miss is our fault, count it
                 cs_log_verbose("correction-miss idx=%d KEEP side=%d our=%.1f meas=%.1f err=%.1f bt=%d (server/backtrack fail #%d, retry same)",
-                               Ent:get_index(), ack_shot_side, ack_delta, ack_measured, ack_angle_err, bt, s.serverfail_streak)
+                               Ent:get_index(), ack_shot_side, ack_delta, ack_side_measured, ack_angle_err, bt, s.serverfail_streak)
             end
         end
         cs_log_verbose("MISS [%s] target=%d count=%d mode=%s",
@@ -4070,7 +4080,17 @@ local function resolve_player(p)
         elseif s.measured_desync > 0 and s.last_hit_side ~= 0 then
             local side = s.last_hit_side
             local corr_diff = (s.correction_right or 0) - (s.correction_left or 0)
-            if math.abs(corr_diff) >= 1 and side ~= 0 then
+            -- V9.64: don't corr-flip in AIR on a confirmed two-side switcher / bimodal
+            -- enemy. Both sides get real hits at very different magnitudes (logs: idx=3
+            -- L=2/23.6° R=2/51.1°, idx=6 L=2/7.6° R=2/29.3°); the corr_diff flip just
+            -- chases the enemy's own alternation and then fires the FAR-side magnitude on
+            -- the freshly-flipped side (idx=3 shot 51.1° vs meas 23.6, idx=6 29.3° vs 7.6).
+            -- Air-CorrFlip was the worst mode at 0/2. Mirrors the V9.63 ground-path
+            -- two_side_switcher KEEP — treat the miss as MAGNITUDE, let BF cycle cover both.
+            local _ra = (s.real_left or 0) + (s.real_right or 0)
+            local _two_side = (_ra >= 2 and (s.real_left or 0) >= 1 and (s.real_right or 0) >= 1)
+                              or (s.bimodal == true)
+            if (not _two_side) and math.abs(corr_diff) >= 1 and side ~= 0 then
                 -- if we keep correction-missing on dominant side, flip
                 if (side > 0 and corr_diff > 0) or (side < 0 and corr_diff < 0) then
                     side = -side
@@ -5477,6 +5497,7 @@ _cs_log_color_raw("V9.35: fast-fire tightened — only fires fast on stable (std
 _cs_log_color_raw("V9.36: snapshot-match REGRESSION FIX — v9.33 matched ack-time tickcount (grabbed the most-recent snapshot, mis-learned sides on rapid fire). Restored event.tick matching of the actual acked shot; kept the stale-reject guard.")
 _cs_log_color_raw("V9.37: AIR first-contact fix (Air was worst @25%) — air guess magnitude biased high (max(median,42), airborne=near-max desync) + first-contact side uses steam-mem dom instead of blind +1.")
 _cs_log_color_raw("V9.38: correction guard is side-aware + correct-angle serverfails retry same side once; BF now trusts strong passive desync before max_desync.")
+_cs_log_color_raw("V9.64: two bimodal/asymmetric fixes from the v9.63 session dump. (1) Air-CorrFlip now respects the V9.63 two_side_switcher guard — it was the worst mode (0/2): on a bimodal enemy it flipped side on corr_diff and fired the FAR-side magnitude on the wrong side (idx=3 shot 51.1° vs meas 23.6, idx=6 29.3° vs 7.6). When both sides have real hits OR bimodal flag set, KEEP the air side, let BF cover both. (2) ack_angle_err now references the PER-SIDE magnitude we actually fire, not the global EMA — idx=1 fired its learned R-side 40.8° on-target but err was computed vs global 31.2° → fake err 9.6 → a clean server-fail got counted as a real miss + mode-blacklisted. Unimodal unchanged.")
 _cs_log_color_raw("V9.39: sample-count EMA alpha ramp (0.55 on hit 1-2, 0.42 on hit 3-4, then 0.30) on global + both per-side — converges in 2-3 hits instead of 5-6, faster + smoother lock (side settles sooner, fewer first-shot mode flips).")
 _cs_log_color_raw("V9.40: point-blank stale-record fix — non-sniper close-priority now forces multipoint (was sniper-only) so a single-point head shot stops whiffing on an enemy running at you (correct angle, high bt, reason=correction). + bt-driven backtrack-resistance (high event.backtrack on correction/prediction-error now counts, was string-only).")
 _cs_log_color_raw("V9.41: air-guess magnitude is per-player passive-aware — uses THIS enemy's measured/passive-seeded desync before the blind floor (v9.37's max(median,42) overshot low-desync air enemies by ~30° and ignored 50+ passive obs we already had). Blind floor softened 42→36.")
