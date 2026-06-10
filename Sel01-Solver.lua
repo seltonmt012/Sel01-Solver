@@ -5,7 +5,7 @@
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 9.69
+-- @version 9.70
 -- @description Correction side guard + serverfail retry:
 --   * correction/prediction-error misses now check SIDE evidence, not only
 --     magnitude. A BF shot on the unlearned opposite side no longer gets labeled
@@ -73,7 +73,7 @@
 --   * v9.26 drift-bump (alpha 0.55 on 5-10° diff) still handles small shifts.
 --   * v9.29 coach variants carry.
 
-local SEL01_VERSION = "9.69"
+local SEL01_VERSION = "9.70"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -3462,17 +3462,37 @@ function pose_cal_record(p, hit_side)
             a.n = a.n + 1; a.sum = a.sum + v; a.sumsq = a.sumsq + v * v
             if hit_side > 0 then a.sr = a.sr + v; a.nr = a.nr + 1
             else                 a.sl = a.sl + v; a.nl = a.nl + 1 end
-            if a.n >= 20 and a.nl >= 5 and a.nr >= 5 then
-                local sep, mid, valid = _pose_eval(a)
-                if valid and math.abs(sep) >= 1.2 and math.abs(sep) > g_pose_best_sep then
-                    g_pose_best_idx = i; g_pose_best_sep = math.abs(sep)
-                    g_pose_best_dir = (sep > 0) and 1 or -1; g_pose_best_mid = mid
-                    cs_log_verbose("pose-cal: index %d promoted (sep=%.2fσ, dir=%d, mid=%.3f, n=%d L%d/R%d)",
-                                   i, sep, g_pose_best_dir, mid, a.n, a.nl, a.nr)
-                end
+        end
+    end
+    -- V9.70: NON-STICKY re-evaluation. The v9.69 promote was sticky (once an index
+    -- crossed the bar it stayed BEST even as its separation decayed) — a small-sample
+    -- fluke (idx 16 hit 1.28σ at n=20) locked in, then collapsed to 0.58σ with more
+    -- data while still showing "<<< BEST". Now we re-scan ALL indices every hit and pick
+    -- the current best meeting STRICTER gates (n≥25, ≥6 per side, |sep|≥1.3). If none
+    -- qualifies, g_pose_best_idx clears → the dump is honest. This means a real body_yaw
+    -- index must hold its separation as samples grow; pure noise self-demotes.
+    local best_i, best_abs, best_sep, best_mid = nil, 0, 0, 0
+    for i = 0, 23 do
+        local a = pose_cal_acc[i]
+        if a and a.n >= 25 and a.nl >= 6 and a.nr >= 6 then
+            local sep, mid, valid = _pose_eval(a)
+            if valid and math.abs(sep) >= 1.3 and math.abs(sep) > best_abs then
+                best_i, best_abs, best_sep, best_mid = i, math.abs(sep), sep, mid
             end
         end
     end
+    if best_i ~= g_pose_best_idx then
+        if best_i then
+            cs_log_verbose("pose-cal: index %d promoted (sep=%.2fσ, dir=%d, mid=%.3f)",
+                           best_i, best_sep, (best_sep > 0) and 1 or -1, best_mid)
+        elseif g_pose_best_idx then
+            cs_log_verbose("pose-cal: index %d DEMOTED (separation decayed below 1.3σ)", g_pose_best_idx)
+        end
+    end
+    g_pose_best_idx = best_i
+    g_pose_best_sep = best_abs
+    g_pose_best_dir = best_i and ((best_sep > 0) and 1 or -1) or 1
+    g_pose_best_mid = best_mid or 0
 end
 function pose_read_side(p)
     if not g_pose_best_idx then return 0 end
@@ -3491,14 +3511,14 @@ function pose_cal_dump()
             local sep, _mid, valid = _pose_eval(a)
             local ml = (a.nl > 0) and (a.sl / a.nl) or 0
             local mr = (a.nr > 0) and (a.sr / a.nr) or 0
-            local strong = valid and math.abs(sep) >= 1.2
+            local strong = valid and math.abs(sep) >= 1.3
             local mark = (g_pose_best_idx == i) and "  <<< BEST (body_yaw)" or (strong and "  *strong*" or "")
             cs_event_console(string.format("  [%d] sep=%.2f  L%d/R%d  %.3f→%.3f%s", i, sep, a.nl, a.nr, ml, mr, mark),
                              strong and 120 or 200, strong and 255 or 200, 120)
         end
     end
     if not g_pose_best_idx then
-        cs_event_console("  no index calibrated — need 20+ hits with 5+ on EACH side, pose collection ON", 255, 200, 120)
+        cs_event_console("  no index calibrated — need a SUSTAINED |sep|>=1.3 (25+ hits, 6+ each side). If none holds, this build does not cleanly expose body_yaw → leave pose OFF.", 255, 200, 120)
     end
 end
 
@@ -5792,6 +5812,7 @@ _cs_log_color_raw("V9.57: cosmetic — chernobl-style menu groups (icon + 'Sel01
 _cs_log_color_raw("V9.56: LBY-Snap-Guess miss-flip is now bt/measurement-aware (matches the generic V9.42/V9.47 logic this older branch never got). It used to flip side on err>5, but err=inf when there is no measurement (first contact, measDesync=0) so it flipped blindly on EVERY first-contact miss — and a high bt (>8) is a server stale-record reject, not a side error. Logs: idx=2 our=29 meas=0 err=inf bt=13 flipped to -1 while the generic path KEPT side=1 the same tick (the two handlers disagreed). Now: no measurement + high bt -> keep + retry the guess once, never flip an unconfirmed side.")
 _cs_log_color_raw("V9.55: honest hit-rate — server-fail filter now reuses the ack_serverfail_like signal (err<=5 OR bt>8) the mode-blacklist already trusts, instead of filtering EVERY kept-side miss. A bt=0 keep with a real magnitude error is the resolver's own side-misprediction on a switch/bimodal enemy (logs: idx=1 bimodal L=40°/R=17.5° kept side ×3 at bt=0 err=10-40 — counted as netcode, inflating session 76.5%->96.3%). Those now count; only clean stale-record rejects (bt>8 / err~0) stay excluded. No aim change, stats only.")
 _cs_log_color_raw("V9.65: PERF/smoothness — RebuildServerYaw is now memoised per (tick, player). It was recomputed up to ~5x per resolve per enemy (once in resolve_player + once in each pick_first_shot branch), every call an FFI-heavy anim_state + velocity + LBY read. The result depends only on this-tick player state, so caching is behaviour-identical — pure FFI-work reduction (lighter per-tick load, smoother frametimes in 5-man HvH). No aim/learning change.")
+_cs_log_color_raw("V9.70: pose-promotion is NON-STICKY (real-dump bug #2). v9.69 promoted on the FIRST threshold cross and never demoted, so a small-sample fluke locked in: idx 16 hit 1.28σ at n=20, was marked '<<< BEST', then DECAYED to 0.58σ at n=23 while still showing best. Now we re-scan all indices every hit and pick the current best meeting STRICTER gates (n≥25, 6+ per side, |sep|≥1.3); if none holds, g_pose_best_idx clears → honest dump. A real body_yaw index must HOLD its separation as samples grow; noise self-demotes. On the user's build no index sustained ≥1.3 (max ~0.78) → this NL build does not cleanly expose body_yaw, so pose-read stays a dead end here and the OTHER levers (v9.66 prediction, speed-bucket, on-shot, switch-period) carry.")
 _cs_log_color_raw("V9.69: pose-calibration scorer FIXED (real-dump bug). The v9.67 sign-vs-running-mean scorer FALSELY read 'eff 100%' on every CONSTANT pose index when the early hits were one-sided (dump: 3 right-side hits → idx 0/1/4/5/9/11.. all 0%/eff100%) — it would have promoted a garbage constant index. New scorer uses SEPARATION: track the param's mean on LEFT hits vs RIGHT hits; body_yaw is the index whose two side-means split cleanly (|meanR-meanL| ≥ 1.2σ). Promotion now needs 20+ hits, 5+ on EACH side, real variance. Dump shows sep(σ) + nL/nR + meanL→meanR. To calibrate: fight enemies you hit on BOTH sides.")
 _cs_log_color_raw("V9.68: presets brought up to v9.65-67. ALL 6 presets now set the new levers explicitly (were untouched → left on user state). pose-collect ON everywhere (pure data, harmless). SSG-Pro (BALANCED, your main): pose-collect + on-shot flip ON, pose-USE + switch-period OFF until you validate the 'Dump Pose Calibration' index — SSG aim stays effectively identical, only learns + handles on-shot AA. Dynamic = experimental showcase (switch-period ON too). Defensive = data-only (no aim-changing levers). The toggle-less v9.65 perf / v9.66 prediction rework / v9.67 speed-bucket were already active in every preset.")
 _cs_log_color_raw("V9.67: four new resolver levers (all opt-in toggles, default OFF except #C which is a safe refinement). #A POSE-PARAM CALIBRATION — collect pose[0..23] vs known hit-side on every HIT, auto-find the index that encodes body_yaw → turns SIDE from a statistical guess into a DIRECT read (toggle 'Pose Calibration' + 'Use Calibrated Pose Side' + 'Dump Pose Calibration' button). #B SWITCH-PERIOD — observe the server's per-tick predicted feet-yaw side (visible without a hit), detect a regular flip interval, predict which side the fake is on at shot-land (toggle 'Switch-Period Side Predict'). #C SPEED-BUCKET magnitude — split measured desync into standing vs moving buckets (real desync shrinks with speed) and use the bucket matching shot-time speed in the global fallback. #D ON-SHOT FLIP — learn enemies whose desync flips the tick they fire (2 wrong-side misses inside their fire window) and flip the resolved side in that window (toggle 'On-Shot Side-Flip Learn'). All three direct-side sources resolve through one central branch; inert for anyone who doesn't opt in.")
