@@ -5,7 +5,7 @@
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 9.64
+-- @version 9.65
 -- @description Correction side guard + serverfail retry:
 --   * correction/prediction-error misses now check SIDE evidence, not only
 --     magnitude. A BF shot on the unlearned opposite side no longer gets labeled
@@ -73,7 +73,7 @@
 --   * v9.26 drift-bump (alpha 0.55 on 5-10° diff) still handles small shifts.
 --   * v9.29 coach variants carry.
 
-local SEL01_VERSION = "9.64"
+local SEL01_VERSION = "9.65"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -2343,11 +2343,22 @@ end
 local function DegToRad(Deg) return Deg * (math.pi / 180) end
 local function RadToDeg(Rad) return Rad * (180 / math.pi) end
 local Lerp = function(a, b, t) return a + (b - a) * t end
+-- V9.65 perf: per-tick per-player memo for RebuildServerYaw. It was recomputed up
+-- to ~5×/resolve/player (resolve_player + each pick_first_shot branch), every one
+-- an FFI-heavy anim_state + velocity + LBY read. Result is deterministic for a given
+-- (tick, player) — reads only this-tick player state, NOT the passed args — so memoising
+-- is behaviour-identical and just removes the redundant FFI work. Globals (200-local cap).
+server_yaw_cache, server_yaw_cache_tick = {}, -1
 local function RebuildServerYaw(player)
     -- V9.32: return nil (not 0) on failure so callers can distinguish a genuine
     -- ~0° server-yaw from a failed computation. They do `... or eye_yaw`, turning a
     -- failure into a 0° delta → existing guess fallback (was resolving to literal 0°).
     if not player then return nil end
+    local _tick = globals.tickcount or 0
+    if _tick ~= server_yaw_cache_tick then server_yaw_cache, server_yaw_cache_tick = {}, _tick end
+    local _idx = player:get_index()
+    local _c = server_yaw_cache[_idx]
+    if _c ~= nil then if _c == false then return nil else return _c end end
     local ok, result = pcall(function()
     local Animstate = player:get_anim_state()
     if not Animstate then return nil end
@@ -2382,7 +2393,8 @@ local function RebuildServerYaw(player)
     end
 	return NormalizeAngle(FinalServerYaw)
     end)
-    if not ok or result == nil then return nil end
+    if not ok or result == nil then server_yaw_cache[_idx] = false; return nil end
+    server_yaw_cache[_idx] = result
     return result
 end
 
@@ -5510,6 +5522,7 @@ _cs_log_color_raw("V9.58: chernobl-style TABS — split the single tab into Main
 _cs_log_color_raw("V9.57: cosmetic — chernobl-style menu groups (icon + 'Sel01 \194\187 Section' headers) + multi-color welcome label (username/version in accent). Group rename re-keys UI elements once, so toggles reset on first reload — click a preset to restore. No logic change.")
 _cs_log_color_raw("V9.56: LBY-Snap-Guess miss-flip is now bt/measurement-aware (matches the generic V9.42/V9.47 logic this older branch never got). It used to flip side on err>5, but err=inf when there is no measurement (first contact, measDesync=0) so it flipped blindly on EVERY first-contact miss — and a high bt (>8) is a server stale-record reject, not a side error. Logs: idx=2 our=29 meas=0 err=inf bt=13 flipped to -1 while the generic path KEPT side=1 the same tick (the two handlers disagreed). Now: no measurement + high bt -> keep + retry the guess once, never flip an unconfirmed side.")
 _cs_log_color_raw("V9.55: honest hit-rate — server-fail filter now reuses the ack_serverfail_like signal (err<=5 OR bt>8) the mode-blacklist already trusts, instead of filtering EVERY kept-side miss. A bt=0 keep with a real magnitude error is the resolver's own side-misprediction on a switch/bimodal enemy (logs: idx=1 bimodal L=40°/R=17.5° kept side ×3 at bt=0 err=10-40 — counted as netcode, inflating session 76.5%->96.3%). Those now count; only clean stale-record rejects (bt>8 / err~0) stay excluded. No aim change, stats only.")
+_cs_log_color_raw("V9.65: PERF/smoothness — RebuildServerYaw is now memoised per (tick, player). It was recomputed up to ~5x per resolve per enemy (once in resolve_player + once in each pick_first_shot branch), every call an FFI-heavy anim_state + velocity + LBY read. The result depends only on this-tick player state, so caching is behaviour-identical — pure FFI-work reduction (lighter per-tick load, smoother frametimes in 5-man HvH). No aim/learning change.")
 _cs_log_color_raw("V9.54: serverfail-retry magnitude is now PER-SIDE on bimodal enemies — the retry froze the GLOBAL desync EMA (s.measured_desync), but a two-mode enemy (idx=10 L=46.2° R=29.7°, diff 16°) has very different per-side magnitudes and the global average swings mid-round. The kept side then re-fired a wrong magnitude for up to 64 ticks (logs: idx=10 retried 15.7° at a 29.7° R side, err=16). Now mirrors effective_desync's per-side pick (measured_left/right with >=1 real sample). Identical to global on unimodal enemies; strictly more accurate on bimodal.")
 _cs_log_color_raw("V9.53: ESP made COMPACT (v9.52 words too big). Now ONE short line per enemy, smaller font: [aa-icon] [side-arrow] [deg] [learn-icon] e.g. '⇄ → 29° ★'. AA-icon: ▬static ⇄switch ≈jitter ⟳spin. Learn-icon: 🔒locked / ★learned / ·learning. Confidence = the bar (color), no second text line. Netcode shrunk to '⚠×N bt pk'. SIDE-DOM mini-bar REMOVED (redundant — side already in the arrow; was just clutter). Confidence bar stays.")
 _cs_log_color_raw("V9.52: ESP labels rewritten in PLAIN WORDS (the v9.51 glyphs ⇄ ·2+53 ★ 🔒 👁 🛡net× were unreadable). Now two clean stacked lines per enemy: MAIN (mode color) = 'TYPE SIDE DEG' e.g. 'SWITCH  R 36°  PRED'; STATE (progress color) = 'LEARNED 4  72%' (NEW / SEEN / LEARNING n / LEARNED n / LOCKED n + confidence%). Netcode tag is now words: 'FAKELAG' (backtrack-resistant) / 'NET×N' (server-fails) / 'PEEK' (teleport-peek). Flash + dots + dom-bar + wedge unchanged (visual, not cryptic). Nothing removed — just readable.")
