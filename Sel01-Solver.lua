@@ -5,7 +5,7 @@
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 9.66
+-- @version 9.67
 -- @description Correction side guard + serverfail retry:
 --   * correction/prediction-error misses now check SIDE evidence, not only
 --     magnitude. A BF shot on the unlearned opposite side no longer gets labeled
@@ -73,7 +73,7 @@
 --   * v9.26 drift-bump (alpha 0.55 on 5-10° diff) still handles small shifts.
 --   * v9.29 coach variants carry.
 
-local SEL01_VERSION = "9.66"
+local SEL01_VERSION = "9.67"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -377,6 +377,20 @@ exp_lock_headpref = g_experimental:switch(accent .. ui.get_icon"bullseye" .. acc
 -- + mapping are NOT documented, so this is a guess (index 11, range ±60°) — OFF by
 -- default, A/B test in-game. Only replaces the side coin-flip in guess fallbacks.
 pose_read_tog = g_experimental:switch(accent .. ui.get_icon"flask" .. accent .. "  [EXP] Pose-param side read (A/B test)", false)
+-- V9.67: four new resolver levers, all GLOBALS (200-local cap) + default OFF so the
+-- baseline is untouched until the user opts in.
+--  A) pose_cal_tog  — collect pose[0..23] vs known hit-side on every HIT, auto-find the
+--     index that actually encodes body_yaw → turns SIDE from a guess into a direct read.
+--  A) pose_use_tog  — once an index is calibrated, use its direct side in the resolve.
+--  D) onshot_flip_tog — learn enemies that flip desync the tick they fire (on-shot AA),
+--     then flip the resolved side inside their fire window.
+--  B) switch_pred_tog — observe the server's per-tick predicted feet-yaw side, detect a
+--     regular flip period, predict which side the fake is on at shot-land.
+pose_cal_tog    = g_experimental:switch(accent .. ui.get_icon"flask"     .. accent .. "  [EXP] Pose-Param Calibration (collect)", false)
+pose_use_tog    = g_experimental:switch(accent .. ui.get_icon"flask"     .. accent .. "  [EXP] Use Calibrated Pose Side", false)
+onshot_flip_tog = g_experimental:switch(accent .. ui.get_icon"bolt"      .. accent .. "  On-Shot Side-Flip Learn", false)
+switch_pred_tog = g_experimental:switch(accent .. ui.get_icon"clock"     .. accent .. "  Switch-Period Side Predict", false)
+g_experimental:button("Dump Pose Calibration", function() pcall(pose_cal_dump) end)
 
 -- ─── ESP / HUD dedicated group ─────────────────────────
 local esp_master       = g_esp:switch(accent .. ui.get_icon"bullseye"  .. accent .. "  ESP Master (on/off)", true)
@@ -2407,6 +2421,16 @@ setmetatable(PlayerState, {__index = function(t, k)
         last_yaw_time     = 0,
         yaw_rate          = 0,
         yaw_accel         = 0,         -- V9.66: rate-of-change of yaw_rate (decel-damp)
+        last_speed2d      = 0,         -- V9.67 #C: shot-time enemy speed (desync bucket)
+        n_stand           = 0,         -- V9.67 #C: standing-desync sample count
+        measured_stand    = nil,       -- V9.67 #C: standing-bucket desync EMA
+        n_move            = 0,         -- V9.67 #C: moving-desync sample count
+        measured_move     = nil,       -- V9.67 #C: moving-bucket desync EMA
+        onshot_evi        = 0,         -- V9.67 #D: on-shot AA evidence counter
+        onshot_aa         = false,     -- V9.67 #D: enemy flips desync on fire
+        sw_last_side      = nil,       -- V9.67 #B: last observed fake side
+        sw_last_t         = 0,         -- V9.67 #B: time of last fake-side flip
+        sw_periods        = nil,       -- V9.67 #B: recent flip intervals ring
         last_resolved     = 0,
         last_eye_yaw      = 0,
         defensive_aa      = false,
@@ -2637,6 +2661,21 @@ events.aim_ack:set(function(event)
         local ack_angle_err = ack_side_measured > 5
                               and math.abs(math.abs(ack_delta) - ack_side_measured) or math.huge
         local ack_side_bad = resolver_side_conflicts(s, ack_shot_side)
+        -- V9.67 #D: on-shot AA learning. A wrong-SIDE miss that lands inside the enemy's
+        -- own fire window (they shot ~within 12 ticks) is evidence their desync flips the
+        -- tick they fire (on-shot AA — our own Config does exactly this). Two such hits
+        -- mark the enemy; the resolve then flips side inside their fire window.
+        if onshot_flip_tog and onshot_flip_tog:get() and ack_side_bad and (s.last_hostile_fire or 0) > 0 then
+            local th_os = (globals.tickcount or 0) - s.last_hostile_fire
+            if th_os >= 0 and th_os <= 12 then
+                s.onshot_evi = (s.onshot_evi or 0) + 1
+                if s.onshot_evi >= 2 and not s.onshot_aa then
+                    s.onshot_aa = true
+                    cs_log_verbose("on-shot AA learned idx=%d (evidence=%d) → flip side in fire window",
+                                   Ent:get_index(), s.onshot_evi)
+                end
+            end
+        end
         local ack_resolverish = ack_reason == "correction" or ack_reason == "prediction error" or ack_reason == "prediction_error"
         local ack_serverfail_like = ack_resolverish and ack_shot_side ~= 0 and not ack_side_bad
                                      and ((ack_side_measured > 5 and ack_angle_err <= 5) or bt > 8)
@@ -2933,6 +2972,11 @@ events.aim_ack:set(function(event)
                 s.last_hit_side = hit_side
             end
         end
+        -- V9.67 #A: feed the pose-param calibrator the confirmed hit-side so it can find
+        -- the index that encodes body_yaw. Cheap, only when collection is enabled.
+        if pose_cal_tog and pose_cal_tog:get() and hit_side ~= 0 then
+            pcall(pose_cal_record, Ent, hit_side)
+        end
         -- update measured-desync EMA (global + per-side)
         if src_res ~= 0 and src_eye ~= 0 then
             local actual = math.abs(NormalizeAngle(src_res - src_eye))
@@ -2976,6 +3020,17 @@ events.aim_ack:set(function(event)
                 -- V9.19: push every hit-derived measurement into the session ring
                 -- so adaptive_guess_mag() reflects current lobby AA magnitudes.
                 session_push_desync(actual)
+                -- V9.67 #C: speed-bucketed magnitude — split the measurement into a
+                -- standing vs moving bucket (real desync shrinks with speed). Used by
+                -- effective_desync's global fallback when the matching bucket is sampled.
+                local _spd = s.last_speed2d or 0
+                if _spd < 80 then
+                    s.n_stand = math.min((s.n_stand or 0) + 1, 99)
+                    s.measured_stand = s.measured_stand and (s.measured_stand * 0.7 + actual * 0.3) or actual
+                else
+                    s.n_move = math.min((s.n_move or 0) + 1, 99)
+                    s.measured_move = s.measured_move and (s.measured_move * 0.7 + actual * 0.3) or actual
+                end
                 -- V9.31: count real (hit-derived) samples side-independently, OUTSIDE
                 -- the per-side guard, so confidence is not capped at 50 when the
                 -- per-side-desync toggle is OFF (real_left/right gate the conf cap).
@@ -3309,6 +3364,15 @@ local function effective_desync(s, max_desync, side)
         end
     end
     if (s.desync_samples or 0) >= 1 and (s.measured_desync or 0) > 5 then
+        -- V9.67 #C: speed-bucket refinement on the GLOBAL fallback only. Real max-desync
+        -- scales with the enemy's speed (GetMaxDesync), so a single blended EMA mixes
+        -- large standing-desync + smaller moving-desync samples = wrong for each. When the
+        -- bucket matching the enemy's CURRENT speed is well-sampled, use it. The per-side
+        -- path above (bimodal) returns first and is untouched — this only sharpens the
+        -- symmetric / pre-per-side case.
+        local spd = s.last_speed2d or 0
+        if spd < 80 and (s.n_stand or 0) >= 2 and (s.measured_stand or 0) > 5 then return s.measured_stand end
+        if spd >= 80 and (s.n_move or 0) >= 2 and (s.measured_move or 0) > 5 then return s.measured_move end
         return s.measured_desync
     end
     if (s.passive_samples or 0) >= 8 and (s.measured_desync or 0) > 5 then
@@ -3319,6 +3383,110 @@ local function effective_desync(s, max_desync, side)
         if passive_mag > 5 then return passive_mag end
     end
     return max_desync
+end
+
+-- ═══════════════════════════════════════════════════════
+-- V9.67 NEW LEVERS (all GLOBAL — 200-local cap; callable from aim_ack / resolve
+-- closures because globals resolve at call-time, not parse-time).
+-- ═══════════════════════════════════════════════════════
+
+-- (A) POSE-PARAM CALIBRATION. NL exposes m_flPoseParameter[]; one of the indices is
+-- the animated body_yaw (= the real desync side) but the index is undocumented and
+-- build-specific. On every HIT we know the true hit_side, so we score each index by
+-- how often sign(pose[i] - running_mean_i) agrees with hit_side. The running mean
+-- auto-centres regardless of the param's normalisation (0..1, ±1, or degrees). The
+-- index that reaches ≥85% agreement over ≥15 hits IS body_yaw → promoted for direct
+-- side reads. Turns the statistical side-guess into a direct read.
+pose_cal_acc    = {}      -- [i] = {n, sum, agree}
+g_pose_best_idx = nil
+g_pose_best_pct = 0
+function pose_cal_record(p, hit_side)
+    if hit_side == 0 then return end
+    for i = 0, 23 do
+        local ok, v = pcall(function() return p.m_flPoseParameter[i] end)
+        if ok and type(v) == "number" then
+            local a = pose_cal_acc[i]
+            if not a then a = {n = 0, sum = 0, agree = 0}; pose_cal_acc[i] = a end
+            local mean = a.n > 0 and (a.sum / a.n) or v   -- judge vs current mean
+            local side = (v > mean) and 1 or -1
+            if side == hit_side then a.agree = a.agree + 1 end
+            a.n = a.n + 1; a.sum = a.sum + v
+            if a.n >= 15 then
+                local pct = (a.agree / a.n) * 100
+                -- also accept a STRONGLY inverse index (param sign opposite to side)
+                local pct_eff = math.max(pct, 100 - pct)
+                if pct_eff >= 85 and pct_eff > g_pose_best_pct then
+                    g_pose_best_idx = i; g_pose_best_pct = pct_eff
+                    cs_log_verbose("pose-cal: index %d promoted (%.0f%% over %d hits)", i, pct_eff, a.n)
+                end
+            end
+        end
+    end
+end
+function pose_read_side(p)
+    if not g_pose_best_idx then return 0 end
+    local ok, v = pcall(function() return p.m_flPoseParameter[g_pose_best_idx] end)
+    if not ok or type(v) ~= "number" then return 0 end
+    local a = pose_cal_acc[g_pose_best_idx]
+    local mean = (a and a.n > 0) and (a.sum / a.n) or v
+    local side = (v > mean) and 1 or -1
+    -- if the calibrated index was the INVERSE correlator, flip the read
+    if a and a.n > 0 and (a.agree / a.n) < 0.5 then side = -side end
+    return side
+end
+function pose_cal_dump()
+    cs_event_console("─── POSE CALIBRATION (index : agree% : samples) ───", 150, 200, 255)
+    for i = 0, 23 do
+        local a = pose_cal_acc[i]
+        if a and a.n > 0 then
+            local pct = (a.agree / a.n) * 100
+            local eff = math.max(pct, 100 - pct)
+            local mark = (g_pose_best_idx == i) and "  <<< BEST (body_yaw)" or ""
+            cs_event_console(string.format("  [%d] %.0f%% (eff %.0f%%) n=%d%s", i, pct, eff, a.n, mark),
+                             (eff >= 85) and 120 or 200, (eff >= 85) and 255 or 200, 120)
+        end
+    end
+    if not g_pose_best_idx then
+        cs_event_console("  no index calibrated yet — need 15+ hits with pose collection ON", 255, 200, 120)
+    end
+end
+
+-- (B) SWITCH-PERIOD. The server's per-tick predicted feet-yaw (m_flGoalFeetYaw, read in
+-- the passive block) gives the CURRENT fake side every tick — observable without a hit.
+-- A switch-AA enemy alternates it on a timer; we record the interval between flips and,
+-- if it is regular, predict which side the fake is on at shot-land time.
+function switch_period_observe(s, side, now)
+    if side == 0 then return end
+    if not s.sw_last_side then s.sw_last_side = side; s.sw_last_t = now; s.sw_periods = {}; return end
+    if side ~= s.sw_last_side then
+        local dt = now - (s.sw_last_t or now)
+        if dt > 0.02 and dt < 2.0 then
+            s.sw_periods = s.sw_periods or {}
+            table.insert(s.sw_periods, dt)
+            while #s.sw_periods > 8 do table.remove(s.sw_periods, 1) end
+        end
+        s.sw_last_side = side; s.sw_last_t = now
+    end
+end
+function switch_period_predict_side(s, now)
+    local arr = s.sw_periods
+    local n = arr and #arr or 0
+    if n < 4 then return 0 end
+    local sorted = {}
+    for i = 1, n do sorted[i] = arr[i] end
+    table.sort(sorted)
+    local med = sorted[math.floor(n / 2) + 1]
+    if not med or med <= 0 then return 0 end
+    -- regularity gate: every interval within 35% of the median (else it is jitter, not a switch)
+    for i = 1, n do
+        if math.abs(sorted[i] - med) > med * 0.35 then return 0 end
+    end
+    local cur = s.sw_last_side or 0
+    if cur == 0 then return 0 end
+    -- phase: half-periods elapsed since the last observed flip, plus a small land-lead.
+    local since = now - (s.sw_last_t or now)
+    local flips = math.floor((since + 0.05) / med)
+    return (flips % 2 == 0) and cur or -cur
 end
 
 -- yaw-extrapolation für hohen ping/lerp
@@ -3347,6 +3515,7 @@ local function _pick_first_shot_impl(p, s, anim, eye_yaw, max_desync, preset)
     local speed2d = math.sqrt(vx*vx + vy*vy)
     -- clamp insane velocity from NL netvar glitches (respawn/teleport spikes 1000+ u/s)
     if speed2d > 320 then speed2d = 0 end  -- CS2 max run speed ≈ 260, anything above = glitch
+    s.last_speed2d = speed2d  -- V9.67 #C: shot-time speed for the desync speed-bucket
     local close = preset.close_boost and s.tmp_close
 
     -- V9.66 #1: keep the RAW eye for the sanity bound below. extrapolate_yaw applies
@@ -3450,6 +3619,32 @@ local function _pick_first_shot_impl(p, s, anim, eye_yaw, max_desync, preset)
                 s.mode = (s.mode or "") .. "+Pred"
                 s.last_used_pred_ticks = ticks
             end
+        end
+    end
+
+    -- V9.67: DIRECT-SIDE SOURCES (pose read / on-shot flip / switch-period). When one of
+    -- these opt-in levers produces a confident side, resolve straight at the per-side
+    -- magnitude and skip the statistical mode tree — these are stronger signals than a
+    -- guess. Priority pose > on-shot > switch. All gated behind their own toggle; the
+    -- branch is inert (direct_side stays 0) for everyone who has not opted in.
+    do
+        local direct_side, direct_tag = 0, nil
+        if pose_use_tog and pose_use_tog:get() and g_pose_best_idx then
+            local ps = pose_read_side(p)
+            if ps ~= 0 then direct_side, direct_tag = ps, "Pose" end
+        end
+        if direct_side == 0 and onshot_flip_tog and onshot_flip_tog:get() and s.onshot_aa
+           and (s.last_hostile_fire or 0) > 0 and s.last_hit_side ~= 0 then
+            local th = (globals.tickcount or 0) - s.last_hostile_fire
+            if th >= 0 and th <= 10 then direct_side, direct_tag = -s.last_hit_side, "OnShot-Flip" end
+        end
+        if direct_side == 0 and switch_pred_tog and switch_pred_tog:get() then
+            local sp = switch_period_predict_side(s, tick_cache.curtime or 0)
+            if sp ~= 0 then direct_side, direct_tag = sp, "Switch-Pred" end
+        end
+        if direct_side ~= 0 then
+            s.mode = direct_tag
+            return eye_yaw + effective_desync(s, max_desync, direct_side) * direct_side
         end
     end
 
@@ -4307,6 +4502,11 @@ local function resolve_player(p)
             -- accumulate passive samples (slower alpha than hit-EMA, lower weight)
             local p_side = server_desync > 0 and 1 or -1
             local p_mag  = math.abs(server_desync)
+            -- V9.67 #B: the server's predicted feet-yaw gives the live fake side every
+            -- tick — feed the switch-period detector so it can time the flips.
+            if switch_pred_tog and switch_pred_tog:get() then
+                pcall(switch_period_observe, s, p_side, globals.realtime or 0)
+            end
             s.passive_samples = (s.passive_samples or 0) + 1
             if p_side > 0 then
                 s.passive_right = s.passive_right and
@@ -5541,6 +5741,7 @@ _cs_log_color_raw("V9.57: cosmetic — chernobl-style menu groups (icon + 'Sel01
 _cs_log_color_raw("V9.56: LBY-Snap-Guess miss-flip is now bt/measurement-aware (matches the generic V9.42/V9.47 logic this older branch never got). It used to flip side on err>5, but err=inf when there is no measurement (first contact, measDesync=0) so it flipped blindly on EVERY first-contact miss — and a high bt (>8) is a server stale-record reject, not a side error. Logs: idx=2 our=29 meas=0 err=inf bt=13 flipped to -1 while the generic path KEPT side=1 the same tick (the two handlers disagreed). Now: no measurement + high bt -> keep + retry the guess once, never flip an unconfirmed side.")
 _cs_log_color_raw("V9.55: honest hit-rate — server-fail filter now reuses the ack_serverfail_like signal (err<=5 OR bt>8) the mode-blacklist already trusts, instead of filtering EVERY kept-side miss. A bt=0 keep with a real magnitude error is the resolver's own side-misprediction on a switch/bimodal enemy (logs: idx=1 bimodal L=40°/R=17.5° kept side ×3 at bt=0 err=10-40 — counted as netcode, inflating session 76.5%->96.3%). Those now count; only clean stale-record rejects (bt>8 / err~0) stay excluded. No aim change, stats only.")
 _cs_log_color_raw("V9.65: PERF/smoothness — RebuildServerYaw is now memoised per (tick, player). It was recomputed up to ~5x per resolve per enemy (once in resolve_player + once in each pick_first_shot branch), every call an FFI-heavy anim_state + velocity + LBY read. The result depends only on this-tick player state, so caching is behaviour-identical — pure FFI-work reduction (lighter per-tick load, smoother frametimes in 5-man HvH). No aim/learning change.")
+_cs_log_color_raw("V9.67: four new resolver levers (all opt-in toggles, default OFF except #C which is a safe refinement). #A POSE-PARAM CALIBRATION — collect pose[0..23] vs known hit-side on every HIT, auto-find the index that encodes body_yaw → turns SIDE from a statistical guess into a DIRECT read (toggle 'Pose Calibration' + 'Use Calibrated Pose Side' + 'Dump Pose Calibration' button). #B SWITCH-PERIOD — observe the server's per-tick predicted feet-yaw side (visible without a hit), detect a regular flip interval, predict which side the fake is on at shot-land (toggle 'Switch-Period Side Predict'). #C SPEED-BUCKET magnitude — split measured desync into standing vs moving buckets (real desync shrinks with speed) and use the bucket matching shot-time speed in the global fallback. #D ON-SHOT FLIP — learn enemies whose desync flips the tick they fire (2 wrong-side misses inside their fire window) and flip the resolved side in that window (toggle 'On-Shot Side-Flip Learn'). All three direct-side sources resolve through one central branch; inert for anyone who doesn't opt in.")
 _cs_log_color_raw("V9.66: PREDICTION rework. (#1) Unified predictor — interp-comp (lerp+ping/2) + tick-lead now fold into ONE term; old code threw away the interp-comp whenever the lead fired (you got one OR the other, never both vs a strafer). (#2) Decel-damping — track yaw_accel; when the enemy is braking (accel opposes rate) the LEAD portion shrinks to 0.3×, so a corner-peek-STOP is no longer overshot (the scout 1-tap case). interp-comp never damped. (#5) dead predict_yaw_ahead (inlined) + predict_position (never called) removed → 2 main-chunk locals freed. (#6) yaw_rate_consistent threshold tightened 60→35 / 0.7→0.5 so a jittery spinner stops passing as a clean steady spin.")
 _cs_log_color_raw("V9.54: serverfail-retry magnitude is now PER-SIDE on bimodal enemies — the retry froze the GLOBAL desync EMA (s.measured_desync), but a two-mode enemy (idx=10 L=46.2° R=29.7°, diff 16°) has very different per-side magnitudes and the global average swings mid-round. The kept side then re-fired a wrong magnitude for up to 64 ticks (logs: idx=10 retried 15.7° at a 29.7° R side, err=16). Now mirrors effective_desync's per-side pick (measured_left/right with >=1 real sample). Identical to global on unimodal enemies; strictly more accurate on bimodal.")
 _cs_log_color_raw("V9.53: ESP made COMPACT (v9.52 words too big). Now ONE short line per enemy, smaller font: [aa-icon] [side-arrow] [deg] [learn-icon] e.g. '⇄ → 29° ★'. AA-icon: ▬static ⇄switch ≈jitter ⟳spin. Learn-icon: 🔒locked / ★learned / ·learning. Confidence = the bar (color), no second text line. Netcode shrunk to '⚠×N bt pk'. SIDE-DOM mini-bar REMOVED (redundant — side already in the arrow; was just clutter). Confidence bar stays.")
