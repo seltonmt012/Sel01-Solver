@@ -5,7 +5,7 @@
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 9.67
+-- @version 9.68
 -- @description Correction side guard + serverfail retry:
 --   * correction/prediction-error misses now check SIDE evidence, not only
 --     magnitude. A BF shot on the unlearned opposite side no longer gets labeled
@@ -73,7 +73,7 @@
 --   * v9.26 drift-bump (alpha 0.55 on 5-10° diff) still handles small shifts.
 --   * v9.29 coach variants carry.
 
-local SEL01_VERSION = "9.67"
+local SEL01_VERSION = "9.68"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -1934,6 +1934,11 @@ local function apply_preset(name)
         safe_set(strat_predict,      "Normal")
         safe_set(strat_visual,       "Standard (ESP + HUD)")
         safe_set(strat_hitbox,       "Head Bias")
+        -- V9.67: new levers — pose-collect (data, harmless), on-shot flip (aggressive)
+        safe_set(pose_cal_tog,       true)
+        safe_set(pose_use_tog,       false)
+        safe_set(onshot_flip_tog,    true)
+        safe_set(switch_pred_tog,    false)
         _cs_log_color_raw("✓ PRESET: AGGRESSIVE — Head-bias (hc=40 mindmg=25), chest-baim after 3 misses, all V4 ON")
     elseif name == "defensive" then
         safe_set(resolver.enable,    true)
@@ -1967,6 +1972,11 @@ local function apply_preset(name)
         safe_set(strat_predict,      "Off")
         safe_set(strat_visual,       "None")
         safe_set(strat_hitbox,       "NL Default (manual)")
+        -- V9.67: defensive = aim stays safe — collect pose data only, no aim-changing levers
+        safe_set(pose_cal_tog,       true)
+        safe_set(pose_use_tog,       false)
+        safe_set(onshot_flip_tog,    false)
+        safe_set(switch_pred_tog,    false)
         _cs_log_color_raw("✓ PRESET: DEFENSIVE — Safe-point, baim after 4 misses, cancel-low-confidence ON")
     elseif name == "dynamic" then
         safe_set(resolver.enable,    true)
@@ -2000,6 +2010,11 @@ local function apply_preset(name)
         safe_set(strat_predict,      "Normal")
         safe_set(strat_visual,       "Standard (ESP + HUD)")
         safe_set(strat_hitbox,       "Head + Chest Fallback")
+        -- V9.67: dynamic = the experimental showcase — all learning levers incl switch-period
+        safe_set(pose_cal_tog,       true)
+        safe_set(pose_use_tog,       false)
+        safe_set(onshot_flip_tog,    true)
+        safe_set(switch_pred_tog,    true)
         _cs_log_color_raw("✓ PRESET: DYNAMIC — Adaptive, balanced, auto-per-weapon, all V4 ON")
     elseif name == "nospread" then
         safe_set(resolver.enable,    true)
@@ -2033,6 +2048,11 @@ local function apply_preset(name)
         safe_set(strat_predict,      "Aggressive")
         safe_set(strat_visual,       "Minimal (HUD only)")
         safe_set(strat_hitbox,       "NoSpread (head always)")
+        -- V9.67: nospread is aggressive — collect pose + on-shot flip (side still matters)
+        safe_set(pose_cal_tog,       true)
+        safe_set(pose_use_tog,       false)
+        safe_set(onshot_flip_tog,    true)
+        safe_set(switch_pred_tog,    false)
         _cs_log_color_raw("✓ PRESET: NOSPREAD — head-only forever, hitchance 1%%, min-dmg 100, multipoint OFF")
         _cs_log_color_raw("  Aktiviere im NL-menu: Hitchance 1, Min-Damage 100, Disable safepoint")
     elseif name == "ssg_pro" then
@@ -2077,9 +2097,19 @@ local function apply_preset(name)
         safe_set(esp_wedge,          true)   -- V9.51: SSG-Pro shows the full on-model visual suite
         safe_set(esp_flash,          true)
         safe_set(esp_enh,            true)
-        _cs_log_color_raw("✓ PRESET: SSG-PRO v9.13 — Tuned for hc=72/dmg=100/multi-hitbox + HEAD-FOCUS")
+        -- V9.67 BALANCED: pose-collect ON (auto-calibrates the body_yaw index in the
+        -- background — pure observation, zero aim change) + on-shot flip ON (well-gated,
+        -- common in HvH). pose-USE + switch-period stay OFF until validated — flip them
+        -- on yourself after 'Dump Pose Calibration' shows a clean >85% index. The toggle-
+        -- less v9.65 perf, v9.66 prediction rework + v9.67 speed-bucket are already active.
+        safe_set(pose_cal_tog,       true)
+        safe_set(pose_use_tog,       false)
+        safe_set(onshot_flip_tog,    true)
+        safe_set(switch_pred_tog,    false)
+        _cs_log_color_raw("✓ PRESET: SSG-PRO v9.67 — hc=72/dmg=100/multi-hitbox + HEAD-FOCUS, now with v9.65-67")
         _cs_log_color_raw("  Preserves: hitchance, min-damage, safe-points 'Prefer'")
-        _cs_log_color_raw("  Enhancements: HEAD-FOCUS + hitbox chain (head->chest->stomach), per-weapon +1 predict, def-AA fingerprint")
+        _cs_log_color_raw("  v9.65-67: cached server-yaw (perf), unified+decel-damped prediction, speed-bucket desync")
+        _cs_log_color_raw("  Levers: pose-collect ON (auto-calibrate) + on-shot flip ON; pose-USE/switch OFF until you validate the dump")
     elseif name == "head_only" then
         -- V7.9: Headshot-Only on normal (spread) servers — head every shot, reasonable hc
         safe_set(resolver.enable,    true)
@@ -2113,6 +2143,11 @@ local function apply_preset(name)
         safe_set(strat_visual,       "Standard (ESP + HUD)")
         safe_set(strat_hitbox,       "Head Only")
         safe_set(exp_head_strict,    true)        -- V7.9: every shot head
+        -- V9.67: precision spread — collect pose + on-shot flip (correct side = the head)
+        safe_set(pose_cal_tog,       true)
+        safe_set(pose_use_tog,       false)
+        safe_set(onshot_flip_tog,    true)
+        safe_set(switch_pred_tog,    false)
         _cs_log_color_raw("✓ PRESET: HEADSHOT-ONLY (Spread) — head-only forever, normal server spread, no baim, no chest fallback")
         _cs_log_color_raw("  Recommended NL settings: Hitchance 40-50, Min-Damage 25-40, Safepoint OFF, Multipoint OFF")
     end
@@ -5741,6 +5776,7 @@ _cs_log_color_raw("V9.57: cosmetic — chernobl-style menu groups (icon + 'Sel01
 _cs_log_color_raw("V9.56: LBY-Snap-Guess miss-flip is now bt/measurement-aware (matches the generic V9.42/V9.47 logic this older branch never got). It used to flip side on err>5, but err=inf when there is no measurement (first contact, measDesync=0) so it flipped blindly on EVERY first-contact miss — and a high bt (>8) is a server stale-record reject, not a side error. Logs: idx=2 our=29 meas=0 err=inf bt=13 flipped to -1 while the generic path KEPT side=1 the same tick (the two handlers disagreed). Now: no measurement + high bt -> keep + retry the guess once, never flip an unconfirmed side.")
 _cs_log_color_raw("V9.55: honest hit-rate — server-fail filter now reuses the ack_serverfail_like signal (err<=5 OR bt>8) the mode-blacklist already trusts, instead of filtering EVERY kept-side miss. A bt=0 keep with a real magnitude error is the resolver's own side-misprediction on a switch/bimodal enemy (logs: idx=1 bimodal L=40°/R=17.5° kept side ×3 at bt=0 err=10-40 — counted as netcode, inflating session 76.5%->96.3%). Those now count; only clean stale-record rejects (bt>8 / err~0) stay excluded. No aim change, stats only.")
 _cs_log_color_raw("V9.65: PERF/smoothness — RebuildServerYaw is now memoised per (tick, player). It was recomputed up to ~5x per resolve per enemy (once in resolve_player + once in each pick_first_shot branch), every call an FFI-heavy anim_state + velocity + LBY read. The result depends only on this-tick player state, so caching is behaviour-identical — pure FFI-work reduction (lighter per-tick load, smoother frametimes in 5-man HvH). No aim/learning change.")
+_cs_log_color_raw("V9.68: presets brought up to v9.65-67. ALL 6 presets now set the new levers explicitly (were untouched → left on user state). pose-collect ON everywhere (pure data, harmless). SSG-Pro (BALANCED, your main): pose-collect + on-shot flip ON, pose-USE + switch-period OFF until you validate the 'Dump Pose Calibration' index — SSG aim stays effectively identical, only learns + handles on-shot AA. Dynamic = experimental showcase (switch-period ON too). Defensive = data-only (no aim-changing levers). The toggle-less v9.65 perf / v9.66 prediction rework / v9.67 speed-bucket were already active in every preset.")
 _cs_log_color_raw("V9.67: four new resolver levers (all opt-in toggles, default OFF except #C which is a safe refinement). #A POSE-PARAM CALIBRATION — collect pose[0..23] vs known hit-side on every HIT, auto-find the index that encodes body_yaw → turns SIDE from a statistical guess into a DIRECT read (toggle 'Pose Calibration' + 'Use Calibrated Pose Side' + 'Dump Pose Calibration' button). #B SWITCH-PERIOD — observe the server's per-tick predicted feet-yaw side (visible without a hit), detect a regular flip interval, predict which side the fake is on at shot-land (toggle 'Switch-Period Side Predict'). #C SPEED-BUCKET magnitude — split measured desync into standing vs moving buckets (real desync shrinks with speed) and use the bucket matching shot-time speed in the global fallback. #D ON-SHOT FLIP — learn enemies whose desync flips the tick they fire (2 wrong-side misses inside their fire window) and flip the resolved side in that window (toggle 'On-Shot Side-Flip Learn'). All three direct-side sources resolve through one central branch; inert for anyone who doesn't opt in.")
 _cs_log_color_raw("V9.66: PREDICTION rework. (#1) Unified predictor — interp-comp (lerp+ping/2) + tick-lead now fold into ONE term; old code threw away the interp-comp whenever the lead fired (you got one OR the other, never both vs a strafer). (#2) Decel-damping — track yaw_accel; when the enemy is braking (accel opposes rate) the LEAD portion shrinks to 0.3×, so a corner-peek-STOP is no longer overshot (the scout 1-tap case). interp-comp never damped. (#5) dead predict_yaw_ahead (inlined) + predict_position (never called) removed → 2 main-chunk locals freed. (#6) yaw_rate_consistent threshold tightened 60→35 / 0.7→0.5 so a jittery spinner stops passing as a clean steady spin.")
 _cs_log_color_raw("V9.54: serverfail-retry magnitude is now PER-SIDE on bimodal enemies — the retry froze the GLOBAL desync EMA (s.measured_desync), but a two-mode enemy (idx=10 L=46.2° R=29.7°, diff 16°) has very different per-side magnitudes and the global average swings mid-round. The kept side then re-fired a wrong magnitude for up to 64 ticks (logs: idx=10 retried 15.7° at a 29.7° R side, err=16). Now mirrors effective_desync's per-side pick (measured_left/right with >=1 real sample). Identical to global on unimodal enemies; strictly more accurate on bimodal.")
