@@ -5,7 +5,7 @@
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 9.65
+-- @version 9.66
 -- @description Correction side guard + serverfail retry:
 --   * correction/prediction-error misses now check SIDE evidence, not only
 --     magnitude. A BF shot on the unlearned opposite side no longer gets labeled
@@ -73,7 +73,7 @@
 --   * v9.26 drift-bump (alpha 0.55 on 5-10° diff) still handles small shifts.
 --   * v9.29 coach variants carry.
 
-local SEL01_VERSION = "9.65"
+local SEL01_VERSION = "9.66"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -1863,27 +1863,8 @@ end
 -- ═══════════════════════════════════════════════════════
 -- V4: PREDICTION / EXTRAPOLATION
 -- ═══════════════════════════════════════════════════════
-local function predict_yaw_ahead(s, ticks_ahead)
-    if not s.yaw_rate or s.yaw_rate == 0 or not s.last_yaw then return s.last_yaw or 0 end
-    local tickint = (tick_cache and tick_cache.tickint) or (1/64)
-    local dt = ticks_ahead * tickint
-    -- clamp delta to prevent explosion if yaw_rate is unrealistic
-    local delta = s.yaw_rate * dt
-    if delta > 60 then delta = 60 elseif delta < -60 then delta = -60 end
-    return s.last_yaw + delta
-end
-
-local function predict_position(p, ticks_ahead)
-    local ok, vec = pcall(function()
-        local v = p.m_vecVelocity
-        local o = p.m_vecOrigin
-        local tickint = (tick_cache and tick_cache.tickint) or (1/64)
-        local dt = ticks_ahead * tickint
-        return vector(o.x + v.x * dt, o.y + v.y * dt, o.z + v.z * dt)
-    end)
-    if not ok then return nil end
-    return vec
-end
+-- V9.66 #5: predict_yaw_ahead (inlined into the unified predictor) + predict_position
+-- (never called) removed — both dead, frees 2 main-chunk locals near the 200 cap.
 -- PlayerState forward-decl now at top of file (V7.3 fix)
 
 -- forward-declared (defined later, called from aim_ack handler)
@@ -2425,6 +2406,7 @@ setmetatable(PlayerState, {__index = function(t, k)
         last_yaw          = 0,
         last_yaw_time     = 0,
         yaw_rate          = 0,
+        yaw_accel         = 0,         -- V9.66: rate-of-change of yaw_rate (decel-damp)
         last_resolved     = 0,
         last_eye_yaw      = 0,
         defensive_aa      = false,
@@ -3151,6 +3133,14 @@ local function update_jitter(p, s)
         -- V9.0: sanity-clamp yaw_rate — >720°/s is impossible (netvar glitch)
         -- max realistic spin ≈ 360°/s, allow 2× buffer for tick interpolation noise
         if math.abs(raw_rate) > 720 then raw_rate = 0 end
+        -- V9.66 #2: yaw acceleration (delta of rate) for decel-damping. A peeker
+        -- accelerates then STOPS at a corner; linear yaw_rate*dt overshoots past where
+        -- the body parks. When accel sign opposes rate sign (= braking), the predictor
+        -- dampens the lead portion. Clamp same as rate (netvar glitch guard).
+        local prev_rate = s.yaw_rate or 0
+        local raw_accel = (raw_rate - prev_rate) / dt
+        if math.abs(raw_accel) > 40000 then raw_accel = 0 end  -- impossible spike
+        s.yaw_accel = raw_accel
         s.yaw_rate = raw_rate
         -- V8.0: yaw-rate consistency — only extrapolate when stable direction (low stddev)
         table.insert(s.yaw_rate_buf, s.yaw_rate)
@@ -3164,7 +3154,9 @@ local function update_jitter(p, s)
             local sd = math.sqrt(sq / n)
             -- consistent if stddev is small RELATIVE to mean magnitude
             -- (so we extrapolate steady spin but NOT random jitter)
-            s.yaw_rate_consistent = sd < math.max(60, math.abs(mean) * 0.7)
+            -- V9.66 #6: tightened (was max(60, mean*0.7)) — 60°/s stddev let a jittery
+            -- spinner pass as "consistent" → fed bad extrapolation. 35 + 0.5× is stricter.
+            s.yaw_rate_consistent = sd < math.max(35, math.abs(mean) * 0.5)
         end
     end
     s.last_yaw = yaw
@@ -3357,6 +3349,12 @@ local function _pick_first_shot_impl(p, s, anim, eye_yaw, max_desync, preset)
     if speed2d > 320 then speed2d = 0 end  -- CS2 max run speed ≈ 260, anything above = glitch
     local close = preset.close_boost and s.tmp_close
 
+    -- V9.66 #1: keep the RAW eye for the sanity bound below. extrapolate_yaw applies
+    -- the lerp+ping/2 interp-compensation and is the FALLBACK when full prediction is
+    -- gated off — so a non-leading target still gets interp-comp. When prediction DOES
+    -- fire, the unified predictor (below) folds interp-comp + lead into one term, so the
+    -- comp is no longer thrown away (old code overwrote eye_yaw with lead-only).
+    local raw_eye = eye_yaw
     eye_yaw = extrapolate_yaw(s, eye_yaw)
     -- V4+V5+V6+V7+V8.0+V8.1: educated extrapolation — tighter gates, smaller ticks
     -- V8.1: predict was overshooting. Lower per-aa caps, raise conf gate, shrink delta sanity.
@@ -3422,15 +3420,35 @@ local function _pick_first_shot_impl(p, s, anim, eye_yaw, max_desync, preset)
                 end
             end)
             if lp_peek then ticks = math.max(1, ticks - 1) end
-            -- V8.1: sanity delta 35° → 25° (tighter, fewer overshot predictions)
-            local predicted = predict_yaw_ahead(s, ticks)
-            if predicted then
-                local delta = NormalizeAngle(predicted - eye_yaw)
-                if math.abs(delta) < 25 then
-                    eye_yaw = predicted
-                    s.mode = (s.mode or "") .. "+Pred"
-                    s.last_used_pred_ticks = ticks
-                end
+            -- V9.66 #1+#2: UNIFIED predictor. One term = interp-comp (lerp+ping/2) + lead
+            -- (ticks). The lead portion is decel-damped: when the enemy is braking
+            -- (yaw_accel sign opposes yaw_rate sign) the lead shrinks toward 0.3× so a
+            -- corner-peek-stop is not overshot. interp-comp is never damped (it corrects
+            -- a delay that already happened). One clamp on the total.
+            local tickint = (tick_cache and tick_cache.tickint) or (1/64)
+            local lerp_ms = 16
+            pcall(function() lerp_ms = (entity.get_lerp_time and entity.get_lerp_time() * 1000) or 16 end)
+            local comp_dt = (lerp_ms + (tick_cache.ping_ms or 0) * 0.5) / 1000
+            -- decel-damp factor for the lead term only
+            local lead_factor = 1.0
+            local ya, yr = s.yaw_accel or 0, s.yaw_rate or 0
+            if yr ~= 0 and ya ~= 0 and ((ya > 0) ~= (yr > 0)) then
+                -- braking: |accel| relative to |rate| over one tick = how much the rate
+                -- will bleed off. Strong brake → minimal lead.
+                local bleed = math.abs(ya) * tickint / math.max(math.abs(yr), 1)
+                lead_factor = math.max(0.3, 1.0 - bleed)
+            end
+            local lead_dt = ticks * tickint * lead_factor
+            local total_delta = yr * (comp_dt + lead_dt)
+            if total_delta > 60 then total_delta = 60 elseif total_delta < -60 then total_delta = -60 end
+            local predicted = (s.last_yaw or raw_eye) + total_delta
+            -- V8.1: sanity vs RAW eye (was the lerp-extrapolated one) — cap 30 since the
+            -- delta now includes interp-comp on top of the lead (was lead-only @25).
+            local delta = NormalizeAngle(predicted - raw_eye)
+            if math.abs(delta) < 30 then
+                eye_yaw = predicted
+                s.mode = (s.mode or "") .. "+Pred"
+                s.last_used_pred_ticks = ticks
             end
         end
     end
@@ -5523,6 +5541,7 @@ _cs_log_color_raw("V9.57: cosmetic — chernobl-style menu groups (icon + 'Sel01
 _cs_log_color_raw("V9.56: LBY-Snap-Guess miss-flip is now bt/measurement-aware (matches the generic V9.42/V9.47 logic this older branch never got). It used to flip side on err>5, but err=inf when there is no measurement (first contact, measDesync=0) so it flipped blindly on EVERY first-contact miss — and a high bt (>8) is a server stale-record reject, not a side error. Logs: idx=2 our=29 meas=0 err=inf bt=13 flipped to -1 while the generic path KEPT side=1 the same tick (the two handlers disagreed). Now: no measurement + high bt -> keep + retry the guess once, never flip an unconfirmed side.")
 _cs_log_color_raw("V9.55: honest hit-rate — server-fail filter now reuses the ack_serverfail_like signal (err<=5 OR bt>8) the mode-blacklist already trusts, instead of filtering EVERY kept-side miss. A bt=0 keep with a real magnitude error is the resolver's own side-misprediction on a switch/bimodal enemy (logs: idx=1 bimodal L=40°/R=17.5° kept side ×3 at bt=0 err=10-40 — counted as netcode, inflating session 76.5%->96.3%). Those now count; only clean stale-record rejects (bt>8 / err~0) stay excluded. No aim change, stats only.")
 _cs_log_color_raw("V9.65: PERF/smoothness — RebuildServerYaw is now memoised per (tick, player). It was recomputed up to ~5x per resolve per enemy (once in resolve_player + once in each pick_first_shot branch), every call an FFI-heavy anim_state + velocity + LBY read. The result depends only on this-tick player state, so caching is behaviour-identical — pure FFI-work reduction (lighter per-tick load, smoother frametimes in 5-man HvH). No aim/learning change.")
+_cs_log_color_raw("V9.66: PREDICTION rework. (#1) Unified predictor — interp-comp (lerp+ping/2) + tick-lead now fold into ONE term; old code threw away the interp-comp whenever the lead fired (you got one OR the other, never both vs a strafer). (#2) Decel-damping — track yaw_accel; when the enemy is braking (accel opposes rate) the LEAD portion shrinks to 0.3×, so a corner-peek-STOP is no longer overshot (the scout 1-tap case). interp-comp never damped. (#5) dead predict_yaw_ahead (inlined) + predict_position (never called) removed → 2 main-chunk locals freed. (#6) yaw_rate_consistent threshold tightened 60→35 / 0.7→0.5 so a jittery spinner stops passing as a clean steady spin.")
 _cs_log_color_raw("V9.54: serverfail-retry magnitude is now PER-SIDE on bimodal enemies — the retry froze the GLOBAL desync EMA (s.measured_desync), but a two-mode enemy (idx=10 L=46.2° R=29.7°, diff 16°) has very different per-side magnitudes and the global average swings mid-round. The kept side then re-fired a wrong magnitude for up to 64 ticks (logs: idx=10 retried 15.7° at a 29.7° R side, err=16). Now mirrors effective_desync's per-side pick (measured_left/right with >=1 real sample). Identical to global on unimodal enemies; strictly more accurate on bimodal.")
 _cs_log_color_raw("V9.53: ESP made COMPACT (v9.52 words too big). Now ONE short line per enemy, smaller font: [aa-icon] [side-arrow] [deg] [learn-icon] e.g. '⇄ → 29° ★'. AA-icon: ▬static ⇄switch ≈jitter ⟳spin. Learn-icon: 🔒locked / ★learned / ·learning. Confidence = the bar (color), no second text line. Netcode shrunk to '⚠×N bt pk'. SIDE-DOM mini-bar REMOVED (redundant — side already in the arrow; was just clutter). Confidence bar stays.")
 _cs_log_color_raw("V9.52: ESP labels rewritten in PLAIN WORDS (the v9.51 glyphs ⇄ ·2+53 ★ 🔒 👁 🛡net× were unreadable). Now two clean stacked lines per enemy: MAIN (mode color) = 'TYPE SIDE DEG' e.g. 'SWITCH  R 36°  PRED'; STATE (progress color) = 'LEARNED 4  72%' (NEW / SEEN / LEARNING n / LEARNED n / LOCKED n + confidence%). Netcode tag is now words: 'FAKELAG' (backtrack-resistant) / 'NET×N' (server-fails) / 'PEEK' (teleport-peek). Flash + dots + dom-bar + wedge unchanged (visual, not cryptic). Nothing removed — just readable.")
