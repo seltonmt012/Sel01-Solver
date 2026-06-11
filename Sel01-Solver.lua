@@ -5,7 +5,7 @@
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 9.71
+-- @version 9.72
 -- @description Correction side guard + serverfail retry:
 --   * correction/prediction-error misses now check SIDE evidence, not only
 --     magnitude. A BF shot on the unlearned opposite side no longer gets labeled
@@ -73,7 +73,7 @@
 --   * v9.26 drift-bump (alpha 0.55 on 5-10° diff) still handles small shifts.
 --   * v9.29 coach variants carry.
 
-local SEL01_VERSION = "9.71"
+local SEL01_VERSION = "9.72"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -1199,6 +1199,11 @@ local log_copy_btn = g_logging:button("📋 Copy Last Logs (for share)", functio
             sf, session_stats.total_hits or 0, raw_shots,
             raw_shots > 0 and (session_stats.total_hits / raw_shots * 100) or 0))
     end
+    -- V9.72: same readout for spread-RNG misses (filtered from stats since v9.72)
+    local spf = sel01_session_spreadfails or 0
+    if spf > 0 then
+        _cs_log_raw(string.format("[SESSION] %d spread misses filtered (bullet RNG, angle accepted)", spf))
+    end
 
     -- mode hit-rates + AUTO-SUGGESTIONS
     _cs_log_raw("--- MODE HIT-RATES + SUGGESTIONS ---")
@@ -1370,6 +1375,8 @@ local log_reset_learn  = g_logging:button("🗑 Reset Learning Data (persistent)
         s.passive_samples  = 0
         s.passive_left     = nil
         s.passive_right    = nil
+        s.passive_n_left   = 0   -- V9.72
+        s.passive_n_right  = 0   -- V9.72
         s.correction_left  = 0
         s.correction_right = 0
     end
@@ -1385,6 +1392,7 @@ local log_reset_session = g_logging:button("🗑 Reset Session Stats (in-memory)
     session_stats.recent_rate = 0
     for k in pairs(session_stats.history) do session_stats.history[k] = nil end
     sel01_session_serverfails = 0  -- V9.50: clear server-fail filter counter
+    sel01_session_spreadfails = 0  -- V9.72: clear spread-RNG filter counter
     -- mode stats
     for k in pairs(mode_stats) do mode_stats[k] = nil end
     -- steam memory
@@ -2706,7 +2714,7 @@ events.aim_ack:set(function(event)
         local server_fail_keep = false
         -- V9.9-B: 2-MISS MODE-BLACKLIST — track misses per mode within engagement.
         -- After 2 misses with same base mode, blacklist it for 3 ticks so alternate path runs.
-        if not ack_serverfail_like then
+        if not ack_serverfail_like and reason ~= "spread" then  -- V9.72: spread = bullet RNG, not the mode's fault
             local mode_clean = tostring(s.mode or ""):gsub("%+Pred","")
                                                      :gsub("%-DefInv","")
                                                      :gsub("%-Recall","")
@@ -2831,7 +2839,28 @@ events.aim_ack:set(function(event)
             elseif bt > 8 then do_flip = false
             elseif ack_side_bad then do_flip = true
             elseif ack_measured > 5 and (real_active >= 1 or bt > 6) then do_flip = false
-            else do_flip = true end
+            else
+                -- V9.72: blind first-contact — consult the PASSIVE side history before
+                -- exploring the other side. Real-dump: idx=6 had 550 passive obs backing
+                -- side R, first miss was a MAGNITUDE error (err=11.8, shot 20.7 vs meas
+                -- 32.5) — the blind explore flipped to L while R was right (4 later real
+                -- R-hits). When passive obs clearly dominate the side we just shot
+                -- (2:1 ratio, 20+ obs), keep it; the V9.49 never-hit explore
+                -- (serverfail_streak>=2) still breaks a frozen wrong guess.
+                local pnl, pnr = s.passive_n_left or 0, s.passive_n_right or 0
+                local p_dom = 0
+                if pnl + pnr >= 20 then
+                    if pnr >= pnl * 2 then p_dom = 1
+                    elseif pnl >= pnr * 2 then p_dom = -1 end
+                end
+                if p_dom ~= 0 and p_dom == ack_shot_side then
+                    do_flip = false
+                    cs_log_verbose("passive-side keep idx=%d side=%d pn{L=%d R=%d} err=%.1f (magnitude miss, side passively confirmed)",
+                                   Ent:get_index(), ack_shot_side, pnl, pnr, ack_angle_err)
+                else
+                    do_flip = true
+                end
+            end
             -- V9.49: never-hit explore. The bt>8 / bt>6 keep branches above rest on pure
             -- passive seed when we have NEVER hit this enemy (real_active==0) — both the
             -- side AND the magnitude are unconfirmed guesses. A genuine stale record gets
@@ -2915,6 +2944,18 @@ events.aim_ack:set(function(event)
             esp_push_shot(s, "serverfail")  -- V9.51: blue flash + blue dot
             cs_log_verbose("server-fail miss NOT counted idx=%d mode=%s (player#%d session#%d)",
                            Ent:get_index(), tostring(s.mode), s.serverfail_misses, sel01_session_serverfails)
+        elseif reason == "spread" then
+            -- V9.72: "spread" = the angle was accepted, the simulated bullet deviated
+            -- (pure RNG — real-dump: idx=4 took 2 spread misses that fed mode-stats,
+            -- mode-blacklist AND read as resolver failures, 0/3 on a possibly-correct
+            -- side). Filter from stats like server-fails; s.missed still advances the
+            -- BF/baim escalation (multipoint + body widen the effective target, the
+            -- correct anti-spread reaction). No side-flip paths fire on spread anyway.
+            s.spread_misses = (s.spread_misses or 0) + 1
+            sel01_session_spreadfails = (sel01_session_spreadfails or 0) + 1
+            esp_push_shot(s, "serverfail")  -- blue = not a resolver fault
+            cs_log_verbose("spread miss NOT counted idx=%d mode=%s (bullet RNG, player#%d session#%d)",
+                           Ent:get_index(), tostring(s.mode), s.spread_misses, sel01_session_spreadfails)
         else
             learning_update_miss(Ent)
             mode_stats_update(tostring(s.mode), false)
@@ -4274,9 +4315,13 @@ local function resolve_player(p)
                 spinner = lrn.best_spinner,
             }
             -- V8.9: throttle boot log — only log if 10s+ since last (prevent spam on dormancy churn)
+            -- V9.72: throttle keyed OUTSIDE PlayerState — the dormancy reset RECREATES s,
+            -- wiping s.last_boot_log, so peek-flicker logged the same boot 3× (real-dump).
+            sel01_boot_log_t = sel01_boot_log_t or {}
             local now_rt = globals.realtime or 0
-            if (now_rt - (s.last_boot_log or 0)) > 10 then
-                s.last_boot_log = now_rt
+            local _bidx = p:get_index()
+            if (now_rt - (sel01_boot_log_t[_bidx] or 0)) > 10 then
+                sel01_boot_log_t[_bidx] = now_rt
                 cs_log_verbose("LearnedModel boot idx=%d L=%d(%.1f°) R=%d(%.1f°) dom=%d hits=%d best{j=%s s=%s sw=%s}",
                                p:get_index(), lsl, ldl, lsr, ldr, (lrn.dom or 0), lrn.hits or 0,
                                tostring(lrn.best_jitter), tostring(lrn.best_static), tostring(lrn.best_switch))
@@ -4580,9 +4625,11 @@ local function resolve_player(p)
             if p_side > 0 then
                 s.passive_right = s.passive_right and
                     (s.passive_right * 0.92 + p_mag * 0.08) or p_mag
+                s.passive_n_right = (s.passive_n_right or 0) + 1  -- V9.72: per-side obs count
             else
                 s.passive_left = s.passive_left and
                     (s.passive_left * 0.92 + p_mag * 0.08) or p_mag
+                s.passive_n_left = (s.passive_n_left or 0) + 1   -- V9.72: per-side obs count
             end
             -- if no measured (no hit yet), seed measured_desync from passive after 8 obs
             if s.passive_samples >= 8 and s.desync_samples == 0 then
@@ -5839,6 +5886,7 @@ _cs_log_color_raw("V9.55: honest hit-rate — server-fail filter now reuses the 
 _cs_log_color_raw("V9.65: PERF/smoothness — RebuildServerYaw is now memoised per (tick, player). It was recomputed up to ~5x per resolve per enemy (once in resolve_player + once in each pick_first_shot branch), every call an FFI-heavy anim_state + velocity + LBY read. The result depends only on this-tick player state, so caching is behaviour-identical — pure FFI-work reduction (lighter per-tick load, smoother frametimes in 5-man HvH). No aim/learning change.")
 _cs_log_color_raw("V9.70: pose-promotion is NON-STICKY (real-dump bug #2). v9.69 promoted on the FIRST threshold cross and never demoted, so a small-sample fluke locked in: idx 16 hit 1.28σ at n=20, was marked '<<< BEST', then DECAYED to 0.58σ at n=23 while still showing best. Now we re-scan all indices every hit and pick the current best meeting STRICTER gates (n≥25, 6+ per side, |sep|≥1.3); if none holds, g_pose_best_idx clears → honest dump. A real body_yaw index must HOLD its separation as samples grow; noise self-demotes. On the user's build no index sustained ≥1.3 (max ~0.78) → this NL build does not cleanly expose body_yaw, so pose-read stays a dead end here and the OTHER levers (v9.66 prediction, speed-bucket, on-shot, switch-period) carry.")
 _cs_log_color_raw("V9.71: PERF + DEAD-CODE batch (full-code audit). Perf: (a) UI :get() reads cached once per tick in tick_cache (close-range/air-resolve/aa-classify/classify-int — were per-enemy×64Hz menu-API calls); (b) yaw_rate_buf + recent_resolved are circular rings now (table.remove(1) shifted per tick per enemy; recent_resolved also reuses entry tables → zero alloc steady-state); (c) ESP label compute (confidence() circular stddev + mode-string finds + string.format + color objects) throttled to 5Hz per enemy in _espc_* cache — draw path just blits; (d) constant render colors hoisted to module globals; (e) HUD panel text/position/conf-color pre-formatted at the 10Hz refresh. Dead code REMOVED: exp_head_focus + exp_hitbox_chain toggles (dead since v9.18 deleted the HEAD-FOCUS override block — they set state nothing read; 'Head + Chest Fallback' strategy now equals 'Head Bias'), apply_hitbox_chain(), DegToRad/RadToDeg. Frees 4 main-chunk locals.")
+_cs_log_color_raw("V9.72: real-dump fixes (SSG-Pro session 6/11). (1) SPREAD-MISS FILTER — reason='spread' means the angle was accepted and the bullet RNG'd; it now skips mode-stats/learning/per-player counters + mode-blacklist exactly like server-fails (real-dump: idx=4 took 2 spread misses that polluted Slow-Passive + BF:def+ stats and read as 0/3 resolver failure). s.missed still escalates baim/multipoint = the correct anti-spread response. New counter sel01_session_spreadfails + [SESSION] dump line. (2) PASSIVE-SIDE KEEP on blind first-contact — the explore-flip now checks passive_n_left/right (new per-side obs counters): when 20+ obs lean 2:1 to the side we just shot, a first-contact magnitude miss keeps the side (idx=6: 550 passive obs backed R, err=11.8 was magnitude, flip to L was wrong — 4 later real R-hits). V9.49 never-hit explore still breaks frozen guesses after 2 keeps. (3) Boot-log throttle keyed OUTSIDE PlayerState (dormancy reset recreated s and wiped the throttle → same boot logged 3×).")
 _cs_log_color_raw("V9.69: pose-calibration scorer FIXED (real-dump bug). The v9.67 sign-vs-running-mean scorer FALSELY read 'eff 100%' on every CONSTANT pose index when the early hits were one-sided (dump: 3 right-side hits → idx 0/1/4/5/9/11.. all 0%/eff100%) — it would have promoted a garbage constant index. New scorer uses SEPARATION: track the param's mean on LEFT hits vs RIGHT hits; body_yaw is the index whose two side-means split cleanly (|meanR-meanL| ≥ 1.2σ). Promotion now needs 20+ hits, 5+ on EACH side, real variance. Dump shows sep(σ) + nL/nR + meanL→meanR. To calibrate: fight enemies you hit on BOTH sides.")
 _cs_log_color_raw("V9.68: presets brought up to v9.65-67. ALL 6 presets now set the new levers explicitly (were untouched → left on user state). pose-collect ON everywhere (pure data, harmless). SSG-Pro (BALANCED, your main): pose-collect + on-shot flip ON, pose-USE + switch-period OFF until you validate the 'Dump Pose Calibration' index — SSG aim stays effectively identical, only learns + handles on-shot AA. Dynamic = experimental showcase (switch-period ON too). Defensive = data-only (no aim-changing levers). The toggle-less v9.65 perf / v9.66 prediction rework / v9.67 speed-bucket were already active in every preset.")
 _cs_log_color_raw("V9.67: four new resolver levers (all opt-in toggles, default OFF except #C which is a safe refinement). #A POSE-PARAM CALIBRATION — collect pose[0..23] vs known hit-side on every HIT, auto-find the index that encodes body_yaw → turns SIDE from a statistical guess into a DIRECT read (toggle 'Pose Calibration' + 'Use Calibrated Pose Side' + 'Dump Pose Calibration' button). #B SWITCH-PERIOD — observe the server's per-tick predicted feet-yaw side (visible without a hit), detect a regular flip interval, predict which side the fake is on at shot-land (toggle 'Switch-Period Side Predict'). #C SPEED-BUCKET magnitude — split measured desync into standing vs moving buckets (real desync shrinks with speed) and use the bucket matching shot-time speed in the global fallback. #D ON-SHOT FLIP — learn enemies whose desync flips the tick they fire (2 wrong-side misses inside their fire window) and flip the resolved side in that window (toggle 'On-Shot Side-Flip Learn'). All three direct-side sources resolve through one central branch; inert for anyone who doesn't opt in.")
