@@ -5,7 +5,7 @@
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 9.70
+-- @version 9.71
 -- @description Correction side guard + serverfail retry:
 --   * correction/prediction-error misses now check SIDE evidence, not only
 --     magnitude. A BF shot on the unlearned opposite side no longer gets labeled
@@ -73,7 +73,7 @@
 --   * v9.26 drift-bump (alpha 0.55 on 5-10° diff) still handles small shifts.
 --   * v9.29 coach variants carry.
 
-local SEL01_VERSION = "9.70"
+local SEL01_VERSION = "9.71"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -349,7 +349,6 @@ local exp_aa_classify  = g_experimental:switch(accent .. ui.get_icon"crosshairs"
 local exp_multipoint   = g_experimental:switch(accent .. ui.get_icon"bullseye"   .. accent .. "  Multipoint Boost",   true)
 local exp_def_aa       = g_experimental:switch(accent .. ui.get_icon"feather"    .. accent .. "  Defensive-AA Detect",true)
 local exp_steam_mem    = g_experimental:switch(accent .. ui.get_icon"user"       .. accent .. "  Steam Memory",       false)
-local exp_head_focus   = g_experimental:switch(accent .. ui.get_icon"crosshairs" .. accent .. "  Aggressive Head-Focus", true)
 local exp_nospread     = g_experimental:switch(accent .. ui.get_icon"bolt"       .. accent .. "  NoSpread Mode (1-tap heads)", false)
 local exp_classify_int = g_experimental:slider(accent .. ui.get_icon"clock"      .. accent .. "  AA-Classify Interval (ticks)", 4, 16, 8)
 
@@ -359,7 +358,6 @@ local exp_perside_desync= g_experimental:switch(accent .. ui.get_icon"sliders"  
 local exp_esp_overlay   = g_experimental:switch(accent .. ui.get_icon"bullseye"   .. accent .. "  ESP Overlay (live mode)",    false)
 local exp_cancel_conf   = g_experimental:switch(accent .. ui.get_icon"feather"    .. accent .. "  Cancel Low-Confidence Shots", true)
 local exp_auto_weapon   = g_experimental:switch(accent .. ui.get_icon"crosshairs" .. accent .. "  Auto Per-Weapon Settings",   false)
-local exp_hitbox_chain  = g_experimental:switch(accent .. ui.get_icon"skull"      .. accent .. "  Hitbox Fallback Chain",      true)
 -- V4: persistent learning + prediction
 local exp_persistent_lm = g_experimental:switch(accent .. ui.get_icon"user"       .. accent .. "  Persistent Self-Learning Model", true)
 local exp_extrapolation = g_experimental:switch(accent .. ui.get_icon"bolt"       .. accent .. "  Strong Prediction / Extrapolation", true)
@@ -483,25 +481,22 @@ end)
 
 strat_hitbox:set_callback(function(r)
     local v = tostring(r:get())
+    -- V9.71: exp_head_focus / exp_hitbox_chain removed — dead since v9.18 deleted the
+    -- HEAD-FOCUS override block (toggles set state nothing ever read).
     if v == "NL Default (manual)" then
-        safe_set_local(exp_head_focus, false); safe_set_local(exp_nospread, false)
-        safe_set_local(exp_hitbox_chain, false); safe_set_local(exp_respect_man, true)
+        safe_set_local(exp_nospread, false); safe_set_local(exp_respect_man, true)
         safe_set_local(exp_multipoint, false)
     elseif v == "Head Bias" then
-        safe_set_local(exp_head_focus, true);  safe_set_local(exp_nospread, false)
-        safe_set_local(exp_hitbox_chain, false); safe_set_local(exp_respect_man, false)
+        safe_set_local(exp_nospread, false); safe_set_local(exp_respect_man, false)
         safe_set_local(exp_multipoint, true)
     elseif v == "Head + Chest Fallback" then
-        safe_set_local(exp_head_focus, true);  safe_set_local(exp_nospread, false)
-        safe_set_local(exp_hitbox_chain, true);  safe_set_local(exp_respect_man, false)
+        safe_set_local(exp_nospread, false); safe_set_local(exp_respect_man, false)
         safe_set_local(exp_multipoint, true)
     elseif v == "Head Only" then
-        safe_set_local(exp_head_focus, true);  safe_set_local(exp_nospread, false)
-        safe_set_local(exp_hitbox_chain, false); safe_set_local(exp_respect_man, false)
+        safe_set_local(exp_nospread, false); safe_set_local(exp_respect_man, false)
         safe_set_local(exp_multipoint, true)
     else -- NoSpread
-        safe_set_local(exp_head_focus, false); safe_set_local(exp_nospread, true)
-        safe_set_local(exp_hitbox_chain, false); safe_set_local(exp_respect_man, false)
+        safe_set_local(exp_nospread, true); safe_set_local(exp_respect_man, false)
         safe_set_local(exp_multipoint, false)
     end
     cs_log("Hitbox Strategy → " .. v)
@@ -1140,16 +1135,16 @@ local log_copy_btn = g_logging:button("📋 Copy Last Logs (for share)", functio
             (resolver.enable:get() and "ON" or "OFF"), tostring(resolver_mode:get()),
             (lby_snap_toggle:get() and "ON" or "OFF"), (air_resolve_tog:get() and "ON" or "OFF"),
             close_range_dist:get(), force_baim_n:get(), baim_min_damage:get(), tostring(baim_hitbox:get())))
-        _cs_log_raw(string.format("[V3] aim_fire=%s perside=%s ESP=%s cancel=%s autoWeap=%s hbChain=%s",
+        _cs_log_raw(string.format("[V3] aim_fire=%s perside=%s ESP=%s cancel=%s autoWeap=%s",
             tostring(exp_aim_fire_snap:get()), tostring(exp_perside_desync:get()),
             tostring(exp_esp_overlay:get()), tostring(exp_cancel_conf:get()),
-            tostring(exp_auto_weapon:get()), tostring(exp_hitbox_chain:get())))
+            tostring(exp_auto_weapon:get())))
         _cs_log_raw(string.format("[V4+] persist=%s extrap=%s respectSSG=%s predTicks=%d",
             tostring(exp_persistent_lm:get()), tostring(exp_extrapolation:get()),
             tostring(exp_respect_man:get()), exp_predict_ticks:get()))
         -- V8.8: additional config dump (head_strict, ESP toggles, smart strategy values)
-        _cs_log_raw(string.format("[V7+] head_strict=%s head_focus=%s nospread=%s aa_classify=%s classify_int=%d",
-            tostring(exp_head_strict:get()), tostring(exp_head_focus:get()),
+        _cs_log_raw(string.format("[V7+] head_strict=%s nospread=%s aa_classify=%s classify_int=%d",
+            tostring(exp_head_strict:get()),
             tostring(exp_nospread:get()), tostring(exp_aa_classify:get()), exp_classify_int:get()))
         _cs_log_raw(string.format("[ESP] master=%s labels=%s confbar=%s hud=%s pos=%s hz=%d",
             tostring(esp_master:get()), tostring(esp_show_labels:get()),
@@ -1916,7 +1911,6 @@ local function apply_preset(name)
         safe_set(exp_multipoint,     true)
         safe_set(exp_def_aa,         true)
         safe_set(exp_steam_mem,      true)         -- learn over match for repeated engagements
-        safe_set(exp_head_focus,     true)         -- bias toward head, chest fallback
         safe_set(exp_nospread,       false)
         safe_set(exp_classify_int,   6)
         safe_set(exp_aim_fire_snap,  true)
@@ -1924,7 +1918,6 @@ local function apply_preset(name)
         safe_set(exp_esp_overlay,    false)
         safe_set(exp_cancel_conf,    false)
         safe_set(exp_auto_weapon,    false)
-        safe_set(exp_hitbox_chain,   true)
         safe_set(exp_persistent_lm,  true)
         safe_set(exp_extrapolation,  true)
         safe_set(exp_respect_man,    false)
@@ -1954,7 +1947,6 @@ local function apply_preset(name)
         safe_set(exp_multipoint,     false)
         safe_set(exp_def_aa,         false)
         safe_set(exp_steam_mem,      true)
-        safe_set(exp_head_focus,     false)
         safe_set(exp_nospread,       false)
         safe_set(exp_classify_int,   12)
         safe_set(exp_aim_fire_snap,  true)
@@ -1962,7 +1954,6 @@ local function apply_preset(name)
         safe_set(exp_esp_overlay,    false)
         safe_set(exp_cancel_conf,    true)         -- defensive = wait for confidence
         safe_set(exp_auto_weapon,    false)
-        safe_set(exp_hitbox_chain,   false)        -- defensive sticks to baim hitbox
         safe_set(exp_persistent_lm,  true)
         safe_set(exp_extrapolation,  false)        -- defensive = trust current state
         safe_set(exp_respect_man,    true)
@@ -1992,7 +1983,6 @@ local function apply_preset(name)
         safe_set(exp_multipoint,     true)
         safe_set(exp_def_aa,         true)
         safe_set(exp_steam_mem,      false)
-        safe_set(exp_head_focus,     false)
         safe_set(exp_nospread,       false)
         safe_set(exp_classify_int,   8)
         safe_set(exp_aim_fire_snap,  true)
@@ -2000,7 +1990,6 @@ local function apply_preset(name)
         safe_set(exp_esp_overlay,    false)
         safe_set(exp_cancel_conf,    true)
         safe_set(exp_auto_weapon,    true)         -- dynamic = auto-switch per weapon
-        safe_set(exp_hitbox_chain,   true)
         safe_set(exp_persistent_lm,  true)
         safe_set(exp_extrapolation,  true)
         safe_set(exp_respect_man,    true)
@@ -2030,7 +2019,6 @@ local function apply_preset(name)
         safe_set(exp_multipoint,     false)       -- multipoint useless w/o spread
         safe_set(exp_def_aa,         true)
         safe_set(exp_steam_mem,      true)        -- learn enemy patterns over match
-        safe_set(exp_head_focus,     true)
         safe_set(exp_nospread,       true)
         safe_set(exp_classify_int,   4)           -- fast re-classify
         safe_set(exp_aim_fire_snap,  true)
@@ -2038,7 +2026,6 @@ local function apply_preset(name)
         safe_set(exp_esp_overlay,    false)
         safe_set(exp_cancel_conf,    true)         -- nospread = single shot precision
         safe_set(exp_auto_weapon,    false)
-        safe_set(exp_hitbox_chain,   false)        -- nospread = head ONLY
         safe_set(exp_persistent_lm,  true)
         safe_set(exp_extrapolation,  true)
         safe_set(exp_respect_man,    false)
@@ -2071,7 +2058,6 @@ local function apply_preset(name)
         safe_set(exp_multipoint,     true)        -- NL Head/Chest/Stomach multipoint stays active
         safe_set(exp_def_aa,         true)
         safe_set(exp_steam_mem,      true)
-        safe_set(exp_head_focus,     true)        -- V9.13: head priority + NL multi-hitbox chest/stomach fallback
         safe_set(exp_nospread,       false)
         safe_set(exp_classify_int,   6)
         safe_set(exp_aim_fire_snap,  true)
@@ -2079,7 +2065,6 @@ local function apply_preset(name)
         safe_set(exp_esp_overlay,    true)
         safe_set(exp_cancel_conf,    true)         -- precision — wait for stable resolve
         safe_set(exp_auto_weapon,    true)
-        safe_set(exp_hitbox_chain,   true)         -- V9.13: head -> chest -> stomach chain for forced head
         safe_set(exp_persistent_lm,  true)
         safe_set(exp_extrapolation,  true)
         safe_set(exp_respect_man,    true)         -- preserve hc=72 dmg=100 multi-hitbox + safe-points
@@ -2125,7 +2110,6 @@ local function apply_preset(name)
         safe_set(exp_multipoint,     false)       -- head only = no multipoint scan
         safe_set(exp_def_aa,         true)
         safe_set(exp_steam_mem,      true)
-        safe_set(exp_head_focus,     true)        -- head bias
         safe_set(exp_nospread,       false)       -- normal spread server (NOT nospread)
         safe_set(exp_classify_int,   6)
         safe_set(exp_aim_fire_snap,  true)
@@ -2133,7 +2117,6 @@ local function apply_preset(name)
         safe_set(exp_esp_overlay,    false)
         safe_set(exp_cancel_conf,    true)        -- head shots = precision needed
         safe_set(exp_auto_weapon,    false)
-        safe_set(exp_hitbox_chain,   false)       -- HEAD ONLY, no chest fallback
         safe_set(exp_persistent_lm,  true)
         safe_set(exp_extrapolation,  true)
         safe_set(exp_respect_man,    false)
@@ -2244,7 +2227,6 @@ pcall(function()
     exp_esp_overlay:set_callback   (function(r) cs_log("ESP Overlay " .. (r:get() and "ON" or "OFF")) end)
     exp_cancel_conf:set_callback   (function(r) cs_log("Cancel Low-Confidence " .. (r:get() and "ON" or "OFF")) end)
     exp_auto_weapon:set_callback   (function(r) cs_log("Auto Per-Weapon " .. (r:get() and "ON" or "OFF")) end)
-    exp_hitbox_chain:set_callback  (function(r) cs_log("Hitbox Fallback Chain " .. (r:get() and "ON" or "OFF")) end)
     exp_persistent_lm:set_callback (function(r) cs_log("Persistent Learning " .. (r:get() and "ON" or "OFF")) end)
     exp_extrapolation:set_callback (function(r) cs_log("Extrapolation " .. (r:get() and "ON" or "OFF")) end)
     exp_respect_man:set_callback   (function(r) cs_log("Respect Manual SSG " .. (r:get() and "ON" or "OFF")) end)
@@ -2370,8 +2352,6 @@ AngleDifference = function(dest_angle, src_angle)
 	end
 	return delta
 end
-local function DegToRad(Deg) return Deg * (math.pi / 180) end
-local function RadToDeg(Rad) return Rad * (180 / math.pi) end
 local Lerp = function(a, b, t) return a + (b - a) * t end
 -- V9.65 perf: per-tick per-player memo for RebuildServerYaw. It was recomputed up
 -- to ~5×/resolve/player (resolve_player + each pick_first_shot branch), every one
@@ -3233,8 +3213,10 @@ local function update_jitter(p, s)
         s.yaw_accel = raw_accel
         s.yaw_rate = raw_rate
         -- V8.0: yaw-rate consistency — only extrapolate when stable direction (low stddev)
-        table.insert(s.yaw_rate_buf, s.yaw_rate)
-        while #s.yaw_rate_buf > 6 do table.remove(s.yaw_rate_buf, 1) end
+        -- V9.71 perf: circular ring (was table.remove(buf,1) shift per tick per enemy).
+        -- Consumers only do mean/stddev + length checks — order-insensitive.
+        s.yaw_rate_idx = (s.yaw_rate_idx or 0) % 6 + 1
+        s.yaw_rate_buf[s.yaw_rate_idx] = s.yaw_rate
         if #s.yaw_rate_buf >= 4 then
             local sum, n = 0, #s.yaw_rate_buf
             for _, r in ipairs(s.yaw_rate_buf) do sum = sum + r end
@@ -4188,6 +4170,14 @@ local function refresh_tick_cache()
     tick_cache.curtime   = globals.curtime  or 0
     tick_cache.frametime = globals.frametime or 0
     tick_cache.tickint   = globals.tickinterval or (1/64)
+    -- V9.71 perf: UI reads cached once per tick (were per-enemy per-tick :get() calls
+    -- in resolve_player — N enemies × 64Hz × menu-API roundtrip)
+    pcall(function()
+        tick_cache.ui_close_range  = close_range_dist:get()
+        tick_cache.ui_air_resolve  = air_resolve_tog:get()
+        tick_cache.ui_aa_classify  = (exp_aa_classify and exp_aa_classify:get()) or false
+        tick_cache.ui_classify_int = (exp_classify_int and exp_classify_int:get()) or 1
+    end)
     local lp = entity.get_local_player()
     tick_cache.lp = lp
     tick_cache.wc = nil  -- invalidate every tick — weapon may swap mid-tick (edge-case rare but cheap)
@@ -4306,7 +4296,7 @@ local function resolve_player(p)
             return
         end
         s.tmp_dist = math.sqrt(dist_sq)
-        s.tmp_close = s.tmp_dist < close_range_dist:get()
+        s.tmp_close = s.tmp_dist < (tick_cache.ui_close_range or 700)  -- V9.71: per-tick cached
         -- V9.31: clear a stale hostile-fire mark for out-of-range enemies (the
         -- weapon_fire handler no longer range-gates — it cannot read enemy origin
         -- safely). Done here, where the distance is already computed safely.
@@ -4328,7 +4318,7 @@ local function resolve_player(p)
 
     -- airborne: enemies still have desync in air. Use server-yaw reconstruction
     -- (old approach assumed 0 desync → broke on nospread)
-    if air_resolve_tog:get() and not anim.m_bOnGround then
+    if tick_cache.ui_air_resolve and not anim.m_bOnGround then  -- V9.71: per-tick cached
         s.mode = "Air"
         -- V9.34: keep yaw_cache / yaw_rate warm during air-time. The air-branch used
         -- to return BEFORE update_jitter ran, so the jitter buffer went stale (wrong
@@ -4417,8 +4407,12 @@ local function resolve_player(p)
         -- V9.33: push to recent_resolved (mirrors the ground path) so cancel-conf's
         -- stddev gate + confidence() reflect AIR volatility, not stale ground data.
         local now_ct = tick_cache.curtime or 0
-        table.insert(s.recent_resolved, {a = server_yaw, t = now_ct})
-        while #s.recent_resolved > 5 do table.remove(s.recent_resolved, 1) end
+        -- V9.71 perf: circular ring, entry tables reused (zero alloc steady-state)
+        local _ri = (s.recent_resolved_idx or 0) % 5 + 1
+        s.recent_resolved_idx = _ri
+        local _re = s.recent_resolved[_ri]
+        if _re then _re.a = server_yaw; _re.t = now_ct
+        else s.recent_resolved[_ri] = {a = server_yaw, t = now_ct} end
         anim.m_flGoalFeetYaw = NormalizeAngle(server_yaw)
         return
     end
@@ -4501,7 +4495,7 @@ local function resolve_player(p)
     -- many false flips. Higher consecutive threshold + longer lockout stabilizes classification.
     -- Also: V9.10 anti-flap protection — if same player commits >3 times within 10s,
     -- freeze the classifier for 5s.
-    if exp_aa_classify and exp_aa_classify:get() then
+    if tick_cache.ui_aa_classify then  -- V9.71: per-tick cached
         local now_rt = globals.realtime or 0
         -- V9.61: sticky classification for well-learned enemies. Once we've HIT an enemy
         -- 4+ times (real_active), its AA type rarely changes mid-round — reclassifying it
@@ -4538,7 +4532,7 @@ local function resolve_player(p)
                 s.pending_aa_type = new_type
                 s.pending_aa_count = 1
             end
-            s.aa_classify_cd = exp_classify_int:get()
+            s.aa_classify_cd = tick_cache.ui_classify_int or 1  -- V9.71: per-tick cached
         else
             s.aa_classify_cd = s.aa_classify_cd - 1
         end
@@ -4561,8 +4555,12 @@ local function resolve_player(p)
 
     -- V3: recent-resolved ring buffer (last 5) for confidence detection
     local now_ct = tick_cache.curtime or 0
-    table.insert(s.recent_resolved, {a = angle, t = now_ct})
-    while #s.recent_resolved > 5 do table.remove(s.recent_resolved, 1) end
+    -- V9.71 perf: circular ring, entry tables reused (zero alloc steady-state)
+    local _ri = (s.recent_resolved_idx or 0) % 5 + 1
+    s.recent_resolved_idx = _ri
+    local _re = s.recent_resolved[_ri]
+    if _re then _re.a = angle; _re.t = now_ct
+    else s.recent_resolved[_ri] = {a = angle, t = now_ct} end
 
     -- V7.1: PASSIVE LEARNING — read server's predicted feet_yaw BEFORE override
     -- This is what the server actually computes for this enemy's desync, no shooting needed
@@ -4861,15 +4859,6 @@ local function get_weapon_class()
     end
     if tick_cache then tick_cache.wc = cls end
     return cls
-end
-
--- V3: hitbox-chain attempt (head → chest → stomach)
-local function apply_hitbox_chain(ctx)
-    if not (exp_hitbox_chain and exp_hitbox_chain:get()) then return false end
-    local ok = pcall(function() ctx:override_hitboxes({0, 6, 3}) end)
-    if not ok then ok = pcall(function() ctx:set_hitboxes({0, 6, 3}) end) end
-    if not ok then ok = pcall(function() ctx:override_hitbox_chain({0, 6, 3}) end) end
-    return ok
 end
 
 pcall(function()
@@ -5246,6 +5235,21 @@ local function color_by_confidence(conf)
     return 80, 255, 80
 end
 
+-- V9.71 perf: constant color objects hoisted — were re-created per enemy per FRAME
+-- in the draw path. GLOBALS (main chunk at the 200-local cap).
+ESP_COL_WEDGE    = color(235, 235, 235, 230)
+ESP_COL_TAG      = color(120, 200, 255, 240)
+ESP_COL_DOT_HIT  = color(90, 255, 110, 230)
+ESP_COL_DOT_MISS = color(255, 70, 70, 230)
+ESP_COL_DOT_SF   = color(90, 170, 255, 230)
+ESP_COL_BAR_BG   = color(40, 40, 40, 200)
+ESP_COL_PANEL    = color(15, 15, 20, 220)
+ESP_COL_BORDER   = color(80, 130, 200, 255)
+ESP_COL_TXT      = color(220, 220, 220, 255)
+ESP_COL_TXT2     = color(180, 220, 255, 255)
+ESP_COL_TITLE    = color(150, 200, 255, 255)
+ESP_HUD_TITLE    = "▸ SEL01-SOLVER v" .. SEL01_VERSION
+
 -- cached HUD data (refreshed at throttled rate, drawn every frame)
 local hud_cache = {
     tracked = 0, learned = 0, avg_conf = 0,
@@ -5281,6 +5285,27 @@ local function esp_refresh_cache()
     hud_cache.top_mode = top_mode
     hud_cache.top_rate = top_rate
     hud_cache.top_total = top_total
+    -- V9.71 perf: pre-format static HUD lines + conf color + panel position at the
+    -- throttled rate (10Hz) instead of every frame in the draw path.
+    hud_cache.txt_tracked = string.format("Tracked: %d enemies", tracked)
+    hud_cache.txt_learned = string.format("Learned: %d players", learned)
+    hud_cache.txt_conf    = string.format("Avg Confidence: %d%%", hud_cache.avg_conf)
+    hud_cache.txt_topmode = string.format("Top Mode: %s", top_mode)
+    hud_cache.txt_toprate = string.format("  Hit-rate: %.0f%% (%d shots)", top_rate, top_total)
+    local ar, ag, ab = color_by_confidence(hud_cache.avg_conf)
+    hud_cache.conf_col = color(ar, ag, ab, 255)
+    pcall(function()
+        local screen = render.screen_size()
+        local panel_w, panel_h = 320, 150
+        local pos = esp_hud_pos and tostring(esp_hud_pos:get()) or "Bottom-Left"
+        local x0, y0
+        if     pos == "Bottom-Right" then x0 = screen.x - panel_w - 20; y0 = screen.y - panel_h - 20
+        elseif pos == "Top-Left"     then x0 = 20;                      y0 = 80
+        elseif pos == "Top-Right"    then x0 = screen.x - panel_w - 20; y0 = 80
+        else                              x0 = 20;                      y0 = screen.y - panel_h - 20
+        end
+        hud_cache.x0, hud_cache.y0 = x0, y0
+    end)
 end
 
 local esp_paint_handler = function()
@@ -5307,46 +5332,59 @@ local esp_paint_handler = function()
             local feet_pos
             pcall(function() feet_pos = render.world_to_screen(vector(ox, oy, oz + 4)) end)
 
-            -- color by mode category
-            local r, g, b = 255, 255, 255
-            local m = tostring(s.mode)
-            if m:find("BF:")         then r, g, b = 255, 100, 100
-            elseif m:find("Air")     then r, g, b = 180, 180, 255
-            elseif m:find("Meas")    then r, g, b = 100, 255, 100
-            elseif m:find("Predict") then r, g, b = 255, 220, 100
-            elseif m:find("Jitter")  then r, g, b = 255, 150, 255
-            elseif m:find("LBY")     then r, g, b = 100, 255, 255
-            end
-
-            -- V9.53: COMPACT symbol label (v9.52 words were too big). ONE short line:
-            -- [aa-icon] [side-arrow] [deg] [learn-icon]   e.g.  "⇄ → 29° ★".
+            -- V9.71 perf: heavy per-enemy label compute (confidence() circular stddev,
+            -- mode-string finds, string.format, color objects) throttled to 5Hz per
+            -- enemy; the per-frame draw path reads the cache. Cosmetic-only fields
+            -- (_espc_*) — no resolver state touched from render.
             local enh_on = esp_enh and esp_enh:get()
-            local conf = confidence(s)
-            local cr, cg, cb = color_by_confidence(conf)
-            local total_samples = (s.samples_left or 0) + (s.samples_right or 0)
-            local locked = total_samples >= 8 and conf >= 60
+            local now_rt = globals.realtime or 0
+            if (now_rt - (s._espc_t or 0)) > 0.2 or s._espc_mode ~= s.mode then
+                s._espc_t = now_rt
+                s._espc_mode = s.mode
+                -- color by mode category
+                local r, g, b = 255, 255, 255
+                local m = tostring(s.mode)
+                if m:find("BF:")         then r, g, b = 255, 100, 100
+                elseif m:find("Air")     then r, g, b = 180, 180, 255
+                elseif m:find("Meas")    then r, g, b = 100, 255, 100
+                elseif m:find("Predict") then r, g, b = 255, 220, 100
+                elseif m:find("Jitter")  then r, g, b = 255, 150, 255
+                elseif m:find("LBY")     then r, g, b = 100, 255, 255
+                end
+                s._espc_col  = color(r, g, b, 255)   -- label text
+                s._espc_wcol = color(r, g, b, 240)   -- wedge resolved-line
+                local conf = confidence(s)
+                s._espc_conf = conf
+                local cr, cg, cb = color_by_confidence(conf)
+                s._espc_fill = color(cr, cg, cb, 220)  -- conf-bar fill
+                local total_samples = (s.samples_left or 0) + (s.samples_right or 0)
+                local locked = total_samples >= 8 and conf >= 60
 
-            -- side as a clear arrow + per-side magnitude
-            local side_ic = s.last_hit_side > 0 and "→" or (s.last_hit_side < 0 and "←" or "•")
-            local desync_val
-            if s.last_hit_side > 0 and s.samples_right >= 1 then desync_val = s.measured_right
-            elseif s.last_hit_side < 0 and s.samples_left >= 1 then desync_val = s.measured_left
-            else desync_val = s.measured_desync end
-
-            -- single clear AA-type icon: ▬ static / ⇄ switch / ≈ jitter / ⟳ spin
-            local at = tostring(s.aa_type or "")
-            local aa_ic = "▬"
-            if     at == "switch"  then aa_ic = "⇄"
-            elseif at == "jitter"  then aa_ic = "≈"
-            elseif at == "spinner" then aa_ic = "⟳" end
-
-            -- learn-state as one icon: 🔒 locked / ★ learned / · learning / nothing
-            local learn_ic = ""
-            if locked then learn_ic = " 🔒"
-            elseif total_samples >= 4 then learn_ic = " ★"
-            elseif total_samples >= 1 then learn_ic = " ·" end
-            -- MAIN line (color already encodes confidence via the bar below)
-            local txt = string.format("%s %s %.0f°%s", aa_ic, side_ic, desync_val, learn_ic)
+                -- V9.53: COMPACT symbol label. [aa-icon] [side-arrow] [deg] [learn-icon]
+                local side_ic = s.last_hit_side > 0 and "→" or (s.last_hit_side < 0 and "←" or "•")
+                local desync_val
+                if s.last_hit_side > 0 and s.samples_right >= 1 then desync_val = s.measured_right
+                elseif s.last_hit_side < 0 and s.samples_left >= 1 then desync_val = s.measured_left
+                else desync_val = s.measured_desync end
+                local at = tostring(s.aa_type or "")
+                local aa_ic = "▬"
+                if     at == "switch"  then aa_ic = "⇄"
+                elseif at == "jitter"  then aa_ic = "≈"
+                elseif at == "spinner" then aa_ic = "⟳" end
+                local learn_ic = ""
+                if locked then learn_ic = " 🔒"
+                elseif total_samples >= 4 then learn_ic = " ★"
+                elseif total_samples >= 1 then learn_ic = " ·" end
+                s._espc_txt = string.format("%s %s %.0f°%s", aa_ic, side_ic, desync_val, learn_ic)
+                -- netcode tag (enh mode): ⚠×N serverfails / bt resistant / tp-peek
+                local tag = ""
+                if (s.serverfail_misses or 0) > 0 then tag = tag .. string.format("⚠×%d ", s.serverfail_misses) end
+                if s.backtrack_resistant then tag = tag .. "bt " end
+                if s.tp_peek_active then tag = tag .. "pk " end
+                s._espc_tag = tag
+            end
+            local conf = s._espc_conf or 0
+            local txt = s._espc_txt or ""
 
             pcall(function()
                 local now_t = globals.curtime or 0
@@ -5384,27 +5422,21 @@ local esp_paint_handler = function()
                     pcall(function() t_eye = tip(s.last_eye_yaw) end)
                     pcall(function() t_res = tip(s.last_resolved) end)
                     if base and t_eye then pcall(function()
-                        render.line(vector(base.x, base.y), vector(t_eye.x, t_eye.y), color(235, 235, 235, 230))
+                        render.line(vector(base.x, base.y), vector(t_eye.x, t_eye.y), ESP_COL_WEDGE)
                     end) end
                     if base and t_res then pcall(function()
-                        render.line(vector(base.x, base.y), vector(t_res.x, t_res.y), color(r, g, b, 240))
+                        render.line(vector(base.x, base.y), vector(t_res.x, t_res.y), s._espc_wcol or ESP_COL_WEDGE)
                     end) end
                 end
 
                 -- V9.53: ONE compact line, smaller font (size 3, was 4). Color = mode;
                 -- confidence is the bar below, learn-state is the trailing icon (🔒/★/·).
-                render.text(3, vector(head_pos.x, head_pos.y - 18), color(r, g, b, 255), "c", txt)
+                render.text(3, vector(head_pos.x, head_pos.y - 18), s._espc_col or ESP_COL_TXT, "c", txt)
 
                 -- V9.53-C: compact netcode icon — THIS enemy fake-lags, so a resolver
                 -- "miss" on them is server-side (filtered by v9.49), not ours. ⚠×N / bt / pk.
-                if enh_on then
-                    local tag = ""
-                    if (s.serverfail_misses or 0) > 0 then tag = tag .. string.format("⚠×%d ", s.serverfail_misses) end
-                    if s.backtrack_resistant then tag = tag .. "bt " end
-                    if s.tp_peek_active then tag = tag .. "pk " end
-                    if tag ~= "" then
-                        render.text(1, vector(head_pos.x, head_pos.y - 30), color(120, 200, 255, 240), "c", tag)
-                    end
+                if enh_on and s._espc_tag and s._espc_tag ~= "" then
+                    render.text(1, vector(head_pos.x, head_pos.y - 30), ESP_COL_TAG, "c", s._espc_tag)
                 end
 
                 -- V9.51-E: shot-history dots (last 6) — green hit / red miss / blue serverfail.
@@ -5415,12 +5447,12 @@ local esp_paint_handler = function()
                     local sx = head_pos.x - total_w / 2
                     for i = 1, n do
                         local k = s.shot_history[i]
-                        local dr, dg, db = 255, 70, 70
-                        if     k == "hit"        then dr, dg, db = 90, 255, 110
-                        elseif k == "serverfail" then dr, dg, db = 90, 170, 255 end
+                        local dc = ESP_COL_DOT_MISS
+                        if     k == "hit"        then dc = ESP_COL_DOT_HIT
+                        elseif k == "serverfail" then dc = ESP_COL_DOT_SF end
                         local dx = sx + (i - 1) * (dw + gap)
                         render.rect(vector(dx, head_pos.y - 42), vector(dx + dw, head_pos.y - 38),
-                                    color(dr, dg, db, 230), 0, true)
+                                    dc, 0, true)
                     end
                 end
 
@@ -5429,10 +5461,10 @@ local esp_paint_handler = function()
                     local fill = math.floor(bar_w * conf / 100)
                     render.rect(vector(head_pos.x - bar_w/2, head_pos.y - 8),
                                 vector(head_pos.x - bar_w/2 + bar_w, head_pos.y - 5),
-                                color(40, 40, 40, 200), 0, true)
+                                ESP_COL_BAR_BG, 0, true)
                     render.rect(vector(head_pos.x - bar_w/2, head_pos.y - 8),
                                 vector(head_pos.x - bar_w/2 + fill, head_pos.y - 5),
-                                color(cr, cg, cb, 220), 0, true)
+                                s._espc_fill or ESP_COL_BAR_BG, 0, true)
                     -- V9.53: side-dom mini-bar REMOVED (user: redundant — side is in the
                     -- label arrow, the second bar just added clutter).
                 end
@@ -5444,37 +5476,31 @@ local esp_paint_handler = function()
     -- ═══ HUD-corner overlay (drawn every frame from cached data) ═══
     if not (esp_show_hud and esp_show_hud:get()) then return end
     pcall(function()
-        local screen = render.screen_size()
         local now = globals.curtime or 0  -- V9.31: `now` was an undefined global (nil)
                                           -- here → HUD silently died at the last-combat
                                           -- line (nil arithmetic, swallowed by pcall).
                                           -- Same clock as current_target.time.
+        -- V9.71 perf: panel position + screen_size + static line text now cached in
+        -- esp_refresh_cache (10Hz) — draw path only positions and blits.
+        local x0, y0 = hud_cache.x0 or 20, hud_cache.y0 or 80
         local panel_w, panel_h = 320, 150
-        local pos = esp_hud_pos and tostring(esp_hud_pos:get()) or "Bottom-Left"
-        local x0, y0
-        if     pos == "Bottom-Right" then x0 = screen.x - panel_w - 20; y0 = screen.y - panel_h - 20
-        elseif pos == "Top-Left"     then x0 = 20;                       y0 = 80
-        elseif pos == "Top-Right"    then x0 = screen.x - panel_w - 20; y0 = 80
-        else                              x0 = 20;                       y0 = screen.y - panel_h - 20
-        end
         local line_h = 14
-        local ar, ag, ab = color_by_confidence(hud_cache.avg_conf)
 
         -- background panel + border (drawn every frame)
         render.rect(vector(x0 - 8, y0 - 8), vector(x0 + panel_w - 8, y0 + panel_h - 8),
-                    color(15, 15, 20, 220), 4, true)
-        local b = color(80, 130, 200, 255)
+                    ESP_COL_PANEL, 4, true)
+        local b = ESP_COL_BORDER
         render.rect(vector(x0 - 8, y0 - 8),                vector(x0 + panel_w - 8, y0 - 7),                b, 0, true)
         render.rect(vector(x0 - 8, y0 + panel_h - 9),      vector(x0 + panel_w - 8, y0 + panel_h - 8),      b, 0, true)
         render.rect(vector(x0 - 8, y0 - 8),                vector(x0 - 7, y0 + panel_h - 8),                b, 0, true)
         render.rect(vector(x0 + panel_w - 9, y0 - 8),      vector(x0 + panel_w - 8, y0 + panel_h - 8),      b, 0, true)
 
-        render.text(3, vector(x0, y0),              color(150, 200, 255, 255), nil, "▸ SEL01-SOLVER v" .. SEL01_VERSION)
-        render.text(3, vector(x0, y0 + line_h),     color(220, 220, 220, 255), nil, string.format("Tracked: %d enemies", hud_cache.tracked))
-        render.text(3, vector(x0, y0 + line_h * 2), color(220, 220, 220, 255), nil, string.format("Learned: %d players", hud_cache.learned))
-        render.text(3, vector(x0, y0 + line_h * 3), color(ar, ag, ab, 255),    nil, string.format("Avg Confidence: %d%%", hud_cache.avg_conf))
-        render.text(3, vector(x0, y0 + line_h * 4), color(180, 220, 255, 255), nil, string.format("Top Mode: %s", hud_cache.top_mode))
-        render.text(3, vector(x0, y0 + line_h * 5), color(180, 220, 255, 255), nil, string.format("  Hit-rate: %.0f%% (%d shots)", hud_cache.top_rate, hud_cache.top_total))
+        render.text(3, vector(x0, y0),              ESP_COL_TITLE, nil, ESP_HUD_TITLE)
+        render.text(3, vector(x0, y0 + line_h),     ESP_COL_TXT,   nil, hud_cache.txt_tracked or "")
+        render.text(3, vector(x0, y0 + line_h * 2), ESP_COL_TXT,   nil, hud_cache.txt_learned or "")
+        render.text(3, vector(x0, y0 + line_h * 3), hud_cache.conf_col or ESP_COL_TXT, nil, hud_cache.txt_conf or "")
+        render.text(3, vector(x0, y0 + line_h * 4), ESP_COL_TXT2,  nil, hud_cache.txt_topmode or "")
+        render.text(3, vector(x0, y0 + line_h * 5), ESP_COL_TXT2,  nil, hud_cache.txt_toprate or "")
 
         local age = now - (last_combat_event.time or 0)
         if age < 5 then
@@ -5767,8 +5793,7 @@ _cs_log_color_raw("V3 Features: " ..
                   " | per-side-desync=" .. (exp_perside_desync:get() and "ON" or "OFF") ..
                   " | ESP=" .. (exp_esp_overlay:get() and "ON" or "OFF") ..
                   " | cancel-conf=" .. (exp_cancel_conf:get() and "ON" or "OFF") ..
-                  " | auto-weapon=" .. (exp_auto_weapon:get() and "ON" or "OFF") ..
-                  " | hitbox-chain=" .. (exp_hitbox_chain:get() and "ON" or "OFF"))
+                  " | auto-weapon=" .. (exp_auto_weapon:get() and "ON" or "OFF"))
 _cs_log_color_raw("V4 Features: " ..
                   "persistent-learning=" .. (exp_persistent_lm:get() and "ON" or "OFF") ..
                   " | extrapolation=" .. (exp_extrapolation:get() and "ON" or "OFF") ..
@@ -5813,6 +5838,7 @@ _cs_log_color_raw("V9.56: LBY-Snap-Guess miss-flip is now bt/measurement-aware (
 _cs_log_color_raw("V9.55: honest hit-rate — server-fail filter now reuses the ack_serverfail_like signal (err<=5 OR bt>8) the mode-blacklist already trusts, instead of filtering EVERY kept-side miss. A bt=0 keep with a real magnitude error is the resolver's own side-misprediction on a switch/bimodal enemy (logs: idx=1 bimodal L=40°/R=17.5° kept side ×3 at bt=0 err=10-40 — counted as netcode, inflating session 76.5%->96.3%). Those now count; only clean stale-record rejects (bt>8 / err~0) stay excluded. No aim change, stats only.")
 _cs_log_color_raw("V9.65: PERF/smoothness — RebuildServerYaw is now memoised per (tick, player). It was recomputed up to ~5x per resolve per enemy (once in resolve_player + once in each pick_first_shot branch), every call an FFI-heavy anim_state + velocity + LBY read. The result depends only on this-tick player state, so caching is behaviour-identical — pure FFI-work reduction (lighter per-tick load, smoother frametimes in 5-man HvH). No aim/learning change.")
 _cs_log_color_raw("V9.70: pose-promotion is NON-STICKY (real-dump bug #2). v9.69 promoted on the FIRST threshold cross and never demoted, so a small-sample fluke locked in: idx 16 hit 1.28σ at n=20, was marked '<<< BEST', then DECAYED to 0.58σ at n=23 while still showing best. Now we re-scan all indices every hit and pick the current best meeting STRICTER gates (n≥25, 6+ per side, |sep|≥1.3); if none holds, g_pose_best_idx clears → honest dump. A real body_yaw index must HOLD its separation as samples grow; noise self-demotes. On the user's build no index sustained ≥1.3 (max ~0.78) → this NL build does not cleanly expose body_yaw, so pose-read stays a dead end here and the OTHER levers (v9.66 prediction, speed-bucket, on-shot, switch-period) carry.")
+_cs_log_color_raw("V9.71: PERF + DEAD-CODE batch (full-code audit). Perf: (a) UI :get() reads cached once per tick in tick_cache (close-range/air-resolve/aa-classify/classify-int — were per-enemy×64Hz menu-API calls); (b) yaw_rate_buf + recent_resolved are circular rings now (table.remove(1) shifted per tick per enemy; recent_resolved also reuses entry tables → zero alloc steady-state); (c) ESP label compute (confidence() circular stddev + mode-string finds + string.format + color objects) throttled to 5Hz per enemy in _espc_* cache — draw path just blits; (d) constant render colors hoisted to module globals; (e) HUD panel text/position/conf-color pre-formatted at the 10Hz refresh. Dead code REMOVED: exp_head_focus + exp_hitbox_chain toggles (dead since v9.18 deleted the HEAD-FOCUS override block — they set state nothing read; 'Head + Chest Fallback' strategy now equals 'Head Bias'), apply_hitbox_chain(), DegToRad/RadToDeg. Frees 4 main-chunk locals.")
 _cs_log_color_raw("V9.69: pose-calibration scorer FIXED (real-dump bug). The v9.67 sign-vs-running-mean scorer FALSELY read 'eff 100%' on every CONSTANT pose index when the early hits were one-sided (dump: 3 right-side hits → idx 0/1/4/5/9/11.. all 0%/eff100%) — it would have promoted a garbage constant index. New scorer uses SEPARATION: track the param's mean on LEFT hits vs RIGHT hits; body_yaw is the index whose two side-means split cleanly (|meanR-meanL| ≥ 1.2σ). Promotion now needs 20+ hits, 5+ on EACH side, real variance. Dump shows sep(σ) + nL/nR + meanL→meanR. To calibrate: fight enemies you hit on BOTH sides.")
 _cs_log_color_raw("V9.68: presets brought up to v9.65-67. ALL 6 presets now set the new levers explicitly (were untouched → left on user state). pose-collect ON everywhere (pure data, harmless). SSG-Pro (BALANCED, your main): pose-collect + on-shot flip ON, pose-USE + switch-period OFF until you validate the 'Dump Pose Calibration' index — SSG aim stays effectively identical, only learns + handles on-shot AA. Dynamic = experimental showcase (switch-period ON too). Defensive = data-only (no aim-changing levers). The toggle-less v9.65 perf / v9.66 prediction rework / v9.67 speed-bucket were already active in every preset.")
 _cs_log_color_raw("V9.67: four new resolver levers (all opt-in toggles, default OFF except #C which is a safe refinement). #A POSE-PARAM CALIBRATION — collect pose[0..23] vs known hit-side on every HIT, auto-find the index that encodes body_yaw → turns SIDE from a statistical guess into a DIRECT read (toggle 'Pose Calibration' + 'Use Calibrated Pose Side' + 'Dump Pose Calibration' button). #B SWITCH-PERIOD — observe the server's per-tick predicted feet-yaw side (visible without a hit), detect a regular flip interval, predict which side the fake is on at shot-land (toggle 'Switch-Period Side Predict'). #C SPEED-BUCKET magnitude — split measured desync into standing vs moving buckets (real desync shrinks with speed) and use the bucket matching shot-time speed in the global fallback. #D ON-SHOT FLIP — learn enemies whose desync flips the tick they fire (2 wrong-side misses inside their fire window) and flip the resolved side in that window (toggle 'On-Shot Side-Flip Learn'). All three direct-side sources resolve through one central branch; inert for anyone who doesn't opt in.")
