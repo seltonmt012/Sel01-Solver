@@ -5,8 +5,20 @@
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 9.72
--- @description Correction side guard + serverfail retry:
+-- @version 9.73
+-- @description v9.73 real-dump fixes (idx=4 switch-stuck / idx=2 BF jitter / cold Air):
+--   * FIX #1 one-sided switch enemy: correct magnitude (err<2) + 2 consecutive
+--     correct-angle KEEPs on same side = the switch moved → force a flip (was 6+ KEEP).
+--   * FIX #2 BF:retry cap — static enemy, 2 correct-angle keeps + samples → commit
+--     measured desync (Static-Meas) instead of jittering the magnitude.
+--   * FIX #3 cold-air gate — no hit-EMA + no passive baseline → alternate side by
+--     miss-count (BF:opposite) at a high air prior, don't fire a blind trusted Air.
+--   * FIX #4 conf<15 → skip speculative correction; let BF cycle sweep sides.
+--   * FIX #5 don't clobber session-learned per-side EMAs from persistent LearnedModel
+--     on dormancy re-track (kept mid-session learning momentum).
+--   * FIX #6 tag correct-angle server-fail keeps so Static-Meas mode-confidence isn't
+--     decayed (mode_stats already gated; flag makes it explicit + ESP-visible).
+-- @description-prev Correction side guard + serverfail retry:
 --   * correction/prediction-error misses now check SIDE evidence, not only
 --     magnitude. A BF shot on the unlearned opposite side no longer gets labeled
 --     "server fail" just because abs(delta) ~= measured_desync.
@@ -73,7 +85,7 @@
 --   * v9.26 drift-bump (alpha 0.55 on 5-10° diff) still handles small shifts.
 --   * v9.29 coach variants carry.
 
-local SEL01_VERSION = "9.72"
+local SEL01_VERSION = "9.73"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -2793,6 +2805,14 @@ events.aim_ack:set(function(event)
         -- otherwise flip/decay as a real resolver error. Correct-angle server rejects
         -- schedule one same-side BF:retry before the normal BF cycle.
         if ack_resolverish and ack_shot_side ~= 0 then
+          -- FIX #4: skip speculative flip/keep correction on very-low-confidence players.
+          -- idx=4 (conf=5, p_hits=1/3) ran the full correction with repeated flips and
+          -- wasted shots on guesses. Below conf 15 there is near-zero learned signal — let
+          -- the BF cycle (s.missed → "opposite") sweep both sides systematically instead.
+          -- serverfail_retry is NOT scheduled here, so BF is free to alternate. A real hit
+          -- lifts conf >=15 and re-enables the correction logic.
+          local _conf_corr = confidence(s)  -- FIX #4
+          if _conf_corr >= 15 then           -- FIX #4
             -- V9.42: decide the side-flip from SIDE evidence, NOT magnitude error.
             -- ack_angle_err = ||delta| - measured| measures MAGNITUDE accuracy: a true
             -- wrong-SIDE miss keeps |delta| ~= measured (right magnitude, wrong sign) →
@@ -2835,6 +2855,12 @@ events.aim_ack:set(function(event)
                                        and (s.real_right or 0) >= 1)
                                       or (s.bimodal == true)
             if two_side_switcher and (ack_angle_err <= 10 or bt > 8) then do_flip = false
+            -- FIX #1: one-sided switch enemy, correct magnitude (err<2), 2+ consecutive
+            -- correct-angle KEEPs on the same side = the switch moved to the other side and
+            -- the bt-fail keep never tries it (idx=4 aa=switch L=3/47.9 R=0, 6+ KEEP err=0.0,
+            -- 75% miss). Angle is right, SIDE is stale — force a flip. (two_side switchers
+            -- above are handled by BF sweep; this catches the one-sided lock.)
+            elseif s.aa_type == "switch" and ack_angle_err < 2.0 and (s.serverfail_streak or 0) >= 2 then do_flip = true  -- FIX #1
             elseif ack_side_bad and (ack_measured <= 5 or ack_angle_err > 10) then do_flip = true
             elseif bt > 8 then do_flip = false
             elseif ack_side_bad then do_flip = true
@@ -2927,6 +2953,11 @@ events.aim_ack:set(function(event)
                 cs_log_verbose("correction-miss idx=%d KEEP side=%d our=%.1f meas=%.1f err=%.1f bt=%d (server/backtrack fail #%d, retry same)",
                                Ent:get_index(), ack_shot_side, ack_delta, ack_side_measured, ack_angle_err, bt, s.serverfail_streak)
             end
+          else
+            -- FIX #4: conf<15 — correction skipped, BF cycle sweeps sides (no flip/keep/retry)
+            cs_log_verbose("correction skip idx=%d conf=%d <15 — BF sweeps sides",
+                           Ent:get_index(), _conf_corr)
+          end  -- FIX #4: closes if _conf_corr >= 15
         end
         cs_log_verbose("MISS [%s] target=%d count=%d mode=%s",
                        tostring(reason), Ent:get_index(), s.missed, tostring(s.mode))
@@ -2941,6 +2972,7 @@ events.aim_ack:set(function(event)
         if server_fail_keep then
             s.serverfail_misses = (s.serverfail_misses or 0) + 1
             sel01_session_serverfails = (sel01_session_serverfails or 0) + 1
+            s.last_miss_server_fail = true  -- FIX #6: correct-angle (err<=5/bt>8) server reject — mode-confidence decay (mode_stats/blacklist) already gated below; flag makes it explicit so Static-Meas is never penalized + ESP can show it
             esp_push_shot(s, "serverfail")  -- V9.51: blue flash + blue dot
             cs_log_verbose("server-fail miss NOT counted idx=%d mode=%s (player#%d session#%d)",
                            Ent:get_index(), tostring(s.mode), s.serverfail_misses, sel01_session_serverfails)
@@ -2957,6 +2989,7 @@ events.aim_ack:set(function(event)
             cs_log_verbose("spread miss NOT counted idx=%d mode=%s (bullet RNG, player#%d session#%d)",
                            Ent:get_index(), tostring(s.mode), s.spread_misses, sel01_session_spreadfails)
         else
+            s.last_miss_server_fail = false  -- FIX #6: real resolver miss — mode-confidence MAY decay
             learning_update_miss(Ent)
             mode_stats_update(tostring(s.mode), false)
             record_player_shot(s, false)  -- V8.0: per-player hit-rate
@@ -4081,6 +4114,25 @@ local function pick_bruteforce_angle(s, anim, eye_yaw, max_desync, p, preset)
     if s.serverfail_retry_side and s.serverfail_retry_miss == s.missed
        and (s.serverfail_retry_until or 0) >= (globals.tickcount or 0) then
         local side = s.serverfail_retry_side
+        -- FIX #2: BF:retry cap. The same side+mag retry can jitter without converging on a
+        -- static enemy we already measured (logs idx=2: our 42.7→43.3→38.2→50.9 vs meas 41.6,
+        -- missCount 4). After 2 consecutive correct-angle keeps (serverfail_streak>=2) with
+        -- samples, stop retrying and COMMIT the measured desync directly (Static-Meas) —
+        -- repeated correct-angle fails on a static enemy are netcode, jittering only hurts.
+        if s.aa_type == "static" and (s.desync_samples or 0) > 0 and (s.serverfail_streak or 0) >= 2 then  -- FIX #2
+            local cmag = effective_desync(s, max_desync, side)  -- FIX #2
+            if cmag >= 5 then
+                if cmag > 58 then cmag = 58 end
+                resolver_clear_serverfail_retry(s)
+                local cres = eye_yaw + cmag * side
+                s.mode = "Static-Meas"  -- FIX #2: commit measured, stop BF jitter
+                s.bf_cached_missed = s.missed
+                s.bf_cached_angle  = cres
+                s.bf_cached_mode   = s.mode
+                s.bf_cached_eye    = eye_yaw
+                return cres
+            end
+        end
         local mag = s.serverfail_retry_mag or effective_desync(s, max_desync, side)
         -- V9.62: USE-SITE guard against a stale/poisoned retry magnitude (V9.44 fixed the
         -- SETTER; this guards the GETTER). If we hold a learned per-side desync and the
@@ -4291,12 +4343,20 @@ local function resolve_player(p)
         local lsl, lsr = (lrn and lrn.sl or 0), (lrn and lrn.sr or 0)
         local ldl, ldr = (lrn and lrn.dl or 0), (lrn and lrn.dr or 0)
         if lrn and (lsl + lsr) >= 5 then
-            if (lrn.dom or 0) ~= 0 then s.last_hit_side = lrn.dom end
-            if lsl >= 2 and ldl > 0 then
+            -- FIX #5: don't clobber session-learned data on re-track. reset_state keeps
+            -- measured_left/right + real_* (only transient counters wiped), but this boot
+            -- overwrote the live per-side EMAs with the OLDER persistent LearnedModel values
+            -- on every dormancy re-engagement, wiping mid-session learning momentum (logs:
+            -- LearnedModel boot idx=1/2 firing 3-4× per session). When we already hold REAL
+            -- session hits on a side, keep the live EMA; only fill sides not yet learned.
+            local _has_sess_l = (s.real_left  or 0) >= 1  -- FIX #5
+            local _has_sess_r = (s.real_right or 0) >= 1  -- FIX #5
+            if (lrn.dom or 0) ~= 0 and not (_has_sess_l or _has_sess_r) then s.last_hit_side = lrn.dom end  -- FIX #5: keep session side
+            if lsl >= 2 and ldl > 0 and not _has_sess_l then  -- FIX #5: keep session L EMA
                 s.measured_left = ldl
                 s.samples_left  = math.min(lsl, 10)
             end
-            if lsr >= 2 and ldr > 0 then
+            if lsr >= 2 and ldr > 0 and not _has_sess_r then  -- FIX #5: keep session R EMA
                 s.measured_right = ldr
                 s.samples_right  = math.min(lsr, 10)
             end
@@ -4398,6 +4458,14 @@ local function resolve_player(p)
         else
             air_guess_mag = math.max(adaptive_guess_mag(), 36)
         end
+        -- FIX #3: cold-air gate. Air corr/alt logic needs a measured side+magnitude; with
+        -- zero hit-EMA AND no passive baseline, RebuildServerYaw is the only signal and it's
+        -- unreliable in air, so Air fired garbage (logs: Air eye=111.4 res=138.9 delta=27.4
+        -- measDesync=0 samples=0 MISS; Air 50% rate). When cold, explore by alternating side
+        -- per miss-count (BF:opposite style) at the high air prior instead of committing a
+        -- single trusted Air angle — gated below right before the eye-yaw guard.
+        local air_cold = (s.desync_samples or 0) == 0 and (s.measured_desync or 0) <= 5
+                         and math.max(s.passive_left or 0, s.passive_right or 0) <= 5  -- FIX #3
         if s.aa_type == "switch" and both_air and s.last_hit_side ~= 0 then
             -- V9.19: dom-bias for Air-Alt — prefer dom if it leads by 2+
             local side = alt_side_pick(s)
@@ -4434,6 +4502,13 @@ local function resolve_player(p)
                      or (side < 0 and (s.measured_left or 0) > 5)  and s.measured_left
                      or s.measured_desync
             server_yaw = anim.m_flEyeYaw + mag * side
+        end
+        -- FIX #3: cold air → force the alternating guess (do NOT trust RebuildServerYaw).
+        if air_cold then
+            local cside = air_side
+            if (s.missed or 0) > 0 then cside = ((s.missed % 2) == 1) and -air_side or air_side end  -- FIX #3: BF:opposite by miss-count
+            server_yaw = anim.m_flEyeYaw + air_guess_mag * cside
+            s.mode = ((s.missed or 0) > 0) and "Air-BFGuess" or "Air-Guess"  -- FIX #3
         end
         -- V9.6+V9.19: never resolve to exact eye_yaw — offset by adaptive median
         if math.abs(NormalizeAngle(server_yaw - anim.m_flEyeYaw)) < 5 then
@@ -5886,6 +5961,7 @@ _cs_log_color_raw("V9.55: honest hit-rate — server-fail filter now reuses the 
 _cs_log_color_raw("V9.65: PERF/smoothness — RebuildServerYaw is now memoised per (tick, player). It was recomputed up to ~5x per resolve per enemy (once in resolve_player + once in each pick_first_shot branch), every call an FFI-heavy anim_state + velocity + LBY read. The result depends only on this-tick player state, so caching is behaviour-identical — pure FFI-work reduction (lighter per-tick load, smoother frametimes in 5-man HvH). No aim/learning change.")
 _cs_log_color_raw("V9.70: pose-promotion is NON-STICKY (real-dump bug #2). v9.69 promoted on the FIRST threshold cross and never demoted, so a small-sample fluke locked in: idx 16 hit 1.28σ at n=20, was marked '<<< BEST', then DECAYED to 0.58σ at n=23 while still showing best. Now we re-scan all indices every hit and pick the current best meeting STRICTER gates (n≥25, 6+ per side, |sep|≥1.3); if none holds, g_pose_best_idx clears → honest dump. A real body_yaw index must HOLD its separation as samples grow; noise self-demotes. On the user's build no index sustained ≥1.3 (max ~0.78) → this NL build does not cleanly expose body_yaw, so pose-read stays a dead end here and the OTHER levers (v9.66 prediction, speed-bucket, on-shot, switch-period) carry.")
 _cs_log_color_raw("V9.71: PERF + DEAD-CODE batch (full-code audit). Perf: (a) UI :get() reads cached once per tick in tick_cache (close-range/air-resolve/aa-classify/classify-int — were per-enemy×64Hz menu-API calls); (b) yaw_rate_buf + recent_resolved are circular rings now (table.remove(1) shifted per tick per enemy; recent_resolved also reuses entry tables → zero alloc steady-state); (c) ESP label compute (confidence() circular stddev + mode-string finds + string.format + color objects) throttled to 5Hz per enemy in _espc_* cache — draw path just blits; (d) constant render colors hoisted to module globals; (e) HUD panel text/position/conf-color pre-formatted at the 10Hz refresh. Dead code REMOVED: exp_head_focus + exp_hitbox_chain toggles (dead since v9.18 deleted the HEAD-FOCUS override block — they set state nothing read; 'Head + Chest Fallback' strategy now equals 'Head Bias'), apply_hitbox_chain(), DegToRad/RadToDeg. Frees 4 main-chunk locals.")
+_cs_log_color_raw("V9.73: real-dump fixes (v9.72 logs). (1) ONE-SIDED SWITCH UNSTICK — a switch enemy with correct magnitude (err<2) that takes 2 consecutive correct-angle KEEPs on the same side now FLIPS instead of looping KEEP forever (idx=4 aa=switch L=3/47.9 R=0, 6+ KEEP err=0.0, 75% miss — the switch had moved sides). (2) BF:retry CAP — a static enemy with samples that takes 2 correct-angle keeps commits the measured desync (Static-Meas) instead of jittering the magnitude (idx=2 our 42.7→43.3→38.2→50.9 vs meas 41.6, missCount 4 no converge). (3) COLD-AIR GATE — Air with zero hit-EMA + no passive baseline no longer fires a blind trusted angle; it alternates side by miss-count at a high air prior (idx=2 Air measDesync=0 samples=0 delta=27.4 MISS). (4) conf<15 SKIPS speculative correction — let the BF cycle sweep sides instead of guessing flips on a conf=5 player. (5) re-track NO LONGER CLOBBERS session-learned per-side EMAs from the persistent LearnedModel (kept mid-session momentum; the repeated boots were wiping it). (6) correct-angle server-fail keeps tagged so Static-Meas mode-confidence is never decayed (mode_stats already gated; flag makes it explicit).")
 _cs_log_color_raw("V9.72: real-dump fixes (SSG-Pro session 6/11). (1) SPREAD-MISS FILTER — reason='spread' means the angle was accepted and the bullet RNG'd; it now skips mode-stats/learning/per-player counters + mode-blacklist exactly like server-fails (real-dump: idx=4 took 2 spread misses that polluted Slow-Passive + BF:def+ stats and read as 0/3 resolver failure). s.missed still escalates baim/multipoint = the correct anti-spread response. New counter sel01_session_spreadfails + [SESSION] dump line. (2) PASSIVE-SIDE KEEP on blind first-contact — the explore-flip now checks passive_n_left/right (new per-side obs counters): when 20+ obs lean 2:1 to the side we just shot, a first-contact magnitude miss keeps the side (idx=6: 550 passive obs backed R, err=11.8 was magnitude, flip to L was wrong — 4 later real R-hits). V9.49 never-hit explore still breaks frozen guesses after 2 keeps. (3) Boot-log throttle keyed OUTSIDE PlayerState (dormancy reset recreated s and wiped the throttle → same boot logged 3×).")
 _cs_log_color_raw("V9.69: pose-calibration scorer FIXED (real-dump bug). The v9.67 sign-vs-running-mean scorer FALSELY read 'eff 100%' on every CONSTANT pose index when the early hits were one-sided (dump: 3 right-side hits → idx 0/1/4/5/9/11.. all 0%/eff100%) — it would have promoted a garbage constant index. New scorer uses SEPARATION: track the param's mean on LEFT hits vs RIGHT hits; body_yaw is the index whose two side-means split cleanly (|meanR-meanL| ≥ 1.2σ). Promotion now needs 20+ hits, 5+ on EACH side, real variance. Dump shows sep(σ) + nL/nR + meanL→meanR. To calibrate: fight enemies you hit on BOTH sides.")
 _cs_log_color_raw("V9.68: presets brought up to v9.65-67. ALL 6 presets now set the new levers explicitly (were untouched → left on user state). pose-collect ON everywhere (pure data, harmless). SSG-Pro (BALANCED, your main): pose-collect + on-shot flip ON, pose-USE + switch-period OFF until you validate the 'Dump Pose Calibration' index — SSG aim stays effectively identical, only learns + handles on-shot AA. Dynamic = experimental showcase (switch-period ON too). Defensive = data-only (no aim-changing levers). The toggle-less v9.65 perf / v9.66 prediction rework / v9.67 speed-bucket were already active in every preset.")
