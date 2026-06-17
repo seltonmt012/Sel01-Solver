@@ -5,8 +5,18 @@
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 9.73
--- @description v9.73 real-dump fixes (idx=4 switch-stuck / idx=2 BF jitter / cold Air):
+-- @version 9.74
+-- @description v9.74 jitter+defAA BF fix + passive-side dump visibility + air/BF:retry guard:
+--   * Issue 1 pick_bruteforce_angle skips the def_delta (BF:def+) cycle when
+--     aa_type=="jitter" — jitter oscillation has no stable defensive delta, so
+--     BF:def+ whiffed (v9.73 idx=3 0/1) while BF:opposite catches it. Falls through
+--     to the standard BF oscillation. aim_ack logs the jitter+defAA+no-samples case.
+--   * Issue 2 copy-dump [P] lines show passive_n_left/right as pL=/pR= so the
+--     V9.72 passive-side-keep can be verified from a dump.
+--   * Issue 3 resolve_player air-branch yields to a pending BF:retry (consumed only
+--     in pick_bruteforce_angle) — v9.73 idx=14 KEEP scheduled but logged mode=Air.
+--   * Issue 4 IMPROVEMENT HINTS: jitter+defAA hint + 0-real/passive-obs hint.
+-- @description-prev v9.73 real-dump fixes (idx=4 switch-stuck / idx=2 BF jitter / cold Air):
 --   * FIX #1 one-sided switch enemy: correct magnitude (err<2) + 2 consecutive
 --     correct-angle KEEPs on same side = the switch moved → force a flip (was 6+ KEEP).
 --   * FIX #2 BF:retry cap — static enemy, 2 correct-angle keeps + samples → commit
@@ -85,7 +95,7 @@
 --   * v9.26 drift-bump (alpha 0.55 on 5-10° diff) still handles small shifts.
 --   * v9.29 coach variants carry.
 
-local SEL01_VERSION = "9.73"
+local SEL01_VERSION = "9.74"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -1248,11 +1258,12 @@ local log_copy_btn = g_logging:button("📋 Copy Last Logs (for share)", functio
             pc = pc + 1
             -- V8.0: defensive tonumber + pcall around format (avoid userdata crash)
             local ok, line = pcall(string.format,
-                "[P] idx=%d mode=%s aa=%s miss=%d L=%d/%.1f R=%d/%.1f pass=%d conf=%d boot=%s",
+                "[P] idx=%d mode=%s aa=%s miss=%d L=%d/%.1f R=%d/%.1f pass=%d pL=%d pR=%d conf=%d boot=%s",
                 tonumber(idx) or 0, tostring(s.mode), tostring(s.aa_type), tonumber(s.missed) or 0,
                 tonumber(s.samples_left) or 0, tonumber(s.measured_left) or 0,
                 tonumber(s.samples_right) or 0, tonumber(s.measured_right) or 0,
                 tonumber(s.passive_samples) or 0,
+                tonumber(s.passive_n_left) or 0, tonumber(s.passive_n_right) or 0,  -- V9.74: passive-side-keep visibility
                 tonumber(confidence(s)) or 0,
                 s.boot_best_modes and "yes" or "no")
             if ok then _cs_log_raw(line)
@@ -1318,6 +1329,22 @@ local log_copy_btn = g_logging:button("📋 Copy Last Logs (for share)", functio
     if mem_passive == 0 and mem_players > 0 then
         _cs_log_raw("[HINT] Zero passive obs — anim.m_flGoalFeetYaw read may be failing (NL API diff)")
     end
+    -- V9.74: per-player pattern hints
+    pcall(function()
+        for idx, s in pairs(PlayerState) do
+            if not (tonumber(idx) == 0 or (s.mode == "Init" and (s.samples_left or 0) + (s.samples_right or 0) == 0)) then
+                local mr = tonumber(s.recent_miss_rate) or 0  -- stored as percent (0-100)
+                if s.defensive_aa == true and s.aa_type == "jitter" and mr >= 50 then
+                    _cs_log_raw(string.format("[HINT] idx=%d jitter+defAA enemy — BF:def+ ineffective; BF:opposite expected to perform better", tonumber(idx) or 0))
+                end
+                local real_active = (s.real_left or 0) + (s.real_right or 0)
+                local pn = (s.passive_n_left or 0) + (s.passive_n_right or 0)
+                if (s.missed or 0) >= 2 and real_active == 0 and pn >= 30 then
+                    _cs_log_raw(string.format("[HINT] idx=%d 0 real hits but %d passive obs — passive-side-keep may activate; fire more to build real samples", tonumber(idx) or 0, pn))
+                end
+            end
+        end
+    end)
 
     _cs_log_color_raw("════ END DUMP — drag-select from COPY-FRIENDLY LOG DUMP line ════")
     -- V8.2 + V8.7: write full dump to file + clipboard direct + restore originals
@@ -2832,6 +2859,13 @@ events.aim_ack:set(function(event)
             -- only when a real hit backs the magnitude OR genuine backtrack evidence
             -- (bt>6) makes a server stale-record plausible; otherwise explore the side.
             local real_active = (s.real_left or 0) + (s.real_right or 0)
+            -- V9.74: document the jitter+defAA pattern. On a jitter enemy the def_delta
+            -- BF cycle is inapplicable (no stable defensive delta) — the actual fix lives
+            -- in pick_bruteforce_angle which now skips def_delta and falls through to
+            -- BF:opposite. No side decision changes here; this note tags the case.
+            if s.defensive_aa and s.aa_type == "jitter" and (s.missed or 0) >= 2 and real_active == 0 then
+                cs_log_verbose("jitter+defAA+no-samples: BF:opposite path preferred idx=%d", Ent:get_index())
+            end
             local do_flip
             -- V9.47: a learned side-conflict overrides the high-bt "keep" ONLY when our
             -- angle was NOT actually on-target. A clean stale-record reject (the reason
@@ -4157,12 +4191,20 @@ local function pick_bruteforce_angle(s, anim, eye_yaw, max_desync, p, preset)
     -- V7.8: static / slow-walker → finer BF cycle
     -- V9.5: defensive_aa with def_delta fingerprint → use learned magnitude
     local bf_list = preset.bruteforce
-    if s.defensive_aa and (s.def_samples or 0) >= 1 and (s.def_delta or 0) > 10 then
+    if s.defensive_aa and s.aa_type ~= "jitter" and (s.def_samples or 0) >= 1 and (s.def_delta or 0) > 10 then
         -- DEF-AA enemy jumps ~def_delta post-fire. Try learned magnitude both sides + variants.
         local dd = math.floor(s.def_delta)
         bf_list = {"def+", "def-", "opposite", "def+wide", "def-wide", "+58", "-58", "0"}
         -- store dynamic magnitude in state for use below
         s.bf_def_delta = dd
+    elseif s.defensive_aa and s.aa_type == "jitter" and (s.def_samples or 0) >= 1 and (s.def_delta or 0) > 10 then
+        -- V9.74: jitter AA oscillates between two yaw positions — there is NO stable
+        -- 'defensive delta'. The def_delta cycle (BF:def+) fires fixed angular offsets
+        -- from a defensive fingerprint that don't match jitter's oscillation, so it kept
+        -- whiffing (v9.73 idx=3 BF:def+ 0/1) while BF:opposite (full opposite hemisphere)
+        -- is what actually catches jitter. Skip the def cycle and fall through to the
+        -- standard BF oscillation (preset.bruteforce → reaches BF:opposite).
+        cs_log_verbose("BF:def+ skipped — jitter AA, def_delta cycle inapplicable idx=" .. (p and p:get_index() or -1))
     elseif s.is_slow_target or s.aa_type == "static" then
         bf_list = {"opposite", "+58", "-58", "+45", "-45", "+35", "-35", "+29", "-29", "+20", "-20", "0"}
     end
@@ -4421,9 +4463,19 @@ local function resolve_player(p)
     local anim = GetAnimStateCached(p)
     if not anim or anim == false then return end
 
+    -- V9.74: a scheduled BF:retry (from the server-fail KEEP path) is consumed ONLY
+    -- inside pick_bruteforce_angle, which the air-branch below short-circuits with an
+    -- unconditional `return`. So when an enemy went airborne the same tick a retry was
+    -- pending, the air-branch ate the tick and the kept-side retry never fired (v9.73
+    -- idx=14: KEEP scheduled, logged mode=Air not BF:retry). Skip the air-branch while
+    -- a retry is pending so pick_bruteforce_angle runs and shoots the learned kept-side
+    -- magnitude — airborne enemies keep their desync, so eye_yaw+mag*side is valid in air.
+    local bf_retry_pending = s.serverfail_retry_side
+        and s.serverfail_retry_miss == s.missed
+        and (s.serverfail_retry_until or 0) >= (globals.tickcount or 0)
     -- airborne: enemies still have desync in air. Use server-yaw reconstruction
     -- (old approach assumed 0 desync → broke on nospread)
-    if tick_cache.ui_air_resolve and not anim.m_bOnGround then  -- V9.71: per-tick cached
+    if tick_cache.ui_air_resolve and not anim.m_bOnGround and not bf_retry_pending then  -- V9.71: per-tick cached; V9.74: yield to pending BF:retry
         s.mode = "Air"
         -- V9.34: keep yaw_cache / yaw_rate warm during air-time. The air-branch used
         -- to return BEFORE update_jitter ran, so the jitter buffer went stale (wrong
@@ -5979,5 +6031,6 @@ _cs_log_color_raw("V9.63: two-side switcher fixes — (A) BF 'opposite' now inve
 _cs_log_color_raw("V9.62: serverfail-retry magnitude USE-SITE guard (V9.44 fixed the setter, this guards the getter) — if the stored serverfail_retry_mag deviates >15° from the CURRENT learned per-side desync, the stored value is suspect (slot reuse / poisoned from an earlier engagement) and the fresh learned magnitude is used instead. Caught idx=11: BF:retry fired -44.5° on a proven 25.4° enemy (learned L=24.9°), a 19.6° overshoot whose origin wasn't derivable from the shot's own data. Free hardening: agrees with stored when sane, overrides only on wild drift.")
 _cs_log_color_raw("V9.61: sticky AA-classification for well-learned enemies — once we've HIT an enemy 4+ times (real_active), reclassifying its AA type on borderline yaw_cache noise just thrashes the resolver mode/label every few seconds (logs: idx=5 still+slow enemy flapped jitter<->static 6+ times while hitting 4/4; the slow flap dodged the 10s anti-flap window). Cold enemies stay responsive (7 evals / 2s lock); learned ones now need 14 consecutive evals + 4s lock to flip. measured_desync + side adapt independently so slower aa_type ≠ worse aim — pure smoothness. No hit-path change.")
 _cs_log_color_raw("V9.60: 'Air*' no longer pollutes best_mode storage — Air/Air-Alt/Air-CorrFlip are POSITIONAL (enemy airborne), not an AA-pattern, but were saved as best_static/best_switch when an enemy was hit mid-air. The known-player fast-path never uses them (only acts on Static/Jitter) so zero benefit, but intel.mode_match compared the grounded resolve (e.g. Static-Meas) against the stored 'Air' → false mismatch → +15 conf cancel threshold → good shots cancelled on known enemies (logs: idx=3 sw=Air, name_369738400 s=Air). Added '^Air' to the save-filter + the load migration (same V9.0 precedent that dropped BF:/*-Guess). Stats/cancel only, no aim-path change.")
+_cs_log_color_raw("V9.74: jitter+defAA BF fix + dump visibility + air/BF:retry guard (v9.73 logs). (1) pick_bruteforce_angle SKIPS the def_delta (BF:def+) cycle when aa_type=='jitter' — jitter oscillates between two yaw positions so there is NO stable defensive delta; BF:def+ kept whiffing (idx=3 0/1) while BF:opposite (full opposite hemisphere) is what catches jitter. Falls through to the standard BF oscillation; aim_ack logs the jitter+defAA+no-samples case. (2) copy-dump [P] lines now show passive_n_left/right as pL=/pR= so the v9.72 passive-side-keep is verifiable from a dump. (3) resolve_player air-branch YIELDS to a pending BF:retry — the retry is consumed only inside pick_bruteforce_angle, which the air-branch short-circuits with an unconditional return, so a KEEP-scheduled retry that coincided with the enemy going airborne was eaten (idx=14 KEEP scheduled, logged mode=Air not BF:retry). (4) IMPROVEMENT HINTS: jitter+defAA hint + 0-real/30+passive-obs hint.")
 _cs_log_color_raw("Logging: " .. (log_enabled:get() and ("ON" .. (log_verbose:get() and " (verbose)" or ""))  or "OFF"))
 _cs_log_color_raw("=========================================")
