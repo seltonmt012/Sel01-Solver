@@ -1,12 +1,22 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Config — Neverlose CSGO HvH config        ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 3.17                                   ║
+-- ║  Version: 3.28                                   ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Config
 -- @author seltonmt01
--- @version 3.27
--- @description Smart freestand (anti-headshot):
+-- @version 3.28
+-- @description AI Peek (auto peek-shoot-retreat):
+--   * New Movement feature (default OFF). When an enemy is within Max Range and
+--     the equipped weapon matches the filter, the bot strafes out toward the
+--     target for a short peek window (cmd.move, WalkBot-style — aiming stays with
+--     the ragebot), raises ragebot Hit Chance + optionally drops Safe Points for
+--     that window only, then strafes back to the cover anchor. Hold-hotkey or
+--     always-on trigger, rate-limited. Original Sel01 code (inspired by, not a
+--     copy of, angelwings). HEURISTIC range/weapon gate — NOT a physics hit-sim.
+--   * The HC / Safe-Point writes deliberately break the v9.18 never-override rule
+--     (user-requested full-send) and are restored the instant the peek ends.
+-- @description-prev Smart freestand (anti-headshot):
 --   * NL freestanding is deterministic — it always picks the same "safe" side, so a
 --     resolver models it and headshots the predictably-exposed side (user report:
 --     "head outside because of freestand"). New OFF→ON toggle auto-DISABLES freestand
@@ -53,7 +63,7 @@
 --     variance for full per-side chaos.
 --   * MAG-JIT indicator added to bottom HvH strip; dumped in v3.8 stats.
 
-local SEL01_CFG_VERSION = "3.27"
+local SEL01_CFG_VERSION = "3.28"
 
 -- DEBUG: print to CSGO console at major load checkpoints. Plain print() bypasses
 -- NL chat (which may not flush before crash) and writes directly to CSGO console.
@@ -233,6 +243,28 @@ local mv_peek_hc      = g_move:slider("Peek HC", 10, 80, 30)
 g_move:label(" ")
 g_move:label(accent .. "  Bind same key as NL Peek Assist for 2-in-1")
 g_move:label(accent .. "  Slow-walk / Fake-duck: NL Anti Aim/Misc tab")
+
+-- V3.28: AI Peek — original Sel01 auto peek→shoot→retreat (inspired by the
+-- angelwings feature; NOT a copy of its code). HEURISTIC, not a physics hit-
+-- simulation: when an enemy is in range + the weapon matches the filter the bot
+-- strafes out toward the target for a short "peek" window (driving cmd.move like
+-- the WalkBot), raises ragebot Hit Chance + optionally drops Safe Points for that
+-- window only, then strafes back to the cover anchor. The HC / Safe-Point writes
+-- deliberately BREAK the v9.18 never-override rule (user-requested full-send) and
+-- are restored the tick the peek ends / feature disables. Default OFF.
+g_move:label(" ")
+g_move:label(accent .. ui.get_icon"crosshairs" .. accent .. "  AI Peek (auto peek-shoot-retreat)")
+local mv_aipeek        = g_move:switch("Enable AI Peek", false)
+local mv_aipeek_mode   = g_move:combo("AI Peek Trigger", {"Hold Hotkey", "Always On"}, 1)
+local mv_aipeek_key    = g_move:hotkey("AI Peek Key (hold)")
+local mv_aipeek_range  = g_move:slider("Max Range (u)", 200, 4000, 2500)
+local mv_aipeek_hold   = g_move:slider("Peek Hold (ms)", 100, 600, 280)
+local mv_aipeek_retr   = g_move:slider("Retreat (ms)", 100, 1000, 280)
+local mv_aipeek_rate   = g_move:slider("Rate Limit (ms)", 0, 3000, 200)
+local mv_aipeek_hc     = g_move:slider("Peek Hit Chance (0=keep NL)", 0, 100, 35)
+local mv_aipeek_unsafe = g_move:switch("Unsafety (drop Safe Points during peek)", false)
+local mv_aipeek_wpn    = g_move:combo("Weapon Filter", {"All", "Snipers only", "Pistols only", "Deagle only"}, 1)
+local mv_aipeek_dev    = g_move:switch("Dev Mode (console debug)", false)
 
 -- ══════════════════════════════════════════════════════════════════════════
 -- VISUALS UI
@@ -1066,6 +1098,188 @@ local function fake_lag_variance_tick()
     aa_state.fl_active = true
 end
 
+-- ══════════════════════════════════════════════════════════════════════════
+-- AI PEEK (V3.28) — auto peek → shoot → retreat state machine. Original code.
+-- ══════════════════════════════════════════════════════════════════════════
+local ai_peek = {
+    phase     = "idle",   -- idle | peek | retreat
+    until_t   = 0,
+    last_peek = 0,
+    anchor_x  = 0, anchor_y = 0,
+    tx = 0, ty = 0,
+    hc_active = false,
+    sp_active = false,
+    dev_t     = 0,
+}
+
+local function ai_peek_origin(ent)
+    local o = nil
+    pcall(function() o = ent.m_vecOrigin end)
+    return o
+end
+
+-- weapon filter: combo :get() returns the option STRING (NL convention)
+local function ai_peek_weapon_ok()
+    local sel = "All"
+    pcall(function() sel = mv_aipeek_wpn:get() end)
+    if sel == "All" then return true end
+    local name = ""
+    pcall(function()
+        local lp = entity.get_local_player()
+        local w  = lp and lp:get_weapon()
+        if w then name = tostring(w:get_name() or ""):lower() end
+    end)
+    if name == "" then return true end   -- unknown weapon → don't block the peek
+    if sel == "Snipers only" then
+        return (name:find("ssg") or name:find("awp") or name:find("scar") or name:find("g3sg")) and true or false
+    elseif sel == "Pistols only" then
+        return (name:find("glock") or name:find("hkp2000") or name:find("usp") or name:find("p250")
+            or name:find("fiveseven") or name:find("tec9") or name:find("cz75") or name:find("elite")
+            or name:find("deagle") or name:find("revolver")) and true or false
+    elseif sel == "Deagle only" then
+        return (name:find("deagle") or name:find("revolver")) and true or false
+    end
+    return true
+end
+
+-- nearest alive non-dormant enemy (WalkBot get_enemies pattern). Returns x,y,z,dist
+local function ai_peek_nearest(lp, lo)
+    local best, bx, by, bz, bd = nil, 0, 0, 0, math.huge
+    local players = nil
+    pcall(function() players = entity.get_players(true) end)
+    if not players then return nil end
+    for _, e in ipairs(players) do
+        local alive = false
+        pcall(function() alive = e:is_alive() end)
+        local dorm = false
+        pcall(function() dorm = e:is_dormant() end)
+        if alive and not dorm and e ~= lp then
+            local o = ai_peek_origin(e)
+            if o then
+                local dx, dy, dz = o.x - lo.x, o.y - lo.y, o.z - lo.z
+                local d = math.sqrt(dx * dx + dy * dy + dz * dz)
+                if d < bd then bd = d; best = e; bx = o.x; by = o.y; bz = o.z end
+            end
+        end
+    end
+    if best then return bx, by, bz, bd end
+    return nil
+end
+
+-- raise ragebot HC + optionally drop Safe Points for the peek window only.
+-- BREAKS the never-override rule on purpose (user-requested). Restored on (false).
+local function ai_peek_set_overrides(on)
+    if on then
+        local hc = 0
+        pcall(function() hc = mv_aipeek_hc:get() end)
+        if hc and hc > 0 and nl_refs.rage_hc then
+            nl_override(nl_refs.rage_hc, hc)
+            ai_peek.hc_active = true
+        end
+        local unsafe = false
+        pcall(function() unsafe = mv_aipeek_unsafe:get() end)
+        if unsafe and nl_refs.rage_safepoint then
+            -- Safe Points is a COMBO on this build — string :override only (bool
+            -- segfaults). "Off" is best-effort; pcall'd so a bad label no-ops.
+            pcall(function() nl_refs.rage_safepoint:override("Off") end)
+            ai_peek.sp_active = true
+        end
+    else
+        if ai_peek.hc_active then
+            pcall(function() if nl_refs.rage_hc then nl_refs.rage_hc:override() end end)
+            ai_peek.hc_active = false
+        end
+        if ai_peek.sp_active then
+            pcall(function() if nl_refs.rage_safepoint then nl_refs.rage_safepoint:override() end end)
+            ai_peek.sp_active = false
+        end
+    end
+end
+
+local function ai_peek_dev(msg)
+    if not (mv_aipeek_dev and mv_aipeek_dev:get()) then return end
+    local now = globals.realtime or 0
+    if now - (ai_peek.dev_t or 0) < 0.5 then return end
+    ai_peek.dev_t = now
+    cs_log("[AI-Peek] " .. tostring(msg))
+end
+
+local function ai_peek_tick(cmd)
+    -- master/feature/cmd gate → restore any live overrides + reset
+    if not (cmd and enable_master:get() and mv_aipeek and mv_aipeek:get()) then
+        if ai_peek.phase ~= "idle" or ai_peek.hc_active or ai_peek.sp_active then
+            ai_peek_set_overrides(false)
+            ai_peek.phase = "idle"
+        end
+        return
+    end
+    local lp = entity.get_local_player()
+    if not lp then return end
+    local alive = false
+    pcall(function() alive = lp:is_alive() end)
+    if not alive then
+        if ai_peek.phase ~= "idle" or ai_peek.hc_active or ai_peek.sp_active then
+            ai_peek_set_overrides(false); ai_peek.phase = "idle"
+        end
+        return
+    end
+
+    local lo = ai_peek_origin(lp)
+    if not lo then return end
+    local now = globals.realtime or 0
+
+    -- trigger gate (hold-hotkey vs always-on)
+    local triggered = true
+    local mode = "Hold Hotkey"
+    pcall(function() mode = mv_aipeek_mode:get() end)
+    if mode == "Hold Hotkey" then
+        triggered = (mv_aipeek_key and mv_aipeek_key:get()) and true or false
+    end
+
+    if ai_peek.phase == "idle" then
+        if not triggered then return end
+        if now - (ai_peek.last_peek or 0) < ((mv_aipeek_rate:get() or 0) / 1000) then return end
+        if not ai_peek_weapon_ok() then ai_peek_dev("weapon filtered"); return end
+        local tx, ty, tz, td = ai_peek_nearest(lp, lo)
+        if not tx then ai_peek_dev("no target"); return end
+        if td > (mv_aipeek_range:get() or 2500) then
+            ai_peek_dev("too far " .. math.floor(td)); return
+        end
+        ai_peek.anchor_x, ai_peek.anchor_y = lo.x, lo.y
+        ai_peek.tx, ai_peek.ty = tx, ty
+        ai_peek.phase   = "peek"
+        ai_peek.until_t = now + ((mv_aipeek_hold:get() or 280) / 1000)
+        ai_peek_set_overrides(true)
+        ai_peek_dev("PEEK dist=" .. math.floor(td))
+        return
+    end
+
+    if ai_peek.phase == "peek" then
+        -- strafe toward target to gain the sightline (world-space move_yaw,
+        -- independent of view → ragebot keeps aiming freely)
+        local ang = math.deg(math.atan2(ai_peek.ty - lo.y, ai_peek.tx - lo.x))
+        pcall(function() cmd.move_yaw = ang; cmd.forwardmove = 450 end)
+        if now >= ai_peek.until_t then
+            ai_peek.phase   = "retreat"
+            ai_peek.until_t = now + ((mv_aipeek_retr:get() or 280) / 1000)
+            ai_peek_set_overrides(false)   -- restore NL config the moment we pull back
+            ai_peek_dev("RETREAT")
+        end
+        return
+    end
+
+    if ai_peek.phase == "retreat" then
+        local ang = math.deg(math.atan2(ai_peek.anchor_y - lo.y, ai_peek.anchor_x - lo.x))
+        pcall(function() cmd.move_yaw = ang; cmd.forwardmove = 450 end)
+        if now >= ai_peek.until_t then
+            ai_peek.phase     = "idle"
+            ai_peek.last_peek = now
+            ai_peek_dev("idle")
+        end
+        return
+    end
+end
+
 -- Single createmove handler that runs movement + NL-visual override sync.
 -- V1.5: also drains pending_preset so preset writes happen OUTSIDE menu callback.
 -- V2.0: dirty-track restored (only write NL :override on toggle change)
@@ -1078,6 +1292,8 @@ local function createmove_unified(cmd)
     end
 
     createmove_handler(cmd)
+    -- V3.28: AI Peek state machine (cheap, internally gated; default OFF)
+    pcall(ai_peek_tick, cmd)
     -- V2.0: AA periodic sync restored (still throttled + alive-checked + lazy).
     aa_periodic_sync()
     -- V3.6: fake-lag variance loop (cheap, internally throttled)
