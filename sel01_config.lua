@@ -1,12 +1,20 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Config — Neverlose CSGO HvH config        ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 3.28                                   ║
+-- ║  Version: 3.29                                   ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Config
 -- @author seltonmt01
--- @version 3.28
--- @description AI Peek (auto peek-shoot-retreat):
+-- @version 3.29
+-- @description AI Peek hittable-gate (only peek when min-dmg shot exists):
+--   * v3.28 peeked at any in-range enemy → walked constantly. v3.29 arms the
+--     peek ONLY while a fresh events.aim_fire (estimated damage >= the user's NL
+--     Min. Damage) says the enemy is provably hittable. No shootable enemy → no
+--     aim_fire → the bot holds position. Peek direction now comes from the
+--     aim_fire world aim point (event.aim — safe vector, no entity read).
+--   * aim_fire re-enabled (disabled since the v1.13 bisect) for THIS gate only;
+--     reads numeric fields + the aim vector, never event.target's entity props.
+-- @description-prev AI Peek (auto peek-shoot-retreat):
 --   * New Movement feature (default OFF). When an enemy is within Max Range and
 --     the equipped weapon matches the filter, the bot strafes out toward the
 --     target for a short peek window (cmd.move, WalkBot-style — aiming stays with
@@ -63,7 +71,7 @@
 --     variance for full per-side chaos.
 --   * MAG-JIT indicator added to bottom HvH strip; dumped in v3.8 stats.
 
-local SEL01_CFG_VERSION = "3.28"
+local SEL01_CFG_VERSION = "3.29"
 
 -- DEBUG: print to CSGO console at major load checkpoints. Plain print() bypasses
 -- NL chat (which may not flush before crash) and writes directly to CSGO console.
@@ -1110,7 +1118,15 @@ local ai_peek = {
     hc_active = false,
     sp_active = false,
     dev_t     = 0,
+    -- V3.29 "hittable" gate: set by the events.aim_fire handler. The NL ragebot
+    -- only fires aim_fire when it has a target whose ESTIMATED damage clears the
+    -- ragebot's Hit Chance + we additionally compare event.damage against the
+    -- user's NL Min. Damage. While that signal is fresh the enemy is provably
+    -- hittable-for-min-dmg → only then do we peek. No fresh signal → bot holds.
+    shootable_until = 0,
+    aim_x = 0, aim_y = 0,  -- world aim point from event.aim (safe vector, no entity read)
 }
+local AI_PEEK_SHOOTABLE_FRESH = 0.35   -- seconds an aim_fire keeps the peek "armed"
 
 local function ai_peek_origin(ent)
     local o = nil
@@ -1240,9 +1256,17 @@ local function ai_peek_tick(cmd)
         if not triggered then return end
         if now - (ai_peek.last_peek or 0) < ((mv_aipeek_rate:get() or 0) / 1000) then return end
         if not ai_peek_weapon_ok() then ai_peek_dev("weapon filtered"); return end
-        local tx, ty, tz, td = ai_peek_nearest(lp, lo)
-        if not tx then ai_peek_dev("no target"); return end
-        if td > (mv_aipeek_range:get() or 2500) then
+        -- V3.29 HITTABLE GATE: only peek while a fresh aim_fire (damage >= NL min
+        -- dmg) has armed us. No shootable enemy → no aim_fire → bot stays put
+        -- instead of walking constantly.
+        if now >= (ai_peek.shootable_until or 0) then ai_peek_dev("not hittable (no min-dmg shot)"); return end
+        -- direction: prefer the armed aim point; fall back to nearest enemy.
+        local tx, ty = ai_peek.aim_x, ai_peek.aim_y
+        local td
+        local nx, ny, nz, nd = ai_peek_nearest(lp, lo)
+        if nx then td = nd; if not (tx ~= 0 or ty ~= 0) then tx, ty = nx, ny end end
+        if (tx == 0 and ty == 0) and not nx then ai_peek_dev("no target"); return end
+        if td and td > (mv_aipeek_range:get() or 2500) then
             ai_peek_dev("too far " .. math.floor(td)); return
         end
         ai_peek.anchor_x, ai_peek.anchor_y = lo.x, lo.y
@@ -1250,7 +1274,7 @@ local function ai_peek_tick(cmd)
         ai_peek.phase   = "peek"
         ai_peek.until_t = now + ((mv_aipeek_hold:get() or 280) / 1000)
         ai_peek_set_overrides(true)
-        ai_peek_dev("PEEK dist=" .. math.floor(td))
+        ai_peek_dev("PEEK armed dist=" .. (td and math.floor(td) or "?"))
         return
     end
 
@@ -1332,7 +1356,35 @@ local update_clantag = function() end
 -- V1.13 BISECT: aim_fire / ragebot_fire / weapon_fire / aim_ack / player_hurt
 -- registrations DISABLED. on_local_fire kept as a stub for any future re-enable.
 local function on_local_fire(event) end
-_hooks_status.aim_fire = nil   -- not registered in v1.13
+
+-- V3.29: aim_fire RE-ENABLED for the AI Peek "hittable" gate ONLY. aim_ack +
+-- player_hurt came back safely after the v1.13 bisect; this handler is stricter
+-- still — it reads ONLY numeric fields (event.damage / event.hitchance) and the
+-- event.aim VECTOR. It NEVER touches event.target's entity properties (the
+-- transition-state crash source). NL fires aim_fire when the ragebot commits a
+-- shot; we mark the enemy "hittable" only when the estimated damage clears the
+-- user's NL Min. Damage, arming the peek for AI_PEEK_SHOOTABLE_FRESH seconds.
+pcall(function()
+    if events.aim_fire then
+        events.aim_fire:set(function(event)
+            pcall(function()
+                if not event then return end
+                if not (mv_aipeek and mv_aipeek:get()) then return end
+                local dmg = tonumber(event.damage) or 0
+                local mindmg = 1
+                pcall(function() mindmg = tonumber(nl_refs.rage_mindmg and nl_refs.rage_mindmg:get()) or 1 end)
+                if dmg < mindmg then return end          -- NOT hittable for the configured min dmg
+                local now = globals.realtime or 0
+                ai_peek.shootable_until = now + AI_PEEK_SHOOTABLE_FRESH
+                local a = event.aim
+                if a then
+                    pcall(function() ai_peek.aim_x, ai_peek.aim_y = a.x, a.y end)
+                end
+            end)
+        end)
+        _hooks_status.aim_fire = "aim_fire"
+    end
+end)
 
 -- V1.13 BISECT: weapon_fire handler DISABLED (no registration). If config is
 -- stable with this off, FD-assist or weapon_fire-related code is the crash.
