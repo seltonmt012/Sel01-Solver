@@ -5,8 +5,14 @@
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 9.74
--- @description v9.74 jitter+defAA BF fix + passive-side dump visibility + air/BF:retry guard:
+-- @version 9.75
+-- @description v9.75 AIR magnitude boost (port of ground Networked-Boost, hits 4/4=100%):
+--   * resolve_player air-branch boosts an undershot RebuildServerYaw magnitude to the
+--     known measured/passive air magnitude (keeps the rebuilt side) in the trust-rebuild
+--     fall-through. RebuildServerYaw gives a good SIDE but undershoots magnitude in air —
+--     a never-hit-but-passively-known air enemy got the raw short angle and missed
+--     (real-dump idx=9: passive/measured 33.9°, rebuild +15° R, 18.9° short → miss → hit).
+-- @description-prev v9.74 jitter+defAA BF fix + passive-side dump visibility + air/BF:retry guard:
 --   * Issue 1 pick_bruteforce_angle skips the def_delta (BF:def+) cycle when
 --     aa_type=="jitter" — jitter oscillation has no stable defensive delta, so
 --     BF:def+ whiffed (v9.73 idx=3 0/1) while BF:opposite catches it. Falls through
@@ -95,7 +101,7 @@
 --   * v9.26 drift-bump (alpha 0.55 on 5-10° diff) still handles small shifts.
 --   * v9.29 coach variants carry.
 
-local SEL01_VERSION = "9.74"
+local SEL01_VERSION = "9.75"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -4482,6 +4488,29 @@ local function resolve_player(p)
         -- aa_type the moment they land) and air-spin was invisible. pcall-guarded inside.
         update_jitter(p, s)
         local server_yaw = RebuildServerYaw(p) or anim.m_flEyeYaw  -- V9.32: nil=fail → eye_yaw
+        -- V9.75: AIR magnitude boost — port of the ground Networked-Boost (which hits
+        -- 4/4 = 100% in real dumps). RebuildServerYaw returns a reliable SIDE but an
+        -- undershot magnitude in air (it samples a mid-flight feet-yaw). When we know a
+        -- LARGER air magnitude (measured EMA or passive-seeded) keep the rebuilt side and
+        -- boost to it. Applied to the RAW rebuild BEFORE the side-specific blocks below —
+        -- those overwrite server_yaw when they fire, so this only survives in the
+        -- trust-rebuild fall-through (the never-hit-but-passively-known air enemy that the
+        -- corr-aware/both-sides/cold blocks all skip). Logs: idx=9 passive/measured 33.9°,
+        -- rebuild gave +15° R (correct side, 18.9° short) → missed; boost → on-target.
+        do
+            local _km = ((s.measured_desync or 0) > 5 and s.measured_desync)
+                     or (math.max(s.passive_left or 0, s.passive_right or 0) > 5
+                         and math.max(s.passive_left or 0, s.passive_right or 0)) or 0
+            if _km > 5 then
+                local _syd = NormalizeAngle(server_yaw - anim.m_flEyeYaw)
+                if math.abs(_syd) >= 5 and _km > math.abs(_syd) + 5 then
+                    _km = math.min(_km, 58)
+                    server_yaw = anim.m_flEyeYaw + _km * (_syd >= 0 and 1 or -1)
+                    cs_log_verbose("air-boost idx=%d side=%d rebuild=%.1f → mag=%.1f",
+                                   p:get_index(), (_syd >= 0 and 1 or -1), _syd, _km)
+                end
+            end
+        end
         -- V8.2: switch-AA alternate (both sides hit) → use opposite of last hit
         local both_air = (s.samples_left or 0) >= 1 and (s.samples_right or 0) >= 1
         -- V9.37: best side we know even without a confirmed hit (steam dom → +1), and a
@@ -5996,6 +6025,7 @@ _cs_log_color_raw("V9.34: AIR-branch hardening — per-side magnitude in air cor
 _cs_log_color_raw("V9.35: fast-fire tightened — only fires fast on stable (stddev<12) + well-sampled resolves, hc floors raised (30/45 not 15/22/30). Stops the 'shoots too early' marginal shots that caught bad backtrack records → correction/prediction-error rejects.")
 _cs_log_color_raw("V9.36: snapshot-match REGRESSION FIX — v9.33 matched ack-time tickcount (grabbed the most-recent snapshot, mis-learned sides on rapid fire). Restored event.tick matching of the actual acked shot; kept the stale-reject guard.")
 _cs_log_color_raw("V9.37: AIR first-contact fix (Air was worst @25%) — air guess magnitude biased high (max(median,42), airborne=near-max desync) + first-contact side uses steam-mem dom instead of blind +1.")
+_cs_log_color_raw("V9.75: AIR magnitude boost — the air-branch now boosts an undershot RebuildServerYaw to the known measured/passive air magnitude (keeps the rebuilt side), porting the ground Networked-Boost that already hits 4/4=100%. RebuildServerYaw gives a reliable SIDE but undershoots magnitude in air; a never-hit-but-passively-known air enemy fired the raw short angle and missed (real-dump idx=9: passive/measured 33.9°, rebuild +15° R = correct side 18.9° short → miss). Only fires in the trust-rebuild fall-through (corr-aware / both-sides / cold blocks unchanged).")
 _cs_log_color_raw("V9.38: correction guard is side-aware + correct-angle serverfails retry same side once; BF now trusts strong passive desync before max_desync.")
 _cs_log_color_raw("V9.64: two bimodal/asymmetric fixes from the v9.63 session dump. (1) Air-CorrFlip now respects the V9.63 two_side_switcher guard — it was the worst mode (0/2): on a bimodal enemy it flipped side on corr_diff and fired the FAR-side magnitude on the wrong side (idx=3 shot 51.1° vs meas 23.6, idx=6 29.3° vs 7.6). When both sides have real hits OR bimodal flag set, KEEP the air side, let BF cover both. (2) ack_angle_err now references the PER-SIDE magnitude we actually fire, not the global EMA — idx=1 fired its learned R-side 40.8° on-target but err was computed vs global 31.2° → fake err 9.6 → a clean server-fail got counted as a real miss + mode-blacklisted. Unimodal unchanged.")
 _cs_log_color_raw("V9.39: sample-count EMA alpha ramp (0.55 on hit 1-2, 0.42 on hit 3-4, then 0.30) on global + both per-side — converges in 2-3 hits instead of 5-6, faster + smoother lock (side settles sooner, fewer first-shot mode flips).")
