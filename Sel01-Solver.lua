@@ -5,8 +5,15 @@
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 9.75
--- @description v9.75 AIR magnitude boost (port of ground Networked-Boost, hits 4/4=100%):
+-- @version 9.76
+-- @description v9.76 AA-classify oscillation-freeze (slow-flap fix):
+--   * the V9.10 anti-flap counted commits in a 10s window — a slow static<->switch<->static
+--     revert spread over >10s never hit 4 entries and flapped freely (real-dump idx=3/7/11
+--     at long range on yaw noise; idx=7 mode-thrashed switch->static->switch into a miss
+--     right after a hit). Now an A->B->A revert (commit back to a just-left type) freezes
+--     the classifier 5s regardless of timing; a real progression never reverts so genuine
+--     AA changes are untouched.
+-- @description-prev v9.75 AIR magnitude boost (port of ground Networked-Boost, hits 4/4=100%):
 --   * resolve_player air-branch boosts an undershot RebuildServerYaw magnitude to the
 --     known measured/passive air magnitude (keeps the rebuilt side) in the trust-rebuild
 --     fall-through. RebuildServerYaw gives a good SIDE but undershoots magnitude in air —
@@ -101,7 +108,7 @@
 --   * v9.26 drift-bump (alpha 0.55 on 5-10° diff) still handles small shifts.
 --   * v9.29 coach variants carry.
 
-local SEL01_VERSION = "9.75"
+local SEL01_VERSION = "9.76"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -4722,9 +4729,25 @@ local function resolve_player(p)
                     while #s.commit_history > 0 and (now_rt - s.commit_history[1]) > 10 do
                         table.remove(s.commit_history, 1)
                     end
-                    if #s.commit_history > 3 then
+                    -- V9.76: oscillation-detect freeze. The 10s-window count above is DODGED
+                    -- by slow flaps — a static<->switch<->static revert spread over >10s never
+                    -- accumulates 4 entries (real-dump idx=3/7/11 flapped at long range on
+                    -- yaw-cache noise; idx=7 mode-thrashed switch->static->switch into a miss
+                    -- right after a hit). Detect the REVERT directly: committing back to a type
+                    -- we just left (T_n == T_{n-2}, an A->B->A flap) is noise regardless of
+                    -- timing → freeze. A genuine progression (static->switch->jitter) never
+                    -- reverts, so a real AA change is untouched.
+                    local osc = false
+                    s.recent_committed_types = s.recent_committed_types or {}
+                    for _, t in ipairs(s.recent_committed_types) do
+                        if t == new_type then osc = true break end
+                    end
+                    table.insert(s.recent_committed_types, new_type)
+                    while #s.recent_committed_types > 2 do table.remove(s.recent_committed_types, 1) end
+                    if #s.commit_history > 3 or osc then
                         s.aa_committed_at = now_rt + 5  -- freeze 5s on top of normal lock
-                        cs_log_verbose("aa_type FREEZE idx=%d (>3 flaps in 10s)", p:get_index())
+                        cs_log_verbose("aa_type FREEZE idx=%d → %s (%s)", p:get_index(), new_type,
+                                       osc and "oscillation revert" or ">3 flaps/10s")
                     else
                         cs_log_verbose("aa_type commit idx=%d → %s", p:get_index(), new_type)
                     end
@@ -6025,6 +6048,7 @@ _cs_log_color_raw("V9.34: AIR-branch hardening — per-side magnitude in air cor
 _cs_log_color_raw("V9.35: fast-fire tightened — only fires fast on stable (stddev<12) + well-sampled resolves, hc floors raised (30/45 not 15/22/30). Stops the 'shoots too early' marginal shots that caught bad backtrack records → correction/prediction-error rejects.")
 _cs_log_color_raw("V9.36: snapshot-match REGRESSION FIX — v9.33 matched ack-time tickcount (grabbed the most-recent snapshot, mis-learned sides on rapid fire). Restored event.tick matching of the actual acked shot; kept the stale-reject guard.")
 _cs_log_color_raw("V9.37: AIR first-contact fix (Air was worst @25%) — air guess magnitude biased high (max(median,42), airborne=near-max desync) + first-contact side uses steam-mem dom instead of blind +1.")
+_cs_log_color_raw("V9.76: AA-classify oscillation-freeze — the V9.10 anti-flap counted commits in a 10s window, which a SLOW static<->switch<->static revert (spread >10s) dodged entirely (real-dump idx=3/7/11 flapped at long range on yaw noise; idx=7 mode-thrashed switch->static->switch into a miss right after a hit). Now an A->B->A revert (committing back to a type just left) freezes the classifier 5s regardless of timing. A genuine progression (static->switch->jitter) never reverts so real AA changes are untouched.")
 _cs_log_color_raw("V9.75: AIR magnitude boost — the air-branch now boosts an undershot RebuildServerYaw to the known measured/passive air magnitude (keeps the rebuilt side), porting the ground Networked-Boost that already hits 4/4=100%. RebuildServerYaw gives a reliable SIDE but undershoots magnitude in air; a never-hit-but-passively-known air enemy fired the raw short angle and missed (real-dump idx=9: passive/measured 33.9°, rebuild +15° R = correct side 18.9° short → miss). Only fires in the trust-rebuild fall-through (corr-aware / both-sides / cold blocks unchanged).")
 _cs_log_color_raw("V9.38: correction guard is side-aware + correct-angle serverfails retry same side once; BF now trusts strong passive desync before max_desync.")
 _cs_log_color_raw("V9.64: two bimodal/asymmetric fixes from the v9.63 session dump. (1) Air-CorrFlip now respects the V9.63 two_side_switcher guard — it was the worst mode (0/2): on a bimodal enemy it flipped side on corr_diff and fired the FAR-side magnitude on the wrong side (idx=3 shot 51.1° vs meas 23.6, idx=6 29.3° vs 7.6). When both sides have real hits OR bimodal flag set, KEEP the air side, let BF cover both. (2) ack_angle_err now references the PER-SIDE magnitude we actually fire, not the global EMA — idx=1 fired its learned R-side 40.8° on-target but err was computed vs global 31.2° → fake err 9.6 → a clean server-fail got counted as a real miss + mode-blacklisted. Unimodal unchanged.")
