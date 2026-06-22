@@ -5,8 +5,16 @@
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 9.77
--- @description v9.77 Networked-Boost side-conflict guard + server-fail filter honesty:
+-- @version 9.78
+-- @description v9.78 BF cycle real-dominance ordering:
+--   * pick_bruteforce_angle for static/slow enemies led every BF cycle with
+--     "opposite" (flip to -last_shot_side). On a strongly one-sided real-hit
+--     enemy that flips onto the side they have NEVER been on = a guaranteed
+--     whiff (real-dump: BF:opposite 0/2; idx=7 real 5L/0R flipped R, idx=8
+--     7R-dom flipped L — both missed). Now: real_left/right firmly one-sided
+--     (>=3 dom, 0 other) → sweep MAGNITUDE on the proven side first, demote
+--     "opposite" to last. Balanced/switch/unknown keep opposite-first (V9.63).
+-- @description-prev v9.77 Networked-Boost side-conflict guard + server-fail filter honesty:
 --   * Networked-Boost (ground 4090 + air 4513) trusted RebuildServerYaw's SIDE
 --     blindly while boosting the magnitude. RebuildServerYaw undershoots magnitude
 --     but can also give the WRONG side; on a hard one-sided enemy it boosted onto
@@ -122,7 +130,7 @@
 --   * v9.26 drift-bump (alpha 0.55 on 5-10° diff) still handles small shifts.
 --   * v9.29 coach variants carry.
 
-local SEL01_VERSION = "9.77"
+local SEL01_VERSION = "9.78"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -4268,7 +4276,20 @@ local function pick_bruteforce_angle(s, anim, eye_yaw, max_desync, p, preset)
         -- standard BF oscillation (preset.bruteforce → reaches BF:opposite).
         cs_log_verbose("BF:def+ skipped — jitter AA, def_delta cycle inapplicable idx=" .. (p and p:get_index() or -1))
     elseif s.is_slow_target or s.aa_type == "static" then
-        bf_list = {"opposite", "+58", "-58", "+45", "-45", "+35", "-35", "+29", "-29", "+20", "-20", "0"}
+        -- V9.78: order by REAL-hit dominance. "opposite" as the first BF guess flips
+        -- onto -last_shot_side, which on a strongly one-sided enemy = the side they
+        -- have NEVER been on = a guaranteed whiff (real-dump: BF:opposite 0/2, idx=7
+        -- real 5L/0R flipped R, idx=8 7R-dom flipped L — both missed). When real hits
+        -- are firmly one-sided, sweep MAGNITUDE on the proven dominant side first and
+        -- demote "opposite" to last. Balanced / switch / unknown keeps opposite first
+        -- (correct for genuine alternators — V9.63).
+        local rl, rr = s.real_left or 0, s.real_right or 0
+        if (rl >= 3 and rr == 0) or (rr >= 3 and rl == 0) then
+            local sgn = (rl > rr) and "-" or "+"   -- dominant real side sign
+            bf_list = {sgn.."58", sgn.."45", sgn.."35", sgn.."29", sgn.."20", "0", "opposite"}
+        else
+            bf_list = {"opposite", "+58", "-58", "+45", "-45", "+35", "-35", "+29", "-29", "+20", "-20", "0"}
+        end
     end
 
     local idx = ((s.missed - 1) % #bf_list) + 1
@@ -6104,6 +6125,7 @@ _cs_log_color_raw("V9.35: fast-fire tightened — only fires fast on stable (std
 _cs_log_color_raw("V9.36: snapshot-match REGRESSION FIX — v9.33 matched ack-time tickcount (grabbed the most-recent snapshot, mis-learned sides on rapid fire). Restored event.tick matching of the actual acked shot; kept the stale-reject guard.")
 _cs_log_color_raw("V9.37: AIR first-contact fix (Air was worst @25%) — air guess magnitude biased high (max(median,42), airborne=near-max desync) + first-contact side uses steam-mem dom instead of blind +1.")
 _cs_log_color_raw("V9.77: Networked-Boost side-conflict guard (RebuildServerYaw side can flip on a hard one-sided enemy — real-dump idx=5 streak L=20 R=0, rebuild said R → boosted 29° R twice → 0/2; learned_dom_side now vetoes a wrong-side boost on ground + air) + server-fail filter honesty (a bt=0 err=0 kept-side miss is OUR switch/side misprediction not netcode; err<=5 branch now needs bt>=4 — real-dump idx=5 had ~14 bt=0/2 keeps excused, headline 86.7% vs raw 59.1%).")
+_cs_log_color_raw("V9.78: BF cycle real-dominance ordering — pick_bruteforce_angle led every static/slow BF cycle with 'opposite' (flip to -last_shot_side), which on a firmly one-sided enemy flips onto the side they have NEVER been on = guaranteed whiff (real-dump BF:opposite 0/2; idx=7 real 5L/0R flipped R, idx=8 7R-dom flipped L). Now real_left/right one-sided (>=3 dom, 0 other) sweeps MAGNITUDE on the proven side first + demotes opposite to last; balanced/switch keep opposite-first (V9.63).")
 _cs_log_color_raw("V9.76: AA-classify oscillation-freeze — the V9.10 anti-flap counted commits in a 10s window, which a SLOW static<->switch<->static revert (spread >10s) dodged entirely (real-dump idx=3/7/11 flapped at long range on yaw noise; idx=7 mode-thrashed switch->static->switch into a miss right after a hit). Now an A->B->A revert (committing back to a type just left) freezes the classifier 5s regardless of timing. A genuine progression (static->switch->jitter) never reverts so real AA changes are untouched.")
 _cs_log_color_raw("V9.75: AIR magnitude boost — the air-branch now boosts an undershot RebuildServerYaw to the known measured/passive air magnitude (keeps the rebuilt side), porting the ground Networked-Boost that already hits 4/4=100%. RebuildServerYaw gives a reliable SIDE but undershoots magnitude in air; a never-hit-but-passively-known air enemy fired the raw short angle and missed (real-dump idx=9: passive/measured 33.9°, rebuild +15° R = correct side 18.9° short → miss). Only fires in the trust-rebuild fall-through (corr-aware / both-sides / cold blocks unchanged).")
 _cs_log_color_raw("V9.38: correction guard is side-aware + correct-angle serverfails retry same side once; BF now trusts strong passive desync before max_desync.")
