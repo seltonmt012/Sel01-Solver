@@ -5,8 +5,22 @@
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 9.76
--- @description v9.76 AA-classify oscillation-freeze (slow-flap fix):
+-- @version 9.77
+-- @description v9.77 Networked-Boost side-conflict guard + server-fail filter honesty:
+--   * Networked-Boost (ground 4090 + air 4513) trusted RebuildServerYaw's SIDE
+--     blindly while boosting the magnitude. RebuildServerYaw undershoots magnitude
+--     but can also give the WRONG side; on a hard one-sided enemy it boosted onto
+--     the wrong side (real-dump idx=5: streak L=20 R=0, real 5L/0R, rebuild said
+--     R → boosted 29° R twice → Networked-Boost 0/2). New learned_dom_side(s) (real
+--     hits / streak only, no seeded/passive) overrides the rebuild side when learned
+--     dominance strongly contradicts it, and uses that side's per-side magnitude.
+--   * server-fail filter (ack_serverfail_like) excused a bt=0 err=0 kept-side miss
+--     as "netcode" — but bt=0 = server used the CURRENT record, no stale replay, so
+--     a correct-magnitude miss there is OUR own side/switch misprediction (the v9.55
+--     note already said so; the code never enforced it). The err<=5 branch now needs
+--     bt>=4 (genuine backtrack); bt 0-3 correct-angle misses COUNT (real-dump idx=5
+--     had ~14 bt=0/2 keeps filtered → headline 86.7% vs raw 59.1%, a 27pt lie).
+-- @description-prev v9.76 AA-classify oscillation-freeze (slow-flap fix):
 --   * the V9.10 anti-flap counted commits in a 10s window — a slow static<->switch<->static
 --     revert spread over >10s never hit 4 entries and flapped freely (real-dump idx=3/7/11
 --     at long range on yaw noise; idx=7 mode-thrashed switch->static->switch into a miss
@@ -108,7 +122,7 @@
 --   * v9.26 drift-bump (alpha 0.55 on 5-10° diff) still handles small shifts.
 --   * v9.29 coach variants carry.
 
-local SEL01_VERSION = "9.76"
+local SEL01_VERSION = "9.77"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -1152,6 +1166,25 @@ function alt_side_pick(s)
     if sr >= sl + 2 then return  1 end
     if (s.last_hit_side or 0) > 0 then return -1 end
     if (s.last_hit_side or 0) < 0 then return  1 end
+    return 0
+end
+
+-- V9.77: STRONG learned-dominance side from REAL data only (real hits + streak),
+-- never seeded/passive sample counts (those mispin — the v9.48 lesson). Returns
+-- -1 (L), +1 (R), or 0 (no strong signal). Used to veto a wrong-side magnitude
+-- BOOST: RebuildServerYaw gives an undershot but usually-right side, EXCEPT on a
+-- hard one-sided enemy where it can flip — there the learned dom must win
+-- (real-dump idx=5: streak L=20 R=0, real 5L/0R, rebuild said R → Networked-Boost
+-- boosted 29° R twice → 0/2). Returns 0 for passive-only enemies (no real hits,
+-- no streak) so the air-boost's never-hit-but-known case keeps the rebuild side.
+function learned_dom_side(s)
+    if not s then return 0 end
+    local rl, rr = s.real_left or 0, s.real_right or 0
+    if rl >= rr + 2 then return -1 end
+    if rr >= rl + 2 then return  1 end
+    local stl, str = s.hit_streak_left or 0, s.hit_streak_right or 0
+    if stl >= str + 2 then return -1 end
+    if str >= stl + 2 then return  1 end
     return 0
 end
 
@@ -2752,8 +2785,14 @@ events.aim_ack:set(function(event)
             end
         end
         local ack_resolverish = ack_reason == "correction" or ack_reason == "prediction error" or ack_reason == "prediction_error"
+        -- V9.77: the err<=5 (correct-magnitude) branch now ALSO needs genuine backtrack
+        -- (bt >= 4). bt=0 means the server used the CURRENT record (no stale replay), so
+        -- a correct-magnitude miss there is OUR own side/switch misprediction, not netcode
+        -- — the v9.55 note said exactly this but the code never enforced it (real-dump
+        -- idx=5: ~14 bt=0/2 keeps excused → headline 86.7% vs raw 59.1%). bt>8 still
+        -- filters outright (clean stale-record reject regardless of our angle theory).
         local ack_serverfail_like = ack_resolverish and ack_shot_side ~= 0 and not ack_side_bad
-                                     and ((ack_side_measured > 5 and ack_angle_err <= 5) or bt > 8)
+                                     and ((ack_side_measured > 5 and ack_angle_err <= 5 and bt >= 4) or bt > 8)
         -- V9.49: a CONFIRMED server-fail keep (correct angle, high bt, side kept) is not
         -- a resolver fault. Logs showed these polluting the headline hit-rate badly:
         -- idx=9 fired the SAME correct -21.8° three times into a declining stale record
@@ -4090,8 +4129,18 @@ local function _pick_first_shot_impl(p, s, anim, eye_yaw, max_desync, preset)
         if s.desync_samples >= 2 and s.measured_desync > math.abs(sy_delta) then
             -- measured suggests bigger desync — boost to measured magnitude, keep side
             local side = sy_delta >= 0 and 1 or -1
+            -- V9.77: side-conflict guard. RebuildServerYaw's side can be WRONG on a hard
+            -- one-sided enemy (real-dump idx=5: streak L=20 R=0, rebuild said R → boosted
+            -- 29° R twice → 0/2). When learned dom (real hits / streak only) strongly
+            -- contradicts, trust dom + use its per-side magnitude.
+            local mag = s.measured_desync
+            local dom = learned_dom_side(s)
+            if dom ~= 0 and dom ~= side then
+                side = dom
+                mag = effective_desync(s, max_desync, side)
+            end
             s.mode = "Networked-Boost"
-            return eye_yaw + s.measured_desync * side
+            return eye_yaw + mag * side
         end
         s.mode = "Networked"
         return sy
@@ -4512,9 +4561,15 @@ local function resolve_player(p)
                 local _syd = NormalizeAngle(server_yaw - anim.m_flEyeYaw)
                 if math.abs(_syd) >= 5 and _km > math.abs(_syd) + 5 then
                     _km = math.min(_km, 58)
-                    server_yaw = anim.m_flEyeYaw + _km * (_syd >= 0 and 1 or -1)
+                    local _bside = (_syd >= 0 and 1 or -1)
+                    -- V9.77: same side-conflict guard as ground Networked-Boost. dom is 0
+                    -- for the passive-only never-hit case this boost targets (idx=9), so the
+                    -- rebuild side stays; only a REAL one-sided enemy vetoes a wrong side.
+                    local _dom = learned_dom_side(s)
+                    if _dom ~= 0 and _dom ~= _bside then _bside = _dom end
+                    server_yaw = anim.m_flEyeYaw + _km * _bside
                     cs_log_verbose("air-boost idx=%d side=%d rebuild=%.1f → mag=%.1f",
-                                   p:get_index(), (_syd >= 0 and 1 or -1), _syd, _km)
+                                   p:get_index(), _bside, _syd, _km)
                 end
             end
         end
@@ -6048,6 +6103,7 @@ _cs_log_color_raw("V9.34: AIR-branch hardening — per-side magnitude in air cor
 _cs_log_color_raw("V9.35: fast-fire tightened — only fires fast on stable (stddev<12) + well-sampled resolves, hc floors raised (30/45 not 15/22/30). Stops the 'shoots too early' marginal shots that caught bad backtrack records → correction/prediction-error rejects.")
 _cs_log_color_raw("V9.36: snapshot-match REGRESSION FIX — v9.33 matched ack-time tickcount (grabbed the most-recent snapshot, mis-learned sides on rapid fire). Restored event.tick matching of the actual acked shot; kept the stale-reject guard.")
 _cs_log_color_raw("V9.37: AIR first-contact fix (Air was worst @25%) — air guess magnitude biased high (max(median,42), airborne=near-max desync) + first-contact side uses steam-mem dom instead of blind +1.")
+_cs_log_color_raw("V9.77: Networked-Boost side-conflict guard (RebuildServerYaw side can flip on a hard one-sided enemy — real-dump idx=5 streak L=20 R=0, rebuild said R → boosted 29° R twice → 0/2; learned_dom_side now vetoes a wrong-side boost on ground + air) + server-fail filter honesty (a bt=0 err=0 kept-side miss is OUR switch/side misprediction not netcode; err<=5 branch now needs bt>=4 — real-dump idx=5 had ~14 bt=0/2 keeps excused, headline 86.7% vs raw 59.1%).")
 _cs_log_color_raw("V9.76: AA-classify oscillation-freeze — the V9.10 anti-flap counted commits in a 10s window, which a SLOW static<->switch<->static revert (spread >10s) dodged entirely (real-dump idx=3/7/11 flapped at long range on yaw noise; idx=7 mode-thrashed switch->static->switch into a miss right after a hit). Now an A->B->A revert (committing back to a type just left) freezes the classifier 5s regardless of timing. A genuine progression (static->switch->jitter) never reverts so real AA changes are untouched.")
 _cs_log_color_raw("V9.75: AIR magnitude boost — the air-branch now boosts an undershot RebuildServerYaw to the known measured/passive air magnitude (keeps the rebuilt side), porting the ground Networked-Boost that already hits 4/4=100%. RebuildServerYaw gives a reliable SIDE but undershoots magnitude in air; a never-hit-but-passively-known air enemy fired the raw short angle and missed (real-dump idx=9: passive/measured 33.9°, rebuild +15° R = correct side 18.9° short → miss). Only fires in the trust-rebuild fall-through (corr-aware / both-sides / cold blocks unchanged).")
 _cs_log_color_raw("V9.38: correction guard is side-aware + correct-angle serverfails retry same side once; BF now trusts strong passive desync before max_desync.")
