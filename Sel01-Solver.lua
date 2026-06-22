@@ -5,7 +5,7 @@
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 9.81
+-- @version 9.82
 -- @description v9.79 BF real-dominance ordering broadened to switch AA:
 --   * v9.78 only reordered the static/slow BF branch. This lobby's one-sided
 --     locks were aa=switch (idx=8 real 10R/0L still fired BF:opposite LEFT;
@@ -132,7 +132,7 @@
 --   * v9.26 drift-bump (alpha 0.55 on 5-10° diff) still handles small shifts.
 --   * v9.29 coach variants carry.
 
-local SEL01_VERSION = "9.81"
+local SEL01_VERSION = "9.82"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -4499,7 +4499,13 @@ local function resolve_player(p)
         -- the whole resolve (boot is pcall'd), leaving the enemy unresolved that tick.
         local lsl, lsr = (lrn and lrn.sl or 0), (lrn and lrn.sr or 0)
         local ldl, ldr = (lrn and lrn.dl or 0), (lrn and lrn.dr or 0)
-        if lrn and (lsl + lsr) >= 5 then
+        -- V9.82: boot gate lowered 5 -> 2. A thinly-saved player (e.g. learned.lua entry
+        -- with 1-3 total hits) never booted, so on reload it re-learned from zero and the
+        -- ESP conf bar dropped to 0 despite having saved data. The per-side EMA fills below
+        -- still require lsl/lsr >= 2 individually, so a 2-total enemy seeds real_*/dom/best
+        -- (enough to restore the bar + dominance) without claiming a per-side magnitude it
+        -- doesn't have. Continuity for ANY saved player, not just well-sampled ones.
+        if lrn and (lsl + lsr) >= 2 then
             -- FIX #5: don't clobber session-learned data on re-track. reset_state keeps
             -- measured_left/right + real_* (only transient counters wiped), but this boot
             -- overwrote the live per-side EMAs with the OLDER persistent LearnedModel values
@@ -4527,6 +4533,12 @@ local function resolve_player(p)
             -- count them as real. Seed when we hold no session real hit on that side yet.
             if not _has_sess_l and lsl >= 1 then s.real_left  = math.min(lsl, 10) end
             if not _has_sess_r and lsr >= 1 then s.real_right = math.min(lsr, 10) end
+            -- V9.82: seed last_seen so confidence()'s age penalty (up to -30 when last_seen
+            -- reads as 0 = "dormant forever") doesn't tank the bar on the first frame after
+            -- a reload boot. resolve_player updates it every tick afterwards.
+            if not s.last_seen or s.last_seen == 0 then
+                s.last_seen = (tick_cache and tick_cache.curtime) or globals.realtime or 0
+            end
             if s.measured_desync == 0 then
                 local total = lsl + lsr
                 if total > 0 then
@@ -6169,6 +6181,7 @@ _cs_log_color_raw("V9.37: AIR first-contact fix (Air was worst @25%) — air gue
 _cs_log_color_raw("V9.77: Networked-Boost side-conflict guard (RebuildServerYaw side can flip on a hard one-sided enemy — real-dump idx=5 streak L=20 R=0, rebuild said R → boosted 29° R twice → 0/2; learned_dom_side now vetoes a wrong-side boost on ground + air) + server-fail filter honesty (a bt=0 err=0 kept-side miss is OUR switch/side misprediction not netcode; err<=5 branch now needs bt>=4 — real-dump idx=5 had ~14 bt=0/2 keeps excused, headline 86.7% vs raw 59.1%).")
 _cs_log_color_raw("V9.78: BF cycle real-dominance ordering — pick_bruteforce_angle led every static/slow BF cycle with 'opposite' (flip to -last_shot_side), which on a firmly one-sided enemy flips onto the side they have NEVER been on = guaranteed whiff (real-dump BF:opposite 0/2; idx=7 real 5L/0R flipped R, idx=8 7R-dom flipped L). Now real_left/right one-sided (>=3 dom, 0 other) sweeps MAGNITUDE on the proven side first + demotes opposite to last; balanced/switch keep opposite-first (V9.63).")
 _cs_log_color_raw("V9.79: BF real-dominance broadened to switch AA — v9.78's reorder was gated to static/slow, but the one-sided locks were aa=switch (idx=8 real 10R/0L still fired BF:opposite LEFT; idx=12 9R/0L fired BF:opposite LEFT) and fell through to the opposite-first default. A >=3-vs-0 REAL split is a confirmed lock regardless of AA-class, so the dominant-side magnitude sweep now applies to ALL non-defensive aa_types. Genuine alternators (real hits both sides, idx=6 L=2 R=1) stay opposite-first.")
+_cs_log_color_raw("V9.82: reload-continuity — two follow-ups to V9.81. (1) Boot gate lowered from (sl+sr)>=5 to >=2: a thinly-saved enemy (1-3 total hits in learned.lua) never booted, so on reload it re-learned from zero and the ESP confidence bar dropped to 0 despite saved data. Per-side EMA fills still need lsl/lsr>=2 each, so a 2-total enemy seeds real_*/dom/best (restores the bar + dominance) without faking a per-side magnitude. (2) Boot now seeds s.last_seen so confidence()'s age penalty (up to -30 when last_seen reads 0) doesn't tank the bar on the first frame after reload.")
 _cs_log_color_raw("V9.81: PERSISTENCE GAP — per-player learning DID save + reload (7 players on disk, boots in dump), but boot restored measured/samples/side/best-modes and NEVER seeded s.real_left/right. The saved sl/sr ARE real hit counts (only bumped on a confirmed hit), yet a known 17-hit enemy rebooted with real_right=0 → one_sided BF ordering (needs real>=3), alt_side_pick real-dominance, and the confidence real-weight cap all stayed OFF. Magnitude + side recalled but the 'locked one side' intelligence did not — looked like nothing persisted. Boot now seeds real_left/right from saved sl/sr (cap 10) when no session real hit held on that side yet.")
 _cs_log_color_raw("V9.80: three fixes targeting the idx=10 problem enemy (def static, miss-rate 50%). (1) SERVER-FAIL FILTER HONESTY — the bt>8 branch pardoned ANY high-backtrack miss outright, even one whose magnitude was also wrong (idx=10 our=57 meas=45 err=11.9 bt=24; idx=9 our=29.7 meas=19.3 err=10.4 bt=25). bt>8 now pardons only when err<=8 (or no measurement); a high-bt + high-err miss COUNTS — headline no longer flattered by our own overshoots. (2) DEF-CYCLE DOMINANCE — a ratio-dominant def enemy (idx=10 real R=5 L=1, not one_sided since L≠0) wasted shots on opposite/wrong-sign (BF:opposite 0%, BF:+58 0%); now leads the proven side's def magnitude + demotes opposite. (3) DEF_DELTA CAP — def_delta latched a lone 57.8° fingerprint while per-side measured R was 45° → BF:def+ overshot 12°; dd now capped toward dominant per-side measured.")
 _cs_log_color_raw("V9.76: AA-classify oscillation-freeze — the V9.10 anti-flap counted commits in a 10s window, which a SLOW static<->switch<->static revert (spread >10s) dodged entirely (real-dump idx=3/7/11 flapped at long range on yaw noise; idx=7 mode-thrashed switch->static->switch into a miss right after a hit). Now an A->B->A revert (committing back to a type just left) freezes the classifier 5s regardless of timing. A genuine progression (static->switch->jitter) never reverts so real AA changes are untouched.")
