@@ -5,7 +5,7 @@
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 9.79
+-- @version 9.80
 -- @description v9.79 BF real-dominance ordering broadened to switch AA:
 --   * v9.78 only reordered the static/slow BF branch. This lobby's one-sided
 --     locks were aa=switch (idx=8 real 10R/0L still fired BF:opposite LEFT;
@@ -132,7 +132,7 @@
 --   * v9.26 drift-bump (alpha 0.55 on 5-10° diff) still handles small shifts.
 --   * v9.29 coach variants carry.
 
-local SEL01_VERSION = "9.79"
+local SEL01_VERSION = "9.80"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -2801,8 +2801,15 @@ events.aim_ack:set(function(event)
         -- — the v9.55 note said exactly this but the code never enforced it (real-dump
         -- idx=5: ~14 bt=0/2 keeps excused → headline 86.7% vs raw 59.1%). bt>8 still
         -- filters outright (clean stale-record reject regardless of our angle theory).
+        -- V9.80: the bt>8 branch used to pardon ANY high-backtrack miss outright, even
+        -- one whose MAGNITUDE was also wrong (idx=10 our=57 meas=45 err=11.9 bt=24,
+        -- idx=9 our=29.7 meas=19.3 err=10.4 bt=25). High bt = stale record likely, but
+        -- err>8 means we'd have whiffed on a FRESH record too = our overshoot, not pure
+        -- netcode. Now bt>8 pardons only when err is also small (or no measurement, where
+        -- err is meaningless). A high-bt + high-err miss COUNTS — keeps headline honest.
         local ack_serverfail_like = ack_resolverish and ack_shot_side ~= 0 and not ack_side_bad
-                                     and ((ack_side_measured > 5 and ack_angle_err <= 5 and bt >= 4) or bt > 8)
+                                     and ((ack_side_measured > 5 and ack_angle_err <= 5 and bt >= 4)
+                                          or (bt > 8 and (ack_side_measured <= 5 or ack_angle_err <= 8)))
         -- V9.49: a CONFIRMED server-fail keep (correct angle, high bt, side kept) is not
         -- a resolver fault. Logs showed these polluting the headline hit-rate badly:
         -- idx=9 fired the SAME correct -21.8° three times into a declining stale record
@@ -4276,7 +4283,25 @@ local function pick_bruteforce_angle(s, anim, eye_yaw, max_desync, p, preset)
     if s.defensive_aa and s.aa_type ~= "jitter" and (s.def_samples or 0) >= 1 and (s.def_delta or 0) > 10 then
         -- DEF-AA enemy jumps ~def_delta post-fire. Try learned magnitude both sides + variants.
         local dd = math.floor(s.def_delta)
-        bf_list = {"def+", "def-", "opposite", "def+wide", "def-wide", "+58", "-58", "0"}
+        -- V9.80: def_delta can latch a LONE fingerprint sample (idx=10 seeded 57.8° from a
+        -- single spread-miss while per-side measured R was 45° → BF:def+ fired 57° = 12°
+        -- overshoot whiff). Cap dd toward the dominant per-side measured when that side has
+        -- real data, so the def cycle can't overshoot a magnitude we already learned.
+        local meas_dom = math.max(s.measured_left or 0, s.measured_right or 0)
+        if meas_dom > 5 and dd > meas_dom + 10 then dd = math.floor(meas_dom + 10) end
+        -- V9.80: order the def cycle by REAL-hit dominance (mirrors the one_sided fix below).
+        -- A ratio-dominant def enemy (idx=10 real R=5 L=1: not one_sided since L≠0, but 5:1 is
+        -- a clear lean) wasted shots — old fixed {def+,def-,opposite,...} tried the wrong
+        -- sign + flipped to the near-never side (BF:opposite 0%, BF:+58 0%). Lead the proven
+        -- side's def magnitude, demote opposite + the weak-side guess to the tail.
+        local rl, rr = s.real_left or 0, s.real_right or 0
+        if (rr >= 3 and rr >= 3 * rl) or (rl >= 3 and rl >= 3 * rr) then
+            local d = (rr > rl) and "+" or "-"
+            local o = (d == "+") and "-" or "+"
+            bf_list = {"def" .. d, "def" .. d .. "wide", d .. "58", d .. "45", "def" .. o, "opposite", "0"}
+        else
+            bf_list = {"def+", "def-", "opposite", "def+wide", "def-wide", "+58", "-58", "0"}
+        end
         -- store dynamic magnitude in state for use below
         s.bf_def_delta = dd
     elseif s.defensive_aa and s.aa_type == "jitter" and (s.def_samples or 0) >= 1 and (s.def_delta or 0) > 10 then
@@ -6134,6 +6159,7 @@ _cs_log_color_raw("V9.37: AIR first-contact fix (Air was worst @25%) — air gue
 _cs_log_color_raw("V9.77: Networked-Boost side-conflict guard (RebuildServerYaw side can flip on a hard one-sided enemy — real-dump idx=5 streak L=20 R=0, rebuild said R → boosted 29° R twice → 0/2; learned_dom_side now vetoes a wrong-side boost on ground + air) + server-fail filter honesty (a bt=0 err=0 kept-side miss is OUR switch/side misprediction not netcode; err<=5 branch now needs bt>=4 — real-dump idx=5 had ~14 bt=0/2 keeps excused, headline 86.7% vs raw 59.1%).")
 _cs_log_color_raw("V9.78: BF cycle real-dominance ordering — pick_bruteforce_angle led every static/slow BF cycle with 'opposite' (flip to -last_shot_side), which on a firmly one-sided enemy flips onto the side they have NEVER been on = guaranteed whiff (real-dump BF:opposite 0/2; idx=7 real 5L/0R flipped R, idx=8 7R-dom flipped L). Now real_left/right one-sided (>=3 dom, 0 other) sweeps MAGNITUDE on the proven side first + demotes opposite to last; balanced/switch keep opposite-first (V9.63).")
 _cs_log_color_raw("V9.79: BF real-dominance broadened to switch AA — v9.78's reorder was gated to static/slow, but the one-sided locks were aa=switch (idx=8 real 10R/0L still fired BF:opposite LEFT; idx=12 9R/0L fired BF:opposite LEFT) and fell through to the opposite-first default. A >=3-vs-0 REAL split is a confirmed lock regardless of AA-class, so the dominant-side magnitude sweep now applies to ALL non-defensive aa_types. Genuine alternators (real hits both sides, idx=6 L=2 R=1) stay opposite-first.")
+_cs_log_color_raw("V9.80: three fixes targeting the idx=10 problem enemy (def static, miss-rate 50%). (1) SERVER-FAIL FILTER HONESTY — the bt>8 branch pardoned ANY high-backtrack miss outright, even one whose magnitude was also wrong (idx=10 our=57 meas=45 err=11.9 bt=24; idx=9 our=29.7 meas=19.3 err=10.4 bt=25). bt>8 now pardons only when err<=8 (or no measurement); a high-bt + high-err miss COUNTS — headline no longer flattered by our own overshoots. (2) DEF-CYCLE DOMINANCE — a ratio-dominant def enemy (idx=10 real R=5 L=1, not one_sided since L≠0) wasted shots on opposite/wrong-sign (BF:opposite 0%, BF:+58 0%); now leads the proven side's def magnitude + demotes opposite. (3) DEF_DELTA CAP — def_delta latched a lone 57.8° fingerprint while per-side measured R was 45° → BF:def+ overshot 12°; dd now capped toward dominant per-side measured.")
 _cs_log_color_raw("V9.76: AA-classify oscillation-freeze — the V9.10 anti-flap counted commits in a 10s window, which a SLOW static<->switch<->static revert (spread >10s) dodged entirely (real-dump idx=3/7/11 flapped at long range on yaw noise; idx=7 mode-thrashed switch->static->switch into a miss right after a hit). Now an A->B->A revert (committing back to a type just left) freezes the classifier 5s regardless of timing. A genuine progression (static->switch->jitter) never reverts so real AA changes are untouched.")
 _cs_log_color_raw("V9.75: AIR magnitude boost — the air-branch now boosts an undershot RebuildServerYaw to the known measured/passive air magnitude (keeps the rebuilt side), porting the ground Networked-Boost that already hits 4/4=100%. RebuildServerYaw gives a reliable SIDE but undershoots magnitude in air; a never-hit-but-passively-known air enemy fired the raw short angle and missed (real-dump idx=9: passive/measured 33.9°, rebuild +15° R = correct side 18.9° short → miss). Only fires in the trust-rebuild fall-through (corr-aware / both-sides / cold blocks unchanged).")
 _cs_log_color_raw("V9.38: correction guard is side-aware + correct-angle serverfails retry same side once; BF now trusts strong passive desync before max_desync.")
