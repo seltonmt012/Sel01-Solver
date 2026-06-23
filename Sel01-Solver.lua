@@ -5,7 +5,7 @@
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 9.83
+-- @version 9.84
 -- @description v9.79 BF real-dominance ordering broadened to switch AA:
 --   * v9.78 only reordered the static/slow BF branch. This lobby's one-sided
 --     locks were aa=switch (idx=8 real 10R/0L still fired BF:opposite LEFT;
@@ -132,7 +132,7 @@
 --   * v9.26 drift-bump (alpha 0.55 on 5-10° diff) still handles small shifts.
 --   * v9.29 coach variants carry.
 
-local SEL01_VERSION = "9.83"
+local SEL01_VERSION = "9.84"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -1053,29 +1053,31 @@ end
 function _side_tag(side)  -- GLOBAL (main chunk at 200-local cap)
     return side and (side > 0 and "R" or (side < 0 and "L" or "·")) or "·"
 end
+-- V9.84: HIT/MISS are TICKER-ONLY (top-left). Console no longer logs every shot
+-- — the per-shot console spam was unreadable. Kills + info still print to console
+-- (they are rare and worth a permanent record). The on-screen ticker keeps the
+-- full per-shot stream. Lines reformatted cleaner: " · " separators + units (° / %).
 function cs_event_hit(idx, mode, delta, meas, conf, side)
     local txt
     if delta then
-        txt = string.format("✓ HIT #%d %s  Δ%.0f m%.0f c%d %s",
-            idx or 0, tostring(mode or "?"), delta or 0, meas or 0, conf or 0, _side_tag(side))
+        txt = string.format("✓ HIT   P%d · %s · %s %.0f° · c%d",
+            idx or 0, tostring(mode or "?"), _side_tag(side), meas or 0, conf or 0)
     else
-        txt = string.format("✓ HIT #%d  %s", idx or 0, tostring(mode or "?"))
+        txt = string.format("✓ HIT   P%d · %s", idx or 0, tostring(mode or "?"))
     end
     event_ticker_push(txt, 110, 240, 130)
-    cs_event_console(txt, 110, 240, 130)
 end
 function cs_event_miss(idx, reason, mode, delta, meas, bt, conf)
     local txt
     if delta then
-        txt = string.format("✗ MISS #%d %s (%s)  Δ%.0f m%.0f bt%d c%d",
-            idx or 0, tostring(reason or "?"), tostring(mode or "?"),
-            delta or 0, meas or 0, bt or 0, conf or 0)
+        txt = string.format("✗ MISS  P%d · %s · %s · m%.0f° bt%d · c%d",
+            idx or 0, tostring(mode or "?"), tostring(reason or "?"),
+            meas or 0, bt or 0, conf or 0)
     else
-        txt = string.format("✗ MISS #%d  %s  (%s)",
-            idx or 0, tostring(reason or "?"), tostring(mode or "?"))
+        txt = string.format("✗ MISS  P%d · %s · %s",
+            idx or 0, tostring(mode or "?"), tostring(reason or "?"))
     end
     event_ticker_push(txt, 240, 110, 110)
-    cs_event_console(txt, 240, 110, 110)
 end
 function cs_event_kill(name)
     local txt = string.format("☠ KILL  %s", tostring(name or "?"))
