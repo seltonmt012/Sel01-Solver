@@ -5,7 +5,7 @@
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 9.82
+-- @version 9.83
 -- @description v9.79 BF real-dominance ordering broadened to switch AA:
 --   * v9.78 only reordered the static/slow BF branch. This lobby's one-sided
 --     locks were aa=switch (idx=8 real 10R/0L still fired BF:opposite LEFT;
@@ -132,7 +132,7 @@
 --   * v9.26 drift-bump (alpha 0.55 on 5-10° diff) still handles small shifts.
 --   * v9.29 coach variants carry.
 
-local SEL01_VERSION = "9.82"
+local SEL01_VERSION = "9.83"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -2856,43 +2856,20 @@ events.aim_ack:set(function(event)
             cs_log_verbose("DEF-AA detected idx=%d delta=%.1f samples=%d",
                            Ent:get_index(), s.def_delta or 0, s.def_samples or 0)
         end
-        -- V9.6+V9.24+V9.38: LBY-Snap-Guess miss flip only when angle OR side
-        -- evidence says the resolver was actually wrong.
-        -- Earlier code flipped on every miss, but logs showed misses where our
-        -- delta exactly matched measured_desync (server-side backtrack failure /
-        -- network noise — not our side error). Flipping then = next attempt picks
-        -- WRONG side, oscillation. V9.38 adds side evidence so a wrong-sign
-        -- BF/opposite shot is not hidden by a matching magnitude.
-        if (reason == "correction" or reason == "prediction error") and
-           tostring(s.mode):find("LBY%-Snap%-Guess") then
-            -- V9.56: flip only on REAL evidence — match the generic path's bt/measurement
-            -- awareness (V9.42/V9.47) that this older LBY-Snap branch never got. err is
-            -- meaningless without a measurement (first contact, measDesync=0 -> err=inf),
-            -- and a high backtrack (bt>8) is a server stale-record reject, not a side error.
-            -- Old code flipped on err=inf on EVERY first-contact miss, contradicting the
-            -- generic path which kept (logs: idx=2 our=29 meas=0 err=inf bt=13 — LBY flipped
-            -- to -1 while generic KEPT side=1 the same tick). Now both agree: no measurement
-            -- + high bt -> keep + retry the blind guess once, don't flip a side we never confirmed.
-            local lby_flip = ack_side_bad or (ack_measured > 5 and ack_angle_err > 5)
-            if bt > 8 then lby_flip = false end
-            if lby_flip then
-                s.last_hit_side = -s.last_hit_side
-                if s.last_hit_side == 0 then s.last_hit_side = -1 end
-                s.fs_cached_time = nil
-                resolver_clear_serverfail_retry(s)
-                cs_log_verbose("LBY-Snap miss FLIP idx=%d our_delta=%.1f measDsync=%.1f err=%.1f side_bad=%s -> side=%d",
-                               Ent:get_index(), ack_delta, ack_measured, ack_angle_err,
-                               tostring(ack_side_bad), s.last_hit_side)
-            else
-                -- V9.43: retry the LEARNED magnitude, not max(|delta|, measured). The
-                -- old max() memorised a bad overshoot delta and repeated it (see generic
-                -- path note) — fatal on a locked enemy whose desync we already know.
-                resolver_note_serverfail_retry(s, ack_shot_side, (ack_side_measured > 5 and ack_side_measured) or math.abs(ack_delta))
-                server_fail_keep = ack_serverfail_like  -- V9.55: only filter GENUINE netcode (err<=5 or bt>8); a bt=0 side-miss is our fault, count it
-                cs_log_verbose("LBY-Snap miss KEEP idx=%d our_delta=%.1f measDsync=%.1f err=%.1f (server-side fail, retry side=%d)",
-                               Ent:get_index(), ack_delta, ack_side_measured, ack_angle_err, ack_shot_side)
-            end
-        end
+        -- V9.83: the dedicated LBY-Snap-Guess miss-flip block (V9.6-V9.56) was DELETED.
+        -- It ran a SECOND, independent side decision for the same miss on top of the
+        -- generic correction block below, which ALSO fires for LBY-Snap-Guess (its gate
+        -- is `ack_resolverish and ack_shot_side ~= 0`, i.e. reason=correction/prediction
+        -- error — true for every LBY-Snap miss). The two diverged: the LBY block tested
+        -- the GLOBAL `ack_measured` while the generic block uses the per-side
+        -- `ack_side_measured` plus richer branches (two_side_switcher / passive-side /
+        -- never-hit explore), so on a bimodal switch enemy they reached OPPOSITE verdicts
+        -- the same tick and left contradictory state (real-dump idx=8 close 378u 0/2:
+        -- LBY FLIP->-1 cleared serverfail_retry, then generic KEEP side=+1 scheduled
+        -- serverfail_retry side=+1 — last_hit_side and the retry side disagreed, resolver
+        -- oscillated). The generic block is a strict superset (same flip/keep/clear +
+        -- serverfail_retry + serverfail_streak + bt_fail_count + backtrack_resistant), so
+        -- removing the duplicate makes the generic path the single owner for ALL modes.
         -- V7.8 + V8.2: correction-miss → wrong side picked. Track + flip immediately.
         -- V9.31: GENERALIZED SERVER-SIDE-FAIL GUARD (was LBY-Snap-only in V9.24).
         -- V9.38: side-aware. Matching magnitude alone is not enough: a wrong-sign
