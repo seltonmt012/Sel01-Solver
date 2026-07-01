@@ -5,7 +5,7 @@
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 9.84
+-- @version 9.85
 -- @description v9.79 BF real-dominance ordering broadened to switch AA:
 --   * v9.78 only reordered the static/slow BF branch. This lobby's one-sided
 --     locks were aa=switch (idx=8 real 10R/0L still fired BF:opposite LEFT;
@@ -132,7 +132,7 @@
 --   * v9.26 drift-bump (alpha 0.55 on 5-10° diff) still handles small shifts.
 --   * v9.29 coach variants carry.
 
-local SEL01_VERSION = "9.84"
+local SEL01_VERSION = "9.85"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -186,8 +186,20 @@ do
                 k32.GlobalUnlock(h)
                 if u32.OpenClipboard(nil) == 0 then error("OpenClipboard") end
                 u32.EmptyClipboard()
-                u32.SetClipboardData(13, h)
+                -- V9.85: the NL ffi state is SHARED across installed scripts, so
+                -- SetClipboardData may already be resident with signature
+                -- (UINT, unsigned int) from another script — our (UINT, HANDLE) proto
+                -- then isn't the one in effect and passing the void* handle threw
+                -- "cannot convert 'void *' to 'unsigned int'" on EVERY dump (copy
+                -- always fell back to file, never reached the clipboard). CSGO is a
+                -- 32-bit process so the handle fits an int; try the pointer form first
+                -- (our proto), then the numeric cast (resident int proto).
+                local set_ok = pcall(function() u32.SetClipboardData(13, h) end)
+                if not set_ok then
+                    set_ok = pcall(function() u32.SetClipboardData(13, ffi.cast("uintptr_t", h)) end)
+                end
                 u32.CloseClipboard()
+                if not set_ok then error("SetClipboardData (all casts failed)") end
             end)
             return ok, err
         end
@@ -6163,6 +6175,7 @@ _cs_log_color_raw("V9.79: BF real-dominance broadened to switch AA — v9.78's r
 _cs_log_color_raw("V9.82: reload-continuity — two follow-ups to V9.81. (1) Boot gate lowered from (sl+sr)>=5 to >=2: a thinly-saved enemy (1-3 total hits in learned.lua) never booted, so on reload it re-learned from zero and the ESP confidence bar dropped to 0 despite saved data. Per-side EMA fills still need lsl/lsr>=2 each, so a 2-total enemy seeds real_*/dom/best (restores the bar + dominance) without faking a per-side magnitude. (2) Boot now seeds s.last_seen so confidence()'s age penalty (up to -30 when last_seen reads 0) doesn't tank the bar on the first frame after reload.")
 _cs_log_color_raw("V9.81: PERSISTENCE GAP — per-player learning DID save + reload (7 players on disk, boots in dump), but boot restored measured/samples/side/best-modes and NEVER seeded s.real_left/right. The saved sl/sr ARE real hit counts (only bumped on a confirmed hit), yet a known 17-hit enemy rebooted with real_right=0 → one_sided BF ordering (needs real>=3), alt_side_pick real-dominance, and the confidence real-weight cap all stayed OFF. Magnitude + side recalled but the 'locked one side' intelligence did not — looked like nothing persisted. Boot now seeds real_left/right from saved sl/sr (cap 10) when no session real hit held on that side yet.")
 _cs_log_color_raw("V9.80: three fixes targeting the idx=10 problem enemy (def static, miss-rate 50%). (1) SERVER-FAIL FILTER HONESTY — the bt>8 branch pardoned ANY high-backtrack miss outright, even one whose magnitude was also wrong (idx=10 our=57 meas=45 err=11.9 bt=24; idx=9 our=29.7 meas=19.3 err=10.4 bt=25). bt>8 now pardons only when err<=8 (or no measurement); a high-bt + high-err miss COUNTS — headline no longer flattered by our own overshoots. (2) DEF-CYCLE DOMINANCE — a ratio-dominant def enemy (idx=10 real R=5 L=1, not one_sided since L≠0) wasted shots on opposite/wrong-sign (BF:opposite 0%, BF:+58 0%); now leads the proven side's def magnitude + demotes opposite. (3) DEF_DELTA CAP — def_delta latched a lone 57.8° fingerprint while per-side measured R was 45° → BF:def+ overshot 12°; dd now capped toward dominant per-side measured.")
+_cs_log_color_raw("V9.85: clipboard copy FINALLY works — the NL ffi state is SHARED across installed scripts, so SetClipboardData was resident with signature (UINT, unsigned int) from another script; our (UINT, HANDLE) proto wasn't in effect and passing the void* handle threw 'cannot convert void* to unsigned int' on EVERY 📋 dump (copy silently fell back to file, never reached the clipboard). CSGO is 32-bit so the handle fits an int — now tries the pointer form (our proto) then the numeric uintptr_t cast (resident int proto), so Ctrl+V works regardless of which script declared it first. No resolver change.")
 _cs_log_color_raw("V9.76: AA-classify oscillation-freeze — the V9.10 anti-flap counted commits in a 10s window, which a SLOW static<->switch<->static revert (spread >10s) dodged entirely (real-dump idx=3/7/11 flapped at long range on yaw noise; idx=7 mode-thrashed switch->static->switch into a miss right after a hit). Now an A->B->A revert (committing back to a type just left) freezes the classifier 5s regardless of timing. A genuine progression (static->switch->jitter) never reverts so real AA changes are untouched.")
 _cs_log_color_raw("V9.75: AIR magnitude boost — the air-branch now boosts an undershot RebuildServerYaw to the known measured/passive air magnitude (keeps the rebuilt side), porting the ground Networked-Boost that already hits 4/4=100%. RebuildServerYaw gives a reliable SIDE but undershoots magnitude in air; a never-hit-but-passively-known air enemy fired the raw short angle and missed (real-dump idx=9: passive/measured 33.9°, rebuild +15° R = correct side 18.9° short → miss). Only fires in the trust-rebuild fall-through (corr-aware / both-sides / cold blocks unchanged).")
 _cs_log_color_raw("V9.38: correction guard is side-aware + correct-angle serverfails retry same side once; BF now trusts strong passive desync before max_desync.")
