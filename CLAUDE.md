@@ -14,8 +14,10 @@ Three Neverlose **CSGO** (legacy build, NOT CS2) Lua scripts for HvH / rage play
 
 **Dual-copy rule (MANDATORY).** After every Edit/Write to either working copy, immediately overwrite the matching NL file (same path, no new files, no renames). PowerShell one-liner: `Copy-Item -Force -LiteralPath '<working>' -Destination '<nl-path>'`. The git repo only tracks working copies — the NL copies need the mirror so reload in NL picks up the change.
 
+**Cloud-copy rule (Sel01-Solver ONLY, MANDATORY since 2026-07-19).** The Solver is ALSO loaded from the NL cloud folder, so every Solver edit is now a **triple-copy**: working → NL local (`Sel01-Solver_59853.lua`) → cloud (`C:\Users\Seltonmt\Desktop\sazz\aron\neverlose hackvshack.net\nl_cloud\scripts\5_Sel Solver.lua`, note the space in the filename → use `-LiteralPath`/`-Destination`). Config + WalkBot are NOT in the cloud folder (it holds unrelated scripts: 6_maycry, 7_angelnbone, 8_angeln, 9_premiumloader, 10_scertiy) — Solver is `5_Sel Solver.lua`.
+
 **Version constants — keep all touchpoints in sync per script:**
-- Sel01-Solver: `local SEL01_VERSION = "X.Y"` + file-header `@version X.Y` + 3 visible mentions (load-banner, UI label, HUD corner)
+- Sel01-Solver: `local SEL01_VERSION = "X.Y"` + file-header `@version X.Y` + **decorative header box `Version: X.Y` (line 4)** + 3 visible mentions (load-banner, UI label, HUD corner)
 - Sel01-Config: `local SEL01_CFG_VERSION = "X.Y"` + file-header `@version X.Y` (no HUD mention; load banner reads constant directly)
 - Sel01-WalkBot: `local SEL01_WB_VERSION = "X.Y"` + file-header `Version: X.Y` + `@version X.Y` (HUD reads the constant)
 

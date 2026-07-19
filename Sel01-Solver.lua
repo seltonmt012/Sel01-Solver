@@ -1,11 +1,11 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 9.63                                   ║
+-- ║  Version: 9.86                                   ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 9.85
+-- @version 9.86
 -- @description v9.79 BF real-dominance ordering broadened to switch AA:
 --   * v9.78 only reordered the static/slow BF branch. This lobby's one-sided
 --     locks were aa=switch (idx=8 real 10R/0L still fired BF:opposite LEFT;
@@ -132,7 +132,7 @@
 --   * v9.26 drift-bump (alpha 0.55 on 5-10° diff) still handles small shifts.
 --   * v9.29 coach variants carry.
 
-local SEL01_VERSION = "9.85"
+local SEL01_VERSION = "9.86"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -1162,6 +1162,28 @@ function adaptive_guess_mag()
     r.cached_mag = mid
     r.dirty = false
     return mid
+end
+
+-- V9.86: FIRST-CONTACT server-yaw magnitude sanity. RebuildServerYaw can overshoot
+-- on the FIRST resolve of an enemy (samples==0, no per-player evidence) — a magnitude
+-- that is a large outlier vs the lobby's own desync distribution is reconstruct noise,
+-- not a genuine wide desync. Clamp the returned delta DOWN toward the session prior
+-- (adaptive_guess_mag median + margin), keeping the SIDE (the side is usually right;
+-- only the magnitude rings false). Self-scaling: the ceiling tracks the lobby median,
+-- so a genuinely-wide lobby lifts it. Self-decaying: only bites at samples==0 — after
+-- one hit Still-Meas/measured paths take over. Never clamps UP (can't worsen a shot).
+-- (logs v9.85/v9.86: idx=7 Still-Server samples=0 fired 48.4° into a ~15-20° desync
+--  enemy → miss; the enemy's true desync sat well under the lobby median across 2 dumps.)
+function clamp_firstcontact_serveryaw(eye_yaw, sy, samples)
+    if (samples or 0) > 0 then return sy end
+    local delta = NormalizeAngle(sy - eye_yaw)
+    local mag = math.abs(delta)
+    local ceil = adaptive_guess_mag() + 15
+    if mag > ceil then
+        local side = delta >= 0 and 1 or -1
+        return eye_yaw + ceil * side
+    end
+    return sy
 end
 
 -- V9.19: ALT-MODE side picker. Predicted-Alt / Air-Alt / Slow-Alt / Still-Alt
@@ -3920,7 +3942,7 @@ local function _pick_first_shot_impl(p, s, anim, eye_yaw, max_desync, preset)
             local sy_delta = NormalizeAngle(sy - eye_yaw)
             if math.abs(sy_delta) >= 5 and math.abs(sy_delta) <= 65 then
                 s.mode = "Still-Server"
-                return sy
+                return clamp_firstcontact_serveryaw(eye_yaw, sy, s.desync_samples)  -- V9.86
             end
             -- if server-yaw useless but we have measured, use it on best side
             if s.desync_samples >= 1 and s.measured_desync > 5 then
