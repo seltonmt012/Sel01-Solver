@@ -1,11 +1,11 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 9.88                                   ║
+-- ║  Version: 9.89                                   ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 9.88
+-- @version 9.89
 -- @description v9.79 BF real-dominance ordering broadened to switch AA:
 --   * v9.78 only reordered the static/slow BF branch. This lobby's one-sided
 --     locks were aa=switch (idx=8 real 10R/0L still fired BF:opposite LEFT;
@@ -132,7 +132,7 @@
 --   * v9.26 drift-bump (alpha 0.55 on 5-10° diff) still handles small shifts.
 --   * v9.29 coach variants carry.
 
-local SEL01_VERSION = "9.88"
+local SEL01_VERSION = "9.89"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -475,6 +475,8 @@ g_esp:label(accent .. ui.get_icon"link-slash" .. accent .. "  Mode colors auto: 
 -- V9.21: live event ticker top-right of screen — HIT/MISS/KILL/INFO with fade.
 -- Global (no `local`) to dodge main-chunk 200-local limit.
 esp_event_ticker = g_esp:switch(accent .. ui.get_icon"bolt" .. accent .. "  Event Ticker (top-right HUD log)", true)
+-- V9.89: angel-wings style colored per-shot console hit/miss logs (opt-in).
+ev_console_log = g_esp:switch(accent .. ui.get_icon"terminal" .. accent .. "  Console Hit/Miss Logs (angel style)", true)
 -- V9.51: per-enemy ON-MODEL visuals. Globals (no `local`) to dodge the 200-local cap.
 esp_wedge = g_esp:switch(accent .. ui.get_icon"diagram-project" .. accent .. "  Desync Wedge (real vs fake yaw lines on body)", true)
 esp_flash = g_esp:switch(accent .. ui.get_icon"bolt-lightning"  .. accent .. "  Hit/Miss Flash (box on each shot)", true)
@@ -1059,37 +1061,50 @@ function cs_event_console(text, r, g, b)
     end
     pcall(function() log_buffer_push(line) end)
 end
--- V9.32: enriched HIT/MISS lines. delta = resolved-vs-eye angle, m = measured EMA,
--- c = confidence, side L/R, bt = backtrack tick (high = stale-record/netcode miss,
--- not our angle error). Extra args optional → callers without them get the short line.
+-- V9.89: ANGEL-WINGS style event logs (7_angelnbone pattern). Segments wrapped in
+-- ${...} render in an accent hex color, the rest in grey; the whole line prints to
+-- console with inline \a<hex> codes (print_raw → print fallback) exactly like angel.
+-- The same event also feeds the on-screen ticker (single color/line there) + log_buffer
+-- for the 📋 copy dump. Gated behind the "Console Hit/Miss Logs" switch (ev_console_log).
+EV_GREY = "b8c0ccff"                                  -- default (non-highlighted) text
+EV_HB   = {[0]="body",[1]="head",[2]="chest",[3]="stomach",[4]="l.arm",
+           [5]="r.arm",[6]="l.leg",[7]="r.leg",[8]="neck",[10]="gear"}
 function _side_tag(side)  -- GLOBAL (main chunk at 200-local cap)
     return side and (side > 0 and "R" or (side < 0 and "L" or "·")) or "·"
 end
--- V9.84: HIT/MISS are TICKER-ONLY (top-left). Console no longer logs every shot
--- — the per-shot console spam was unreadable. Kills + info still print to console
--- (they are rare and worth a permanent record). The on-screen ticker keeps the
--- full per-shot stream. Lines reformatted cleaner: " · " separators + units (° / %).
-function cs_event_hit(idx, mode, delta, meas, conf, side)
-    local txt
-    if delta then
-        txt = string.format("✓ HIT   P%d · %s · %s %.0f° · c%d",
-            idx or 0, tostring(mode or "?"), _side_tag(side), meas or 0, conf or 0)
-    else
-        txt = string.format("✓ HIT   P%d · %s", idx or 0, tostring(mode or "?"))
-    end
-    event_ticker_push(txt, 110, 240, 130)
+function ev_colorize(text, hex)  -- ${x} → colored x, rest grey (angel slot_0_50_25)
+    local out = string.gsub(tostring(text), "${(.-)}", "\a" .. hex .. "%1\a" .. EV_GREY)
+    if out:sub(1, 1) ~= "\a" then out = "\a" .. EV_GREY .. out end
+    return out
 end
-function cs_event_miss(idx, reason, mode, delta, meas, bt, conf)
-    local txt
-    if delta then
-        txt = string.format("✗ MISS  P%d · %s · %s · m%.0f° bt%d · c%d",
-            idx or 0, tostring(mode or "?"), tostring(reason or "?"),
-            meas or 0, bt or 0, conf or 0)
-    else
-        txt = string.format("✗ MISS  P%d · %s · %s",
-            idx or 0, tostring(mode or "?"), tostring(reason or "?"))
-    end
-    event_ticker_push(txt, 240, 110, 110)
+function ev_print(colored)  -- console writer with inline color codes (angel print_raw)
+    if not (ev_console_log and ev_console_log:get()) then return end
+    local ok = pcall(function() print_raw(colored) end)
+    if not ok then pcall(function() print(colored) end) end
+end
+-- HIT — "hit ${name} in ${hb} for ${dmg} dmg · bt ${bt} · hc ${hc}% · ${mode} ${side°}"
+function cs_event_hit(idx, name, hb, dmg, bt, hc, mode, meas, side)
+    name = (name and name ~= "" and name) or ("P" .. tostring(idx or 0))
+    local line = string.format(
+        "hit ${%s} in ${%s} for ${%d} dmg  ·  bt ${%d}  ·  hc ${%d%%}  ·  ${%s} ${%s %.0f\194\176}",
+        name, hb or "?", math.floor(dmg or 0), math.floor(bt or 0), math.floor(hc or 0),
+        tostring(mode or "?"), _side_tag(side), meas or 0)
+    ev_print(ev_colorize("[Sel01] " .. line, "6ef07aff"))            -- green accent
+    event_ticker_push(string.format("\226\156\147 %s \194\183 %s \194\183 %ddmg \194\183 %s",
+        name, hb or "?", math.floor(dmg or 0), tostring(mode or "?")), 110, 240, 130)
+    pcall(function() log_buffer_push("HIT " .. line:gsub("[${}]", "")) end)
+end
+-- MISS — "missed ${name} in ${hb} due to ${reason} · bt ${bt} · hc ${hc}% · ${mode °}"
+function cs_event_miss(idx, name, hb, reason, dmg, bt, hc, mode, meas)
+    name = (name and name ~= "" and name) or ("P" .. tostring(idx or 0))
+    local line = string.format(
+        "missed ${%s} in ${%s} due to ${%s}  ·  bt ${%d}  ·  hc ${%d%%}  ·  ${%s %.0f\194\176}",
+        name, hb or "?", tostring(reason or "?"), math.floor(bt or 0), math.floor(hc or 0),
+        tostring(mode or "?"), meas or 0)
+    ev_print(ev_colorize("[Sel01] " .. line, "ff6464ff"))            -- red accent
+    event_ticker_push(string.format("\226\156\151 %s \194\183 %s \194\183 %s",
+        name, hb or "?", tostring(reason or "?")), 240, 110, 110)
+    pcall(function() log_buffer_push("MISS " .. line:gsub("[${}]", "")) end)
 end
 function cs_event_kill(name)
     local txt = string.format("☠ KILL  %s", tostring(name or "?"))
@@ -3135,10 +3150,13 @@ events.aim_ack:set(function(event)
                 s.measured_desync, s.desync_samples,
                 s.hit_streak_left, s.hit_streak_right, tostring(s.defensive_aa)
             )
-            -- V9.21: also surface to event ticker + console (always-on)
-            pcall(cs_event_miss, Ent:get_index(), reason, s.mode,
-                  NormalizeAngle((s.last_resolved or 0) - (s.last_eye_yaw or 0)),
-                  s.measured_desync, bt, confidence(s))
+            -- V9.89: angel-style event log — gather name / wanted-hitbox / hc from the ack
+            local _nm, _hb, _hc = nil, nil, 0
+            pcall(function() _nm = Ent:get_name() end)
+            pcall(function() _hc = event.hitchance or 0 end)
+            pcall(function() _hb = EV_HB[event.wanted_hitgroup or event.hitgroup or -1] end)
+            pcall(cs_event_miss, Ent:get_index(), _nm, _hb, reason, 0, bt, _hc,
+                  s.mode, s.measured_desync)
         end
     else
         -- V9.9-B: clear mode-blacklist + miss-counter on HIT (mode proven working)
@@ -3342,10 +3360,14 @@ events.aim_ack:set(function(event)
                 s.measured_desync, s.desync_samples,
                 s.hit_streak_left, s.hit_streak_right
             )
-            -- V9.21: also surface to event ticker + console (always-on)
-            pcall(cs_event_hit, Ent:get_index(), s.mode,
-                  NormalizeAngle((s.last_resolved or 0) - (s.last_eye_yaw or 0)),
-                  s.measured_desync, confidence(s), s.last_hit_side)
+            -- V9.89: angel-style event log — gather name / hitbox / dmg / hc from the ack
+            local _nm, _hb, _dmg, _hc = nil, nil, 0, 0
+            pcall(function() _nm = Ent:get_name() end)
+            pcall(function() _dmg = event.damage or 0 end)
+            pcall(function() _hc = event.hitchance or 0 end)
+            pcall(function() _hb = EV_HB[event.hitgroup or -1] end)
+            pcall(cs_event_hit, Ent:get_index(), _nm, _hb, _dmg, bt, _hc,
+                  s.mode, s.measured_desync, s.last_hit_side)
         end
         s.missed = 0
         s.bf_cached_missed = nil  -- clear BF cache so next miss recomputes fresh
@@ -6269,6 +6291,7 @@ _cs_log_color_raw("V9.79: BF real-dominance broadened to switch AA — v9.78's r
 _cs_log_color_raw("V9.82: reload-continuity — two follow-ups to V9.81. (1) Boot gate lowered from (sl+sr)>=5 to >=2: a thinly-saved enemy (1-3 total hits in learned.lua) never booted, so on reload it re-learned from zero and the ESP confidence bar dropped to 0 despite saved data. Per-side EMA fills still need lsl/lsr>=2 each, so a 2-total enemy seeds real_*/dom/best (restores the bar + dominance) without faking a per-side magnitude. (2) Boot now seeds s.last_seen so confidence()'s age penalty (up to -30 when last_seen reads 0) doesn't tank the bar on the first frame after reload.")
 _cs_log_color_raw("V9.81: PERSISTENCE GAP — per-player learning DID save + reload (7 players on disk, boots in dump), but boot restored measured/samples/side/best-modes and NEVER seeded s.real_left/right. The saved sl/sr ARE real hit counts (only bumped on a confirmed hit), yet a known 17-hit enemy rebooted with real_right=0 → one_sided BF ordering (needs real>=3), alt_side_pick real-dominance, and the confidence real-weight cap all stayed OFF. Magnitude + side recalled but the 'locked one side' intelligence did not — looked like nothing persisted. Boot now seeds real_left/right from saved sl/sr (cap 10) when no session real hit held on that side yet.")
 _cs_log_color_raw("V9.80: three fixes targeting the idx=10 problem enemy (def static, miss-rate 50%). (1) SERVER-FAIL FILTER HONESTY — the bt>8 branch pardoned ANY high-backtrack miss outright, even one whose magnitude was also wrong (idx=10 our=57 meas=45 err=11.9 bt=24; idx=9 our=29.7 meas=19.3 err=10.4 bt=25). bt>8 now pardons only when err<=8 (or no measurement); a high-bt + high-err miss COUNTS — headline no longer flattered by our own overshoots. (2) DEF-CYCLE DOMINANCE — a ratio-dominant def enemy (idx=10 real R=5 L=1, not one_sided since L≠0) wasted shots on opposite/wrong-sign (BF:opposite 0%, BF:+58 0%); now leads the proven side's def magnitude + demotes opposite. (3) DEF_DELTA CAP — def_delta latched a lone 57.8° fingerprint while per-side measured R was 45° → BF:def+ overshot 12°; dd now capped toward dominant per-side measured.")
+_cs_log_color_raw("V9.89: ANGEL-WINGS style event logs (7_angelnbone pattern) — HIT/MISS now print a colored per-shot line to console: 'hit ${name} in ${head} for ${100} dmg · bt ${2} · hc ${85%} · ${Static-Meas} ${L 32°}' with ${..} segments in accent color (green hit / red miss) via inline \\a<hex> print_raw. Same event feeds the on-screen ticker (name · hb · dmg · mode) + log_buffer. New 'Console Hit/Miss Logs' switch (ESP tab, default ON) gates the console spam. Reads name/hitbox/dmg/hitchance from the aim_ack event. BF:+90 fake-flick counter confirmed working this session (caught a real 90° flick on idx=3, 1/1).")
 _cs_log_color_raw("V9.88: FAKE-FLICK detection MUCH stricter (v9.87 flagged everyone — counted EVERY 65-115° eye swing, so any peek/turn/switch-AA triggered ⚡FF). Now only counts a CONFIRMED round-trip: rest → near-±90 excursion → SNAP BACK to the same rest yaw. A real turn/peek does not revert (new heading = new rest) so it can't fake it. Needs ff_score>=4 confirmed round-trips to flag; pitch≈±89 accelerates but isn't required; decays + auto-clears after 4s. ⚡FF now only shows when genuinely sure.")
 _cs_log_color_raw("V9.87: FAKE-FLICK counter (ADDITIVE — first-shot resolve untouched, base mechanics 100% intact). Detects the hidden-yaw ±90 exploit (11_fakeflick.lua: override_hidden_yaw_offset ±90 + hidden_pitch 89 + force_defensive every 7th cmd) via the rest→±90 excursion→rest eye pattern on a non-spinner (pitch≈±89 doubles the evidence). On a flagged enemy pick_bruteforce_angle leads the MISS cycle with ±90 candidates (standard ≤58° BF can never reach the flicked hitboxes) — only after a miss, per-flagged, ff_score>=3 so a single hard peek never flags + auto-clears after 3s. Shows ⚡FF ESP tag + flags{ff=T/N} in the copy-dump.")
 _cs_log_color_raw("V9.85: clipboard copy FINALLY works — the NL ffi state is SHARED across installed scripts, so SetClipboardData was resident with signature (UINT, unsigned int) from another script; our (UINT, HANDLE) proto wasn't in effect and passing the void* handle threw 'cannot convert void* to unsigned int' on EVERY 📋 dump (copy silently fell back to file, never reached the clipboard). CSGO is 32-bit so the handle fits an int — now tries the pointer form (our proto) then the numeric uintptr_t cast (resident int proto), so Ctrl+V works regardless of which script declared it first. No resolver change.")
