@@ -1,11 +1,11 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 9.87                                   ║
+-- ║  Version: 9.88                                   ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 9.87
+-- @version 9.88
 -- @description v9.79 BF real-dominance ordering broadened to switch AA:
 --   * v9.78 only reordered the static/slow BF branch. This lobby's one-sided
 --     locks were aa=switch (idx=8 real 10R/0L still fired BF:opposite LEFT;
@@ -132,7 +132,7 @@
 --   * v9.26 drift-bump (alpha 0.55 on 5-10° diff) still handles small shifts.
 --   * v9.29 coach variants carry.
 
-local SEL01_VERSION = "9.87"
+local SEL01_VERSION = "9.88"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -2592,9 +2592,10 @@ setmetatable(PlayerState, {__index = function(t, k)
         -- V9.87: fake-flick (hidden-yaw ±90 exploit) detection — ADDITIVE, per-player.
         -- Never alters the first-shot resolve; only lets BF add ±90 candidates + shows a tag.
         fake_flick        = false,     -- flagged: enemy runs hidden-yaw ±90 fake flick
-        ff_score          = 0,         -- rolling flick-evidence counter (0-8)
+        ff_score          = 0,         -- CONFIRMED out-and-back flick counter (0-10)
         ff_base_eye       = nil,       -- slow baseline eye yaw (resting, non-flick ticks)
-        ff_last_t         = 0,         -- time of last flick excursion (auto-clear)
+        ff_last_t         = 0,         -- time of last confirmed flick (auto-clear)
+        ff_pending        = false,     -- saw a near-±90 excursion, awaiting return-to-base
         -- AA classification
         aa_type           = "switch",
         aa_classify_cd    = 0,
@@ -4931,13 +4932,15 @@ local function resolve_player(p)
     local max_desync = GetMaxDesync(anim) * 58
     local angle
 
-    -- V9.87: FAKE-FLICK detection (ADDITIVE — does NOT touch the resolve below).
-    -- Hidden-yaw ±90 exploit (11_fakeflick.lua): on defensive/choke ticks the networked
-    -- eye flicks ~90° off a stable resting yaw then snaps back, and hidden_pitch pins the
-    -- pitch near ±89. We look for the "rest → ±90 excursion → rest" pattern on a NON-spinner
-    -- and flag the enemy. pick_bruteforce_angle then adds ±90 candidates to the miss cycle
-    -- (standard ≤58° BF magnitudes can never reach the flicked hitboxes). Requires ff_score>=3
-    -- (multiple flicks) so a single hard peek never flags; decays + auto-clears after ~3s idle.
+    -- V9.88: FAKE-FLICK detection (ADDITIVE — does NOT touch the resolve below).
+    -- Hidden-yaw ±90 exploit (11_fakeflick.lua): on defensive/choke ticks the networked eye
+    -- flicks ~90° off a stable resting yaw then SNAPS BACK to it. The revert is the key tell:
+    -- a real turn/peek does NOT return — the new heading becomes the new rest. So we only count
+    -- a CONFIRMED "rest → near-±90 excursion → back-to-rest" round-trip, not any wide movement
+    -- (v9.87 counted every 65-115° swing → flagged everyone who peeked/turned/switch-AA'd).
+    -- pitch pinned near ±89 (hidden_pitch) accelerates the count but is not required. Needs
+    -- ff_score>=4 CONFIRMED round-trips to flag — normal play never produces 4 clean 90-and-back
+    -- reverts. Decays + auto-clears after ~4s idle. Flag only shows (⚡FF) once genuinely sure.
     do
         local now_rt = globals.realtime or 0
         local spd = s.last_speed2d or 0
@@ -4949,18 +4952,31 @@ local function resolve_player(p)
                 s.ff_base_eye = eye_yaw
             else
                 local exc = math.abs(NormalizeAngle(eye_yaw - base))
-                if exc >= 65 and exc <= 115 then
-                    local pitch_hint = math.abs(anim.m_flPitch or 0) >= 80
-                    s.ff_score = math.min((s.ff_score or 0) + (pitch_hint and 2 or 1), 8)
-                    s.ff_last_t = now_rt                -- base stays put — it tracks resting yaw
-                elseif exc < 25 then
-                    -- resting: slow-track baseline toward real yaw, gently decay evidence
-                    s.ff_base_eye = NormalizeAngle(base + NormalizeAngle(eye_yaw - base) * 0.25)
-                    if (s.ff_score or 0) > 0 and (now_rt - (s.ff_last_t or 0)) > 3 then
+                if exc <= 22 then
+                    -- resting at base: a pending excursion that RETURNED = one confirmed flick
+                    if s.ff_pending then
+                        local pitch_hi = math.abs(anim.m_flPitch or 0) >= 78
+                        s.ff_score  = math.min((s.ff_score or 0) + (pitch_hi and 2 or 1), 10)
+                        s.ff_last_t = now_rt
+                        s.ff_pending = false
+                    end
+                    -- slow-track baseline toward true rest + decay when idle
+                    s.ff_base_eye = NormalizeAngle(base + NormalizeAngle(eye_yaw - base) * 0.2)
+                    if (s.ff_score or 0) > 0 and (now_rt - (s.ff_last_t or 0)) > 4 then
                         s.ff_score = s.ff_score - 1
                     end
+                elseif exc >= 78 and exc <= 102 then
+                    -- near-±90 off rest = candidate flick tick; arm, keep base put (awaits return)
+                    s.ff_pending = true
+                else
+                    -- mid-range movement (real turn/peek): NOT a flick. Adopt as new heading,
+                    -- clear any pending so a turn-through-90 can't masquerade as a round-trip.
+                    if exc > 22 then
+                        s.ff_base_eye = NormalizeAngle(base + NormalizeAngle(eye_yaw - base) * 0.15)
+                        s.ff_pending = false
+                    end
                 end
-                s.fake_flick = (s.ff_score or 0) >= 3
+                s.fake_flick = (s.ff_score or 0) >= 4
             end
         end
     end
@@ -6253,6 +6269,7 @@ _cs_log_color_raw("V9.79: BF real-dominance broadened to switch AA — v9.78's r
 _cs_log_color_raw("V9.82: reload-continuity — two follow-ups to V9.81. (1) Boot gate lowered from (sl+sr)>=5 to >=2: a thinly-saved enemy (1-3 total hits in learned.lua) never booted, so on reload it re-learned from zero and the ESP confidence bar dropped to 0 despite saved data. Per-side EMA fills still need lsl/lsr>=2 each, so a 2-total enemy seeds real_*/dom/best (restores the bar + dominance) without faking a per-side magnitude. (2) Boot now seeds s.last_seen so confidence()'s age penalty (up to -30 when last_seen reads 0) doesn't tank the bar on the first frame after reload.")
 _cs_log_color_raw("V9.81: PERSISTENCE GAP — per-player learning DID save + reload (7 players on disk, boots in dump), but boot restored measured/samples/side/best-modes and NEVER seeded s.real_left/right. The saved sl/sr ARE real hit counts (only bumped on a confirmed hit), yet a known 17-hit enemy rebooted with real_right=0 → one_sided BF ordering (needs real>=3), alt_side_pick real-dominance, and the confidence real-weight cap all stayed OFF. Magnitude + side recalled but the 'locked one side' intelligence did not — looked like nothing persisted. Boot now seeds real_left/right from saved sl/sr (cap 10) when no session real hit held on that side yet.")
 _cs_log_color_raw("V9.80: three fixes targeting the idx=10 problem enemy (def static, miss-rate 50%). (1) SERVER-FAIL FILTER HONESTY — the bt>8 branch pardoned ANY high-backtrack miss outright, even one whose magnitude was also wrong (idx=10 our=57 meas=45 err=11.9 bt=24; idx=9 our=29.7 meas=19.3 err=10.4 bt=25). bt>8 now pardons only when err<=8 (or no measurement); a high-bt + high-err miss COUNTS — headline no longer flattered by our own overshoots. (2) DEF-CYCLE DOMINANCE — a ratio-dominant def enemy (idx=10 real R=5 L=1, not one_sided since L≠0) wasted shots on opposite/wrong-sign (BF:opposite 0%, BF:+58 0%); now leads the proven side's def magnitude + demotes opposite. (3) DEF_DELTA CAP — def_delta latched a lone 57.8° fingerprint while per-side measured R was 45° → BF:def+ overshot 12°; dd now capped toward dominant per-side measured.")
+_cs_log_color_raw("V9.88: FAKE-FLICK detection MUCH stricter (v9.87 flagged everyone — counted EVERY 65-115° eye swing, so any peek/turn/switch-AA triggered ⚡FF). Now only counts a CONFIRMED round-trip: rest → near-±90 excursion → SNAP BACK to the same rest yaw. A real turn/peek does not revert (new heading = new rest) so it can't fake it. Needs ff_score>=4 confirmed round-trips to flag; pitch≈±89 accelerates but isn't required; decays + auto-clears after 4s. ⚡FF now only shows when genuinely sure.")
 _cs_log_color_raw("V9.87: FAKE-FLICK counter (ADDITIVE — first-shot resolve untouched, base mechanics 100% intact). Detects the hidden-yaw ±90 exploit (11_fakeflick.lua: override_hidden_yaw_offset ±90 + hidden_pitch 89 + force_defensive every 7th cmd) via the rest→±90 excursion→rest eye pattern on a non-spinner (pitch≈±89 doubles the evidence). On a flagged enemy pick_bruteforce_angle leads the MISS cycle with ±90 candidates (standard ≤58° BF can never reach the flicked hitboxes) — only after a miss, per-flagged, ff_score>=3 so a single hard peek never flags + auto-clears after 3s. Shows ⚡FF ESP tag + flags{ff=T/N} in the copy-dump.")
 _cs_log_color_raw("V9.85: clipboard copy FINALLY works — the NL ffi state is SHARED across installed scripts, so SetClipboardData was resident with signature (UINT, unsigned int) from another script; our (UINT, HANDLE) proto wasn't in effect and passing the void* handle threw 'cannot convert void* to unsigned int' on EVERY 📋 dump (copy silently fell back to file, never reached the clipboard). CSGO is 32-bit so the handle fits an int — now tries the pointer form (our proto) then the numeric uintptr_t cast (resident int proto), so Ctrl+V works regardless of which script declared it first. No resolver change.")
 _cs_log_color_raw("V9.76: AA-classify oscillation-freeze — the V9.10 anti-flap counted commits in a 10s window, which a SLOW static<->switch<->static revert (spread >10s) dodged entirely (real-dump idx=3/7/11 flapped at long range on yaw noise; idx=7 mode-thrashed switch->static->switch into a miss right after a hit). Now an A->B->A revert (committing back to a type just left) freezes the classifier 5s regardless of timing. A genuine progression (static->switch->jitter) never reverts so real AA changes are untouched.")
