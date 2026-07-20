@@ -1,11 +1,11 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 9.86                                   ║
+-- ║  Version: 9.87                                   ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 9.86
+-- @version 9.87
 -- @description v9.79 BF real-dominance ordering broadened to switch AA:
 --   * v9.78 only reordered the static/slow BF branch. This lobby's one-sided
 --     locks were aa=switch (idx=8 real 10R/0L still fired BF:opposite LEFT;
@@ -132,7 +132,7 @@
 --   * v9.26 drift-bump (alpha 0.55 on 5-10° diff) still handles small shifts.
 --   * v9.29 coach variants carry.
 
-local SEL01_VERSION = "9.86"
+local SEL01_VERSION = "9.87"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -1362,9 +1362,10 @@ local log_copy_btn = g_logging:button("📋 Copy Last Logs (for share)", functio
             else _cs_log_raw("[P] (format error idx=" .. tostring(idx) .. ")") end
             -- V8.8: extended per-player detail (slow/still flags, correction L/R, streak, yaw_rate, last_hit_side, dist, miss-rate)
             pcall(function()
-                _cs_log_raw(string.format("    └ flags{slow=%s still=%s def=%s lby=%s} streak{L=%d R=%d} corr{L=%d R=%d} yaw_rate=%.1f last_hit=%d dist=%.0f miss_rate=%.0f%% p_hits=%d/%d",
+                _cs_log_raw(string.format("    └ flags{slow=%s still=%s def=%s lby=%s ff=%s/%d} streak{L=%d R=%d} corr{L=%d R=%d} yaw_rate=%.1f last_hit=%d dist=%.0f miss_rate=%.0f%% p_hits=%d/%d",
                     tostring(s.is_slow_target), tostring(s.is_stationary or false),
                     tostring(s.defensive_aa), tostring(s.lby_snap),
+                    tostring(s.fake_flick or false), tonumber(s.ff_score) or 0,
                     tonumber(s.hit_streak_left) or 0, tonumber(s.hit_streak_right) or 0,
                     tonumber(s.correction_left) or 0, tonumber(s.correction_right) or 0,
                     tonumber(s.yaw_rate) or 0, tonumber(s.last_hit_side) or 0,
@@ -2588,6 +2589,12 @@ setmetatable(PlayerState, {__index = function(t, k)
         last_resolved     = 0,
         last_eye_yaw      = 0,
         defensive_aa      = false,
+        -- V9.87: fake-flick (hidden-yaw ±90 exploit) detection — ADDITIVE, per-player.
+        -- Never alters the first-shot resolve; only lets BF add ±90 candidates + shows a tag.
+        fake_flick        = false,     -- flagged: enemy runs hidden-yaw ±90 fake flick
+        ff_score          = 0,         -- rolling flick-evidence counter (0-8)
+        ff_base_eye       = nil,       -- slow baseline eye yaw (resting, non-flick ticks)
+        ff_last_t         = 0,         -- time of last flick excursion (auto-clear)
         -- AA classification
         aa_type           = "switch",
         aa_classify_cd    = 0,
@@ -4337,6 +4344,18 @@ local function pick_bruteforce_angle(s, anim, eye_yaw, max_desync, p, preset)
         bf_list = {"opposite", "+58", "-58", "+45", "-45", "+35", "-35", "+29", "-29", "+20", "-20", "0"}
     end
 
+    -- V9.87: FAKE-FLICK backup — flagged enemy runs hidden-yaw ±90. Standard BF magnitudes
+    -- (≤58°) can NEVER reach the flicked hitboxes, so on flagged enemies ONLY, lead the cycle
+    -- with ±90 (both signs), lead with the side opposite our last shot, then fall back to the
+    -- normal wide magnitudes. Purely additive: unflagged enemies keep the list chosen above.
+    if s.fake_flick then
+        if s.last_shot_side == 1 then
+            bf_list = {"-90", "+90", "opposite", "+58", "-58", "0"}
+        else
+            bf_list = {"+90", "-90", "opposite", "+58", "-58", "0"}
+        end
+    end
+
     local idx = ((s.missed - 1) % #bf_list) + 1
     local kind = bf_list[idx]
     s.mode = "BF:" .. kind
@@ -4366,6 +4385,8 @@ local function pick_bruteforce_angle(s, anim, eye_yaw, max_desync, p, preset)
         result = eye_yaw + desync * kind_side
     elseif kind == "desync"   then result = eye_yaw + desync
     elseif kind == "-desync"  then result = eye_yaw - desync
+    elseif kind == "+90"      then result = eye_yaw + 90   -- V9.87: fake-flick hidden-yaw
+    elseif kind == "-90"      then result = eye_yaw - 90   -- V9.87: fake-flick hidden-yaw
     elseif kind == "+58"      then result = eye_yaw + 58
     elseif kind == "-58"      then result = eye_yaw - 58
     elseif kind == "+45"      then result = eye_yaw + 45
@@ -4909,6 +4930,40 @@ local function resolve_player(p)
     local eye_yaw    = anim.m_flEyeYaw
     local max_desync = GetMaxDesync(anim) * 58
     local angle
+
+    -- V9.87: FAKE-FLICK detection (ADDITIVE — does NOT touch the resolve below).
+    -- Hidden-yaw ±90 exploit (11_fakeflick.lua): on defensive/choke ticks the networked
+    -- eye flicks ~90° off a stable resting yaw then snaps back, and hidden_pitch pins the
+    -- pitch near ±89. We look for the "rest → ±90 excursion → rest" pattern on a NON-spinner
+    -- and flag the enemy. pick_bruteforce_angle then adds ±90 candidates to the miss cycle
+    -- (standard ≤58° BF magnitudes can never reach the flicked hitboxes). Requires ff_score>=3
+    -- (multiple flicks) so a single hard peek never flags; decays + auto-clears after ~3s idle.
+    do
+        local now_rt = globals.realtime or 0
+        local spd = s.last_speed2d or 0
+        if s.aa_type == "spin" then
+            s.fake_flick = false                       -- spinner eye advances continuously
+        elseif spd < 140 then
+            local base = s.ff_base_eye
+            if base == nil then
+                s.ff_base_eye = eye_yaw
+            else
+                local exc = math.abs(NormalizeAngle(eye_yaw - base))
+                if exc >= 65 and exc <= 115 then
+                    local pitch_hint = math.abs(anim.m_flPitch or 0) >= 80
+                    s.ff_score = math.min((s.ff_score or 0) + (pitch_hint and 2 or 1), 8)
+                    s.ff_last_t = now_rt                -- base stays put — it tracks resting yaw
+                elseif exc < 25 then
+                    -- resting: slow-track baseline toward real yaw, gently decay evidence
+                    s.ff_base_eye = NormalizeAngle(base + NormalizeAngle(eye_yaw - base) * 0.25)
+                    if (s.ff_score or 0) > 0 and (now_rt - (s.ff_last_t or 0)) > 3 then
+                        s.ff_score = s.ff_score - 1
+                    end
+                end
+                s.fake_flick = (s.ff_score or 0) >= 3
+            end
+        end
+    end
 
     if s.missed == 0 then
         angle = pick_first_shot_angle(p, s, anim, eye_yaw, max_desync, preset)
@@ -5747,6 +5802,7 @@ local esp_paint_handler = function()
                 s._espc_txt = string.format("%s %s %.0f°%s", aa_ic, side_ic, desync_val, learn_ic)
                 -- netcode tag (enh mode): ⚠×N serverfails / bt resistant / tp-peek
                 local tag = ""
+                if s.fake_flick then tag = tag .. "⚡FF " end   -- V9.87: hidden-yaw fake flick
                 if (s.serverfail_misses or 0) > 0 then tag = tag .. string.format("⚠×%d ", s.serverfail_misses) end
                 if s.backtrack_resistant then tag = tag .. "bt " end
                 if s.tp_peek_active then tag = tag .. "pk " end
@@ -6197,6 +6253,7 @@ _cs_log_color_raw("V9.79: BF real-dominance broadened to switch AA — v9.78's r
 _cs_log_color_raw("V9.82: reload-continuity — two follow-ups to V9.81. (1) Boot gate lowered from (sl+sr)>=5 to >=2: a thinly-saved enemy (1-3 total hits in learned.lua) never booted, so on reload it re-learned from zero and the ESP confidence bar dropped to 0 despite saved data. Per-side EMA fills still need lsl/lsr>=2 each, so a 2-total enemy seeds real_*/dom/best (restores the bar + dominance) without faking a per-side magnitude. (2) Boot now seeds s.last_seen so confidence()'s age penalty (up to -30 when last_seen reads 0) doesn't tank the bar on the first frame after reload.")
 _cs_log_color_raw("V9.81: PERSISTENCE GAP — per-player learning DID save + reload (7 players on disk, boots in dump), but boot restored measured/samples/side/best-modes and NEVER seeded s.real_left/right. The saved sl/sr ARE real hit counts (only bumped on a confirmed hit), yet a known 17-hit enemy rebooted with real_right=0 → one_sided BF ordering (needs real>=3), alt_side_pick real-dominance, and the confidence real-weight cap all stayed OFF. Magnitude + side recalled but the 'locked one side' intelligence did not — looked like nothing persisted. Boot now seeds real_left/right from saved sl/sr (cap 10) when no session real hit held on that side yet.")
 _cs_log_color_raw("V9.80: three fixes targeting the idx=10 problem enemy (def static, miss-rate 50%). (1) SERVER-FAIL FILTER HONESTY — the bt>8 branch pardoned ANY high-backtrack miss outright, even one whose magnitude was also wrong (idx=10 our=57 meas=45 err=11.9 bt=24; idx=9 our=29.7 meas=19.3 err=10.4 bt=25). bt>8 now pardons only when err<=8 (or no measurement); a high-bt + high-err miss COUNTS — headline no longer flattered by our own overshoots. (2) DEF-CYCLE DOMINANCE — a ratio-dominant def enemy (idx=10 real R=5 L=1, not one_sided since L≠0) wasted shots on opposite/wrong-sign (BF:opposite 0%, BF:+58 0%); now leads the proven side's def magnitude + demotes opposite. (3) DEF_DELTA CAP — def_delta latched a lone 57.8° fingerprint while per-side measured R was 45° → BF:def+ overshot 12°; dd now capped toward dominant per-side measured.")
+_cs_log_color_raw("V9.87: FAKE-FLICK counter (ADDITIVE — first-shot resolve untouched, base mechanics 100% intact). Detects the hidden-yaw ±90 exploit (11_fakeflick.lua: override_hidden_yaw_offset ±90 + hidden_pitch 89 + force_defensive every 7th cmd) via the rest→±90 excursion→rest eye pattern on a non-spinner (pitch≈±89 doubles the evidence). On a flagged enemy pick_bruteforce_angle leads the MISS cycle with ±90 candidates (standard ≤58° BF can never reach the flicked hitboxes) — only after a miss, per-flagged, ff_score>=3 so a single hard peek never flags + auto-clears after 3s. Shows ⚡FF ESP tag + flags{ff=T/N} in the copy-dump.")
 _cs_log_color_raw("V9.85: clipboard copy FINALLY works — the NL ffi state is SHARED across installed scripts, so SetClipboardData was resident with signature (UINT, unsigned int) from another script; our (UINT, HANDLE) proto wasn't in effect and passing the void* handle threw 'cannot convert void* to unsigned int' on EVERY 📋 dump (copy silently fell back to file, never reached the clipboard). CSGO is 32-bit so the handle fits an int — now tries the pointer form (our proto) then the numeric uintptr_t cast (resident int proto), so Ctrl+V works regardless of which script declared it first. No resolver change.")
 _cs_log_color_raw("V9.76: AA-classify oscillation-freeze — the V9.10 anti-flap counted commits in a 10s window, which a SLOW static<->switch<->static revert (spread >10s) dodged entirely (real-dump idx=3/7/11 flapped at long range on yaw noise; idx=7 mode-thrashed switch->static->switch into a miss right after a hit). Now an A->B->A revert (committing back to a type just left) freezes the classifier 5s regardless of timing. A genuine progression (static->switch->jitter) never reverts so real AA changes are untouched.")
 _cs_log_color_raw("V9.75: AIR magnitude boost — the air-branch now boosts an undershot RebuildServerYaw to the known measured/passive air magnitude (keeps the rebuilt side), porting the ground Networked-Boost that already hits 4/4=100%. RebuildServerYaw gives a reliable SIDE but undershoots magnitude in air; a never-hit-but-passively-known air enemy fired the raw short angle and missed (real-dump idx=9: passive/measured 33.9°, rebuild +15° R = correct side 18.9° short → miss). Only fires in the trust-rebuild fall-through (corr-aware / both-sides / cold blocks unchanged).")
