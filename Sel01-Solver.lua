@@ -1,11 +1,11 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 9.89                                   ║
+-- ║  Version: 9.90                                   ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 9.89
+-- @version 9.90
 -- @description v9.79 BF real-dominance ordering broadened to switch AA:
 --   * v9.78 only reordered the static/slow BF branch. This lobby's one-sided
 --     locks were aa=switch (idx=8 real 10R/0L still fired BF:opposite LEFT;
@@ -132,7 +132,7 @@
 --   * v9.26 drift-bump (alpha 0.55 on 5-10° diff) still handles small shifts.
 --   * v9.29 coach variants carry.
 
-local SEL01_VERSION = "9.89"
+local SEL01_VERSION = "9.90"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -2993,7 +2993,19 @@ events.aim_ack:set(function(event)
             local two_side_switcher = (real_active >= 2 and (s.real_left or 0) >= 1
                                        and (s.real_right or 0) >= 1)
                                       or (s.bimodal == true)
-            if two_side_switcher and (ack_angle_err <= 10 or bt > 8) then do_flip = false
+            -- V9.90: JITTER FIRST-CONTACT. On a jitter enemy the measured_desync EMA is
+            -- the AVERAGE of a per-tick-moving fake, so a small ack_angle_err (our |delta|
+            -- ~= the EMA) does NOT mean the angle was correct — the side AND magnitude are
+            -- different next tick. The KEEP + serverfail_retry-same-magnitude path assumes
+            -- a STABLE fake the server rejected, which jitter does not have; freezing wastes
+            -- shots (real-dump idx=7 aa=jitter samples=0: 3 KEEPs at meas 30.9->37.0->41.1,
+            -- all missed, only resolved when the enemy stabilised). Force a side flip so the
+            -- BF cycle sweeps side + magnitude instead of re-firing the same angle. Gated on
+            -- real_active==0 so a LEARNED one-sided jitter (idx=8, 8 real L-hits, streak L=8)
+            -- keeps its proven side — this only touches the blind never-hit case. Mirrors the
+            -- v9.74 "jitter has no stable delta" precedent (BF skips def_delta on jitter).
+            if s.aa_type == "jitter" and real_active == 0 then do_flip = true
+            elseif two_side_switcher and (ack_angle_err <= 10 or bt > 8) then do_flip = false
             -- FIX #1: one-sided switch enemy, correct magnitude (err<2), 2+ consecutive
             -- correct-angle KEEPs on the same side = the switch moved to the other side and
             -- the bt-fail keep never tries it (idx=4 aa=switch L=3/47.9 R=0, 6+ KEEP err=0.0,
@@ -6283,6 +6295,7 @@ _cs_log_color_raw("V9.32: bimodal-switch detection (suppress global hard-reset t
 _cs_log_color_raw("V9.33: air-branch recent_resolved push (cancel-conf/conf now air-aware) + snapshot tick-window guard (no stale cross-engagement match) + boot nil-guard + adaptive-guess cap 58 + [EXP off] pose-param side read.")
 _cs_log_color_raw("V9.34: AIR-branch hardening — per-side magnitude in air corr-aware path (was global, wrong for bimodal) + update_jitter now runs in air (yaw_cache/rate warm → correct aa_type on landing + air-spin visible).")
 _cs_log_color_raw("V9.35: fast-fire tightened — only fires fast on stable (stddev<12) + well-sampled resolves, hc floors raised (30/45 not 15/22/30). Stops the 'shoots too early' marginal shots that caught bad backtrack records → correction/prediction-error rejects.")
+_cs_log_color_raw("V9.90: JITTER first-contact no longer freezes the side. On a jitter enemy the measured_desync EMA is the AVERAGE of a per-tick-moving fake, so a small ack_angle_err (our |delta| ~= EMA) does NOT mean the angle was right — side + magnitude move next tick. The KEEP + serverfail_retry-same-magnitude path assumes a STABLE fake the server rejected, which jitter lacks (real-dump idx=7 aa=jitter samples=0: 3 KEEPs at meas 30.9→37.0→41.1, all missed, only resolved when the enemy stabilised into Static-Server 19.6°). Now jitter + real_active==0 forces a side flip so the BF cycle sweeps side+magnitude instead of re-firing the same angle. Gated on real_active==0 so a LEARNED one-sided jitter (idx=8, 8 real L-hits, streak L=8) keeps its proven side. Mirrors the v9.74 'jitter has no stable delta' precedent.")
 _cs_log_color_raw("V9.36: snapshot-match REGRESSION FIX — v9.33 matched ack-time tickcount (grabbed the most-recent snapshot, mis-learned sides on rapid fire). Restored event.tick matching of the actual acked shot; kept the stale-reject guard.")
 _cs_log_color_raw("V9.37: AIR first-contact fix (Air was worst @25%) — air guess magnitude biased high (max(median,42), airborne=near-max desync) + first-contact side uses steam-mem dom instead of blind +1.")
 _cs_log_color_raw("V9.77: Networked-Boost side-conflict guard (RebuildServerYaw side can flip on a hard one-sided enemy — real-dump idx=5 streak L=20 R=0, rebuild said R → boosted 29° R twice → 0/2; learned_dom_side now vetoes a wrong-side boost on ground + air) + server-fail filter honesty (a bt=0 err=0 kept-side miss is OUR switch/side misprediction not netcode; err<=5 branch now needs bt>=4 — real-dump idx=5 had ~14 bt=0/2 keeps excused, headline 86.7% vs raw 59.1%).")
