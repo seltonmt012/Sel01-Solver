@@ -1,11 +1,11 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-WalkBot                                     ║
--- ║  Version: 1.7                                      ║
+-- ║  Version: 1.8                                      ║
 -- ║  Greedy nav-bot: map + enemy detect, walk-to-foe  ║
 -- ║  by seltonmt01                                     ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-WalkBot
--- @version 1.7
+-- @version 1.8
 -- @author seltonmt01
 -- @description Greedy walk-bot. Detects map + enemies, walks the local player
 --   toward a chosen target using NL movement cmd (move_yaw + forwardmove) with
@@ -19,7 +19,7 @@
 --   entity.get_players(true) (enemies) / entity.get_local_player() / p.m_vecOrigin / p:get_eye_position()
 --   globals.mapname / globals.tickcount / globals.realtime
 
-local SEL01_WB_VERSION = "1.7"
+local SEL01_WB_VERSION = "1.8"
 
 local ffi_ok, ffi = pcall(require, "ffi")
 
@@ -102,7 +102,8 @@ pcall(function()
     wb_clantag  = g_main:switch("Clantag 'WalkBot rn' when active")
     wb_nav      = g_main:switch("Load Nav-Mesh (real map routes — experimental)")
     wb_hud      = g_hud:switch("HUD Overlay")
-    wb_debug    = g_hud:switch("Debug Info")
+    wb_debug    = g_hud:switch("Debug Info (live stuck/roam/target console logs)")
+    g_hud:button("Dump WalkBot Logs (console)", function() _wb_pending_dumplog = true end)
 end)
 -- sensible defaults (switches default off; flip the ones we want on)
 pcall(function() if wb_peekslow then wb_peekslow:set(true) end end)
@@ -162,11 +163,47 @@ local state = {
     nav_goal_id  = nil,
     nav_path_t   = 0,
     nav_path_len = 0,
+    -- v1.8 stuck detector (velocity + rolling-progress) + diagnostics
+    hspeed       = 0,          -- horizontal speed this tick (u/s) from m_vecVelocity
+    onground     = true,       -- m_fFlags FL_ONGROUND — airborne ticks skip stuck-check
+    stuck_ref_origin = nil,    -- rolling reference point; advances on real progress
+    stuck_ref_t  = 0,
+    logs         = {},         -- ring buffer of diagnostic lines (Dump button)
+    last_target_idx = nil,     -- for target acquire/lose/switch logging
+    last_roam_mode = nil,      -- for roam sub-mode change logging
 }
 -- button -> tick drain flags (module globals: button closures run before `state`
 -- helpers are bound; globals dodge the forward-reference trap, Solver pattern).
 _wb_pending_record = false
 _wb_pending_clear  = false
+_wb_pending_dumplog = false
+
+-- ─── diagnostic logging (v1.8) ───────────────────────────
+-- Ring buffer + throttled console writer so real-session movement (stuck / roam /
+-- target) can be diagnosed after the fact. Every message ALWAYS lands in the ring
+-- (for the Dump button), and — when "Debug Info" is on — also prints to the game
+-- console, throttled per message KEY so one recurring event can't spam. Console
+-- writer multi-fallback (client.log -> print), Solver pattern. wb_debug is a local
+-- declared earlier in the chunk; this closure reads it at call-time so the ref is live.
+local WB_LOG_CAP = 140
+local wb_log_last = {}   -- key -> last realtime it printed to console
+local function wb_console(text)
+    if not pcall(function() client.log(text) end) then pcall(function() print(text) end) end
+end
+local function wb_log(key, throttle, fmt, ...)
+    local now = 0; pcall(function() now = globals.realtime end)
+    local msg = (select('#', ...) > 0) and string.format(fmt, ...) or fmt
+    local r = state.logs
+    r[#r + 1] = string.format("[%7.1f] %s", now, msg)
+    if #r > WB_LOG_CAP then table.remove(r, 1) end
+    local dbg = false
+    pcall(function() dbg = wb_debug and wb_debug:get() end)
+    if not dbg then return end
+    if (now - (wb_log_last[key] or -1e9)) >= (throttle or 0) then
+        wb_log_last[key] = now
+        wb_console(string.format("[WB %5.1f] %s", now, msg))
+    end
+end
 
 -- ─── helpers needing NL API (all pcall-guarded for version variance) ──
 local function get_lp()
@@ -506,18 +543,44 @@ local function compute_move(lp, lo, want_yaw, now, base_act, no_stuck)
         end
     end
 
-    -- ESCALATING stuck breakout (shared by walk / roam / wander). Skipped when the caller
-    -- is intentionally holding/peeking in place (no_stuck) — that's not being wedged, it's
-    -- a chosen safe position, and flagging it as STUCK made it dance off a good angle.
-    if no_stuck then state.stuck_since = 0 end
-    if state.last_origin and not no_stuck then
-        local moved = v_len2d(vector(lo.x - state.last_origin.x, lo.y - state.last_origin.y, 0))
-        if moved < 1.5 then
-            if state.stuck_since == 0 then state.stuck_since = now end
+    -- ESCALATING stuck breakout — VELOCITY + ROLLING-PROGRESS aware (v1.8). The old
+    -- detector flagged STUCK off a per-tick displacement < 1.5u, i.e. anything under
+    -- ~96 u/s. A legit slow-walk (~90-130 u/s = 1.4-2u/tick), a turn, or an avoid
+    -- transition all dip below that and tripped STUCK within 0.35s -> "goes to stuck too
+    -- fast", danced off good positions, and blacklisted fine spots via record_bad. Now
+    -- stuck needs BOTH: (a) actual horizontal velocity pinned low (hspeed < WB_STUCK_SPD)
+    -- AND (b) no NET progress from a rolling reference point that only advances on real
+    -- movement — so brief dips reset nothing and a slow-walk (velocity well above the
+    -- floor) never trips. Airborne ticks are skipped (can't read ground progress).
+    -- no_stuck (HOLD/peek) disables it fully — a held angle is a choice, not a wedge.
+    local WB_STUCK_SPD = 34       -- u/s floor; below this while commanded-to-move = pinned
+    local WB_PROG      = 20       -- u of net progress that counts as "still moving"
+    if no_stuck then
+        state.stuck_since = 0
+        state.stuck_ref_origin = lo; state.stuck_ref_t = now
+    elseif state.last_origin then
+        if not state.stuck_ref_origin then state.stuck_ref_origin = lo; state.stuck_ref_t = now end
+        local hspeed = state.hspeed or 999
+        local prog = v_len2d(vector(lo.x - state.stuck_ref_origin.x, lo.y - state.stuck_ref_origin.y, 0))
+        -- advance the reference whenever we've covered real ground -> resets the timer
+        if prog >= WB_PROG then
+            state.stuck_ref_origin = lo; state.stuck_ref_t = now
+            if state.stuck_since ~= 0 then
+                wb_log("unstuck", 0.5, "%s recovered (hspeed=%.0f prog=%.0f)", base_act, hspeed, prog)
+            end
+            state.stuck_since = 0
+        end
+        local pinned = (hspeed < WB_STUCK_SPD) and state.onground
+        if pinned then
+            if state.stuck_since == 0 then
+                state.stuck_since = now
+                wb_log("pinned", 0, "%s pinned hspeed=%.0f prog=%.0f block=%s -> watching",
+                       base_act, hspeed, prog, tostring(state.block))
+            end
             local dur = now - state.stuck_since
-            if dur > 1.2 then
-                -- WEDGED: commit a back+side escape heading for ~0.8s + jump, and flip the
-                -- preferred avoid side so we don't re-wedge the same way.
+            if dur > 1.8 then
+                -- WEDGED: commit a back+side escape heading for ~0.8s + jump, flip the
+                -- preferred avoid side so we don't re-wedge the same way, learn the spot.
                 state.activity = "STUCK"; state.stuck_hard = true; state.block = "wedged"
                 local side = (state.avoid_dir ~= 0 and state.avoid_dir) or 1
                 state.escape_yaw = norm_ang(want_yaw + 160 * side)
@@ -527,14 +590,22 @@ local function compute_move(lp, lo, want_yaw, now, base_act, no_stuck)
                 state.diag = base_act .. " WEDGED -> hard escape"
                 move_yaw = state.escape_yaw
                 state.stuck_since = now
+                state.stuck_ref_origin = lo; state.stuck_ref_t = now
                 record_bad(lo)                              -- learn: this is a bad spot
-            elseif dur > 0.35 then
+                wb_log("wedge", 0, "%s WEDGED %.1fs hspeed=%.0f @(%.0f,%.0f) -> escape %.0f deg + record_bad",
+                       base_act, dur, hspeed, lo.x, lo.y, state.escape_yaw)
+            elseif dur > 0.7 then
                 state.activity = "STUCK"
                 move_yaw = want_yaw + (state.avoid_dir ~= 0 and state.avoid_dir or 1) * 90
                 if aj and can_step_up(lp, lo, want_yaw, probe) then state.jump_until = now + 0.15 end
                 state.diag = base_act .. " stuck -> strafe"
+                wb_log("strafe", 0.5, "%s stuck %.1fs hspeed=%.0f -> strafe %+.0f deg",
+                       base_act, dur, hspeed, move_yaw - want_yaw)
             end
         else
+            if state.stuck_since ~= 0 then
+                wb_log("unstuck", 0.5, "%s recovered (hspeed=%.0f)", base_act, hspeed)
+            end
             state.stuck_since = 0
         end
     end
@@ -832,6 +903,22 @@ local function walkbot_tick(cmd)
     if use_nav and nav.map ~= state.mapname then nav_load(state.mapname) end
     if not lo then state.activity = "IDLE"; state.diag = "no origin"; return end
 
+    -- v1.8: horizontal speed + ground flag drive the stuck detector (see compute_move).
+    do
+        local vx, vy = 0, 0
+        pcall(function() local v = lp.m_vecVelocity; vx = v.x or 0; vy = v.y or 0 end)
+        state.hspeed = math.sqrt(vx * vx + vy * vy)
+        local fl = 1; pcall(function() fl = tonumber(lp.m_fFlags) or 1 end)
+        state.onground = bit.band(fl, 1) == 1
+    end
+    -- drain Dump-Logs button
+    if _wb_pending_dumplog then
+        _wb_pending_dumplog = false
+        wb_console(string.format("──── WalkBot v%s log dump (%d lines) ────", SEL01_WB_VERSION, #state.logs))
+        for _, ln in ipairs(state.logs) do wb_console(ln) end
+        wb_console("──── end WalkBot log dump ────")
+    end
+
     local enemies = get_enemies()
     state.enemy_count = #enemies
     -- enemy HISTORY: remember where each enemy was last seen (not all are visible at
@@ -844,6 +931,22 @@ local function walkbot_tick(cmd)
         end
     end
     local target, dist = pick_target(lp)
+
+    -- v1.8: log target acquire / lose / switch (enemy_count context helps diagnose ROAM)
+    do
+        local tidx = nil
+        if target then pcall(function() tidx = target:get_index() end) end
+        if tidx ~= state.last_target_idx then
+            if tidx and not state.last_target_idx then
+                wb_log("tgt_get", 0, "TARGET acquired idx=%s d=%.0f (enemies=%d)", tostring(tidx), dist or 0, state.enemy_count)
+            elseif not tidx and state.last_target_idx then
+                wb_log("tgt_lose", 0, "TARGET lost -> ROAM (enemies=%d, history=%d)", state.enemy_count, (function() local c=0 for _ in pairs(state.enemy_history) do c=c+1 end return c end)())
+            elseif tidx then
+                wb_log("tgt_switch", 0, "TARGET switch idx=%s d=%.0f", tostring(tidx), dist or 0)
+            end
+            state.last_target_idx = tidx
+        end
+    end
 
     -- ════════ ENGAGE: we have a target ════════
     if target then
@@ -996,6 +1099,16 @@ local function walkbot_tick(cmd)
         move_yaw = compute_move(lp, lo, state.wander_yaw or 0, now, "WANDER")
         if state.activity == "WANDER" then
             state.diag = "WANDER (exploring near mid)"
+        end
+    end
+
+    -- v1.8: log ROAM sub-mode transitions (HUNT / ROAM / LEAVE-SPAWN / WANDER) so a
+    -- "wanders wrong / thrashes" report can be read straight off the log.
+    do
+        local mode = tostring(state.diag):match("^(%S+)") or "?"
+        if mode ~= state.last_roam_mode then
+            wb_log("roam_mode", 0, "ROAM -> %s | %s", mode, state.diag)
+            state.last_roam_mode = mode
         end
     end
 
