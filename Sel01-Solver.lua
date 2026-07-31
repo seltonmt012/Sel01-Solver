@@ -1,11 +1,11 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 9.92                                   ║
+-- ║  Version: 9.93                                   ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 9.92
+-- @version 9.93
 -- @description v9.79 BF real-dominance ordering broadened to switch AA:
 --   * v9.78 only reordered the static/slow BF branch. This lobby's one-sided
 --     locks were aa=switch (idx=8 real 10R/0L still fired BF:opposite LEFT;
@@ -132,7 +132,7 @@
 --   * v9.26 drift-bump (alpha 0.55 on 5-10° diff) still handles small shifts.
 --   * v9.29 coach variants carry.
 
-local SEL01_VERSION = "9.92"
+local SEL01_VERSION = "9.93"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -292,9 +292,12 @@ local loading_render_callback = function()
     end;
 end;
 
-events.render:set(function() 
+events.render:set(function()
     loading_render_callback();
     sidebar();
+    -- v9.93: on-screen version banner (under the load logo, then fades). Global fn,
+    -- defined by the version-check block at the bottom — resolved at call time.
+    if sel01_vc_draw then sel01_vc_draw() end
 end)
 pui.sidebar("boost ~ beta",ui.get_icon"sparkles")
 local accent = "\a{Link Active}"
@@ -6281,13 +6284,35 @@ pcall(function()
     end
 end)
 
--- ═══ VERSION CHECK (GitHub, v9.91) ═══════════════════════
--- One fetch of versions.txt from the repo at load. Deliberately quiet: the result is
--- ONE menu line (top of Main) + one console line, nothing drawn on screen.
+-- ═══ VERSION CHECK (GitHub, v9.93) ═══════════════════════
+-- One fetch of versions.txt from the repo at load. Result goes to THREE places: the
+-- menu label (top of Main), one console line, and an ON-SCREEN banner drawn under the
+-- loading logo — "checking version..." while the request is in flight, then a short
+-- green "up to date" or a longer red "UPDATE available", both fading out. Nothing
+-- stays on screen afterwards.
 -- do...end block: the main chunk is at the 200-local cap, so these stay block-scoped.
 do
     local VC_URL = "https://raw.githubusercontent.com/seltonmt012/Sel01-Solver/master/versions.txt"
     local VC_KEY = "solver"
+
+    sel01_vc_scr = { text = "checking version...", r = 190, g = 190, b = 190,
+                     t_until = (globals.realtime or 0) + 12 }
+    function sel01_vc_draw()                       -- global: called from the render wrapper
+        local st = sel01_vc_scr
+        if not st then return end
+        local now = globals.realtime or 0
+        if now >= (st.t_until or 0) then sel01_vc_scr = nil; return end
+        local a = 255
+        local left = st.t_until - now
+        if left < 1.0 then a = math.floor(255 * left) end
+        pcall(function()
+            local ss = render.screen_size()
+            render.text(4, vector(ss.x / 2, ss.y * 0.70), color(st.r, st.g, st.b, a), "c", st.text)
+        end)
+    end
+    function sel01_vc_screen(text, r, g, b, secs)   -- global: main chunk is AT the 200-local cap
+        sel01_vc_scr = { text = text, r = r, g = g, b = b, t_until = (globals.realtime or 0) + secs }
+    end
 
     local function vc_num(v)
         local a, b = tostring(v):match("(%d+)%.(%d+)")
@@ -6300,13 +6325,20 @@ do
             local k, v = line:match("^%s*([%w_]+)%s*=%s*([%d%.]+)")
             if k == VC_KEY then latest = v end
         end
-        if not latest then vc_set("\aAAAAAAFFv" .. SEL01_VERSION .. " - update check: no entry"); return end
+        if not latest then
+            vc_set("\aAAAAAAFFv" .. SEL01_VERSION .. " - update check: no entry")
+            sel01_vc_screen("Sel01-Solver v" .. SEL01_VERSION .. "  -  version unknown", 190, 190, 190, 4)
+            return
+        end
         if vc_num(latest) > vc_num(SEL01_VERSION) then
             vc_set("\aFF5555FFUPDATE: v" .. latest .. " available (you run v" .. SEL01_VERSION .. ")")
+            sel01_vc_screen("Sel01-Solver OUTDATED  -  v" .. latest .. " available (you run v" .. SEL01_VERSION .. ")",
+                      255, 85, 85, 15)
             pcall(function() _cs_log_color_raw("Sel01-Solver: UPDATE AVAILABLE v" .. latest .. " (you run v"
                 .. SEL01_VERSION .. ") - github.com/seltonmt012/Sel01-Solver") end)
         else
             vc_set("\a55DD55FFv" .. SEL01_VERSION .. " - up to date")
+            sel01_vc_screen("Sel01-Solver v" .. SEL01_VERSION .. "  -  up to date", 85, 221, 85, 4)
         end
     end
     local started = false
@@ -6316,6 +6348,7 @@ do
                 pcall(vc_apply, resp.body)
             else
                 vc_set("\aAAAAAAFFv" .. SEL01_VERSION .. " - update check failed")
+                sel01_vc_screen("Sel01-Solver v" .. SEL01_VERSION .. "  -  update check failed", 190, 190, 190, 4)
             end
         end)
         started = true
@@ -6336,6 +6369,11 @@ do
             local body = files.read(path)
             if body and #body > 0 then vc_apply(body) end
         end)
+        -- fallback ran synchronously: if it produced nothing, say so instead of leaving
+        -- "checking version..." on screen until it times out.
+        if sel01_vc_scr and tostring(sel01_vc_scr.text):find("checking") then
+            sel01_vc_screen("Sel01-Solver v" .. SEL01_VERSION .. "  -  update check failed", 190, 190, 190, 4)
+        end
     end
 end
 

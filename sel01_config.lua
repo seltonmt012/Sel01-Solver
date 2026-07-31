@@ -5,7 +5,7 @@
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Config
 -- @author seltonmt01
--- @version 3.30
+-- @version 3.31
 -- @description AI Peek hittable-gate (only peek when min-dmg shot exists):
 --   * v3.28 peeked at any in-range enemy → walked constantly. v3.29 arms the
 --     peek ONLY while a fresh events.aim_fire (estimated damage >= the user's NL
@@ -71,7 +71,7 @@
 --     variance for full per-side chaos.
 --   * MAG-JIT indicator added to bottom HvH strip; dumped in v3.8 stats.
 
-local SEL01_CFG_VERSION = "3.30"
+local SEL01_CFG_VERSION = "3.31"
 
 -- DEBUG: print to CSGO console at major load checkpoints. Plain print() bypasses
 -- NL chat (which may not flush before crash) and writes directly to CSGO console.
@@ -1724,6 +1724,9 @@ end
 -- Render loop
 pcall(function()
     events.render:set(function()
+        -- v3.31: on-screen version banner. Drawn BEFORE the master-disable check so the
+        -- load-time result is visible even with the script's master switch off.
+        if cfg_vc_draw then cfg_vc_draw() end
         if not enable_master:get() then return end
         update_perf()
         update_specs()
@@ -2551,6 +2554,28 @@ do
     local VC_URL = "https://raw.githubusercontent.com/seltonmt012/Sel01-Solver/master/versions.txt"
     local VC_KEY = "config"
 
+    -- v3.31: ON-SCREEN banner (menu label alone was easy to miss). "checking version..."
+    -- while the request is in flight, then a short green "up to date" or a longer red
+    -- "OUTDATED", each fading out — nothing stays on screen afterwards.
+    cfg_vc_scr = { text = "checking version...", r = 190, g = 190, b = 190,
+                   t_until = (globals.realtime or 0) + 12 }
+    function cfg_vc_draw()
+        local st = cfg_vc_scr
+        if not st then return end
+        local now = globals.realtime or 0
+        if now >= (st.t_until or 0) then cfg_vc_scr = nil; return end
+        local a = 255
+        local left = st.t_until - now
+        if left < 1.0 then a = math.floor(255 * left) end
+        pcall(function()
+            local ss = render.screen_size()
+            render.text(4, vector(ss.x / 2, ss.y * 0.74), color(st.r, st.g, st.b, a), "c", st.text)
+        end)
+    end
+    function cfg_vc_screen(text, r, g, b, secs)   -- global: main chunk is at the 200-local cap
+        cfg_vc_scr = { text = text, r = r, g = g, b = b, t_until = (globals.realtime or 0) + secs }
+    end
+
     local function vc_num(v)
         local a, b = tostring(v):match("(%d+)%.(%d+)")
         return (tonumber(a) or 0) * 1000 + (tonumber(b) or 0)
@@ -2562,13 +2587,20 @@ do
             local k, v = line:match("^%s*([%w_]+)%s*=%s*([%d%.]+)")
             if k == VC_KEY then latest = v end
         end
-        if not latest then vc_set("\aAAAAAAFFv" .. SEL01_CFG_VERSION .. " - update check: no entry"); return end
+        if not latest then
+            vc_set("\aAAAAAAFFv" .. SEL01_CFG_VERSION .. " - update check: no entry")
+            cfg_vc_screen("Sel01-Config v" .. SEL01_CFG_VERSION .. "  -  version unknown", 190, 190, 190, 4)
+            return
+        end
         if vc_num(latest) > vc_num(SEL01_CFG_VERSION) then
             vc_set("\aFF5555FFUPDATE: v" .. latest .. " available (you run v" .. SEL01_CFG_VERSION .. ")")
+            cfg_vc_screen("Sel01-Config OUTDATED  -  v" .. latest .. " available (you run v" .. SEL01_CFG_VERSION .. ")",
+                      255, 85, 85, 15)
             pcall(function() cs_log_color("Sel01-Config: update available v" .. latest .. " (you run v"
                 .. SEL01_CFG_VERSION .. ") - github.com/seltonmt012/Sel01-Solver") end)
         else
             vc_set("\a55DD55FFv" .. SEL01_CFG_VERSION .. " - up to date")
+            cfg_vc_screen("Sel01-Config v" .. SEL01_CFG_VERSION .. "  -  up to date", 85, 221, 85, 4)
         end
     end
     local started = false
@@ -2578,6 +2610,7 @@ do
                 pcall(vc_apply, resp.body)
             else
                 vc_set("\aAAAAAAFFv" .. SEL01_CFG_VERSION .. " - update check failed")
+                cfg_vc_screen("Sel01-Config v" .. SEL01_CFG_VERSION .. "  -  update check failed", 190, 190, 190, 4)
             end
         end)
         started = true
@@ -2598,6 +2631,9 @@ do
             local body = files.read(path)
             if body and #body > 0 then vc_apply(body) end
         end)
+        if cfg_vc_scr and tostring(cfg_vc_scr.text):find("checking") then
+            cfg_vc_screen("Sel01-Config v" .. SEL01_CFG_VERSION .. "  -  update check failed", 190, 190, 190, 4)
+        end
     end
 end
 

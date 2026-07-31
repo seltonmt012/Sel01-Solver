@@ -1,12 +1,12 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-PlantBot                                    ║
--- ║  Version: 1.5                                      ║
+-- ║  Version: 1.6                                      ║
 -- ║  One job: walk to a marked A spot, plant the C4,   ║
 -- ║  walk to a marked safe spot, done. Auto-picks T.   ║
 -- ║  by seltonmt01                                     ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-PlantBot
--- @version 1.5
+-- @version 1.6
 -- @author seltonmt01
 -- @description Standalone plant-bot. You MARK two spots once (persisted per map):
 --   the A plant spot + the safe spot. Then it loops every round:
@@ -18,7 +18,7 @@
 --   Movement ONLY — aiming stays with the ragebot. While idle/done it does NOT touch
 --   the cmd, so your normal keys work.
 
-local SEL01_PB_VERSION = "1.5"
+local SEL01_PB_VERSION = "1.6"
 
 local ffi_ok, ffi = pcall(require, "ffi")
 
@@ -874,7 +874,10 @@ local function render_hud()
         end
     end)
 end
-pcall(function() events.render:set(render_hud) end)
+pcall(function() events.render:set(function()
+    render_hud()
+    if pb_vc_draw then pb_vc_draw() end   -- v1.6 on-screen version banner (load-time only)
+end) end)
 
 -- ─── shutdown ────────────────────────────────────────────
 pcall(function()
@@ -895,6 +898,28 @@ end)
 local VC_URL = "https://raw.githubusercontent.com/seltonmt012/Sel01-Solver/master/versions.txt"
 local VC_KEY = "plantbot"
 
+-- v1.6: ON-SCREEN banner (the menu label alone is easy to miss). "checking version..."
+-- while the request is in flight, then a short green "up to date" or a longer red
+-- "OUTDATED", both fading out. Nothing stays on screen afterwards.
+pb_vc_scr = { text = "checking version...", r = 190, g = 190, b = 190,
+              t_until = (globals.realtime or 0) + 12 }
+function pb_vc_draw()
+    local st = pb_vc_scr
+    if not st then return end
+    local now = globals.realtime or 0
+    if now >= (st.t_until or 0) then pb_vc_scr = nil; return end
+    local a = 255
+    local left = st.t_until - now
+    if left < 1.0 then a = math.floor(255 * left) end
+    pcall(function()
+        local ss = render.screen_size()
+        render.text(4, vector(ss.x / 2, ss.y * 0.78), color(st.r, st.g, st.b, a), "c", st.text)
+    end)
+end
+local function vc_screen(text, r, g, b, secs)
+    pb_vc_scr = { text = text, r = r, g = g, b = b, t_until = (globals.realtime or 0) + secs }
+end
+
 local function vc_num(v)
     local a, b = tostring(v):match("(%d+)%.(%d+)")
     return (tonumber(a) or 0) * 1000 + (tonumber(b) or 0)
@@ -906,13 +931,20 @@ local function vc_apply(body)
         local k, v = line:match("^%s*([%w_]+)%s*=%s*([%d%.]+)")
         if k == VC_KEY then latest = v end
     end
-    if not latest then vc_set("\aAAAAAAFFv" .. SEL01_PB_VERSION .. " - update check: no entry"); return end
+    if not latest then
+        vc_set("\aAAAAAAFFv" .. SEL01_PB_VERSION .. " - update check: no entry")
+        vc_screen("Sel01-PlantBot v" .. SEL01_PB_VERSION .. "  -  version unknown", 190, 190, 190, 4)
+        return
+    end
     if vc_num(latest) > vc_num(SEL01_PB_VERSION) then
         vc_set("\aFF5555FFUPDATE: v" .. latest .. " available (you run v" .. SEL01_PB_VERSION .. ")")
+        vc_screen("Sel01-PlantBot OUTDATED  -  v" .. latest .. " available (you run v" .. SEL01_PB_VERSION .. ")",
+                  255, 85, 85, 15)
         pcall(function() print("[PlantBot] update available: v" .. latest .. " (you run v" .. SEL01_PB_VERSION
             .. ") - github.com/seltonmt012/Sel01-Solver") end)
     else
         vc_set("\a55DD55FFv" .. SEL01_PB_VERSION .. " - up to date")
+        vc_screen("Sel01-PlantBot v" .. SEL01_PB_VERSION .. "  -  up to date", 85, 221, 85, 4)
     end
 end
 local function vc_check()
@@ -923,6 +955,7 @@ local function vc_check()
                 pcall(vc_apply, resp.body)
             else
                 vc_set("\aAAAAAAFFv" .. SEL01_PB_VERSION .. " - update check failed")
+                vc_screen("Sel01-PlantBot v" .. SEL01_PB_VERSION .. "  -  update check failed", 190, 190, 190, 4)
             end
         end)
         started = true
@@ -944,6 +977,9 @@ local function vc_check()
         local body = files.read(path)
         if body and #body > 0 then vc_apply(body) end
     end)
+    if pb_vc_scr and tostring(pb_vc_scr.text):find("checking") then
+        vc_screen("Sel01-PlantBot v" .. SEL01_PB_VERSION .. "  -  update check failed", 190, 190, 190, 4)
+    end
 end
 pcall(vc_check)
 
