@@ -1,11 +1,11 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-WalkBot                                     ║
--- ║  Version: 2.1                                      ║
+-- ║  Version: 2.2                                      ║
 -- ║  Greedy nav-bot: map + enemy detect, walk-to-foe  ║
 -- ║  by seltonmt01                                     ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-WalkBot
--- @version 2.1
+-- @version 2.2
 -- @author seltonmt01
 -- @description Greedy walk-bot. Detects map + enemies, walks the local player
 --   toward a chosen target using NL movement cmd (move_yaw + forwardmove) with
@@ -19,7 +19,7 @@
 --   entity.get_players(true) (enemies) / entity.get_local_player() / p.m_vecOrigin / p:get_eye_position()
 --   globals.mapname / globals.tickcount / globals.realtime
 
-local SEL01_WB_VERSION = "2.1"
+local SEL01_WB_VERSION = "2.2"
 
 local ffi_ok, ffi = pcall(require, "ffi")
 
@@ -964,6 +964,37 @@ local function walkbot_tick(cmd)
         local fl = 1; pcall(function() fl = tonumber(lp.m_fFlags) or 1 end)
         state.onground = bit.band(fl, 1) == 1
     end
+    -- ── v2.2: FREEZE TIME / WARMUP awareness ──
+    -- The bot had no idea a round had not been released yet: during buy time the server
+    -- ignores movement, so it commanded full forwardmove, went nowhere, and the stuck
+    -- detector read that as a wedge — burning escape commits and record_bad marks on
+    -- perfectly fine spawn spots before the round even started ("thinks everyone is
+    -- walking but nothing is released yet"). Now we hold still and keep the stuck
+    -- detector disarmed. Placed AFTER the button drains + weapon switch so waypoints can
+    -- still be recorded during freeze time and the rifle is already out on release.
+    do
+        local gr = nil
+        pcall(function() gr = entity.get_game_rules() end)
+        local freeze, warm = false, false
+        if gr then
+            pcall(function() freeze = gr.m_bFreezePeriod and true or false end)
+            pcall(function() warm   = gr.m_bWarmupPeriod and true or false end)
+        end
+        state.freeze = freeze
+        state.warmup = warm
+        if freeze or warm then
+            state.activity = freeze and "FREEZE" or "WARMUP"
+            state.diag     = freeze and "freeze time — waiting for round start" or "warmup — waiting"
+            state.stuck_since      = 0
+            state.stuck_ref_origin = nil
+            state.escape_yaw       = nil
+            state.escape_until     = 0
+            state.last_origin      = nil
+            state.nav_path         = nil        -- re-path once we can actually move
+            return                              -- no cmd writes: your own keys still work
+        end
+    end
+
     -- drain Dump-Logs button
     if _wb_pending_dumplog then
         _wb_pending_dumplog = false
@@ -1219,15 +1250,23 @@ pcall(function() events.createmove:set(walkbot_tick) end)
 -- ─── clantag while active ────────────────────────────────
 -- set_clan_tag is a game-state write -> only takes effect from net_update_end
 -- (the render thread silently drops it; bloodwings pattern). Only writes on change.
+-- v2.2: RE-STAMP every 30s. Writing only on change lost the tag whenever the server or
+-- another script overwrote it (round change / rejoin / clantag spammers), and it never
+-- came back because our mirror still said "already set". Now the write repeats on a
+-- timer as well, so the tag re-appears on its own.
 local function update_clantag()
     local want = ""
     local on, tagon = false, false
     pcall(function() on = wb_enable and wb_enable:get() end)
     pcall(function() tagon = wb_clantag and wb_clantag:get() end)
     if on and tagon then want = "WalkBot rn" end
-    if want ~= state.clantag_set then
+    local now = 0
+    pcall(function() now = globals.realtime end)
+    local due = (now - (state.clantag_t or 0)) >= 30.0
+    if want ~= state.clantag_set or (want ~= "" and due) then
         pcall(function() common.set_clan_tag(want) end)
         state.clantag_set = want
+        state.clantag_t   = now
     end
 end
 if not pcall(function() events.net_update_end:set(update_clantag) end) then
