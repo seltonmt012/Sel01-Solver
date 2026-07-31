@@ -1,11 +1,11 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 9.90                                   ║
+-- ║  Version: 9.91                                   ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 9.90
+-- @version 9.91
 -- @description v9.79 BF real-dominance ordering broadened to switch AA:
 --   * v9.78 only reordered the static/slow BF branch. This lobby's one-sided
 --     locks were aa=switch (idx=8 real 10R/0L still fired BF:opposite LEFT;
@@ -132,7 +132,7 @@
 --   * v9.26 drift-bump (alpha 0.55 on 5-10° diff) still handles small shifts.
 --   * v9.29 coach variants carry.
 
-local SEL01_VERSION = "9.90"
+local SEL01_VERSION = "9.91"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -373,6 +373,9 @@ _uname = (common and common.get_username and common.get_username()) or "player" 
 g_main:label(ui.get_icon"user" .. "  Dear " .. accent .. _uname .. "\aDEFAULT, have a good game!")
 g_main:label(ui.get_icon"sparkles" .. "  Build " .. accent .. "Sel01-Solver" .. "\aDEFAULT  version " .. accent .. SEL01_VERSION .. "\aDEFAULT")
 g_main:label(ui.get_icon"crosshairs" .. "  Resolver by " .. accent .. "seltonmt01" .. "\aDEFAULT")
+-- v9.91 update line (global: main chunk at the 200-local cap). Filled by the version
+-- check at the bottom of the file; stays a single quiet line, never an on-screen popup.
+sel01_vc_label = g_main:label("\aAAAAAAFFv" .. SEL01_VERSION .. " - checking for updates...")
 g_main:label(" ")
 g_main:label(accent .. ui.get_icon"sliders" .. accent .. "  Quick Presets:")
 
@@ -6247,6 +6250,64 @@ pcall(function()
         cs_event_info(string.format("Persistent model loaded: %d players", _lc))
     end
 end)
+
+-- ═══ VERSION CHECK (GitHub, v9.91) ═══════════════════════
+-- One fetch of versions.txt from the repo at load. Deliberately quiet: the result is
+-- ONE menu line (top of Main) + one console line, nothing drawn on screen.
+-- do...end block: the main chunk is at the 200-local cap, so these stay block-scoped.
+do
+    local VC_URL = "https://raw.githubusercontent.com/seltonmt012/Sel01-Solver/master/versions.txt"
+    local VC_KEY = "solver"
+
+    local function vc_num(v)
+        local a, b = tostring(v):match("(%d+)%.(%d+)")
+        return (tonumber(a) or 0) * 1000 + (tonumber(b) or 0)
+    end
+    local function vc_set(text) pcall(function() if sel01_vc_label then sel01_vc_label:name(text) end end) end
+    local function vc_apply(body)
+        local latest
+        for line in tostring(body):gmatch("[^\r\n]+") do
+            local k, v = line:match("^%s*([%w_]+)%s*=%s*([%d%.]+)")
+            if k == VC_KEY then latest = v end
+        end
+        if not latest then vc_set("\aAAAAAAFFv" .. SEL01_VERSION .. " - update check: no entry"); return end
+        if vc_num(latest) > vc_num(SEL01_VERSION) then
+            vc_set("\aFF5555FFUPDATE: v" .. latest .. " available (you run v" .. SEL01_VERSION .. ")")
+            pcall(function() _cs_log_color_raw("Sel01-Solver: UPDATE AVAILABLE v" .. latest .. " (you run v"
+                .. SEL01_VERSION .. ") - github.com/seltonmt012/Sel01-Solver") end)
+        else
+            vc_set("\a55DD55FFv" .. SEL01_VERSION .. " - up to date")
+        end
+    end
+    local started = false
+    pcall(function()
+        http.get(VC_URL, function(ok, resp)
+            if ok and resp and (resp.status == nil or resp.status == 200) and resp.body then
+                pcall(vc_apply, resp.body)
+            else
+                vc_set("\aAAAAAAFFv" .. SEL01_VERSION .. " - update check failed")
+            end
+        end)
+        started = true
+    end)
+    if not started then
+        -- fallback for builds without `http`: urlmon download to disk, then read it back
+        pcall(function()
+            pcall(ffi.cdef, [[
+                void* __stdcall URLDownloadToFileA(void* a, const char* url, const char* file, int r, int cb);
+                bool DeleteUrlCacheEntryA(const char* url);
+            ]])
+            local um, wi = ffi.load("UrlMon"), ffi.load("WinInet")
+            local path = "nl/Sel01-Solver/versions.txt"
+            pcall(function() files.create_folder("nl/Sel01-Solver/") end)
+            pcall(function() files.write(path, "") end)   -- files.read popups on a missing path
+            pcall(function() wi.DeleteUrlCacheEntryA(VC_URL) end)
+            um.URLDownloadToFileA(nil, VC_URL, path, 0, 0)
+            local body = files.read(path)
+            if body and #body > 0 then vc_apply(body) end
+        end)
+    end
+end
 
 _cs_log_color_raw("=========================================")
 _cs_log_color_raw("Sel01-Solver v" .. SEL01_VERSION .. " loaded — by seltonmt01")

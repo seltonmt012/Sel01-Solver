@@ -1,11 +1,11 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-WalkBot                                     ║
--- ║  Version: 1.8                                      ║
+-- ║  Version: 1.9                                      ║
 -- ║  Greedy nav-bot: map + enemy detect, walk-to-foe  ║
 -- ║  by seltonmt01                                     ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-WalkBot
--- @version 1.8
+-- @version 1.9
 -- @author seltonmt01
 -- @description Greedy walk-bot. Detects map + enemies, walks the local player
 --   toward a chosen target using NL movement cmd (move_yaw + forwardmove) with
@@ -19,7 +19,7 @@
 --   entity.get_players(true) (enemies) / entity.get_local_player() / p.m_vecOrigin / p:get_eye_position()
 --   globals.mapname / globals.tickcount / globals.realtime
 
-local SEL01_WB_VERSION = "1.8"
+local SEL01_WB_VERSION = "1.9"
 
 local ffi_ok, ffi = pcall(require, "ffi")
 
@@ -104,6 +104,8 @@ pcall(function()
     wb_hud      = g_hud:switch("HUD Overlay")
     wb_debug    = g_hud:switch("Debug Info (live stuck/roam/target console logs)")
     g_hud:button("Dump WalkBot Logs (console)", function() _wb_pending_dumplog = true end)
+    g_hud:label(" ")
+    wb_vc_label = g_hud:label("\aAAAAAAFFv" .. SEL01_WB_VERSION .. " - checking for updates...")
 end)
 -- sensible defaults (switches default off; flip the ones we want on)
 pcall(function() if wb_peekslow then wb_peekslow:set(true) end end)
@@ -1259,6 +1261,64 @@ pcall(function()
         pcall(function() events.net_update_end:unset() end)
     end)
 end)
+
+-- ═══ VERSION CHECK (GitHub, v1.9) ════════════════════════
+-- One fetch of versions.txt from the repo at load. No nagging: the result is a single
+-- line in the menu (Display group) plus one console line — nothing drawn on screen.
+local VC_URL = "https://raw.githubusercontent.com/seltonmt012/Sel01-Solver/master/versions.txt"
+local VC_KEY = "walkbot"
+
+local function vc_num(v)
+    local a, b = tostring(v):match("(%d+)%.(%d+)")
+    return (tonumber(a) or 0) * 1000 + (tonumber(b) or 0)
+end
+local function vc_set(text) pcall(function() if wb_vc_label then wb_vc_label:name(text) end end) end
+local function vc_apply(body)
+    local latest
+    for line in tostring(body):gmatch("[^\r\n]+") do
+        local k, v = line:match("^%s*([%w_]+)%s*=%s*([%d%.]+)")
+        if k == VC_KEY then latest = v end
+    end
+    if not latest then vc_set("\aAAAAAAFFv" .. SEL01_WB_VERSION .. " - update check: no entry"); return end
+    if vc_num(latest) > vc_num(SEL01_WB_VERSION) then
+        vc_set("\aFF5555FFUPDATE: v" .. latest .. " available (you run v" .. SEL01_WB_VERSION .. ")")
+        pcall(function() print("[WalkBot] update available: v" .. latest .. " (you run v" .. SEL01_WB_VERSION
+            .. ") - github.com/seltonmt012/Sel01-Solver") end)
+    else
+        vc_set("\a55DD55FFv" .. SEL01_WB_VERSION .. " - up to date")
+    end
+end
+local function vc_check()
+    local started = false
+    pcall(function()
+        http.get(VC_URL, function(ok, resp)
+            if ok and resp and (resp.status == nil or resp.status == 200) and resp.body then
+                pcall(vc_apply, resp.body)
+            else
+                vc_set("\aAAAAAAFFv" .. SEL01_WB_VERSION .. " - update check failed")
+            end
+        end)
+        started = true
+    end)
+    if started then return end
+    -- fallback for builds without `http`: urlmon download to disk, then read it back
+    pcall(function()
+        if not (ffi_ok and ffi) then return end
+        pcall(ffi.cdef, [[
+            void* __stdcall URLDownloadToFileA(void* a, const char* url, const char* file, int r, int cb);
+            bool DeleteUrlCacheEntryA(const char* url);
+        ]])
+        local um, wi = ffi.load("UrlMon"), ffi.load("WinInet")
+        local path = "nl/Sel01-WalkBot/versions.txt"
+        pcall(function() files.create_folder("nl/Sel01-WalkBot/") end)
+        pcall(function() files.write(path, "") end)   -- files.read popups on a missing path
+        pcall(function() wi.DeleteUrlCacheEntryA(VC_URL) end)
+        um.URLDownloadToFileA(nil, VC_URL, path, 0, 0)
+        local body = files.read(path)
+        if body and #body > 0 then vc_apply(body) end
+    end)
+end
+pcall(vc_check)
 
 -- ─── load banner ─────────────────────────────────────────
 local function log(t) pcall(function() print(t) end) end

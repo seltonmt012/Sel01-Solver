@@ -16,6 +16,10 @@ Three Neverlose **CSGO** (legacy build, NOT CS2) Lua scripts for HvH / rage play
 
 **Cloud-copy rule (Sel01-Solver ONLY, MANDATORY since 2026-07-19).** The Solver is ALSO loaded from the NL cloud folder, so every Solver edit is now a **triple-copy**: working → NL local (`Sel01-Solver_59853.lua`) → cloud (`C:\Users\Seltonmt\Desktop\sazz\aron\neverlose hackvshack.net\nl_cloud\scripts\5_Sel Solver.lua`, note the space in the filename → use `-LiteralPath`/`-Destination`). Config + WalkBot are NOT in the cloud folder (it holds unrelated scripts: 6_maycry, 7_angelnbone, 8_angeln, 9_premiumloader, 10_scertiy) — Solver is `5_Sel Solver.lua`.
 
+**Version checker (all 4 scripts, since 2026-07-31).** Every script fetches `versions.txt` from the repo raw URL (`https://raw.githubusercontent.com/seltonmt012/Sel01-Solver/master/versions.txt`, keys `solver` / `config` / `walkbot` / `plantbot`) ONCE at load via `http.get(url, cb)` (confirmed on this NL build — bloodwings uses it), falling back to urlmon `URLDownloadToFileA` → `files.read` when `http` is absent. Result = ONE menu label (updated via `:name()`, red when outdated / green when current) + one console line. Nothing on screen. **MANDATORY: bump the matching line in `versions.txt` in the SAME commit as any version constant**, otherwise users see a stale "up to date". Label globals per script (never share a name): `sel01_vc_label` / `cfg_vc_label` / `wb_vc_label` / `pb_vc_label`.
+
+**Cloud mirrors exist for ALL FOUR scripts** (`nl_cloud/scripts/`): `5_Sel Solver.lua`, `12_sel01_config.lua`, `15_workbot.lua`, `18_plant.lua`. PlantBot additionally has TWO NL-local files (`Sel01-PlantBot_35563.lua` + `plant_18.lua`) — both must be overwritten. Use `-LiteralPath`/`-Destination` (the Solver cloud name contains a space).
+
 **Version constants — keep all touchpoints in sync per script:**
 - Sel01-Solver: `local SEL01_VERSION = "X.Y"` + file-header `@version X.Y` + **decorative header box `Version: X.Y` (line 4)** + 3 visible mentions (load-banner, UI label, HUD corner)
 - Sel01-Config: `local SEL01_CFG_VERSION = "X.Y"` + file-header `@version X.Y` (no HUD mention; load banner reads constant directly)
@@ -434,6 +438,16 @@ A standalone movement bot. ONE `events.createmove` handler (`walkbot_tick`) driv
 - **`files.read` on a MISSING path raises an unsuppressable popup** (ui.find class) — only read paths you know exist (the copied navs / your own written files).
 - **Default OFF: jumping** (`Allow Jumping`). Per user, the bot should never jump; bhop + step-up + wedge jumps are all gated behind it. New switches take their default immediately (NL has no persisted value yet), which is how a hard-default-off override reaches an existing user.
 - **Distance is king** — far enemy → ROAM/route, not beeline (rams walls, "thinks 3k is near"). Aggressive peek only when the enemy is genuinely visible; close-but-unseen → careful slow approach to gain the sightline.
+
+## Sel01-PlantBot (`Sel01-PlantBot.lua`, v1.5)
+
+One `events.createmove` handler (`plantbot_tick`). You mark two spots per map (persisted in `nl/Sel01-PlantBot/<map>.txt`): the A plant spot + the safe spot. Loop: `GOTO_A` → `PLANT` → `RETREAT` → `DONE`, restarted every round.
+
+- **Plant completion is SERVER-side only** (v1.4 fix). v1.3 ended PLANT when `active_is_c4()` went false after a 0.6s hold — that weapon read is build-dependent and returned false while the C4 was still in hand, so `+attack` was dropped and EVERY plant was cancelled. Completion now = `events.bomb_planted` OR game-rules `m_bBombPlanted` OR a `CPlantedC4` entity existing. Arming is tracked via CC4 `m_bStartedArming` + `bomb_beginplant`/`bomb_abortplant` (userid filtered by `entity.get(uid,true)` identity).
+- **Never switch weapons mid-arm** — a `slot5` exec while arming cancels the plant, so `equip_c4` only runs before arming starts. PLANT also forces zero move / no duck / no jump for the whole arm; an abort releases `+attack` ~0.2s then re-presses.
+- **Round + warmup handling** (v1.4): `run_reset` on `round_prestart` / `round_start`, plus an `m_fRoundStartTime` poll fallback (a surviving bot would otherwise sit in DONE forever). `m_bWarmupPeriod` parks the bot with no cmd writes and starts a fresh run the moment warmup ends; `m_bFreezePeriod` holds position (and keeps the stuck detector from firing) while still equipping the bomb.
+- **Nav-mesh routing** (v1.5): the WalkBot parser ported verbatim (kernel32 binary read + scan-based v16 parse + A*). Reads the SAME pre-copied navs (`nl/Sel01-WalkBot/<map>.nav` first in `NAV_BASES`) so maps aren't copied twice. `nav_dir()` feeds the want-yaw of GOTO_A + RETREAT; traces still handle local dodging. Toggle `Use Nav-Mesh Routing`, default ON; falls back to straight-line when the mesh is missing.
+- **`jointeam` while ALIVE = suicide** — only exec it while dead / in team select.
 
 ## Common mistakes to avoid
 

@@ -1,12 +1,12 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-PlantBot                                    ║
--- ║  Version: 1.4                                      ║
+-- ║  Version: 1.5                                      ║
 -- ║  One job: walk to a marked A spot, plant the C4,   ║
 -- ║  walk to a marked safe spot, done. Auto-picks T.   ║
 -- ║  by seltonmt01                                     ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-PlantBot
--- @version 1.4
+-- @version 1.5
 -- @author seltonmt01
 -- @description Standalone plant-bot. You MARK two spots once (persisted per map):
 --   the A plant spot + the safe spot. Then it loops every round:
@@ -18,7 +18,9 @@
 --   Movement ONLY — aiming stays with the ragebot. While idle/done it does NOT touch
 --   the cmd, so your normal keys work.
 
-local SEL01_PB_VERSION = "1.4"
+local SEL01_PB_VERSION = "1.5"
+
+local ffi_ok, ffi = pcall(require, "ffi")
 
 -- ─── small helpers ───────────────────────────────────────
 local function v_len2d(v) return math.sqrt((v.x or 0) ^ 2 + (v.y or 0) ^ 2) end
@@ -70,6 +72,12 @@ local state = {
     warmup       = false,
     round_t      = nil,         -- m_fRoundStartTime — changes = new round
     round_state  = "LIVE",
+    -- v1.5 nav-mesh routing (same parser as Sel01-WalkBot)
+    nav_map      = nil,
+    nav_path     = nil,         -- cached A* route (list of area centers)
+    nav_goal_id  = nil,
+    nav_path_t   = 0,
+    nav_path_len = 0,
 }
 
 -- button drains (module globals: closures run before `state` helpers bind)
@@ -90,13 +98,14 @@ if not ok_ui or not g_main then
     pcall(function() g_hud  = g_main end)
 end
 
-local pb_enable, pb_radius, pb_speed, pb_jump, pb_probe, pb_safe_radius, pb_autot, pb_hud, pb_debug
+local pb_enable, pb_radius, pb_speed, pb_jump, pb_probe, pb_safe_radius, pb_autot, pb_hud, pb_debug, pb_nav
 pcall(function()
     pb_enable      = g_main:switch("Enable PlantBot")
     pb_autot       = g_main:switch("Auto-Join T (pick T every round)")
     g_main:button("Mark A Spot (stand on plant spot)",  function() _pb_mark_a    = true end)
     g_main:button("Mark Safe Spot (stand on safe spot)", function() _pb_mark_safe = true end)
     g_main:button("Clear Marks (this map)",              function() _pb_clear     = true end)
+    pb_nav         = g_main:switch("Use Nav-Mesh Routing (real map paths)")
     pb_radius      = g_main:slider("A-Site Plant Radius", 60, 600, 120)
     pb_safe_radius = g_main:slider("Safe-Spot Arrive Radius", 80, 600, 180)
     pb_speed       = g_main:slider("Move Speed", 50, 450, 450)
@@ -105,7 +114,10 @@ pcall(function()
     pb_hud         = g_hud:switch("HUD Overlay")
     pb_debug       = g_hud:switch("Debug Info")
     g_hud:button("Print My Pos (console)", function() _pb_print_pos = true end)
+    g_hud:label(" ")
+    pb_vc_label    = g_hud:label("\aAAAAAAFFv" .. SEL01_PB_VERSION .. " — checking for updates...")
 end)
+pcall(function() if pb_nav then pb_nav:set(true) end end)
 pcall(function() if pb_hud then pb_hud:set(true) end end)
 pcall(function() if pb_autot then pb_autot:set(true) end end)
 
@@ -249,6 +261,231 @@ local function marks_load(map)
     end
 end
 
+-- ═══ NAV-MESH (v1.5 — same parser as Sel01-WalkBot) ══════
+-- Straight-line walking rams every wall between spawn and the site. The .nav mesh is
+-- the graph CSGO's own bots route on, so with it loaded the bot knows the real way to A
+-- (doors, ramps, connectors) and only needs the traces for local obstacle dodging.
+-- Reads the SAME pre-copied navs the WalkBot uses (nl/Sel01-WalkBot/<map>.nav) so you
+-- do not have to copy the maps twice.
+local nav = { ok = false, map = nil, count = 0, areas = nil, err = "not loaded" }
+
+-- Binary read via kernel32: files.read TRUNCATES at the first null byte (nav header has
+-- 0x00 at byte 5) and raises an unsuppressable popup on a missing path. CreateFileA just
+-- returns INVALID_HANDLE on a miss — clean.
+local nav_k32, nav_cdef_ok
+if ffi_ok and ffi then
+    nav_cdef_ok = pcall(ffi.cdef, [[
+        void* CreateFileA(const char* name, unsigned long access, unsigned long share, void* sec, unsigned long disp, unsigned long flags, void* templ);
+        int ReadFile(void* h, void* buf, unsigned long nNumberOfBytesToRead, unsigned long* lpNumberOfBytesRead, void* lpOverlapped);
+        unsigned long GetFileSize(void* h, void* lpFileSizeHigh);
+        int CloseHandle(void* h);
+    ]])
+    local ok; ok, nav_k32 = pcall(ffi.load, "kernel32")
+    if not ok then nav_k32 = nil end
+end
+
+local NAV_BASES = {
+    "nl/Sel01-WalkBot/",
+    "nl/Sel01-PlantBot/",
+    "E:/SteamLibrary/steamapps/common/Counter-Strike Global Offensive/nl/Sel01-WalkBot/",
+    "csgo/maps/",
+    "E:/SteamLibrary/steamapps/common/Counter-Strike Global Offensive/csgo/maps/",
+}
+
+local function nav_read(map)
+    if not (ffi_ok and ffi and nav_cdef_ok and nav_k32) then return nil, "no ffi/kernel32" end
+    local INVALID = ffi.cast("void*", -1)
+    for _, base in ipairs(NAV_BASES) do
+        local got = nil
+        pcall(function()
+            local h = nav_k32.CreateFileA(base .. map .. ".nav", 0x80000000, 1, nil, 3, 0x80, nil)
+            if h ~= nil and h ~= INVALID then
+                local sz = tonumber(nav_k32.GetFileSize(h, nil)) or 0
+                if sz > 64 and sz < 50000000 then
+                    local buf = ffi.new("uint8_t[?]", sz)
+                    local rd = ffi.new("unsigned long[1]")
+                    if nav_k32.ReadFile(h, buf, sz, rd, nil) ~= 0 then
+                        got = ffi.string(buf, tonumber(rd[0]))
+                    end
+                end
+                nav_k32.CloseHandle(h)
+            end
+        end)
+        if got and #got > 64 then return got, "kernel32 " .. base end
+    end
+    return nil, "no nav (copy csgo/maps/<map>.nav to nl/Sel01-WalkBot/)"
+end
+
+-- SCAN-BASED parser: the documented v16 area layout has a build-specific ~99-byte
+-- undocumented trailing block per area, and area ids are non-contiguous. So we read each
+-- area header + connections, then scan forward for the next plausible header.
+local function nav_parse_scan(raw)
+    local n = #raw
+    local base = ffi.cast("const uint8_t*", raw)
+    local function u16(o) return tonumber(ffi.cast("const uint16_t*", base + o)[0]) end
+    local function u32(o) return tonumber(ffi.cast("const uint32_t*", base + o)[0]) end
+    local function f32(o) return tonumber(ffi.cast("const float*",    base + o)[0]) end
+
+    if n < 64 or u32(0) ~= 0xFEEDFACE then return nil, "bad magic", 0 end
+    local major = u32(4)
+    local off = 12 + 4
+    if major >= 14 then off = off + 1 end
+    local placeCount = u16(off); off = off + 2
+    for _ = 1, placeCount do off = off + 2 + u16(off) end
+    if major >= 12 then off = off + 1 end
+    local areaCount = u32(off); off = off + 4
+    if areaCount < 1 or areaCount > 60000 then return nil, "bad areaCount " .. areaCount, 0 end
+
+    local function plaus(o)
+        if o + 44 > n then return false end
+        if u32(o + 4) ~= 0 then return false end
+        for k = 0, 5 do
+            local f = f32(o + 8 + 4 * k)
+            if f ~= f then return false end
+            if (f < 0 and -f or f) > 8000 then return false end
+        end
+        local nwz, sez = f32(o + 16), f32(o + 28)
+        local nez, swz = f32(o + 32), f32(o + 36)
+        local zlo = (nwz < sez and nwz or sez) - 200
+        local zhi = (nwz > sez and nwz or sez) + 200
+        if nez < zlo or nez > zhi or swz < zlo or swz > zhi then return false end
+        local nwx, nwy = f32(o + 8), f32(o + 12)
+        local sex, sey = f32(o + 20), f32(o + 24)
+        local ext = (sex - nwx < 0 and nwx - sex or sex - nwx)
+                  + (sey - nwy < 0 and nwy - sey or sey - nwy)
+        local mag = (nwx < 0 and -nwx or nwx) + (nwy < 0 and -nwy or nwy)
+        if not (ext > 16 and ext < 12000 and mag > 30) then return false end
+        local h = o + 40
+        for _ = 1, 4 do
+            local c = u32(h); h = h + 4
+            if c > 40 then return false end
+            h = h + 4 * c
+            if h > n then return false end
+        end
+        return true
+    end
+
+    local areas = {}
+    local got = 0
+    for a = 1, areaCount do
+        if not plaus(off) then
+            return areas, string.format("stopped @%d/%d (got %d)", a, areaCount, got), got
+        end
+        local id = u32(off)
+        local nwx, nwy, nwz = f32(off + 8), f32(off + 12), f32(off + 16)
+        local sex, sey, sez = f32(off + 20), f32(off + 24), f32(off + 28)
+        local h = off + 40
+        local conns = {}
+        for _ = 1, 4 do
+            local c = u32(h); h = h + 4
+            for _ = 1, c do conns[#conns + 1] = u32(h); h = h + 4 end
+        end
+        areas[id] = { id = id, x = (nwx + sex) * 0.5, y = (nwy + sey) * 0.5,
+                      z = (nwz + sez) * 0.5, conns = conns }
+        got = got + 1
+        if a == areaCount then break end
+        local limit = math.min(h + 16000, n - 44)
+        local found, p = nil, h
+        while p < limit do
+            if plaus(p) then found = p; break end
+            p = p + 1
+        end
+        if not found then
+            return areas, string.format("ended early %d/%d", got, areaCount), got
+        end
+        off = found
+    end
+    return areas, nil, got
+end
+
+local function nav_load(map)
+    nav = { ok = false, map = map, count = 0, areas = nil, err = "loading" }
+    state.nav_path = nil; state.nav_goal_id = nil; state.nav_path_len = 0
+    if not (ffi_ok and ffi) then nav.err = "no ffi"; return end
+    local raw, how = nav_read(map)
+    if not raw then nav.err = tostring(how); return end
+    local ok, areas, err, cnt = pcall(nav_parse_scan, raw)
+    if not ok then nav.err = "parse crash"; return end
+    cnt = cnt or 0
+    if areas then
+        local got, edges = 0, 0
+        for _, ar in pairs(areas) do got = got + 1; edges = edges + #(ar.conns or {}) end
+        nav.areas = areas; nav.count = got; nav.edges = edges
+        nav.ok = got >= 50
+        nav.err = string.format("%s %d/%d areas, %d links", nav.ok and "OK" or "too few", got, cnt, edges)
+    else
+        nav.err = "parse failed: " .. tostring(err)
+    end
+end
+
+local function nav_nearest(x, y)
+    if not (nav.ok and nav.areas) then return nil end
+    local best, bestd
+    for _, a in pairs(nav.areas) do
+        local dx, dy = a.x - x, a.y - y
+        local d = dx * dx + dy * dy
+        if not bestd or d < bestd then best, bestd = a, d end
+    end
+    return best
+end
+
+-- A* over the area graph -> ordered list of area centers
+local function nav_astar(startId, goalId)
+    local areas = nav.areas
+    if not (areas and areas[startId] and areas[goalId]) then return nil end
+    if startId == goalId then return { areas[goalId] } end
+    local goal = areas[goalId]
+    local function hcost(a) local dx, dy = a.x - goal.x, a.y - goal.y; return math.sqrt(dx * dx + dy * dy) end
+    local open, came, g, f, closed = { [startId] = true }, {}, { [startId] = 0 }, { [startId] = hcost(areas[startId]) }, {}
+    local guard = 0
+    while next(open) and guard < 6000 do
+        guard = guard + 1
+        local cur, curf
+        for id in pairs(open) do if not curf or f[id] < curf then cur, curf = id, f[id] end end
+        if cur == goalId then
+            local path, c = {}, cur
+            while c do table.insert(path, 1, areas[c]); c = came[c] end
+            return path
+        end
+        open[cur] = nil; closed[cur] = true
+        local ca = areas[cur]
+        for _, nb in ipairs(ca.conns) do
+            local na = areas[nb]
+            if na and not closed[nb] then
+                local dx, dy = ca.x - na.x, ca.y - na.y
+                local tg = g[cur] + math.sqrt(dx * dx + dy * dy)
+                if not g[nb] or tg < g[nb] then
+                    came[nb] = cur; g[nb] = tg; f[nb] = tg + hcost(na); open[nb] = true
+                end
+            end
+        end
+    end
+    return nil
+end
+
+-- yaw toward a world goal, ROUTED through the mesh when loaded, else straight line.
+-- Path cached per goal-area, re-pathed every 1.5s, nodes popped as we reach them.
+local function nav_dir(lo, gx, gy, now)
+    local use = false
+    pcall(function() use = pb_nav and pb_nav:get() end)
+    if not (use and nav.ok) then state.nav_path_len = 0; return dir_yaw_xy(lo.x, lo.y, gx, gy) end
+    local ga = nav_nearest(gx, gy)
+    local sa = nav_nearest(lo.x, lo.y)
+    if not (ga and sa) then state.nav_path_len = 0; return dir_yaw_xy(lo.x, lo.y, gx, gy) end
+    if state.nav_goal_id ~= ga.id or not state.nav_path or (now - (state.nav_path_t or 0)) > 1.5 then
+        state.nav_path = nav_astar(sa.id, ga.id)
+        state.nav_goal_id = ga.id
+        state.nav_path_t = now
+    end
+    local path = state.nav_path
+    if not path or #path == 0 then state.nav_path_len = 0; return dir_yaw_xy(lo.x, lo.y, gx, gy) end
+    while #path > 1 and dist2d(lo.x, lo.y, path[1].x, path[1].y) < 130 do table.remove(path, 1) end
+    state.nav_path_len = #path
+    -- last node reached: aim at the real mark, not the area center
+    if #path <= 1 then return dir_yaw_xy(lo.x, lo.y, gx, gy) end
+    return dir_yaw_xy(lo.x, lo.y, path[1].x, path[1].y)
+end
+
 -- ─── obstacle traces (world geometry only — NOT players) ─
 local PROBE_MASK = 0x400B
 local function probe_clear(lp, lo, yaw_deg, dist)
@@ -372,6 +609,17 @@ local function plantbot_tick(cmd)
     state.mapname = safe_mapname()
     if state.spots_map ~= state.mapname then marks_load(state.mapname) end
 
+    -- v1.5: (re)load the nav mesh on map change while the toggle is on
+    do
+        local use_nav = false
+        pcall(function() use_nav = pb_nav and pb_nav:get() end)
+        if use_nav and state.mapname ~= "unknown" and state.nav_map ~= state.mapname then
+            state.nav_map = state.mapname
+            pcall(nav_load, state.mapname)
+            pcall(function() print("[PlantBot] nav " .. state.mapname .. ": " .. tostring(nav.err)) end)
+        end
+    end
+
     local now = 0
     pcall(function() now = globals.realtime end)
 
@@ -489,7 +737,8 @@ local function plantbot_tick(cmd)
             state.diag = "at A -> planting"
             return
         end
-        local mv = compute_move(lp, lo, dir_yaw_xy(lo.x, lo.y, a.x, a.y), now, "GOTO_A")
+        -- routed through the nav mesh when loaded (real map path), else straight line
+        local mv = compute_move(lp, lo, nav_dir(lo, a.x, a.y, now), now, "GOTO_A")
         apply_move(cmd, mv, now)
 
     elseif state.phase == "PLANT" then
@@ -556,7 +805,7 @@ local function plantbot_tick(cmd)
             state.phase = "DONE"; state.activity = "DONE"; state.diag = "at safe spot -> done"
             return
         end
-        local mv = compute_move(lp, lo, dir_yaw_xy(lo.x, lo.y, s.x, s.y), now, "RETREAT")
+        local mv = compute_move(lp, lo, nav_dir(lo, s.x, s.y, now), now, "RETREAT")
         apply_move(cmd, mv, now)
 
     else -- DONE: release control (your WASD works), wait for next respawn to loop
@@ -612,6 +861,9 @@ local function render_hud()
             render.text(3, vector(x, y), col(180, 180, 180), nil, "C4: ")
             render.text(3, vector(x + 28, y), state.had_c4 and col(120, 230, 120) or col(255, 160, 90), nil,
                 state.had_c4 and "in hand" or "not active"); y = y + line
+            render.text(3, vector(x, y), col(180, 180, 180), nil, "nav: ")
+            render.text(3, vector(x + 34, y), nav.ok and col(120, 230, 120) or col(255, 160, 90), nil,
+                tostring(nav.err) .. (state.nav_path_len > 0 and ("  path " .. state.nav_path_len) or "")); y = y + line
             render.text(3, vector(x, y), col(180, 180, 180), nil, "arm: ")
             render.text(3, vector(x + 34, y), state.arm_started and col(120, 230, 120) or col(160, 160, 160), nil,
                 (state.arm_started and "started" or "no") .. "  aborts " .. tostring(state.aborts or 0)); y = y + line
@@ -636,6 +888,64 @@ pcall(function()
         pcall(function() events.round_start:unset() end)
     end)
 end)
+
+-- ═══ VERSION CHECK (GitHub, v1.5) ════════════════════════
+-- One fetch of versions.txt from the repo at load. No nagging: the result is a single
+-- line in the menu (Display group) plus one console line — nothing drawn on screen.
+local VC_URL = "https://raw.githubusercontent.com/seltonmt012/Sel01-Solver/master/versions.txt"
+local VC_KEY = "plantbot"
+
+local function vc_num(v)
+    local a, b = tostring(v):match("(%d+)%.(%d+)")
+    return (tonumber(a) or 0) * 1000 + (tonumber(b) or 0)
+end
+local function vc_set(text) pcall(function() if pb_vc_label then pb_vc_label:name(text) end end) end
+local function vc_apply(body)
+    local latest
+    for line in tostring(body):gmatch("[^\r\n]+") do
+        local k, v = line:match("^%s*([%w_]+)%s*=%s*([%d%.]+)")
+        if k == VC_KEY then latest = v end
+    end
+    if not latest then vc_set("\aAAAAAAFFv" .. SEL01_PB_VERSION .. " - update check: no entry"); return end
+    if vc_num(latest) > vc_num(SEL01_PB_VERSION) then
+        vc_set("\aFF5555FFUPDATE: v" .. latest .. " available (you run v" .. SEL01_PB_VERSION .. ")")
+        pcall(function() print("[PlantBot] update available: v" .. latest .. " (you run v" .. SEL01_PB_VERSION
+            .. ") - github.com/seltonmt012/Sel01-Solver") end)
+    else
+        vc_set("\a55DD55FFv" .. SEL01_PB_VERSION .. " - up to date")
+    end
+end
+local function vc_check()
+    local started = false
+    pcall(function()
+        http.get(VC_URL, function(ok, resp)
+            if ok and resp and (resp.status == nil or resp.status == 200) and resp.body then
+                pcall(vc_apply, resp.body)
+            else
+                vc_set("\aAAAAAAFFv" .. SEL01_PB_VERSION .. " - update check failed")
+            end
+        end)
+        started = true
+    end)
+    if started then return end
+    -- fallback for builds without `http`: urlmon download to disk, then read it back
+    pcall(function()
+        if not (ffi_ok and ffi) then return end
+        pcall(ffi.cdef, [[
+            void* __stdcall URLDownloadToFileA(void* a, const char* url, const char* file, int r, int cb);
+            bool DeleteUrlCacheEntryA(const char* url);
+        ]])
+        local um, wi = ffi.load("UrlMon"), ffi.load("WinInet")
+        local path = "nl/Sel01-PlantBot/versions.txt"
+        pcall(function() files.create_folder("nl/Sel01-PlantBot/") end)
+        pcall(function() files.write(path, "") end)   -- files.read popups on a missing path
+        pcall(function() wi.DeleteUrlCacheEntryA(VC_URL) end)
+        um.URLDownloadToFileA(nil, VC_URL, path, 0, 0)
+        local body = files.read(path)
+        if body and #body > 0 then vc_apply(body) end
+    end)
+end
+pcall(vc_check)
 
 -- ─── load banner ─────────────────────────────────────────
 local function log(t) pcall(function() print(t) end) end

@@ -5,7 +5,7 @@
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Config
 -- @author seltonmt01
--- @version 3.29
+-- @version 3.30
 -- @description AI Peek hittable-gate (only peek when min-dmg shot exists):
 --   * v3.28 peeked at any in-range enemy → walked constantly. v3.29 arms the
 --     peek ONLY while a fresh events.aim_fire (estimated damage >= the user's NL
@@ -71,7 +71,7 @@
 --     variance for full per-side chaos.
 --   * MAG-JIT indicator added to bottom HvH strip; dumped in v3.8 stats.
 
-local SEL01_CFG_VERSION = "3.29"
+local SEL01_CFG_VERSION = "3.30"
 
 -- DEBUG: print to CSGO console at major load checkpoints. Plain print() bypasses
 -- NL chat (which may not flush before crash) and writes directly to CSGO console.
@@ -373,6 +373,8 @@ local btn_stats  = g_info:button("Dump Debug Stats", function() end) -- V2.6
 local btn_clear  = g_info:button("Clear Stats", function() end) -- V2.6
 local btn_recom  = g_info:button("Print Recommendations", function() end) -- V3.1
 local btn_antihs = g_info:button("Toggle Anti-HS Bundle", function() end) -- V3.1
+g_info:label(" ")
+cfg_vc_label = g_info:label("\aAAAAAAFFv" .. SEL01_CFG_VERSION .. " - checking for updates...")
 g_info:label(" ")
 g_info:label(accent .. "  Sel01-Solver handles RESOLVING (separate tab)")
 g_info:label(accent .. "  This script handles AA / Movement / Visuals / QoL only")
@@ -2541,6 +2543,64 @@ end)
 -- ══════════════════════════════════════════════════════════════════════════
 -- LOAD BANNER
 -- ══════════════════════════════════════════════════════════════════════════
+-- ══════════════════════════════════════════════════════════════════════════
+-- VERSION CHECK (GitHub, v3.30) — one fetch of versions.txt at load. No nagging:
+-- result is one line in the Info group + one console line, nothing on screen.
+-- ══════════════════════════════════════════════════════════════════════════
+do
+    local VC_URL = "https://raw.githubusercontent.com/seltonmt012/Sel01-Solver/master/versions.txt"
+    local VC_KEY = "config"
+
+    local function vc_num(v)
+        local a, b = tostring(v):match("(%d+)%.(%d+)")
+        return (tonumber(a) or 0) * 1000 + (tonumber(b) or 0)
+    end
+    local function vc_set(text) pcall(function() if cfg_vc_label then cfg_vc_label:name(text) end end) end
+    local function vc_apply(body)
+        local latest
+        for line in tostring(body):gmatch("[^\r\n]+") do
+            local k, v = line:match("^%s*([%w_]+)%s*=%s*([%d%.]+)")
+            if k == VC_KEY then latest = v end
+        end
+        if not latest then vc_set("\aAAAAAAFFv" .. SEL01_CFG_VERSION .. " - update check: no entry"); return end
+        if vc_num(latest) > vc_num(SEL01_CFG_VERSION) then
+            vc_set("\aFF5555FFUPDATE: v" .. latest .. " available (you run v" .. SEL01_CFG_VERSION .. ")")
+            pcall(function() cs_log_color("Sel01-Config: update available v" .. latest .. " (you run v"
+                .. SEL01_CFG_VERSION .. ") - github.com/seltonmt012/Sel01-Solver") end)
+        else
+            vc_set("\a55DD55FFv" .. SEL01_CFG_VERSION .. " - up to date")
+        end
+    end
+    local started = false
+    pcall(function()
+        http.get(VC_URL, function(ok, resp)
+            if ok and resp and (resp.status == nil or resp.status == 200) and resp.body then
+                pcall(vc_apply, resp.body)
+            else
+                vc_set("\aAAAAAAFFv" .. SEL01_CFG_VERSION .. " - update check failed")
+            end
+        end)
+        started = true
+    end)
+    if not started then
+        -- fallback for builds without `http`: urlmon download to disk, then read it back
+        pcall(function()
+            pcall(ffi.cdef, [[
+                void* __stdcall URLDownloadToFileA(void* a, const char* url, const char* file, int r, int cb);
+                bool DeleteUrlCacheEntryA(const char* url);
+            ]])
+            local um, wi = ffi.load("UrlMon"), ffi.load("WinInet")
+            local path = "nl/Sel01-Config/versions.txt"
+            pcall(function() files.create_folder("nl/Sel01-Config/") end)
+            pcall(function() files.write(path, "") end)   -- files.read popups on a missing path
+            pcall(function() wi.DeleteUrlCacheEntryA(VC_URL) end)
+            um.URLDownloadToFileA(nil, VC_URL, path, 0, 0)
+            local body = files.read(path)
+            if body and #body > 0 then vc_apply(body) end
+        end)
+    end
+end
+
 cs_log_color("══════════════════════════════════════════")
 cs_log_color("Sel01-Config v" .. SEL01_CFG_VERSION .. " loaded (CSGO HvH — +Magnitude jitter per-tick variance, anti EMA-resolvers)")
 cs_log(string.format("  hooks  createmove=%s  aim_fire=%s",
