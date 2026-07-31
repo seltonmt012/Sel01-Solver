@@ -1,24 +1,24 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-PlantBot                                    ║
--- ║  Version: 1.3                                      ║
+-- ║  Version: 1.4                                      ║
 -- ║  One job: walk to a marked A spot, plant the C4,   ║
 -- ║  walk to a marked safe spot, done. Auto-picks T.   ║
 -- ║  by seltonmt01                                     ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-PlantBot
--- @version 1.3
+-- @version 1.4
 -- @author seltonmt01
 -- @description Standalone plant-bot. You MARK two spots once (persisted per map):
 --   the A plant spot + the safe spot. Then it loops every round:
 --   GOTO_A  -> greedy-walk straight to the marked A spot (equips the bomb on the way)
---   PLANT   -> stop + hold +attack until the bomb is down (or a short timeout)
+--   PLANT   -> stop + hold +attack until the SERVER reports the bomb down (v1.4)
 --   RETREAT -> greedy-walk straight to the marked safe spot
 --   DONE    -> release control (your WASD works) until next round / respawn, then loop
 --   Auto-joins T whenever a team is not assigned (handles the round team-select menu).
 --   Movement ONLY — aiming stays with the ragebot. While idle/done it does NOT touch
 --   the cmd, so your normal keys work.
 
-local SEL01_PB_VERSION = "1.3"
+local SEL01_PB_VERSION = "1.4"
 
 -- ─── small helpers ───────────────────────────────────────
 local function v_len2d(v) return math.sqrt((v.x or 0) ^ 2 + (v.y or 0) ^ 2) end
@@ -61,6 +61,15 @@ local state = {
     team_pick_t  = 0,
     had_c4       = false,
     was_alive    = false,
+    -- v1.4 plant / round tracking
+    arm_started  = false,       -- CC4 m_bStartedArming seen (or bomb_beginplant fired)
+    bomb_down    = false,       -- bomb_planted event fired this round
+    rearm_until  = 0,           -- release +attack until this time (re-press after an abort)
+    reposition_until = 0,       -- walk onto the mark again while the plant refuses to start
+    aborts       = 0,
+    warmup       = false,
+    round_t      = nil,         -- m_fRoundStartTime — changes = new round
+    round_state  = "LIVE",
 }
 
 -- button drains (module globals: closures run before `state` helpers bind)
@@ -145,6 +154,79 @@ local function active_is_c4(lp)
     end)
     return is
 end
+
+-- ─── v1.4: bomb / round truth ────────────────────────────
+-- v1.3 called the plant "done" as soon as `active_is_c4` went false. That read is
+-- unreliable (get_weapon / class-name shape varies per build), so the bot dropped
+-- +attack ~0.6s in and the plant was CANCELLED every time. Now the plant is only
+-- finished when the SERVER says the bomb is down.
+local function gr_get(name)
+    local v = nil
+    pcall(function()
+        local gr = entity.get_game_rules()
+        if gr then v = gr[name] end
+    end)
+    return v
+end
+local function bomb_is_planted()
+    if state.bomb_down then return true end
+    if gr_get("m_bBombPlanted") then return true end
+    local n = 0
+    pcall(function()
+        local t = entity.get_entities("CPlantedC4")
+        n = (t and #t) or 0
+    end)
+    return n > 0
+end
+-- CC4 netvar: true from the first arming tick until planted / aborted
+local function c4_arming(lp)
+    local a = false
+    pcall(function()
+        local w = lp:get_weapon()
+        if w and w.m_bStartedArming then a = true end
+    end)
+    return a
+end
+local function in_bomb_zone(lp)
+    local z = nil
+    pcall(function() z = lp.m_bInBombZone end)
+    return z
+end
+
+-- one full run reset (new round / warmup end / respawn)
+local function run_reset(why)
+    state.phase            = "IDLE"
+    state.bomb_down        = false
+    state.arm_started      = false
+    state.plant_hold_t     = 0
+    state.rearm_until      = 0
+    state.reposition_until = 0
+    state.last_origin      = nil
+    state.stuck_since      = 0
+    state.escape_yaw       = nil
+    state.escape_until     = 0
+    state.jump_until       = 0
+    state.diag             = why or "reset"
+end
+
+-- event.userid -> is that me? (object identity, JAG0YAW pattern — never read enemy props)
+local function ev_is_me(e)
+    local mine = false
+    pcall(function()
+        local ent = entity.get(e.userid, true)
+        mine = (ent ~= nil and ent == entity.get_local_player())
+    end)
+    return mine
+end
+
+pcall(function() events.bomb_beginplant:set(function(e) if ev_is_me(e) then state.arm_started = true end end) end)
+pcall(function() events.bomb_abortplant:set(function(e)
+    if ev_is_me(e) then state.arm_started = false; state.aborts = (state.aborts or 0) + 1; state.rearm_until = 0 end
+end) end)
+-- planted by ANYONE ends our job -> retreat
+pcall(function() events.bomb_planted:set(function() state.bomb_down = true end) end)
+pcall(function() events.round_prestart:set(function() run_reset("round prestart") end) end)
+pcall(function() events.round_start:set(function() run_reset("round start") end) end)
 
 -- ─── marks: persisted per map ────────────────────────────
 local function marks_path(map) return "nl/Sel01-PlantBot/" .. tostring(map or "unknown") .. ".txt" end
@@ -331,6 +413,24 @@ local function plantbot_tick(cmd)
         exec("jointeam 2")        -- pick / force Terrorists (only while dead = safe)
     end
 
+    -- ── v1.4 round tracking ──
+    -- events.round_start covers the normal case; this poll is the fallback for builds
+    -- where the event does not fire (and it also catches a mid-round round reset).
+    -- m_fRoundStartTime is re-stamped by the server on every fresh round.
+    local rst = gr_get("m_fRoundStartTime")
+    if rst and state.round_t and math.abs(rst - state.round_t) > 0.01 then run_reset("new round") end
+    if rst then state.round_t = rst end
+
+    -- warmup: planting is disabled -> park, and start a fresh run the moment it ends
+    local warmup = gr_get("m_bWarmupPeriod") and true or false
+    if state.warmup and not warmup then run_reset("warmup over -> run") end
+    state.warmup = warmup
+    if warmup then
+        state.round_state = "WARMUP"
+        state.phase = "IDLE"; state.activity = "WARMUP"; state.diag = "warmup — waiting for live round"
+        return              -- no cmd writes -> your WASD works
+    end
+
     local lp = get_lp()
     if not lp then
         -- dead / in team menu: arm a fresh run for when we respawn. Don't touch cmd.
@@ -352,12 +452,29 @@ local function plantbot_tick(cmd)
         return  -- no cmd writes -> your WASD works
     end
 
+    -- freeze time: the server ignores movement anyway, and standing still would trip
+    -- the stuck detector. Hold, keep the bomb in hand, start moving when it unfreezes.
+    if gr_get("m_bFreezePeriod") then
+        state.round_state = "FREEZE"
+        state.activity = "FREEZE"; state.diag = "freeze time — waiting"
+        state.last_origin = nil; state.stuck_since = 0
+        equip_c4(now)
+        return
+    end
+    state.round_state = "LIVE"
+
     -- start a run: on respawn, or when enabled while idle/done and alive
     if respawned or state.phase == "IDLE" or state.phase == "NEED_MARK" then
+        run_reset("run start")
         state.phase = "GOTO_A"; state.diag = "run start"
     end
 
     local has_c4 = active_is_c4(lp)
+
+    -- bomb already down (we planted it, or a teammate did) -> nothing left but retreat
+    if (state.phase == "GOTO_A" or state.phase == "PLANT") and bomb_is_planted() then
+        state.phase = "RETREAT"; state.diag = "bomb is down -> retreat"
+    end
 
     -- ── state machine ──
     if state.phase == "GOTO_A" then
@@ -367,20 +484,67 @@ local function plantbot_tick(cmd)
         local radius = 120
         pcall(function() radius = pb_radius:get() end)
         if d <= radius then
-            state.phase = "PLANT"; state.plant_hold_t = now; state.diag = "at A -> planting"
+            state.phase = "PLANT"; state.plant_hold_t = now
+            state.arm_started = false; state.rearm_until = 0; state.reposition_until = 0
+            state.diag = "at A -> planting"
             return
         end
         local mv = compute_move(lp, lo, dir_yaw_xy(lo.x, lo.y, a.x, a.y), now, "GOTO_A")
         apply_move(cmd, mv, now)
 
     elseif state.phase == "PLANT" then
-        equip_c4(now)
-        pcall(function() cmd.move_yaw = 0; cmd.forwardmove = 0; cmd.sidemove = 0; cmd.in_attack = true end)
-        state.activity = "PLANT"; state.diag = "holding +attack"
+        local arming = c4_arming(lp)
+        if arming then state.arm_started = true end
+
+        -- not standing in the bomb zone (or the plant refuses to start) -> close the gap first
+        local zone = in_bomb_zone(lp)
+        if (not arming) and (zone == false or now < (state.reposition_until or 0)) then
+            local a = state.a_spot
+            if dist2d(lo.x, lo.y, a.x, a.y) > 25 then
+                equip_c4(now)
+                local mv = compute_move(lp, lo, dir_yaw_xy(lo.x, lo.y, a.x, a.y), now, "PLANT")
+                apply_move(cmd, mv, now)
+                state.plant_hold_t = now            -- hold clock only starts once we are there
+                state.diag = (zone == false) and "not in bomb zone -> closing" or "re-positioning on mark"
+                state.had_c4 = has_c4
+                return
+            end
+        end
+
+        -- take the bomb out ONLY before arming starts: a slot switch mid-arm cancels the plant
+        if (not arming) and (not has_c4) then equip_c4(now) end
+
+        -- freeze completely and HOLD +attack. Any movement / duck / jump aborts the plant.
+        local release = now < (state.rearm_until or 0)   -- brief release so a re-press registers
+        state.jump_until = 0; state.pass_crouch = false
+        pcall(function() cmd.move_yaw = 0; cmd.forwardmove = 0; cmd.sidemove = 0 end)
+        pcall(function() cmd.in_attack = (not release) end)
+        pcall(function() cmd.in_jump = false end)
+        pcall(function() cmd.in_duck = false end)
+
         local held = now - (state.plant_hold_t or 0)
-        -- planted when the bomb leaves our hands (after a min hold) OR a safety timeout
-        if (held > 0.6 and not has_c4) or held > 5.0 then
-            state.phase = "RETREAT"; state.diag = (has_c4 and "plant timeout" or "planted") .. " -> retreat"
+        state.activity = "PLANT"
+        state.diag = arming and string.format("arming %.1fs — holding", held)
+                    or (release and "re-press +attack" or "holding +attack")
+
+        if bomb_is_planted() then
+            -- the ONLY real completion signal (server side), v1.3 guessed from the weapon
+            state.phase = "RETREAT"; state.diag = "planted -> retreat"
+        elseif state.arm_started and (not arming) and held > 1.0 then
+            -- arming stopped without a plant = aborted (bumped / damaged) -> release + re-press
+            state.arm_started = false
+            state.rearm_until = now + 0.2
+            state.plant_hold_t = now
+            state.aborts = (state.aborts or 0) + 1
+            state.diag = "plant aborted -> re-arm"
+        elseif (not state.arm_started) and held > 3.0 then
+            -- +attack does nothing here (wrong spot / bomb not out) -> step back onto the mark
+            state.reposition_until = now + 0.6
+            state.rearm_until = now + 0.2
+            state.plant_hold_t = now
+            state.diag = "plant not starting -> re-position"
+        elseif state.arm_started and held > 12.0 then
+            state.phase = "RETREAT"; state.diag = "plant timeout -> retreat"
         end
 
     elseif state.phase == "RETREAT" then
@@ -437,13 +601,20 @@ local function render_hud()
             state.activity .. (state.pass_crouch and "  +DUCK" or "")); y = y + line
         render.text(3, vector(x, y), col(180, 180, 180), nil, "Marks: ")
         render.text(3, vector(x + 50, y), state.a_spot and col(120, 230, 120) or col(255, 110, 110), nil, "A")
-        render.text(3, vector(x + 66, y), state.safe_spot and col(120, 230, 120) or col(255, 110, 110), nil, "Safe")
+        render.text(3, vector(x + 66, y), state.safe_spot and col(120, 230, 120) or col(255, 110, 110), nil, "Safe"); y = y + line
+        render.text(3, vector(x, y), col(180, 180, 180), nil, "Round: ")
+        render.text(3, vector(x + 50, y),
+            (state.round_state == "LIVE") and col(120, 230, 120) or col(255, 200, 90), nil,
+            tostring(state.round_state) .. (state.bomb_down and "  BOMB DOWN" or ""))
         if dbg then
             y = y + line + 4
             render.text(3, vector(x, y), col(120, 200, 255), nil, "── debug ──"); y = y + line
             render.text(3, vector(x, y), col(180, 180, 180), nil, "C4: ")
             render.text(3, vector(x + 28, y), state.had_c4 and col(120, 230, 120) or col(255, 160, 90), nil,
                 state.had_c4 and "in hand" or "not active"); y = y + line
+            render.text(3, vector(x, y), col(180, 180, 180), nil, "arm: ")
+            render.text(3, vector(x + 34, y), state.arm_started and col(120, 230, 120) or col(160, 160, 160), nil,
+                (state.arm_started and "started" or "no") .. "  aborts " .. tostring(state.aborts or 0)); y = y + line
             render.text(3, vector(x, y), col(180, 180, 180), nil, "block: ")
             render.text(3, vector(x + 46, y), col(255, 255, 255), nil, tostring(state.block)); y = y + line
             render.text(3, vector(x, y), col(180, 180, 180), nil, "why: ")
@@ -458,6 +629,11 @@ pcall(function()
     events.shutdown:set(function()
         pcall(function() events.createmove:unset() end)
         pcall(function() events.render:unset() end)
+        pcall(function() events.bomb_beginplant:unset() end)
+        pcall(function() events.bomb_abortplant:unset() end)
+        pcall(function() events.bomb_planted:unset() end)
+        pcall(function() events.round_prestart:unset() end)
+        pcall(function() events.round_start:unset() end)
     end)
 end)
 
