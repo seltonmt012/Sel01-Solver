@@ -5,7 +5,7 @@
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Config
 -- @author seltonmt01
--- @version 3.31
+-- @version 3.32
 -- @description AI Peek hittable-gate (only peek when min-dmg shot exists):
 --   * v3.28 peeked at any in-range enemy → walked constantly. v3.29 arms the
 --     peek ONLY while a fresh events.aim_fire (estimated damage >= the user's NL
@@ -71,7 +71,7 @@
 --     variance for full per-side chaos.
 --   * MAG-JIT indicator added to bottom HvH strip; dumped in v3.8 stats.
 
-local SEL01_CFG_VERSION = "3.31"
+local SEL01_CFG_VERSION = "3.32"
 
 -- DEBUG: print to CSGO console at major load checkpoints. Plain print() bypasses
 -- NL chat (which may not flush before crash) and writes directly to CSGO console.
@@ -2557,23 +2557,48 @@ do
     -- v3.31: ON-SCREEN banner (menu label alone was easy to miss). "checking version..."
     -- while the request is in flight, then a short green "up to date" or a longer red
     -- "OUTDATED", each fading out — nothing stays on screen afterwards.
-    cfg_vc_scr = { text = "checking version...", r = 190, g = 190, b = 190,
-                   t_until = (globals.realtime or 0) + 12 }
+    -- v3.31: bigger text, and the banner waits ~4s so it appears AFTER the Solver's
+    -- fullscreen intro (the scripts load together). Sequence: intro -> "checking
+    -- version..." -> verdict, instead of everything stacked at once.
+    cfg_vc_font = nil
+    pcall(function() cfg_vc_font = render.load_font("Verdana", 26, "b") end)
+    cfg_vc_scr  = { text = "checking version...", r = 190, g = 190, b = 190, hold = nil }
+    cfg_vc_gate = (globals.realtime or 0) + 4.0
     function cfg_vc_draw()
         local st = cfg_vc_scr
         if not st then return end
         local now = globals.realtime or 0
-        if now >= (st.t_until or 0) then cfg_vc_scr = nil; return end
+        if now < cfg_vc_gate then return end
+        local shown = now - cfg_vc_gate
+        local drawing = st
+        if st.hold and shown < 1.2 then
+            drawing = { text = "checking version...", r = 190, g = 190, b = 190 }
+        elseif st.hold then
+            if not st.t_until then st.t_until = now + st.hold end
+            if now >= st.t_until then cfg_vc_scr = nil; return end
+        elseif shown > 14 then
+            cfg_vc_scr = nil; return
+        end
         local a = 255
-        local left = st.t_until - now
-        if left < 1.0 then a = math.floor(255 * left) end
+        if drawing.t_until then
+            local left = drawing.t_until - now
+            if left < 1.0 then a = math.floor(255 * left) end
+        end
         pcall(function()
             local ss = render.screen_size()
-            render.text(4, vector(ss.x / 2, ss.y * 0.74), color(st.r, st.g, st.b, a), "c", st.text)
+            local y  = ss.y * 0.71
+            local col = color(drawing.r, drawing.g, drawing.b, a)
+            local f, w = cfg_vc_font, nil
+            if f then pcall(function() w = render.measure_text(f, nil, drawing.text) end) end
+            if f and w then
+                render.text(f, vector(ss.x / 2 - w.x / 2, y), col, nil, drawing.text)
+            else
+                render.text(5, vector(ss.x / 2, y), col, "c", drawing.text)
+            end
         end)
     end
     function cfg_vc_screen(text, r, g, b, secs)   -- global: main chunk is at the 200-local cap
-        cfg_vc_scr = { text = text, r = r, g = g, b = b, t_until = (globals.realtime or 0) + secs }
+        cfg_vc_scr = { text = text, r = r, g = g, b = b, hold = secs }
     end
 
     local function vc_num(v)

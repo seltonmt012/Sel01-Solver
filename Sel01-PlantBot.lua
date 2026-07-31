@@ -1,12 +1,12 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-PlantBot                                    ║
--- ║  Version: 1.6                                      ║
+-- ║  Version: 1.7                                      ║
 -- ║  One job: walk to a marked A spot, plant the C4,   ║
 -- ║  walk to a marked safe spot, done. Auto-picks T.   ║
 -- ║  by seltonmt01                                     ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-PlantBot
--- @version 1.6
+-- @version 1.7
 -- @author seltonmt01
 -- @description Standalone plant-bot. You MARK two spots once (persisted per map):
 --   the A plant spot + the safe spot. Then it loops every round:
@@ -18,7 +18,7 @@
 --   Movement ONLY — aiming stays with the ragebot. While idle/done it does NOT touch
 --   the cmd, so your normal keys work.
 
-local SEL01_PB_VERSION = "1.6"
+local SEL01_PB_VERSION = "1.7"
 
 local ffi_ok, ffi = pcall(require, "ffi")
 
@@ -901,23 +901,45 @@ local VC_KEY = "plantbot"
 -- v1.6: ON-SCREEN banner (the menu label alone is easy to miss). "checking version..."
 -- while the request is in flight, then a short green "up to date" or a longer red
 -- "OUTDATED", both fading out. Nothing stays on screen afterwards.
-pb_vc_scr = { text = "checking version...", r = 190, g = 190, b = 190,
-              t_until = (globals.realtime or 0) + 12 }
+pb_vc_font = nil
+pcall(function() pb_vc_font = render.load_font("Verdana", 26, "b") end)
+pb_vc_scr  = { text = "checking version...", r = 190, g = 190, b = 190, hold = nil }
+pb_vc_gate = (globals.realtime or 0) + 4.0   -- let the Solver's fullscreen intro finish first
 function pb_vc_draw()
     local st = pb_vc_scr
     if not st then return end
     local now = globals.realtime or 0
-    if now >= (st.t_until or 0) then pb_vc_scr = nil; return end
+    if now < pb_vc_gate then return end
+    local shown = now - pb_vc_gate
+    local drawing = st
+    if st.hold and shown < 1.2 then
+        drawing = { text = "checking version...", r = 190, g = 190, b = 190 }
+    elseif st.hold then
+        if not st.t_until then st.t_until = now + st.hold end
+        if now >= st.t_until then pb_vc_scr = nil; return end
+    elseif shown > 14 then
+        pb_vc_scr = nil; return
+    end
     local a = 255
-    local left = st.t_until - now
-    if left < 1.0 then a = math.floor(255 * left) end
+    if drawing.t_until then
+        local left = drawing.t_until - now
+        if left < 1.0 then a = math.floor(255 * left) end
+    end
     pcall(function()
         local ss = render.screen_size()
-        render.text(4, vector(ss.x / 2, ss.y * 0.78), color(st.r, st.g, st.b, a), "c", st.text)
+        local y  = ss.y * 0.81
+        local col = color(drawing.r, drawing.g, drawing.b, a)
+        local f, w = pb_vc_font, nil
+        if f then pcall(function() w = render.measure_text(f, nil, drawing.text) end) end
+        if f and w then
+            render.text(f, vector(ss.x / 2 - w.x / 2, y), col, nil, drawing.text)
+        else
+            render.text(5, vector(ss.x / 2, y), col, "c", drawing.text)
+        end
     end)
 end
 local function vc_screen(text, r, g, b, secs)
-    pb_vc_scr = { text = text, r = r, g = g, b = b, t_until = (globals.realtime or 0) + secs }
+    pb_vc_scr = { text = text, r = r, g = g, b = b, hold = secs }
 end
 
 local function vc_num(v)

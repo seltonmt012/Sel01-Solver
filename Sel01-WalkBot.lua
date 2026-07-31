@@ -1,11 +1,11 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-WalkBot                                     ║
--- ║  Version: 2.0                                      ║
+-- ║  Version: 2.1                                      ║
 -- ║  Greedy nav-bot: map + enemy detect, walk-to-foe  ║
 -- ║  by seltonmt01                                     ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-WalkBot
--- @version 2.0
+-- @version 2.1
 -- @author seltonmt01
 -- @description Greedy walk-bot. Detects map + enemies, walks the local player
 --   toward a chosen target using NL movement cmd (move_yaw + forwardmove) with
@@ -19,7 +19,7 @@
 --   entity.get_players(true) (enemies) / entity.get_local_player() / p.m_vecOrigin / p:get_eye_position()
 --   globals.mapname / globals.tickcount / globals.realtime
 
-local SEL01_WB_VERSION = "2.0"
+local SEL01_WB_VERSION = "2.1"
 
 local ffi_ok, ffi = pcall(require, "ffi")
 
@@ -584,18 +584,52 @@ local function compute_move(lp, lo, want_yaw, now, base_act, no_stuck)
                 -- WEDGED: commit a back+side escape heading for ~0.8s + jump, flip the
                 -- preferred avoid side so we don't re-wedge the same way, learn the spot.
                 state.activity = "STUCK"; state.stuck_hard = true; state.block = "wedged"
+                -- v2.1 PING-PONG BREAKER. The old escape was always "want_yaw + 160*side
+                -- for 0.8s, then flip side". Real log: the bot wedged at (570,-1400),
+                -- escaped ~140u back, walked the SAME straight heading in again, wedged at
+                -- (592,-1256) — the two spots 144u apart — and bounced between them for a
+                -- full minute. The flip is what alternates it, and 0.8s is only ever long
+                -- enough to reach the other side of the pocket. So: count how often we
+                -- wedged NEAR HERE recently and escalate instead of repeating.
+                state.wedge_hist = state.wedge_hist or {}
+                local rep = 0
+                for _, w in ipairs(state.wedge_hist) do
+                    local wdx, wdy = w.x - lo.x, w.y - lo.y
+                    if (now - w.t) < 12.0 and (wdx * wdx + wdy * wdy) < (260 * 260) then rep = rep + 1 end
+                end
+                table.insert(state.wedge_hist, 1, { x = lo.x, y = lo.y, t = now })
+                while #state.wedge_hist > 6 do table.remove(state.wedge_hist) end
+
                 local side = (state.avoid_dir ~= 0 and state.avoid_dir) or 1
-                state.escape_yaw = norm_ang(want_yaw + 160 * side)
-                state.escape_until = now + 0.8
-                state.avoid_dir = -side
+                local ang, commit
+                if rep == 0 then
+                    ang, commit = 160 * side, 0.8              -- first time: as before
+                    state.avoid_dir = -side                     -- try the other way next
+                elseif rep == 1 then
+                    ang, commit = 180 - 20 * side, 1.8          -- back OUT of the pocket, further
+                    -- keep avoid_dir: flipping it is exactly what made it dance L/R/L/R
+                else
+                    ang, commit = 90 * side, 3.0                -- wall-follow: long sideways commit
+                end
+                state.escape_yaw = norm_ang(want_yaw + ang)
+                state.escape_until = now + commit
                 if aj then state.jump_until = now + 0.18 end
                 state.diag = base_act .. " WEDGED -> hard escape"
                 move_yaw = state.escape_yaw
                 state.stuck_since = now
                 state.stuck_ref_origin = lo; state.stuck_ref_t = now
                 record_bad(lo)                              -- learn: this is a bad spot
-                wb_log("wedge", 0, "%s WEDGED %.1fs hspeed=%.0f @(%.0f,%.0f) -> escape %.0f deg + record_bad",
-                       base_act, dur, hspeed, lo.x, lo.y, state.escape_yaw)
+                -- repeat wedge = this pocket is a genuine dead end, not bad luck. Make the
+                -- MESH avoid it (penalised area -> A* routes around) and force the engage
+                -- path onto nav for a while instead of the straight line that got us here.
+                if rep >= 1 then
+                    if wb_nav_penalize then pcall(wb_nav_penalize, lo.x, lo.y, 25.0) end
+                    state.force_nav_until = now + 10.0
+                    state.nav_path = nil
+                end
+                wb_log("wedge", 0, "%s WEDGED %.1fs hspeed=%.0f @(%.0f,%.0f) rep=%d -> escape %.0f deg for %.1fs%s",
+                       base_act, dur, hspeed, lo.x, lo.y, rep, state.escape_yaw, commit,
+                       rep >= 1 and " + nav-penalty" or "")
             elseif dur > 0.7 then
                 state.activity = "STUCK"
                 move_yaw = want_yaw + (state.avoid_dir ~= 0 and state.avoid_dir or 1) * 90
@@ -805,6 +839,17 @@ local function nav_nearest(x, y)
     return best, bestd and math.sqrt(bestd) or 0
 end
 
+-- v2.1: penalised areas. A repeat wedge means that pocket is a real dead end, so the
+-- area is given a huge extra A* cost for a while and the router walks around it. Global
+-- (table + fn) because compute_move sits ABOVE this block and resolves it at call time.
+wb_nav_pen = {}
+function wb_nav_penalize(x, y, secs)
+    if not (nav.ok and nav.areas) then return end
+    local a = nav_nearest(x, y)
+    if not a then return end
+    wb_nav_pen[a.id] = (globals.realtime or 0) + (secs or 20)
+end
+
 -- A* over the area graph. start/goal = area ids. Returns an ordered list of area
 -- centers {x,y,z} (the route), or nil if unreachable.
 local function nav_astar(startId, goalId)
@@ -831,6 +876,12 @@ local function nav_astar(startId, goalId)
             if na and not closed[nb] then
                 local dx, dy = ca.x - na.x, ca.y - na.y
                 local tg = g[cur] + math.sqrt(dx * dx + dy * dy)
+                -- v2.1: penalised (repeatedly wedged) area — passable, but expensive, so
+                -- any sane detour wins. Expired entries fall away on their own.
+                local pen = wb_nav_pen[nb]
+                if pen then
+                    if pen > (globals.realtime or 0) then tg = tg + 4000 else wb_nav_pen[nb] = nil end
+                end
                 if not g[nb] or tg < g[nb] then
                     came[nb] = cur; g[nb] = tg; f[nb] = tg + hcost(na); open[nb] = true
                 end
@@ -1009,7 +1060,25 @@ local function walkbot_tick(cmd)
             -- ── AGGRESSIVE peek ONLY when the enemy is VISIBLE. Close but NOT visible
             -- (sitting around a corner) -> do NOT blind-jiggle into the angle; slow-
             -- approach to gain the sightline carefully instead. ──
-            local want_yaw = dir_yaw(lo, to)
+            -- v2.1: ENGAGE also routes through the NAV MESH. Until now the whole close
+            -- band (everything under "Approach Over", 1300u by default) walked a STRAIGHT
+            -- line at the enemy — through walls, boxes and closed doors. compute_move's
+            -- fan-out plus the wedge-escape then fought that heading every tick, which is
+            -- the "runs straight into the enemy / stuck keeps saving it" behaviour: the
+            -- avoidance only knows a 55u probe, the mesh knows the actual way around.
+            -- Straight line is kept where it is genuinely better: point-blank (inside
+            -- Stop Distance, where the jiggle peek lives) and whenever we can SEE the
+            -- target (a sightline means the path is mostly open anyway). No LOS, or we
+            -- just wedged (escape fired < 2s ago), and the mesh takes over.
+            local recent_wedge = now < ((state.escape_until or 0) + 2.0)
+                                 or now < (state.force_nav_until or 0)
+            local use_nav_engage = nav.ok and dist > stop_d and ((not visible) or recent_wedge)
+            local want_yaw
+            if use_nav_engage then
+                want_yaw = nav_dir(lo, to.x, to.y, now)
+            else
+                want_yaw = dir_yaw(lo, to)
+            end
             local close = dist <= stop_d
             local aggressive = close and visible
             if aggressive then
@@ -1029,7 +1098,8 @@ local function walkbot_tick(cmd)
                     visible and "PEEK-visible" or "careful-approach", dist, mstate,
                     aggressive and " +jiggle" or "")
             else
-                state.diag = string.format("engage #%s d=%.0f enemy=%s", tostring(state.target_idx), dist, mstate)
+                state.diag = string.format("engage #%s d=%.0f enemy=%s%s", tostring(state.target_idx), dist, mstate,
+                    use_nav_engage and string.format(" nav(%d)", state.nav_path_len or 0) or " direct")
             end
             -- CROUCH when EXPOSED: enemy around a corner (not visible) + we're standing in
             -- the open + in combat range -> duck = smaller target, lowers their hit chance.
@@ -1274,23 +1344,45 @@ local VC_KEY = "walkbot"
 -- v2.0: ON-SCREEN banner (the menu label alone is easy to miss). "checking version..."
 -- while the request is in flight, then a short green "up to date" or a longer red
 -- "OUTDATED", both fading out. Nothing stays on screen afterwards.
-wb_vc_scr = { text = "checking version...", r = 190, g = 190, b = 190,
-              t_until = (globals.realtime or 0) + 12 }
+wb_vc_font = nil
+pcall(function() wb_vc_font = render.load_font("Verdana", 26, "b") end)
+wb_vc_scr  = { text = "checking version...", r = 190, g = 190, b = 190, hold = nil }
+wb_vc_gate = (globals.realtime or 0) + 4.0   -- let the Solver's fullscreen intro finish first
 function wb_vc_draw()
     local st = wb_vc_scr
     if not st then return end
     local now = globals.realtime or 0
-    if now >= (st.t_until or 0) then wb_vc_scr = nil; return end
+    if now < wb_vc_gate then return end
+    local shown = now - wb_vc_gate
+    local drawing = st
+    if st.hold and shown < 1.2 then
+        drawing = { text = "checking version...", r = 190, g = 190, b = 190 }
+    elseif st.hold then
+        if not st.t_until then st.t_until = now + st.hold end
+        if now >= st.t_until then wb_vc_scr = nil; return end
+    elseif shown > 14 then
+        wb_vc_scr = nil; return
+    end
     local a = 255
-    local left = st.t_until - now
-    if left < 1.0 then a = math.floor(255 * left) end
+    if drawing.t_until then
+        local left = drawing.t_until - now
+        if left < 1.0 then a = math.floor(255 * left) end
+    end
     pcall(function()
         local ss = render.screen_size()
-        render.text(4, vector(ss.x / 2, ss.y * 0.74), color(st.r, st.g, st.b, a), "c", st.text)
+        local y  = ss.y * 0.76
+        local col = color(drawing.r, drawing.g, drawing.b, a)
+        local f, w = wb_vc_font, nil
+        if f then pcall(function() w = render.measure_text(f, nil, drawing.text) end) end
+        if f and w then
+            render.text(f, vector(ss.x / 2 - w.x / 2, y), col, nil, drawing.text)
+        else
+            render.text(5, vector(ss.x / 2, y), col, "c", drawing.text)
+        end
     end)
 end
 local function vc_screen(text, r, g, b, secs)
-    wb_vc_scr = { text = text, r = r, g = g, b = b, t_until = (globals.realtime or 0) + secs }
+    wb_vc_scr = { text = text, r = r, g = g, b = b, hold = secs }
 end
 
 local function vc_num(v)

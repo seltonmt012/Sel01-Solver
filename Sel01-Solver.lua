@@ -1,11 +1,11 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 9.93                                   ║
+-- ║  Version: 9.94                                   ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 9.93
+-- @version 9.94
 -- @description v9.79 BF real-dominance ordering broadened to switch AA:
 --   * v9.78 only reordered the static/slow BF branch. This lobby's one-sided
 --     locks were aa=switch (idx=8 real 10R/0L still fired BF:opposite LEFT;
@@ -132,7 +132,7 @@
 --   * v9.26 drift-bump (alpha 0.55 on 5-10° diff) still handles small shifts.
 --   * v9.29 coach variants carry.
 
-local SEL01_VERSION = "9.93"
+local SEL01_VERSION = "9.94"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -6295,23 +6295,54 @@ do
     local VC_URL = "https://raw.githubusercontent.com/seltonmt012/Sel01-Solver/master/versions.txt"
     local VC_KEY = "solver"
 
-    sel01_vc_scr = { text = "checking version...", r = 190, g = 190, b = 190,
-                     t_until = (globals.realtime or 0) + 12 }
+    -- v9.94: BIGGER text + the banner waits for the fullscreen intro to be GONE. While
+    -- the logo overlay is up the banner would be competing with it (and half of it sat
+    -- behind the dark rect), so nothing is drawn until `loading_effect` clears. After
+    -- that it shows "checking version..." for a beat, THEN the result — so the sequence
+    -- reads intro -> check -> verdict instead of everything at once.
+    sel01_vc_font = nil
+    pcall(function() sel01_vc_font = render.load_font("Verdana", 26, "b") end)
+    -- state: pending result waits here until the intro is gone and the "checking" beat ran
+    sel01_vc_scr = { text = "checking version...", r = 190, g = 190, b = 190, hold = nil }
+    sel01_vc_gate = nil          -- realtime the banner first became visible
     function sel01_vc_draw()                       -- global: called from the render wrapper
         local st = sel01_vc_scr
         if not st then return end
+        if loading_effect ~= nil then return end   -- intro still on screen -> stay hidden
         local now = globals.realtime or 0
-        if now >= (st.t_until or 0) then sel01_vc_scr = nil; return end
+        if not sel01_vc_gate then sel01_vc_gate = now end
+        local shown = now - sel01_vc_gate
+        -- hold the "checking..." line for a beat even if the answer already arrived
+        local drawing = st
+        if st.hold and shown < 1.2 then
+            drawing = { text = "checking version...", r = 190, g = 190, b = 190 }
+        elseif st.hold then
+            if not st.t_until then st.t_until = now + st.hold end
+            if now >= st.t_until then sel01_vc_scr = nil; return end
+        elseif shown > 14 then                     -- no answer at all -> give up quietly
+            sel01_vc_scr = nil; return
+        end
         local a = 255
-        local left = st.t_until - now
-        if left < 1.0 then a = math.floor(255 * left) end
+        if drawing.t_until then
+            local left = drawing.t_until - now
+            if left < 1.0 then a = math.floor(255 * left) end
+        end
         pcall(function()
             local ss = render.screen_size()
-            render.text(4, vector(ss.x / 2, ss.y * 0.70), color(st.r, st.g, st.b, a), "c", st.text)
+            local y  = ss.y * 0.66
+            local col = color(drawing.r, drawing.g, drawing.b, a)
+            local f = sel01_vc_font
+            local w = nil
+            if f then pcall(function() w = render.measure_text(f, nil, drawing.text) end) end
+            if f and w then
+                render.text(f, vector(ss.x / 2 - w.x / 2, y), col, nil, drawing.text)
+            else
+                render.text(5, vector(ss.x / 2, y), col, "c", drawing.text)
+            end
         end)
     end
     function sel01_vc_screen(text, r, g, b, secs)   -- global: main chunk is AT the 200-local cap
-        sel01_vc_scr = { text = text, r = r, g = g, b = b, t_until = (globals.realtime or 0) + secs }
+        sel01_vc_scr = { text = text, r = r, g = g, b = b, hold = secs }
     end
 
     local function vc_num(v)
