@@ -1,11 +1,11 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 9.91                                   ║
+-- ║  Version: 9.92                                   ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 9.91
+-- @version 9.92
 -- @description v9.79 BF real-dominance ordering broadened to switch AA:
 --   * v9.78 only reordered the static/slow BF branch. This lobby's one-sided
 --     locks were aa=switch (idx=8 real 10R/0L still fired BF:opposite LEFT;
@@ -132,7 +132,7 @@
 --   * v9.26 drift-bump (alpha 0.55 on 5-10° diff) still handles small shifts.
 --   * v9.29 coach variants carry.
 
-local SEL01_VERSION = "9.91"
+local SEL01_VERSION = "9.92"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -355,6 +355,10 @@ TAB_MAIN = ui.get_icon"sliders"    .. "  Main"
 TAB_CORE = ui.get_icon"crosshairs" .. "  Resolver"
 TAB_ESP  = ui.get_icon"eye"        .. "  ESP / Advisor"
 TAB_ADV  = ui.get_icon"feather"    .. "  Advanced"
+-- v9.92: logging / debugging / dumps live in their OWN tab — the Advanced tab was a mix
+-- of resolver fine-control and diagnostics, and the log buttons are what you reach for
+-- mid-match. Perf-Info moved along with it (it is read-only diagnostics too).
+TAB_LOG  = ui.get_icon"terminal"   .. "  Logs / Debug"
 local g_main         = ui.create(TAB_MAIN, "Main",              1)
 local g_smart        = ui.create(TAB_MAIN, "Smart Strategy",    2)
 local g_resolver     = ui.create(TAB_CORE, "Resolver Core",     1)
@@ -362,8 +366,8 @@ local g_aggro        = ui.create(TAB_CORE, "Aggressive Tuning", 2)
 local g_baim         = ui.create(TAB_CORE, "Bruteforce / Baim", 2)
 local g_esp          = ui.create(TAB_ESP,  "ESP / HUD",         1)
 local g_experimental = ui.create(TAB_ADV,  "Advanced (Fine Control)", 1)
-local g_perf         = ui.create(TAB_ADV,  "Performance Info",  2)
-local g_logging      = ui.create(TAB_ADV,  "Logging",           2)
+local g_perf         = ui.create(TAB_LOG,  "Performance Info",  2)
+local g_logging      = ui.create(TAB_LOG,  "Logging",           1)
 local g_chat         = ui.create(TAB_ESP,  "Sel01-Roast (on kill)", 2)
 -- V9.20: AA Advisor group — global (no `local`) to dodge main-chunk 200-local limit.
 g_advisor = ui.create(TAB_ESP, "AA Advisor (Per-enemy)", 1)
@@ -477,9 +481,10 @@ local esp_label_color  = g_esp:color_picker(accent .. ui.get_icon"feather" .. ac
 g_esp:label(accent .. ui.get_icon"link-slash" .. accent .. "  Mode colors auto: green=Meas, yellow=Predict, red=BF, cyan=LBY")
 -- V9.21: live event ticker top-right of screen — HIT/MISS/KILL/INFO with fade.
 -- Global (no `local`) to dodge main-chunk 200-local limit.
-esp_event_ticker = g_esp:switch(accent .. ui.get_icon"bolt" .. accent .. "  Event Ticker (top-right HUD log)", true)
+-- v9.92: both event-LOG outputs live in the Logs / Debug tab (they are log sinks, not ESP).
+esp_event_ticker = g_logging:switch(accent .. ui.get_icon"bolt" .. accent .. "  Event Ticker (top-right HUD log)", true)
 -- V9.89: angel-wings style colored per-shot console hit/miss logs (opt-in).
-ev_console_log = g_esp:switch(accent .. ui.get_icon"terminal" .. accent .. "  Console Hit/Miss Logs (angel style)", true)
+ev_console_log = g_logging:switch(accent .. ui.get_icon"terminal" .. accent .. "  Console Hit/Miss Logs (angel style)", true)
 -- V9.51: per-enemy ON-MODEL visuals. Globals (no `local`) to dodge the 200-local cap.
 esp_wedge = g_esp:switch(accent .. ui.get_icon"diagram-project" .. accent .. "  Desync Wedge (real vs fake yaw lines on body)", true)
 esp_flash = g_esp:switch(accent .. ui.get_icon"bolt-lightning"  .. accent .. "  Hit/Miss Flash (box on each shot)", true)
@@ -3102,7 +3107,24 @@ events.aim_ack:set(function(event)
                 -- v9.42) poisoned serverfail_retry_mag with the bad value and BF:retry
                 -- repeated the overshoot. Logs: locked idx=3 (18 hits, measured 22.3°) shot
                 -- 41.9° on BF:retry then retried 41.9° again. Trust the measurement instead.
-                resolver_note_serverfail_retry(s, ack_shot_side, (ack_side_measured > 5 and ack_side_measured) or math.abs(ack_delta))
+                -- V9.92: JITTER gets NO magnitude freeze. resolver_note_serverfail_retry pins
+                -- the next shot to the SAME magnitude — that only makes sense for a STABLE
+                -- fake the server rejected. A jitter fake moves every tick, so err~0 merely
+                -- proves we shot our own BELIEF (the EMA average), not that the belief was
+                -- right at that tick. Real dump: idx=2 aa=jitter with 9 real R-hits spread
+                -- 29-36° produced six KEEPs at our=33.2/33.9/35.0 vs meas identical (err
+                -- 0.0-0.4) with bt as low as 0 — every retry re-fired the same angle and
+                -- missed again. v9.90 already flips the BLIND (real_active==0) jitter case;
+                -- here the side is proven one-sided, so keep the side and just refuse to
+                -- freeze: the BF cycle then sweeps the jitter band around the EMA. High bt
+                -- (>8) is genuine netcode, where retry-same is still correct.
+                if s.aa_type == "jitter" and bt <= 8 then
+                    resolver_clear_serverfail_retry(s)
+                    cs_log_verbose("jitter keep-no-freeze idx=%d side=%d our=%.1f meas=%.1f bt=%d — BF sweeps magnitude",
+                                   Ent:get_index(), ack_shot_side, ack_delta, ack_side_measured, bt)
+                else
+                    resolver_note_serverfail_retry(s, ack_shot_side, (ack_side_measured > 5 and ack_side_measured) or math.abs(ack_delta))
+                end
                 server_fail_keep = ack_serverfail_like  -- V9.55: only filter GENUINE netcode (err<=5 or bt>8); a bt=0 side-miss is our fault, count it
                 cs_log_verbose("correction-miss idx=%d KEEP side=%d our=%.1f meas=%.1f err=%.1f bt=%d (server/backtrack fail #%d, retry same)",
                                Ent:get_index(), ack_shot_side, ack_delta, ack_side_measured, ack_angle_err, bt, s.serverfail_streak)
@@ -3951,7 +3973,15 @@ local function _pick_first_shot_impl(p, s, anim, eye_yaw, max_desync, preset)
                 if s.measured_desync > 5 then
                     local side = s.last_hit_side ~= 0 and s.last_hit_side or 1
                     s.mode = clean .. "-Recall"
-                    return eye_yaw + s.measured_desync * side
+                    -- V9.92: PER-SIDE magnitude (same fix v9.22 made for Predicted-Alt).
+                    -- This path fired the GLOBAL EMA on whichever side we last hit — on a
+                    -- bimodal enemy that is the average of two different magnitudes and is
+                    -- wrong on BOTH sides. Real dump: idx=3 learned L=11 hits @27.5° vs
+                    -- R=3 @20.2° (one stretch measured R at 15.2°), and Static-Server-Recall
+                    -- kept firing ~27° after the enemy moved to the 15° right side.
+                    -- effective_desync falls back to the global EMA when that side has no
+                    -- samples, so one-sided enemies behave exactly as before.
+                    return eye_yaw + effective_desync(s, max_desync, side) * side
                 end
             end
         end
@@ -6356,6 +6386,7 @@ _cs_log_color_raw("V9.32: bimodal-switch detection (suppress global hard-reset t
 _cs_log_color_raw("V9.33: air-branch recent_resolved push (cancel-conf/conf now air-aware) + snapshot tick-window guard (no stale cross-engagement match) + boot nil-guard + adaptive-guess cap 58 + [EXP off] pose-param side read.")
 _cs_log_color_raw("V9.34: AIR-branch hardening — per-side magnitude in air corr-aware path (was global, wrong for bimodal) + update_jitter now runs in air (yaw_cache/rate warm → correct aa_type on landing + air-spin visible).")
 _cs_log_color_raw("V9.35: fast-fire tightened — only fires fast on stable (stddev<12) + well-sampled resolves, hc floors raised (30/45 not 15/22/30). Stops the 'shoots too early' marginal shots that caught bad backtrack records → correction/prediction-error rejects.")
+_cs_log_color_raw("V9.92: (1) Known-player Recall fast-path now uses the PER-SIDE magnitude (effective_desync) instead of the GLOBAL measured_desync EMA — on a bimodal enemy the global EMA is the average of two different magnitudes and is wrong on BOTH sides (real-dump idx=3: learned L=11 hits @27.5° vs R=3 @20.2°, one stretch measured R at 15.2°, while Static-Server-Recall kept firing ~27° after the enemy moved to the right side; same class of bug v9.22 fixed for Predicted-Alt). (2) LEARNED jitter enemies get keep-side but NO magnitude freeze: resolver_note_serverfail_retry pins the next shot to the SAME magnitude, which only makes sense for a stable fake the server rejected — err~0 on jitter merely proves we shot our own belief (real-dump idx=2 aa=jitter, 9 real R-hits spread 29-36°, six KEEPs at our=33.2/33.9/35.0 err 0.0-0.4 with bt down to 0, every retry re-firing the same angle). bt>8 still retries same (genuine netcode). v9.90 covers the blind case, this covers the learned one. (3) UI: logging / debug / dumps + event ticker + console hit-miss logs moved into their own 'Logs / Debug' tab (perf-info alongside).")
 _cs_log_color_raw("V9.90: JITTER first-contact no longer freezes the side. On a jitter enemy the measured_desync EMA is the AVERAGE of a per-tick-moving fake, so a small ack_angle_err (our |delta| ~= EMA) does NOT mean the angle was right — side + magnitude move next tick. The KEEP + serverfail_retry-same-magnitude path assumes a STABLE fake the server rejected, which jitter lacks (real-dump idx=7 aa=jitter samples=0: 3 KEEPs at meas 30.9→37.0→41.1, all missed, only resolved when the enemy stabilised into Static-Server 19.6°). Now jitter + real_active==0 forces a side flip so the BF cycle sweeps side+magnitude instead of re-firing the same angle. Gated on real_active==0 so a LEARNED one-sided jitter (idx=8, 8 real L-hits, streak L=8) keeps its proven side. Mirrors the v9.74 'jitter has no stable delta' precedent.")
 _cs_log_color_raw("V9.36: snapshot-match REGRESSION FIX — v9.33 matched ack-time tickcount (grabbed the most-recent snapshot, mis-learned sides on rapid fire). Restored event.tick matching of the actual acked shot; kept the stale-reject guard.")
 _cs_log_color_raw("V9.37: AIR first-contact fix (Air was worst @25%) — air guess magnitude biased high (max(median,42), airborne=near-max desync) + first-contact side uses steam-mem dom instead of blind +1.")
