@@ -1,11 +1,11 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 10.7                                   ║
+-- ║  Version: 10.8                                   ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 10.7
+-- @version 10.8
 -- @description v9.79 BF real-dominance ordering broadened to switch AA:
 --   * v9.78 only reordered the static/slow BF branch. This lobby's one-sided
 --     locks were aa=switch (idx=8 real 10R/0L still fired BF:opposite LEFT;
@@ -132,7 +132,7 @@
 --   * v9.26 drift-bump (alpha 0.55 on 5-10° diff) still handles small shifts.
 --   * v9.29 coach variants carry.
 
-local SEL01_VERSION = "10.7"
+local SEL01_VERSION = "10.8"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -1272,7 +1272,8 @@ sel01_session_desyncs = { cap = 20, head = 0, count = 0, dirty = true }
 -- every burst we observe regardless of whether the gate fired, so the dump can answer
 -- "does this signal even exist in my lobby" before anyone tunes a threshold.
 sel01_dt_stats = { seen = 0, max = 0, b3 = 0, b6 = 0, air = 0, duck = 0, fired = 0, reject_gap = 0, reject_ctx = 0 }
-sel01_keep_stats = { lo = { same = 0, opp = 0 }, hi = { same = 0, opp = 0 } }
+sel01_keep_stats = { stat = { lo = { hit = 0, miss = 0 }, hi = { hit = 0, miss = 0 } },
+                     mov  = { lo = { hit = 0, miss = 0 }, hi = { hit = 0, miss = 0 } } }
 function session_push_desync(v)
     if not v or v < 5 or v > 58 then return end  -- V9.33: cap at 58 (max desync) so >58 reads can't bias the median high
     local r = sel01_session_desyncs
@@ -1491,11 +1492,14 @@ local log_copy_btn = g_logging:button("📋 Copy Last Logs (for share)", functio
     -- freeze should go; dominated by "same" means the server really was rejecting a
     -- correct angle and retry-same earns its keep.
     do
+        local function _kb(b)
+            local n = b.hit + b.miss
+            if n == 0 then return "-" end
+            return string.format("%d/%d (%.0f%%)", b.hit, n, b.hit / n * 100)
+        end
         local k = sel01_keep_stats
-        local lo, hi = k.lo.same + k.lo.opp, k.hi.same + k.hi.opp
-        _cs_log_raw(string.format("[KEEP] resolved by SAME side vs OPPOSITE — bt<4: %d same / %d opp%s | bt>=4: %d same / %d opp%s",
-            k.lo.same, k.lo.opp, lo > 0 and string.format(" (%.0f%% same)", k.lo.same / lo * 100) or "",
-            k.hi.same, k.hi.opp, hi > 0 and string.format(" (%.0f%% same)", k.hi.same / hi * 100) or ""))
+        _cs_log_raw(string.format("[KEEP] next shot after a keep — STATIC bt<4 %s, bt>=4 %s | MOVING(switch/jitter) bt<4 %s, bt>=4 %s",
+            _kb(k.stat.lo), _kb(k.stat.hi), _kb(k.mov.lo), _kb(k.mov.hi)))
     end
     -- V9.95: animation-layer signal scoreboard. Compare the *-AnimGuess rows in MODE
     -- HIT-RATES below against plain *-Guess to judge whether the layers actually help.
@@ -1718,7 +1722,8 @@ local log_reset_session = g_logging:button("🗑 Reset Session Stats (in-memory)
     sel01_session_serverfails = 0  -- V9.50: clear server-fail filter counter
     sel01_session_spreadfails = 0  -- V9.72: clear spread-RNG filter counter
     sel01_dt_stats = { seen = 0, max = 0, b3 = 0, b6 = 0, air = 0, duck = 0, fired = 0, reject_gap = 0, reject_ctx = 0 }
-sel01_keep_stats = { lo = { same = 0, opp = 0 }, hi = { same = 0, opp = 0 } }  -- V10.0
+sel01_keep_stats = { stat = { lo = { hit = 0, miss = 0 }, hi = { hit = 0, miss = 0 } },
+                     mov  = { lo = { hit = 0, miss = 0 }, hi = { hit = 0, miss = 0 } } }  -- V10.0
     -- mode stats
     for k in pairs(mode_stats) do mode_stats[k] = nil end
     -- steam memory
@@ -3013,6 +3018,20 @@ events.aim_ack:set(function(event)
     pcall(function() bt = event.backtrack or 0 end)
     -- INVERTED: default to MISS, only count HIT when explicit known-hit
     local is_hit = (reason == nil) or HIT_STATES[reason]
+    -- V10.8: settle a pending KEEP on the very NEXT shot, hit or miss. The v10.4 metric
+    -- ("which side did the next LANDED hit use") is biased: on a switch or jitter enemy
+    -- the next hit naturally comes from the other side because the enemy alternates, so
+    -- "opposite" gets counted as a failure of the keep when it was simply the enemy
+    -- moving. Scoring the immediate next shot instead answers the question the keep
+    -- actually poses — did holding the side and re-firing that angle pay off — and the
+    -- static bucket is the one that can settle it, since a static enemy's side does not
+    -- move on its own.
+    if s.pending_keep_side then
+        local grp = (s.pending_keep_aa == "static") and sel01_keep_stats.stat or sel01_keep_stats.mov
+        local b = ((s.pending_keep_bt or 0) >= 4) and grp.hi or grp.lo
+        if is_hit then b.hit = b.hit + 1 else b.miss = b.miss + 1 end
+        s.pending_keep_side = nil
+    end
     -- log unknown reasons in debug so we can learn what NL sends
     if reason ~= nil and not HIT_STATES[reason] and not MISS_STATES[reason] then
         cs_log_debug("UNKNOWN aim_ack state='%s' — treated as MISS", tostring(reason))
@@ -3395,6 +3414,7 @@ events.aim_ack:set(function(event)
                 -- samples cannot settle that, so measure it instead of guessing.
                 s.pending_keep_side = ack_shot_side
                 s.pending_keep_bt   = bt
+                s.pending_keep_aa   = s.aa_type   -- V10.8: static enemies settle the question
                 -- V10.5: say what ACTUALLY happened. This line printed "retry same"
                 -- unconditionally, including when the no-freeze path had just cleared the
                 -- retry — so a v10.3 dump reads "KEEP our=90.0 meas=34.1 err=55.9 ...
@@ -7243,5 +7263,6 @@ _cs_log_color_raw("V10.4: [KEEP] telemetry — is a low-backtrack KEEP worth its
 _cs_log_color_raw("V10.5: chasing 'hits fine but feels less clean' at 85.2%. (1) DT-peek context tightened — close range ALONE is not a peek context, it is most of the game. The v10.4 dump opened 4396 windows across a 61-shot session, so cancel-low-confidence stayed suspended through nearly every close fight and marginal shots the filter would have held back got taken: exactly the reported feel. Close range now only counts together with the airborne/ducking posture the feature is named after; being shot at still qualifies alone (counter-fire). (2) Passive-side keep needs CLEAR dominance and never outranks real data. A bare 2:1 passive split is close to noise — real dump idx=8 had 323R vs 158L (2.04:1), pinned RIGHT, kept it through three misses, and the enemy finished 5 real hits LEFT / 0 right. Now 3:1, and a single real hit on the other side vetoes the passive read outright. (3) The KEEP log line printed 'retry same' unconditionally, including when the no-freeze path had just cleared the retry — a v10.3 dump reads 'err=55.9 ... retry same' for a BF probe that was actually released. A log that contradicts the code is worse than no log; it costs a debugging session. It now reports which branch ran.")
 _cs_log_color_raw("V10.6: bimodality must rest on REAL hits, never on seeded data. s.bimodal was set from samples_left/right, which include passive and learned-boot entries — so an enemy we had NEVER hit could be flagged bimodal purely because its two seeded EMAs differed by more than 12 degrees. That flag makes two_side_switcher true in the ack path, handing a zero-evidence enemy both the v9.63 keep-the-side branch and the v9.97 no-freeze. Real dump v10.5: idx=2 logged 'no-freeze: two-side' three times at samples=0 sideL=0 sideR=0, off nothing but a learned boot of L=21.7 / R=25.6. Now it needs 2+ REAL hits on each side. Same principle the resolver has had to relearn three times already — v9.45 seed-only keep, v9.48 alt_side_pick real dominance, v10.5 passive dominance: seeded data never decides. Also: v10.5's DT tightening worked, windows fell from 4396 to 813 with 1279 bursts rejected as fake-lag noise.")
 _cs_log_color_raw("V10.7: stale state outliving its evidence — the other half of v10.6. That version stopped SETTING s.bimodal without real hits, but a v10.6 dump still logged 'no-freeze: two-side' on an enemy at samples=0 sideL=0 sideR=0, because nothing ever CLEARED an old flag. Two fixes: (1) reset_state now clears bimodal, serverfail_streak and the pending-keep marker, so a dormancy gap cannot carry a verdict into a fresh engagement. (2) IDENTITY CHECK — PlayerState is keyed by ENTITY INDEX and CSGO reuses a slot the moment its occupant disconnects, so per-side magnitudes, real hit counts, streaks and flags learned about one player silently describe whoever takes that slot next, and the resolver acts on them at full confidence. Dormancy reset never caught this: a takeover can happen with no gap at all. The steam id is now compared per resolve and the whole entry is wiped when it changes. This class of bug is invisible in a hit-rate number — it just makes some enemies inexplicably worse than they should be.")
+_cs_log_color_raw("V10.8: the [KEEP] metric was measuring the wrong thing — my own instrument was biased. v10.4 asked 'which side did the next LANDED hit use', and across four sessions both buckets came out ~35% same-side, which looks like damning evidence against retry-same. But on a switch or jitter enemy the next hit comes from the other side because THE ENEMY ALTERNATES, not because the keep was wrong: the metric counts the enemy moving as a failure of our decision. Two changes make it answer the actual question. (1) It now scores the very NEXT SHOT after a keep, hit or miss — that is what the keep costs or buys. (2) It splits by aa_type, and the STATIC bucket is the one that can settle it, because a static enemy's side does not move on its own. New line: '[KEEP] next shot after a keep — STATIC bt<4 2/7 (29%), bt>=4 5/8 (63%) | MOVING ...'. A weak STATIC bt<4 number is real evidence to drop the low-backtrack freeze; the MOVING buckets are context only. Four sessions of data thrown away rather than acted on — a biased measurement is worse than none, because it is persuasive.")
 _cs_log_color_raw("Logging: " .. (log_enabled:get() and ("ON" .. (log_verbose:get() and " (verbose)" or ""))  or "OFF"))
 _cs_log_color_raw("=========================================")
