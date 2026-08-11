@@ -1,11 +1,11 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 10.4                                   ║
+-- ║  Version: 10.5                                   ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 10.4
+-- @version 10.5
 -- @description v9.79 BF real-dominance ordering broadened to switch AA:
 --   * v9.78 only reordered the static/slow BF branch. This lobby's one-sided
 --     locks were aa=switch (idx=8 real 10R/0L still fired BF:opposite LEFT;
@@ -132,7 +132,7 @@
 --   * v9.26 drift-bump (alpha 0.55 on 5-10° diff) still handles small shifts.
 --   * v9.29 coach variants carry.
 
-local SEL01_VERSION = "10.4"
+local SEL01_VERSION = "10.5"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -3244,12 +3244,20 @@ events.aim_ack:set(function(event)
                 -- R-hits). When passive obs clearly dominate the side we just shot
                 -- (2:1 ratio, 20+ obs), keep it; the V9.49 never-hit explore
                 -- (serverfail_streak>=2) still breaks a frozen wrong guess.
+                -- V10.5: passive dominance needs to be CLEAR, and it never outranks real
+                -- data. A bare 2:1 split is close to noise: real dump idx=8 had passive
+                -- 323R vs 158L (2.04:1) so this pinned RIGHT, kept it through three misses,
+                -- and the enemy turned out to be 5 real hits LEFT / 0 right. Now 3:1 is
+                -- required, and any real hit on the OTHER side vetoes the passive read
+                -- outright — one confirmed hit beats any number of passive observations.
                 local pnl, pnr = s.passive_n_left or 0, s.passive_n_right or 0
                 local p_dom = 0
                 if pnl + pnr >= 20 then
-                    if pnr >= pnl * 2 then p_dom = 1
-                    elseif pnl >= pnr * 2 then p_dom = -1 end
+                    if pnr >= pnl * 3 then p_dom = 1
+                    elseif pnl >= pnr * 3 then p_dom = -1 end
                 end
+                if p_dom > 0 and (s.real_left or 0) > 0 then p_dom = 0 end
+                if p_dom < 0 and (s.real_right or 0) > 0 then p_dom = 0 end
                 if p_dom ~= 0 and p_dom == ack_shot_side then
                     do_flip = false
                     cs_log_verbose("passive-side keep idx=%d side=%d pn{L=%d R=%d} err=%.1f (magnitude miss, side passively confirmed)",
@@ -3378,8 +3386,16 @@ events.aim_ack:set(function(event)
                 -- samples cannot settle that, so measure it instead of guessing.
                 s.pending_keep_side = ack_shot_side
                 s.pending_keep_bt   = bt
-                cs_log_verbose("correction-miss idx=%d KEEP side=%d our=%.1f meas=%.1f err=%.1f bt=%d (server/backtrack fail #%d, retry same)",
-                               Ent:get_index(), ack_shot_side, ack_delta, ack_side_measured, ack_angle_err, bt, s.serverfail_streak)
+                -- V10.5: say what ACTUALLY happened. This line printed "retry same"
+                -- unconditionally, including when the no-freeze path had just cleared the
+                -- retry — so a v10.3 dump reads "KEEP our=90.0 meas=34.1 err=55.9 ...
+                -- retry same" for a BF probe that was in fact released. A log that
+                -- contradicts the code is worse than no log; it sent me hunting a bug that
+                -- had already been fixed.
+                cs_log_verbose("correction-miss idx=%d KEEP side=%d our=%.1f meas=%.1f err=%.1f bt=%d (fail #%d, %s)",
+                               Ent:get_index(), ack_shot_side, ack_delta, ack_side_measured, ack_angle_err, bt,
+                               s.serverfail_streak,
+                               keep_no_freeze and ("no-freeze: " .. nf_why .. " → BF sweeps") or "retry same")
             end
           else
             -- FIX #4: conf<15 — correction skipped, BF cycle sweeps sides (no flip/keep/retry)
@@ -5233,10 +5249,17 @@ local function resolve_player(p)
         -- and a plain grounded burst has to be big (>=8) on top of that. This keeps the
         -- response for the case it was built for while handing the ordinary fake-lagger
         -- back to cancel-low-confidence, which is what earns the hit rate.
+        -- V10.5: close range ALONE is not a peek context — it is most of the game. The
+        -- v10.4 dump opened 4396 windows in a session of 61 shots, so cancel-low-
+        -- confidence was still effectively suspended through every close fight, which is
+        -- exactly the "hits fine but feels less clean" symptom: marginal shots the filter
+        -- would have held back. Close range now only counts together with the airborne /
+        -- ducking posture this feature is named after. Being shot at still qualifies on
+        -- its own — that is the counter-fire case, where firing back is the whole point.
         local hostile_recent = (s.last_hostile_fire or 0) > 0
             and ((globals.tickcount or 0) - s.last_hostile_fire) <= 64
         local close_ctx = (s.tmp_dist or 99999) <= (tick_cache.ui_close_range or 800) * 1.5
-        local peek_ctx  = hostile_recent or close_ctx
+        local peek_ctx  = hostile_recent or (close_ctx and (airborne or duck_amt > 0.35))
         local fire = peek_ctx and ((burst >= 4 and (airborne or duck_amt > 0.35)) or burst >= 8)
         if burst >= 4 and not peek_ctx then
             sel01_dt_stats.reject_ctx = (sel01_dt_stats.reject_ctx or 0) + 1
@@ -7180,5 +7203,6 @@ _cs_log_color_raw("V10.2: ANIMATED CLANTAG in the Solver, on by default. The Sel
 _cs_log_color_raw("Clantag: " .. ((sel01_ct_tog and sel01_ct_tog:get()) and ("ON via " .. tostring(sel01_ct_hook or "no hook found")) or "OFF"))
 _cs_log_color_raw("V10.3: (0) LOAD FIX — v10.2 called ui_sub() from the clantag block that sits ABOVE the definition. Globals resolve at CALL time, so the whole script died at load with 'attempt to call global ui_sub (a nil value)'. Both UI helpers now lead the UI section. (1) A well-measured side outranks a wide server-yaw reconstruct. clamp_learned_serveryaw is the other end of the sample range from the v9.86 first-contact clamp: with 4+ real hits on the shot side and a per-side EMA, a RebuildServerYaw magnitude more than 10 degrees off that EMA is reconstruct noise — a genuine change moves the EMA, which the v9.39 alpha ramp tracks in 2-3 hits. Keeps the server's SIDE, takes the learned magnitude, labels the mode *-Clamp so the dump shows how often it bites. Real dump v10.1: idx=2 had FOURTEEN straight right-side hits at 17.9 (EMA 17.6, conf 100) and Static-Server-Recall fired 31.9 — err 14.3, missed. (2) A BF sweep probe is not a rejected belief. BF fires deliberate off-angles to find the enemy; when one misses the sweep must CONTINUE, not pin the probe as the retry angle. An angle error above 25 degrees from a real measurement can only be a probe, so it now takes the keep-no-freeze path. Real dump: idx=6 'KEEP side=-1 our=-90.0 meas=29.8 err=60.2' stalled the sweep for four straight misses.")
 _cs_log_color_raw("V10.4: [KEEP] telemetry — is a low-backtrack KEEP worth its shot? Every keep holds the shot side AND schedules a retry of the same angle. The v10.3 dump argues both ways: 'KEEP err=0 bt<4 -> miss -> BF:opposite HIT' says the keep burned a shot (BF:opposite went 7/7 and BF:+90 3/3 that session), but 'KEEP err=0 bt<4 -> miss -> same angle HIT' says the server really was rejecting a correct angle twice. Roughly ten hand-read samples cannot settle that, and guessing here would trade one blind heuristic for another. So each keep now remembers its side, and the NEXT landed hit scores it: same side or opposite, bucketed by bt<4 vs bt>=4. A low-bt bucket dominated by OPPOSITE means the freeze should go; dominated by SAME means retry-same earns it. No aim change this version — measurement first, exactly like the v10.0 [DT] line that exposed the dormancy-gap bug.")
+_cs_log_color_raw("V10.5: chasing 'hits fine but feels less clean' at 85.2%. (1) DT-peek context tightened — close range ALONE is not a peek context, it is most of the game. The v10.4 dump opened 4396 windows across a 61-shot session, so cancel-low-confidence stayed suspended through nearly every close fight and marginal shots the filter would have held back got taken: exactly the reported feel. Close range now only counts together with the airborne/ducking posture the feature is named after; being shot at still qualifies alone (counter-fire). (2) Passive-side keep needs CLEAR dominance and never outranks real data. A bare 2:1 passive split is close to noise — real dump idx=8 had 323R vs 158L (2.04:1), pinned RIGHT, kept it through three misses, and the enemy finished 5 real hits LEFT / 0 right. Now 3:1, and a single real hit on the other side vetoes the passive read outright. (3) The KEEP log line printed 'retry same' unconditionally, including when the no-freeze path had just cleared the retry — a v10.3 dump reads 'err=55.9 ... retry same' for a BF probe that was actually released. A log that contradicts the code is worse than no log; it costs a debugging session. It now reports which branch ran.")
 _cs_log_color_raw("Logging: " .. (log_enabled:get() and ("ON" .. (log_verbose:get() and " (verbose)" or ""))  or "OFF"))
 _cs_log_color_raw("=========================================")
