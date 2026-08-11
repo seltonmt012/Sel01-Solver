@@ -1,11 +1,11 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 9.97                                   ║
+-- ║  Version: 9.98                                   ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 9.97
+-- @version 9.98
 -- @description v9.79 BF real-dominance ordering broadened to switch AA:
 --   * v9.78 only reordered the static/slow BF branch. This lobby's one-sided
 --     locks were aa=switch (idx=8 real 10R/0L still fired BF:opposite LEFT;
@@ -132,7 +132,7 @@
 --   * v9.26 drift-bump (alpha 0.55 on 5-10° diff) still handles small shifts.
 --   * v9.29 coach variants carry.
 
-local SEL01_VERSION = "9.97"
+local SEL01_VERSION = "9.98"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -419,11 +419,38 @@ local air_resolve_tog  = g_aggro:switch(accent .. ui.get_icon"feather"  .. accen
 local close_range_dist = g_aggro:slider(accent .. ui.get_icon"bullseye" .. accent .. "  Close Range (units)",  200, 1500, 800)
 local dormancy_reset_t = g_aggro:slider(accent .. ui.get_icon"clock"    .. accent .. "  Dormancy Reset (ms)",  100, 2000, 500)
 
+-- V9.98 UI: `item:create()` returns a MenuGroup attached to that item, so options that
+-- only matter while their parent is active can live INDENTED underneath it instead of
+-- floating in a flat wall of switches. Confirmed API (docs + gingersense / unskilled),
+-- but pcall-guarded with a fallback to the flat group so an older build still builds a
+-- working menu. GLOBAL (main chunk is at the 200-local cap).
+function ui_sub(parent, fallback)
+    local ok, g = pcall(function() return parent:create() end)
+    if ok and g then return g end
+    return fallback
+end
+-- V9.98: tooltips are set as their OWN statement, never chained into the assignment —
+-- `:tooltip(v)` is a setter and does not reliably return the item, so
+-- `local x = g:switch(...):tooltip("..")` would leave x nil.
+function ui_tip(item, text)
+    if not item then return end
+    pcall(function() item:tooltip(text) end)
+end
+
 -- Brute-force / Baim
 local force_baim_n     = g_baim:slider(accent .. ui.get_icon"skull"     .. accent .. "  Force Baim After N misses", 0, 5, 2)
-local baim_min_damage  = g_baim:slider(accent .. ui.get_icon"crosshairs".. accent .. "  Baim Min Damage",       1, 100, 20)
-local baim_hitbox      = g_baim:combo(accent  .. ui.get_icon"bullseye"  .. accent .. "  Baim Hitbox",
+g_baim_sub             = ui_sub(force_baim_n, g_baim)
+local baim_min_damage  = g_baim_sub:slider(accent .. ui.get_icon"crosshairs".. accent .. "  Baim Min Damage",       1, 100, 20)
+local baim_hitbox      = g_baim_sub:combo(accent  .. ui.get_icon"bullseye"  .. accent .. "  Baim Hitbox",
                                       "Stomach", "Pelvis", "Chest", "Legs")
+ui_tip(force_baim_n,    "After this many misses on the same enemy, aim at the body instead of the head. 0 = never body-aim (head only, forever).")
+ui_tip(baim_min_damage, "Minimum damage the body shot must be worth before the ragebot takes it.")
+ui_tip(baim_hitbox,     "Which body hitbox the forced body-aim targets. Chest trades best; Pelvis is the widest.")
+ui_tip(lby_snap_toggle, "Detect the lower-body-yaw snap that fires when an enemy shoots — their server yaw is briefly locked to their eye angle, which is a free hit.")
+ui_tip(air_resolve_tog, "Resolve airborne enemies too. They still carry desync in the air, so leaving this off gives up every jump-peek.")
+ui_tip(close_range_dist,"Under this distance the resolver switches to close-range priority: lower hitchance, faster shots, full multipoint.")
+ui_tip(dormancy_reset_t,"How long an enemy must stay out of sight before their live state is thrown away. Learned data across matches is never affected.")
+ui_tip(resolver_mode,   "Adaptive = balanced. Aggressive = shoots earlier on less evidence. Defensive = waits for a confident resolve.")
 
 -- Experimental
 local exp_aa_classify  = g_experimental:switch(accent .. ui.get_icon"crosshairs" .. accent .. "  AA-Classification",  true)
@@ -431,7 +458,13 @@ local exp_multipoint   = g_experimental:switch(accent .. ui.get_icon"bullseye"  
 local exp_def_aa       = g_experimental:switch(accent .. ui.get_icon"feather"    .. accent .. "  Defensive-AA Detect",true)
 local exp_steam_mem    = g_experimental:switch(accent .. ui.get_icon"user"       .. accent .. "  Steam Memory",       false)
 local exp_nospread     = g_experimental:switch(accent .. ui.get_icon"bolt"       .. accent .. "  NoSpread Mode (1-tap heads)", false)
-local exp_classify_int = g_experimental:slider(accent .. ui.get_icon"clock"      .. accent .. "  AA-Classify Interval (ticks)", 4, 16, 8)
+local exp_classify_int = ui_sub(exp_aa_classify, g_experimental):slider(accent .. ui.get_icon"clock" .. accent .. "  AA-Classify Interval (ticks)", 4, 16, 8)
+ui_tip(exp_aa_classify, "Sort each enemy into static / switch / jitter / spinner and pick the resolver mode that fits. Off = one generic mode for everyone.")
+ui_tip(exp_classify_int,"How many ticks of evidence before the classification may change. Higher = steadier, slower to notice an AA switch.")
+ui_tip(exp_multipoint,  "Let the ragebot scan several points on the target hitbox instead of one. Costs nothing, catches edge-peeks.")
+ui_tip(exp_def_aa,      "Detect defensive anti-aim (the fake that only appears while they are being shot at) and invert the side accordingly.")
+ui_tip(exp_steam_mem,   "Remember an enemy's dominant desync side by Steam ID for the rest of the match, across deaths.")
+ui_tip(exp_nospread,    "Only for no-spread servers: every shot goes head, hitchance 1%. Useless and harmful on a normal server.")
 
 -- V3 features
 local exp_aim_fire_snap = g_experimental:switch(accent .. ui.get_icon"bolt"       .. accent .. "  aim_fire Snapshot Learning", true)
@@ -443,14 +476,24 @@ local exp_auto_weapon   = g_experimental:switch(accent .. ui.get_icon"crosshairs
 local exp_persistent_lm = g_experimental:switch(accent .. ui.get_icon"user"       .. accent .. "  Persistent Self-Learning Model", true)
 local exp_extrapolation = g_experimental:switch(accent .. ui.get_icon"bolt"       .. accent .. "  Strong Prediction / Extrapolation", true)
 local exp_respect_man   = g_experimental:switch(accent .. ui.get_icon"crosshairs" .. accent .. "  Respect Manual SSG/Sniper Settings", true)
-local exp_predict_ticks = g_experimental:slider(accent .. ui.get_icon"clock"      .. accent .. "  Prediction Ticks Ahead", 1, 6, 2)
+local exp_predict_ticks = ui_sub(exp_extrapolation, g_experimental):slider(accent .. ui.get_icon"clock" .. accent .. "  Prediction Ticks Ahead", 1, 6, 2)
+ui_tip(exp_extrapolation,"Aim where a turning enemy WILL be when the bullet is processed, not where they were. Only extrapolates when their turn rate is stable.")
+ui_tip(exp_predict_ticks,"How far ahead to project. Too high overshoots a decelerating enemy; the resolver already damps this per weapon and per ping.")
+ui_tip(exp_aim_fire_snap,"Record the exact angle at the moment of firing so the hit/miss feedback scores the right shot. Leave on — the learning depends on it.")
+ui_tip(exp_perside_desync,"Learn LEFT and RIGHT desync magnitudes separately. Essential against bimodal enemies whose two sides differ by 10°+.")
+ui_tip(exp_cancel_conf, "Hold fire when the resolve is a coin-flip. Trades a few shots for a much better hit rate.")
+ui_tip(exp_auto_weapon, "Let the script pick hitchance / damage per weapon class. Off is correct when your NL Selection is already tuned.")
+ui_tip(exp_persistent_lm,"Save learned enemies to disk so a player you fought yesterday is resolved on the first shot today.")
+ui_tip(exp_respect_man, "Never touch your NL ragebot settings (hitchance, min-damage, hitboxes, safe-points). Keep this ON if you tuned NL yourself.")
 -- V7.9: strict head-only on normal (spread) servers
 local exp_head_strict   = g_experimental:switch(accent .. ui.get_icon"crosshairs" .. accent .. "  Headshot-Only Strict (spread server)", false)
+ui_tip(exp_head_strict, "Force the head hitbox on every single shot. Only sane on a server where you can reliably one-tap.")
 -- V9.31: relax NL safe-point on LOCKED targets so the ragebot takes HEAD instead
 -- of the safe BODY point on proven enemies. GLOBAL (main chunk is at the 200-local
 -- cap). Only toggles safepoint+multipoint (NEVER mindmg/hitbox) → respects the
 -- never-override-NL-config rule; baseline unchanged for un-learned enemies.
 exp_lock_headpref = g_experimental:switch(accent .. ui.get_icon"bullseye" .. accent .. "  Head-Pref on Locked Targets (less body)", true)
+ui_tip(exp_lock_headpref,"On enemies you have hit many times, relax NL's safe-point so the shot goes head instead of a safe body point.")
 -- V9.33 EXPERIMENTAL: read the enemy's animated body-yaw pose param to pick the
 -- guess SIDE without shooting. NL exposes m_flPoseParameter[] but the desync index
 -- + mapping are NOT documented, so this is a guess (index 11, range ±60°) — OFF by
@@ -477,17 +520,31 @@ g_experimental:button("Dump Pose Calibration", function() pcall(pose_cal_dump) e
 -- Default OFF so the v9.94 baseline is A/B comparable.
 anim_side_tog = g_experimental:switch(accent .. ui.get_icon"flask" .. accent .. "  [EXP] Animation-Layer Side Read", false)
 g_experimental:button("Dump Anim-Layer Polarity", function() pcall(anim_pol_dump) end)
+ui_tip(anim_side_tog,  "Reads the enemy's animation layers, which the SERVER writes against their real yaw, and votes on the per-tick change to pick a desync side without ever having hit them. Replaces the coin-flip in the guess fallbacks only. Modes show up as *-AnimGuess in the dump so you can compare them against plain *-Guess.")
+ui_tip(onshot_flip_tog,"Learn enemies that flip their desync on the exact tick they fire, then invert the side inside their shot window.")
+ui_tip(switch_pred_tog,"Watch how often an enemy alternates sides and predict which side the fake is on when the bullet lands.")
+ui_tip(pose_read_tog,  "Dead end on this build — no pose index tracks body yaw reliably. Superseded by the animation-layer read above. Leave off.")
+ui_tip(pose_cal_tog,   "Dead end on this build. Also costs a 24-index scan on every hit. Leave off.")
+ui_tip(pose_use_tog,   "Only meaningful if calibration ever finds a clean index, which it does not on this build. Leave off.")
 
 -- ─── ESP / HUD dedicated group ─────────────────────────
 local esp_master       = g_esp:switch(accent .. ui.get_icon"bullseye"  .. accent .. "  ESP Master (on/off)", true)
-local esp_show_labels  = g_esp:switch(accent .. ui.get_icon"crosshairs".. accent .. "  Show Enemy Labels (mode/side/desync)", true)
-local esp_show_confbar = g_esp:switch(accent .. ui.get_icon"sliders"   .. accent .. "  Show Confidence Bar", true)
-local esp_show_hud     = g_esp:switch(accent .. ui.get_icon"sparkles"  .. accent .. "  Show HUD Corner Panel",  true)
+-- V9.98: everything below only does anything while the master is on — indent it there.
+g_esp_sub              = ui_sub(esp_master, g_esp)
+local esp_show_labels  = g_esp_sub:switch(accent .. ui.get_icon"crosshairs".. accent .. "  Show Enemy Labels (mode/side/desync)", true)
+local esp_show_confbar = g_esp_sub:switch(accent .. ui.get_icon"sliders"   .. accent .. "  Show Confidence Bar", true)
+local esp_show_hud     = g_esp_sub:switch(accent .. ui.get_icon"sparkles"  .. accent .. "  Show HUD Corner Panel",  true)
 -- v9.59: Top-Left listed first = the combo default (fresh installs start Top-Left)
-local esp_hud_pos      = g_esp:combo (accent .. ui.get_icon"clock"     .. accent .. "  HUD Position",
+local esp_hud_pos      = ui_sub(esp_show_hud, g_esp_sub):combo(accent .. ui.get_icon"clock" .. accent .. "  HUD Position",
                                       "Top-Left", "Bottom-Left", "Bottom-Right", "Top-Right")
-local esp_throttle_hz  = g_esp:slider(accent .. ui.get_icon"bolt"      .. accent .. "  ESP Refresh Rate (Hz)", 5, 30, 10)
-local esp_label_color  = g_esp:color_picker(accent .. ui.get_icon"feather" .. accent .. "  Label Default Color", color(255, 255, 255, 255))
+local esp_throttle_hz  = g_esp_sub:slider(accent .. ui.get_icon"bolt"      .. accent .. "  ESP Refresh Rate (Hz)", 5, 30, 10)
+local esp_label_color  = ui_sub(esp_show_labels, g_esp_sub):color_picker(accent .. ui.get_icon"feather" .. accent .. "  Label Default Color", color(255, 255, 255, 255))
+ui_tip(esp_master,      "Master switch for every on-screen element this script draws.")
+ui_tip(esp_show_labels, "The one-line symbol tag next to each enemy: AA type, resolved side, desync degrees, how well they are learned.")
+ui_tip(esp_show_confbar,"Small bar showing how much the resolver trusts its own answer for that enemy.")
+ui_tip(esp_show_hud,    "Corner panel: tracked / learned counts, hit rate, current target intel, session trend.")
+ui_tip(esp_hud_pos,     "Which screen corner the panel sits in.")
+ui_tip(esp_throttle_hz, "How often the ESP text is recomputed. Drawing stays every frame — this only affects the maths.")
 g_esp:label(accent .. ui.get_icon"link-slash" .. accent .. "  Mode colors auto: green=Meas, yellow=Predict, red=BF, cyan=LBY")
 -- V9.21: live event ticker top-right of screen — HIT/MISS/KILL/INFO with fade.
 -- Global (no `local`) to dodge main-chunk 200-local limit.
@@ -496,9 +553,14 @@ esp_event_ticker = g_logging:switch(accent .. ui.get_icon"bolt" .. accent .. "  
 -- V9.89: angel-wings style colored per-shot console hit/miss logs (opt-in).
 ev_console_log = g_logging:switch(accent .. ui.get_icon"terminal" .. accent .. "  Console Hit/Miss Logs (angel style)", true)
 -- V9.51: per-enemy ON-MODEL visuals. Globals (no `local`) to dodge the 200-local cap.
-esp_wedge = g_esp:switch(accent .. ui.get_icon"diagram-project" .. accent .. "  Desync Wedge (real vs fake yaw lines on body)", true)
-esp_flash = g_esp:switch(accent .. ui.get_icon"bolt-lightning"  .. accent .. "  Hit/Miss Flash (box on each shot)", true)
-esp_enh   = g_esp:switch(accent .. ui.get_icon"layer-group"      .. accent .. "  Enhanced Tags (AA-glyph / netcode / shot-dots / side-dom)", true)
+esp_wedge = g_esp_sub:switch(accent .. ui.get_icon"diagram-project" .. accent .. "  Desync Wedge (real vs fake yaw lines on body)", true)
+esp_flash = g_esp_sub:switch(accent .. ui.get_icon"bolt-lightning"  .. accent .. "  Hit/Miss Flash (box on each shot)", true)
+esp_enh   = g_esp_sub:switch(accent .. ui.get_icon"layer-group"      .. accent .. "  Enhanced Tags (AA-glyph / netcode / shot-dots / side-dom)", true)
+ui_tip(esp_wedge, "Two lines from the pelvis: white = where the enemy really looks, coloured = where we resolved them. Instantly shows a wrong side.")
+ui_tip(esp_flash, "Short box flash around the model on every shot — green hit, red miss, blue server-side reject.")
+ui_tip(esp_enh,   "Extra glyphs: AA type icon, netcode warnings, and the last six shot results as coloured dots.")
+ui_tip(esp_event_ticker, "Live HIT / MISS / KILL list in the top-right corner with a short fade.")
+ui_tip(ev_console_log,   "Write every shot result to the game console, coloured, whether or not console logging is on.")
 
 -- ─── SMART STRATEGY COMBOS (batch-set individual toggles) ─────
 local strat_learning = g_smart:combo(accent .. ui.get_icon"user"      .. accent .. "  Learning Strategy",
@@ -509,6 +571,13 @@ local strat_visual   = g_smart:combo(accent .. ui.get_icon"bullseye"  .. accent 
                                      "None", "Minimal (HUD only)", "Standard (ESP + HUD)", "Full (everything)")
 local strat_hitbox   = g_smart:combo(accent .. ui.get_icon"crosshairs".. accent .. "  Hitbox Strategy",
                                      "NL Default (manual)", "Head Bias", "Head + Chest Fallback", "Head Only", "NoSpread (head always)")
+
+-- V9.98: tooltips go AFTER the elements exist — these four are locals, so a call placed
+-- earlier in the chunk would silently hit a nil global and do nothing.
+ui_tip(strat_learning, "One dropdown that batch-sets the individual learning switches.")
+ui_tip(strat_predict,  "Batch-sets extrapolation and prediction ticks.")
+ui_tip(strat_visual,   "Batch-sets the ESP switches.")
+ui_tip(strat_hitbox,   "Batch-sets hitbox behaviour. 'NL Default (manual)' hands full control back to your own NL Selection.")
 
 local function safe_set_local(ctrl, val) if ctrl then pcall(function() ctrl:set(val) end) end end
 
@@ -1143,8 +1212,13 @@ g_perf:label(accent .. ui.get_icon"bolt"     .. accent .. "  Lazy log format: ON
 
 -- Logging
 local log_enabled      = g_logging:switch(accent .. ui.get_icon"link-slash" .. accent .. "  Console Logging", true)
-local log_verbose      = g_logging:switch(accent .. ui.get_icon"sliders"    .. accent .. "  Verbose (per-shot)", false)
-local log_debug        = g_logging:switch(accent .. ui.get_icon"link-slash" .. accent .. "  DEBUG MODE (full dump)", false)
+-- V9.98: verbose + debug are refinements of console logging — nest them under it.
+g_log_sub              = ui_sub(log_enabled, g_logging)
+local log_verbose      = g_log_sub:switch(accent .. ui.get_icon"sliders"    .. accent .. "  Verbose (per-shot)", false)
+local log_debug        = g_log_sub:switch(accent .. ui.get_icon"link-slash" .. accent .. "  DEBUG MODE (full dump)", false)
+ui_tip(log_enabled, "Script messages in the game console.")
+ui_tip(log_verbose, "One line per shot with the side, magnitude and why the resolver chose it.")
+ui_tip(log_debug,   "Everything, including per-resolve state. Loud — turn on when you are about to send a dump.")
 -- V7.1 + V9.3: log-buffer as ring (O(1) push). All state in single table to save locals.
 -- V9.10: cap 80 -> 200. User reported "not all logs sent" — bigger ring keeps more
 -- aa-commit / hit / miss / snapshot history in the copy-logs dump for long sessions.
@@ -6787,5 +6861,6 @@ _cs_log_color_raw("V9.60: 'Air*' no longer pollutes best_mode storage — Air/Ai
 _cs_log_color_raw("V9.74: jitter+defAA BF fix + dump visibility + air/BF:retry guard (v9.73 logs). (1) pick_bruteforce_angle SKIPS the def_delta (BF:def+) cycle when aa_type=='jitter' — jitter oscillates between two yaw positions so there is NO stable defensive delta; BF:def+ kept whiffing (idx=3 0/1) while BF:opposite (full opposite hemisphere) is what catches jitter. Falls through to the standard BF oscillation; aim_ack logs the jitter+defAA+no-samples case. (2) copy-dump [P] lines now show passive_n_left/right as pL=/pR= so the v9.72 passive-side-keep is verifiable from a dump. (3) resolve_player air-branch YIELDS to a pending BF:retry — the retry is consumed only inside pick_bruteforce_angle, which the air-branch short-circuits with an unconditional return, so a KEEP-scheduled retry that coincided with the enemy going airborne was eaten (idx=14 KEEP scheduled, logged mode=Air not BF:retry). (4) IMPROVEMENT HINTS: jitter+defAA hint + 0-real/30+passive-obs hint.")
 _cs_log_color_raw("V9.95: [EXP, default OFF] ANIMATION-LAYER SIDE READ — a desync side that needs NO prior hit, closing our single biggest gap (first contact, Air, never-hit explore all coin-flip until now). NL exposes p:get_anim_state() and p:get_anim_overlay(i) natively (no FFI): the enemy's animation layers are authored SERVER-SIDE against their REAL yaw and replicated verbatim, so the fake yaw does not colour them like it colours m_flGoalFeetYaw. anim_side_update() reads layers 3/4/6/7/8 + the LEAN pose each fresh simulation tick and votes on the per-tick DELTAS in a priority cascade (MOVEMENT_MOVE weight first, then its weight_delta_rate / playback_rate, then STRAFECHANGE / WHOLE_BODY / JUMP_OR_FALL / lean, with ADJUST weight as steady-state fallback). DELTAS, never absolutes — that is exactly why our m_flPoseParameter[11] body-yaw attempt died on this build: a sign-of-change needs no calibration. Each signal's POLARITY is learned, not assumed: every confirmed hit scores the signal that was live, and one that disagrees with reality flips itself after 6+ samples. Wired ONLY into the coin-flip fallbacks (Static-Guess / Networked-Guess / Air-Guess / LBY-Snap-Guess / alt_side_pick's no-signal return), never over real evidence; magnitude stays ours. Modes log as *-AnimGuess so the dump's MODE HIT-RATES compares them directly against plain *-Guess, plus an [ANIM] polarity scoreboard line.")
 _cs_log_color_raw("V9.97: TWO-SIDE keep-no-freeze — a confirmed two-side enemy (real hits on BOTH sides, or bimodal) no longer re-fires the identical angle after a low-bt KEEP. v9.63 keeps the side here deliberately (flipping on the alternation's own noise corrupts last_hit_side/dom), but the keep ALSO scheduled a serverfail retry of the same side+magnitude — so an enemy that had already switched sides ate two shots at the side it left. err~0 with bt~0 is not netcode evidence; it only proves we shot our own belief, which on a two-side enemy says nothing about which side is live this shot. Real dump v9.95: idx=2 (L=12@38.9 R=4@47.0) kept -39.7 err=0.0 bt=0 twice, both missed, then BF:+90 HIT at +90; idx=3 (L=5 R=2) kept -36.1 err=0.3 bt=0, missed, then BF:opposite HIT at +31. Side bookkeeping unchanged — only the magnitude/side freeze is dropped so the v9.63 L/R BF sweep gets the very next shot. bt>4 untouched (genuine stale-record netcode, retry-same still correct). Same shape as the v9.92 jitter no-freeze.")
+_cs_log_color_raw("V9.98: MENU — nested sub-options + tooltips on every setting. NL's `item:create()` returns a MenuGroup attached to that item, so options that only matter while their parent is on now sit INDENTED under it instead of floating in a flat wall of ~40 switches: Baim Min-Damage + Hitbox under 'Force Baim After N', Classify Interval under 'AA-Classification', Prediction Ticks under 'Strong Prediction', HUD Position under 'Show HUD Panel', Label Colour under 'Show Enemy Labels', the whole ESP block under 'ESP Master', and Verbose + Debug under 'Console Logging'. Every setting also carries a plain-English `:tooltip()` explaining what it does and when to use it. Both APIs are pcall-guarded and fall back to the flat group / no tooltip on an older build. NOTE: nesting changes an element's stored path, so the moved switches reset to their defaults ONCE on this reload — click a preset to restore.")
 _cs_log_color_raw("Logging: " .. (log_enabled:get() and ("ON" .. (log_verbose:get() and " (verbose)" or ""))  or "OFF"))
 _cs_log_color_raw("=========================================")
