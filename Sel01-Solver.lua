@@ -1,11 +1,11 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 10.1                                   ║
+-- ║  Version: 10.2                                   ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 10.1
+-- @version 10.2
 -- @description v9.79 BF real-dominance ordering broadened to switch AA:
 --   * v9.78 only reordered the static/slow BF branch. This lobby's one-sided
 --     locks were aa=switch (idx=8 real 10R/0L still fired BF:opposite LEFT;
@@ -132,7 +132,7 @@
 --   * v9.26 drift-bump (alpha 0.55 on 5-10° diff) still handles small shifts.
 --   * v9.29 coach variants carry.
 
-local SEL01_VERSION = "10.1"
+local SEL01_VERSION = "10.2"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -394,6 +394,17 @@ local btn_preset_def      = g_main:button("Defensive (Safe)",         function()
 local btn_preset_nospread = g_main:button("NoSpread Server (1-Tap)",  function() apply_preset_fwd("nospread")   end)
 local btn_preset_ssg      = g_main:button("SSG-Pro (Sniper + Learn)",  function() apply_preset_fwd("ssg_pro")    end)
 local btn_preset_headonly = g_main:button("Headshot Only (Spread)",    function() apply_preset_fwd("head_only")  end)
+
+-- V10.2: animated clantag. GLOBALS (main chunk is at the 200-local cap). Default ON per
+-- request. The frames + the net_update_end hook live at the bottom of the file.
+g_main:label(" ")
+sel01_ct_tog   = g_main:switch(accent .. ui.get_icon"sparkles" .. accent .. "  Animated Clantag", true)
+sel01_ct_style = ui_sub(sel01_ct_tog, g_main):combo(accent .. ui.get_icon"clock" .. accent .. "  Style",
+                                                    "Marquee", "Typewriter", "Pulse", "Loading", "Static")
+sel01_ct_speed = ui_sub(sel01_ct_tog, g_main):slider(accent .. ui.get_icon"bolt" .. accent .. "  Frame Time (ms)", 200, 900, 400)
+ui_tip(sel01_ct_tog,   "Animated clan tag next to your name. Marquee scrolls over a visible track instead of spaces, because CSGO trims whitespace off a tag — that is why a space-padded animation only ever moves on one side and never wipes clean. Turn the Sel01-Config clantag OFF if you use this one; two scripts writing the tag will fight.")
+ui_tip(sel01_ct_style, "Marquee scrolls across a dashed track. Typewriter types itself in and deletes itself again. Pulse and Loading are short cycles. Static just sets the name once.")
+ui_tip(sel01_ct_speed, "Time per frame. Below ~250ms the game starts throttling tag updates and frames get skipped.")
 
 g_smart:label(accent .. ui.get_icon"sparkles" .. accent .. "  Quick setup via dropdowns — beats individual toggles below")
 g_smart:label(" ")
@@ -6742,9 +6753,91 @@ events.player_death:set(function(e)
     end
 end)
 
+-- ═══ V10.2: ANIMATED CLANTAG ═══════════════════════════════════════════════
+-- The Sel01-Config version animated badly: CSGO TRIMS leading and trailing
+-- whitespace off a clan tag, so frames padded with spaces collapse to the same
+-- string — the motion only ever showed on one side and old text never wiped.
+-- Two consequences drive this implementation:
+--   * the marquee runs over a visible TRACK ("-") instead of spaces, so every
+--     frame is a genuinely different string and the movement is real
+--   * a frame is only written when it DIFFERS from the last one written; the game
+--     throttles clan-tag updates and spamming identical values is what produces
+--     the half-updated tag
+-- Written from events.net_update_end, never from render: common.set_clan_tag is a
+-- game-state write and is silently ignored on the render thread (Config v3.18).
+sel01_ct = { i = 0, t = 0, last = nil }
+
+function sel01_ct_frame(style, i)
+    local TXT = "SEL01"
+    if style == "Typewriter" then
+        -- types itself in, holds, deletes itself, pauses — a clean in and out
+        local n = #TXT
+        local cycle = 2 * n + 6
+        local k = i % cycle
+        if k < n then             return TXT:sub(1, k + 1)
+        elseif k < n + 3 then     return TXT
+        elseif k < 2 * n + 3 then return TXT:sub(1, (2 * n + 2) - k)
+        else                      return " " end
+    elseif style == "Marquee" then
+        local track = string.rep("-", 9) .. " " .. TXT .. " " .. string.rep("-", 9)
+        local W = 11
+        local span = #track - W + 1
+        local pos = (i % span) + 1
+        return track:sub(pos, pos + W - 1)
+    elseif style == "Pulse" then
+        local f = { TXT, "[" .. TXT .. "]", TXT, "<" .. TXT .. ">" }
+        return f[(i % #f) + 1]
+    elseif style == "Loading" then
+        local f = { TXT, TXT .. ".", TXT .. "..", TXT .. "...", TXT .. "..", TXT .. "." }
+        return f[(i % #f) + 1]
+    end
+    return TXT   -- Static
+end
+
+function sel01_clantag_tick()
+    if not (sel01_ct_tog and sel01_ct_tog:get()) then
+        -- clear exactly once when switched off, then stay quiet
+        if sel01_ct.last ~= nil then
+            pcall(function() common.set_clan_tag("") end)
+            sel01_ct.last = nil
+        end
+        return
+    end
+    local now = globals.realtime or 0
+    local iv = 0.4
+    pcall(function() iv = (sel01_ct_speed:get() or 400) / 1000 end)
+    if (now - (sel01_ct.t or 0)) < iv then return end
+    sel01_ct.t = now
+    local style = "Marquee"
+    pcall(function() style = tostring(sel01_ct_style:get()) end)
+    sel01_ct.i = sel01_ct.i + 1
+    local frame = sel01_ct_frame(style, sel01_ct.i)
+    if frame == sel01_ct.last then return end   -- never re-write the same value
+    sel01_ct.last = frame
+    pcall(function() common.set_clan_tag(frame) end)
+end
+
+-- alias-walk: use the first event name this build exposes (Sel01-Config v1.7 pattern).
+-- NEVER fall back to createmove — the Solver already owns that hook.
+sel01_ct_hook = nil
+pcall(function()
+    -- inside a function on purpose: the main chunk is AT the Lua 5.1 200-local ceiling,
+    -- so even a loop variable up there fails the build.
+    for _, name in ipairs({ "net_update_end", "net_update", "round_prestart" }) do
+        if not sel01_ct_hook and events[name] then
+            local ok = pcall(function()
+                events[name]:set(function() pcall(sel01_clantag_tick) end)
+            end)
+            if ok then sel01_ct_hook = name end
+        end
+    end
+end)
+
 pcall(function()
     events.shutdown:set(function()
         cs_log("shutdown — unhooking events + clearing state")
+        pcall(function() common.set_clan_tag("") end)   -- V10.2: never leave a tag behind
+        if sel01_ct_hook then pcall(function() events[sel01_ct_hook]:unset() end) end
         pcall(function() events.render:unset() end)
         pcall(function() events.aim_ack:unset() end)
         pcall(function() events.player_death:unset() end)
@@ -7012,5 +7105,7 @@ _cs_log_color_raw("V9.98: MENU — nested sub-options + tooltips on every settin
 _cs_log_color_raw("V9.99: AIR-DUCK / DOUBLE-TAP UNCHARGE PEEK. The peek that beats us most reliably — jump, crouch mid-air, sit on a charged tickbase behind cover, release it and materialise already shooting. The tell is the SIMULATION-TIME BURST: a normal enemy advances one tick per tick, a charged one advances 3+ at once on release; paired with airborne or a mid-air duck that is a peek, not lag. Detection had to move ABOVE the air-branch, which returns early — so the v9.46 teleport detector below it never ran for an airborne enemy, exactly the case that matters. On detect, a 0.45s window: extrapolation off (a yaw rate sampled across the charged ticks cannot predict where the body lands), full-spread multipoint, NL safe-point relaxed, and the shot allowed through the low-confidence cancel + a hitchance floor of 20 — the same trade the counter-fire path already makes, because refusing to fire at a materialising double-tapper just loses the duel. Never touches min-damage (v9.18 ban) and never forces a hitbox: a mid-air crouch moves the head somewhere NL's own multi-hitbox handles better. On a sniper with Respect Manual on, the hitchance floor is skipped entirely. Side and EMA are untouched. ESP tags it 'dt' / 'dt^' (air-duck); toggle 'Double-Tap / Air-Duck Peek Response', on in every preset.")
 _cs_log_color_raw("V10.0: DT-peek reaches the ground + gets measured. (1) v9.99 required airborne-or-ducking, but plenty of uncharge peeks happen flat-footed around a corner. Grounded now counts too, at a higher bar (burst >= 6 ticks, beyond a normal fake-lag limit of 5) because steady fake-lag also arrives in bursts and would otherwise trigger constantly; airborne / mid-air-duck keeps the looser >= 3. (2) New [DT] telemetry line in the copy-dump counting EVERY simulation-time burst of 2+ ticks regardless of whether the gate fired, with the max burst length and how many windows opened. Tuning a threshold blind is how a feature ends up never firing with nobody noticing — if bursts is 0 the signal does not exist on this build; if bursts is high but windows is 0 the bar is simply too strict. Counter clears with Reset Session Stats.")
 _cs_log_color_raw("V10.1: DT-peek detector fixed by its own telemetry. The v10.0 [DT] line read 'bursts>=2: 10062, max 7249 ticks, windows opened: 3331' — a 7249-tick burst is 113 seconds, i.e. an enemy going dormant behind a wall and coming back, not a tickbase charge. Two failures: (1) the simulation-time delta was measured across dormancy gaps, so any re-appearance looked like an uncharge; (2) a burst on its own is the background noise of an HvH lobby, because everyone fake-lags — 3331 open windows meant cancel-low-confidence was effectively disabled for most of the session. Now the burst only counts between CONSECUTIVE observations (last seen <= 0.25s ago) and is discarded above 20 ticks, and it only opens the window together with a peek CONTEXT: they fired at us within the last second, or they are inside close range. A plain grounded burst additionally needs >= 8 ticks. The ordinary fake-lagger goes back to cancel-low-confidence, which is what earns the hit rate. New dump line counts both rejection reasons so the next session shows whether the gate now sits in the right place.")
+_cs_log_color_raw("V10.2: ANIMATED CLANTAG in the Solver, on by default. The Sel01-Config one animated badly because CSGO TRIMS leading and trailing whitespace off a clan tag — space-padded frames collapse to the same string, so the motion only ever showed on one side and old text never wiped. Fixes: the Marquee scrolls over a visible dashed TRACK instead of spaces so every frame is genuinely different, and a frame is only written when it DIFFERS from the last one written (the game throttles tag updates; spamming identical values is what produces a half-updated tag). Typewriter types itself in and deletes itself again for a clean in/out. Driven from events.net_update_end — common.set_clan_tag is a game-state write and is silently ignored on the render thread — with an alias walk that NEVER falls back to createmove, which the Solver already owns. The tag is cleared once on toggle-off and on shutdown. Turn the Sel01-Config clantag OFF: two scripts writing the tag will fight over it.")
+_cs_log_color_raw("Clantag: " .. ((sel01_ct_tog and sel01_ct_tog:get()) and ("ON via " .. tostring(sel01_ct_hook or "no hook found")) or "OFF"))
 _cs_log_color_raw("Logging: " .. (log_enabled:get() and ("ON" .. (log_verbose:get() and " (verbose)" or ""))  or "OFF"))
 _cs_log_color_raw("=========================================")
