@@ -1,11 +1,11 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 9.96                                   ║
+-- ║  Version: 9.97                                   ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 9.96
+-- @version 9.97
 -- @description v9.79 BF real-dominance ordering broadened to switch AA:
 --   * v9.78 only reordered the static/slow BF branch. This lobby's one-sided
 --     locks were aa=switch (idx=8 real 10R/0L still fired BF:opposite LEFT;
@@ -132,7 +132,7 @@
 --   * v9.26 drift-bump (alpha 0.55 on 5-10° diff) still handles small shifts.
 --   * v9.29 coach variants carry.
 
-local SEL01_VERSION = "9.96"
+local SEL01_VERSION = "9.97"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -3181,10 +3181,33 @@ events.aim_ack:set(function(event)
                 -- here the side is proven one-sided, so keep the side and just refuse to
                 -- freeze: the BF cycle then sweeps the jitter band around the EMA. High bt
                 -- (>8) is genuine netcode, where retry-same is still correct.
+                -- V9.97: the SAME no-freeze rule for a confirmed TWO-SIDE enemy at low bt.
+                -- v9.63 keeps the side here on purpose (flipping on the alternation's own
+                -- noise corrupts last_hit_side/dom), but keeping the side ALSO scheduled a
+                -- retry of the identical angle — so a genuinely alternating enemy ate two
+                -- shots at the side it had already left. err~0 with bt~0 is not netcode
+                -- evidence: it only proves we shot our own belief, and on an enemy with
+                -- real hits on BOTH sides that belief carries no information about which
+                -- side is live THIS shot. Real dump (v9.95 session):
+                --   idx=2 (L=12@38.9 R=4@47.0) KEEP -39.7 err=0.0 bt=0 -> miss,
+                --                              KEEP -39.7 err=0.0 bt=0 -> miss,
+                --                              then BF:+90 HIT (+90) — enemy was RIGHT.
+                --   idx=3 (L=5 R=2)            KEEP -36.1 err=0.3 bt=0 -> miss,
+                --                              then BF:opposite HIT (+31).
+                -- Keep the side bookkeeping (v9.63 stands), just refuse to freeze the
+                -- angle, so the v9.63 L/R BF sweep gets the very next shot. bt > 4 is left
+                -- alone — that is real stale-record netcode where retry-same is correct.
+                local keep_no_freeze, nf_why = false, nil
                 if s.aa_type == "jitter" and bt <= 8 then
+                    keep_no_freeze, nf_why = true, "jitter"
+                elseif two_side_switcher and bt <= 4 then
+                    keep_no_freeze, nf_why = true, "two-side"
+                end
+                if keep_no_freeze then
                     resolver_clear_serverfail_retry(s)
-                    cs_log_verbose("jitter keep-no-freeze idx=%d side=%d our=%.1f meas=%.1f bt=%d — BF sweeps magnitude",
-                                   Ent:get_index(), ack_shot_side, ack_delta, ack_side_measured, bt)
+                    cs_log_verbose("keep-no-freeze (%s) idx=%d side=%d our=%.1f meas=%.1f err=%.1f bt=%d — BF sweeps side+magnitude",
+                                   nf_why, Ent:get_index(), ack_shot_side, ack_delta,
+                                   ack_side_measured, ack_angle_err, bt)
                 else
                     resolver_note_serverfail_retry(s, ack_shot_side, (ack_side_measured > 5 and ack_side_measured) or math.abs(ack_delta))
                 end
@@ -6763,5 +6786,6 @@ _cs_log_color_raw("V9.61: sticky AA-classification for well-learned enemies — 
 _cs_log_color_raw("V9.60: 'Air*' no longer pollutes best_mode storage — Air/Air-Alt/Air-CorrFlip are POSITIONAL (enemy airborne), not an AA-pattern, but were saved as best_static/best_switch when an enemy was hit mid-air. The known-player fast-path never uses them (only acts on Static/Jitter) so zero benefit, but intel.mode_match compared the grounded resolve (e.g. Static-Meas) against the stored 'Air' → false mismatch → +15 conf cancel threshold → good shots cancelled on known enemies (logs: idx=3 sw=Air, name_369738400 s=Air). Added '^Air' to the save-filter + the load migration (same V9.0 precedent that dropped BF:/*-Guess). Stats/cancel only, no aim-path change.")
 _cs_log_color_raw("V9.74: jitter+defAA BF fix + dump visibility + air/BF:retry guard (v9.73 logs). (1) pick_bruteforce_angle SKIPS the def_delta (BF:def+) cycle when aa_type=='jitter' — jitter oscillates between two yaw positions so there is NO stable defensive delta; BF:def+ kept whiffing (idx=3 0/1) while BF:opposite (full opposite hemisphere) is what catches jitter. Falls through to the standard BF oscillation; aim_ack logs the jitter+defAA+no-samples case. (2) copy-dump [P] lines now show passive_n_left/right as pL=/pR= so the v9.72 passive-side-keep is verifiable from a dump. (3) resolve_player air-branch YIELDS to a pending BF:retry — the retry is consumed only inside pick_bruteforce_angle, which the air-branch short-circuits with an unconditional return, so a KEEP-scheduled retry that coincided with the enemy going airborne was eaten (idx=14 KEEP scheduled, logged mode=Air not BF:retry). (4) IMPROVEMENT HINTS: jitter+defAA hint + 0-real/30+passive-obs hint.")
 _cs_log_color_raw("V9.95: [EXP, default OFF] ANIMATION-LAYER SIDE READ — a desync side that needs NO prior hit, closing our single biggest gap (first contact, Air, never-hit explore all coin-flip until now). NL exposes p:get_anim_state() and p:get_anim_overlay(i) natively (no FFI): the enemy's animation layers are authored SERVER-SIDE against their REAL yaw and replicated verbatim, so the fake yaw does not colour them like it colours m_flGoalFeetYaw. anim_side_update() reads layers 3/4/6/7/8 + the LEAN pose each fresh simulation tick and votes on the per-tick DELTAS in a priority cascade (MOVEMENT_MOVE weight first, then its weight_delta_rate / playback_rate, then STRAFECHANGE / WHOLE_BODY / JUMP_OR_FALL / lean, with ADJUST weight as steady-state fallback). DELTAS, never absolutes — that is exactly why our m_flPoseParameter[11] body-yaw attempt died on this build: a sign-of-change needs no calibration. Each signal's POLARITY is learned, not assumed: every confirmed hit scores the signal that was live, and one that disagrees with reality flips itself after 6+ samples. Wired ONLY into the coin-flip fallbacks (Static-Guess / Networked-Guess / Air-Guess / LBY-Snap-Guess / alt_side_pick's no-signal return), never over real evidence; magnitude stays ours. Modes log as *-AnimGuess so the dump's MODE HIT-RATES compares them directly against plain *-Guess, plus an [ANIM] polarity scoreboard line.")
+_cs_log_color_raw("V9.97: TWO-SIDE keep-no-freeze — a confirmed two-side enemy (real hits on BOTH sides, or bimodal) no longer re-fires the identical angle after a low-bt KEEP. v9.63 keeps the side here deliberately (flipping on the alternation's own noise corrupts last_hit_side/dom), but the keep ALSO scheduled a serverfail retry of the same side+magnitude — so an enemy that had already switched sides ate two shots at the side it left. err~0 with bt~0 is not netcode evidence; it only proves we shot our own belief, which on a two-side enemy says nothing about which side is live this shot. Real dump v9.95: idx=2 (L=12@38.9 R=4@47.0) kept -39.7 err=0.0 bt=0 twice, both missed, then BF:+90 HIT at +90; idx=3 (L=5 R=2) kept -36.1 err=0.3 bt=0, missed, then BF:opposite HIT at +31. Side bookkeeping unchanged — only the magnitude/side freeze is dropped so the v9.63 L/R BF sweep gets the very next shot. bt>4 untouched (genuine stale-record netcode, retry-same still correct). Same shape as the v9.92 jitter no-freeze.")
 _cs_log_color_raw("Logging: " .. (log_enabled:get() and ("ON" .. (log_verbose:get() and " (verbose)" or ""))  or "OFF"))
 _cs_log_color_raw("=========================================")
