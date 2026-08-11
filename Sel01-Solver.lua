@@ -1,11 +1,11 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 10.3                                   ║
+-- ║  Version: 10.4                                   ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 10.3
+-- @version 10.4
 -- @description v9.79 BF real-dominance ordering broadened to switch AA:
 --   * v9.78 only reordered the static/slow BF branch. This lobby's one-sided
 --     locks were aa=switch (idx=8 real 10R/0L still fired BF:opposite LEFT;
@@ -132,7 +132,7 @@
 --   * v9.26 drift-bump (alpha 0.55 on 5-10° diff) still handles small shifts.
 --   * v9.29 coach variants carry.
 
-local SEL01_VERSION = "10.3"
+local SEL01_VERSION = "10.4"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -1272,6 +1272,7 @@ sel01_session_desyncs = { cap = 20, head = 0, count = 0, dirty = true }
 -- every burst we observe regardless of whether the gate fired, so the dump can answer
 -- "does this signal even exist in my lobby" before anyone tunes a threshold.
 sel01_dt_stats = { seen = 0, max = 0, b3 = 0, b6 = 0, air = 0, duck = 0, fired = 0, reject_gap = 0, reject_ctx = 0 }
+sel01_keep_stats = { lo = { same = 0, opp = 0 }, hi = { same = 0, opp = 0 } }
 function session_push_desync(v)
     if not v or v < 5 or v > 58 then return end  -- V9.33: cap at 58 (max desync) so >58 reads can't bias the median high
     local r = sel01_session_desyncs
@@ -1483,6 +1484,18 @@ local log_copy_btn = g_logging:button("📋 Copy Last Logs (for share)", functio
             d.seen, d.b3, d.b6, d.max, d.air, d.duck, d.fired))
         _cs_log_raw(string.format("[DT] rejected: %d stale/dormant gap, %d no peek context (fake-lag noise)",
             d.reject_gap or 0, d.reject_ctx or 0))
+    end
+    -- V10.4: was the KEEP worth its shot? Each keep holds the shot side and schedules a
+    -- retry of the same angle. This scores what the NEXT landed hit actually used. A
+    -- low-bt bucket dominated by "opposite" means the keep is burning a shot and the
+    -- freeze should go; dominated by "same" means the server really was rejecting a
+    -- correct angle and retry-same earns its keep.
+    do
+        local k = sel01_keep_stats
+        local lo, hi = k.lo.same + k.lo.opp, k.hi.same + k.hi.opp
+        _cs_log_raw(string.format("[KEEP] resolved by SAME side vs OPPOSITE — bt<4: %d same / %d opp%s | bt>=4: %d same / %d opp%s",
+            k.lo.same, k.lo.opp, lo > 0 and string.format(" (%.0f%% same)", k.lo.same / lo * 100) or "",
+            k.hi.same, k.hi.opp, hi > 0 and string.format(" (%.0f%% same)", k.hi.same / hi * 100) or ""))
     end
     -- V9.95: animation-layer signal scoreboard. Compare the *-AnimGuess rows in MODE
     -- HIT-RATES below against plain *-Guess to judge whether the layers actually help.
@@ -1704,7 +1717,8 @@ local log_reset_session = g_logging:button("🗑 Reset Session Stats (in-memory)
     for k in pairs(session_stats.history) do session_stats.history[k] = nil end
     sel01_session_serverfails = 0  -- V9.50: clear server-fail filter counter
     sel01_session_spreadfails = 0  -- V9.72: clear spread-RNG filter counter
-    sel01_dt_stats = { seen = 0, max = 0, b3 = 0, b6 = 0, air = 0, duck = 0, fired = 0, reject_gap = 0, reject_ctx = 0 }  -- V10.0
+    sel01_dt_stats = { seen = 0, max = 0, b3 = 0, b6 = 0, air = 0, duck = 0, fired = 0, reject_gap = 0, reject_ctx = 0 }
+sel01_keep_stats = { lo = { same = 0, opp = 0 }, hi = { same = 0, opp = 0 } }  -- V10.0
     -- mode stats
     for k in pairs(mode_stats) do mode_stats[k] = nil end
     -- steam memory
@@ -3356,6 +3370,14 @@ events.aim_ack:set(function(event)
                     resolver_note_serverfail_retry(s, ack_shot_side, (ack_side_measured > 5 and ack_side_measured) or math.abs(ack_delta))
                 end
                 server_fail_keep = ack_serverfail_like  -- V9.55: only filter GENUINE netcode (err<=5 or bt>8); a bt=0 side-miss is our fault, count it
+                -- V10.4: remember this keep so the NEXT hit on this player can score it.
+                -- The open question is whether a low-bt keep is worth its shot: the v10.3
+                -- dump shows plenty of "KEEP err=0 bt<4 -> miss -> BF:opposite HIT" (the
+                -- keep cost a shot) but also "KEEP err=0 bt<4 -> miss -> same angle HIT"
+                -- (the keep was right and the server simply rejected twice). ~10 hand-read
+                -- samples cannot settle that, so measure it instead of guessing.
+                s.pending_keep_side = ack_shot_side
+                s.pending_keep_bt   = bt
                 cs_log_verbose("correction-miss idx=%d KEEP side=%d our=%.1f meas=%.1f err=%.1f bt=%d (server/backtrack fail #%d, retry same)",
                                Ent:get_index(), ack_shot_side, ack_delta, ack_side_measured, ack_angle_err, bt, s.serverfail_streak)
             end
@@ -3478,6 +3500,14 @@ events.aim_ack:set(function(event)
         -- V9.95: score the animation-layer signal that was live when we fired, so a
         -- signal whose sign convention is backwards on this build corrects itself.
         if hit_side ~= 0 then pcall(anim_pol_feedback, s, hit_side) end
+        -- V10.4: settle the pending KEEP. Did the shot that finally landed use the side we
+        -- kept, or the opposite one? Bucketed by backtrack, because bt >= 4 is the case
+        -- where retry-same is believed to be genuine netcode.
+        if hit_side ~= 0 and s.pending_keep_side and s.pending_keep_side ~= 0 then
+            local b = ((s.pending_keep_bt or 0) >= 4) and sel01_keep_stats.hi or sel01_keep_stats.lo
+            if hit_side == s.pending_keep_side then b.same = b.same + 1 else b.opp = b.opp + 1 end
+            s.pending_keep_side = nil
+        end
         -- update measured-desync EMA (global + per-side)
         if src_res ~= 0 and src_eye ~= 0 then
             local actual = math.abs(NormalizeAngle(src_res - src_eye))
@@ -7149,5 +7179,6 @@ _cs_log_color_raw("V10.1: DT-peek detector fixed by its own telemetry. The v10.0
 _cs_log_color_raw("V10.2: ANIMATED CLANTAG in the Solver, on by default. The Sel01-Config one animated badly because CSGO TRIMS leading and trailing whitespace off a clan tag — space-padded frames collapse to the same string, so the motion only ever showed on one side and old text never wiped. Fixes: the Marquee scrolls over a visible dashed TRACK instead of spaces so every frame is genuinely different, and a frame is only written when it DIFFERS from the last one written (the game throttles tag updates; spamming identical values is what produces a half-updated tag). Typewriter types itself in and deletes itself again for a clean in/out. Driven from events.net_update_end — common.set_clan_tag is a game-state write and is silently ignored on the render thread — with an alias walk that NEVER falls back to createmove, which the Solver already owns. The tag is cleared once on toggle-off and on shutdown. Turn the Sel01-Config clantag OFF: two scripts writing the tag will fight over it.")
 _cs_log_color_raw("Clantag: " .. ((sel01_ct_tog and sel01_ct_tog:get()) and ("ON via " .. tostring(sel01_ct_hook or "no hook found")) or "OFF"))
 _cs_log_color_raw("V10.3: (0) LOAD FIX — v10.2 called ui_sub() from the clantag block that sits ABOVE the definition. Globals resolve at CALL time, so the whole script died at load with 'attempt to call global ui_sub (a nil value)'. Both UI helpers now lead the UI section. (1) A well-measured side outranks a wide server-yaw reconstruct. clamp_learned_serveryaw is the other end of the sample range from the v9.86 first-contact clamp: with 4+ real hits on the shot side and a per-side EMA, a RebuildServerYaw magnitude more than 10 degrees off that EMA is reconstruct noise — a genuine change moves the EMA, which the v9.39 alpha ramp tracks in 2-3 hits. Keeps the server's SIDE, takes the learned magnitude, labels the mode *-Clamp so the dump shows how often it bites. Real dump v10.1: idx=2 had FOURTEEN straight right-side hits at 17.9 (EMA 17.6, conf 100) and Static-Server-Recall fired 31.9 — err 14.3, missed. (2) A BF sweep probe is not a rejected belief. BF fires deliberate off-angles to find the enemy; when one misses the sweep must CONTINUE, not pin the probe as the retry angle. An angle error above 25 degrees from a real measurement can only be a probe, so it now takes the keep-no-freeze path. Real dump: idx=6 'KEEP side=-1 our=-90.0 meas=29.8 err=60.2' stalled the sweep for four straight misses.")
+_cs_log_color_raw("V10.4: [KEEP] telemetry — is a low-backtrack KEEP worth its shot? Every keep holds the shot side AND schedules a retry of the same angle. The v10.3 dump argues both ways: 'KEEP err=0 bt<4 -> miss -> BF:opposite HIT' says the keep burned a shot (BF:opposite went 7/7 and BF:+90 3/3 that session), but 'KEEP err=0 bt<4 -> miss -> same angle HIT' says the server really was rejecting a correct angle twice. Roughly ten hand-read samples cannot settle that, and guessing here would trade one blind heuristic for another. So each keep now remembers its side, and the NEXT landed hit scores it: same side or opposite, bucketed by bt<4 vs bt>=4. A low-bt bucket dominated by OPPOSITE means the freeze should go; dominated by SAME means retry-same earns it. No aim change this version — measurement first, exactly like the v10.0 [DT] line that exposed the dormancy-gap bug.")
 _cs_log_color_raw("Logging: " .. (log_enabled:get() and ("ON" .. (log_verbose:get() and " (verbose)" or ""))  or "OFF"))
 _cs_log_color_raw("=========================================")
