@@ -1,24 +1,24 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-PlantBot                                    ║
--- ║  Version: 1.7                                      ║
+-- ║  Version: 1.8                                      ║
 -- ║  One job: walk to a marked A spot, plant the C4,   ║
 -- ║  walk to a marked safe spot, done. Auto-picks T.   ║
 -- ║  by seltonmt01                                     ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-PlantBot
--- @version 1.7
+-- @version 1.8
 -- @author seltonmt01
 -- @description Standalone plant-bot. You MARK two spots once (persisted per map):
 --   the A plant spot + the safe spot. Then it loops every round:
 --   GOTO_A  -> greedy-walk straight to the marked A spot (equips the bomb on the way)
---   PLANT   -> stop + hold +attack until the SERVER reports the bomb down (v1.4)
+--   PLANT   -> stop + hold +attack until the SERVER reports the bomb down (v1.4/v1.8)
 --   RETREAT -> greedy-walk straight to the marked safe spot
 --   DONE    -> release control (your WASD works) until next round / respawn, then loop
 --   Auto-joins T whenever a team is not assigned (handles the round team-select menu).
 --   Movement ONLY — aiming stays with the ragebot. While idle/done it does NOT touch
 --   the cmd, so your normal keys work.
 
-local SEL01_PB_VERSION = "1.7"
+local SEL01_PB_VERSION = "1.8"
 
 local ffi_ok, ffi = pcall(require, "ffi")
 
@@ -69,6 +69,9 @@ local state = {
     rearm_until  = 0,           -- release +attack until this time (re-press after an abort)
     reposition_until = 0,       -- walk onto the mark again while the plant refuses to start
     aborts       = 0,
+    -- v1.8 plant hold-lock
+    attack_since = 0,           -- when the current uninterrupted +attack hold started (0 = not pressing)
+    arm_read_ok  = false,       -- the arming netvar has read TRUE at least once on this build
     warmup       = false,
     round_t      = nil,         -- m_fRoundStartTime — changes = new round
     round_state  = "LIVE",
@@ -190,13 +193,27 @@ local function bomb_is_planted()
     end)
     return n > 0
 end
--- CC4 netvar: true from the first arming tick until planted / aborted
+-- CC4 netvar: true from the first arming tick until planted / aborted.
+-- v1.8: `lp:get_weapon()` is build-dependent and returns nil / a shape without the
+-- netvar on some builds. A false "not arming" made the caller exec slot5 mid-arm,
+-- which CANCELS the plant every 0.4s (bot only ever "tapped" +attack). Two extra
+-- sources now back it up: the CC4 world entity, and the bomb_beginplant event flag.
 local function c4_arming(lp)
     local a = false
     pcall(function()
         local w = lp:get_weapon()
         if w and w.m_bStartedArming then a = true end
     end)
+    if not a then
+        pcall(function()
+            local t = entity.get_entities("CC4")
+            for i = 1, (t and #t or 0) do
+                local e = t[i]
+                if e and e.m_bStartedArming then a = true; break end
+            end
+        end)
+    end
+    if a then state.arm_read_ok = true end   -- this build DOES expose the netvar
     return a
 end
 local function in_bomb_zone(lp)
@@ -211,6 +228,7 @@ local function run_reset(why)
     state.bomb_down        = false
     state.arm_started      = false
     state.plant_hold_t     = 0
+    state.attack_since     = 0
     state.rearm_until      = 0
     state.reposition_until = 0
     state.last_origin      = nil
@@ -734,6 +752,7 @@ local function plantbot_tick(cmd)
         if d <= radius then
             state.phase = "PLANT"; state.plant_hold_t = now
             state.arm_started = false; state.rearm_until = 0; state.reposition_until = 0
+            state.attack_since = 0
             state.diag = "at A -> planting"
             return
         end
@@ -742,8 +761,11 @@ local function plantbot_tick(cmd)
         apply_move(cmd, mv, now)
 
     elseif state.phase == "PLANT" then
-        local arming = c4_arming(lp)
-        if arming then state.arm_started = true end
+        local arming_live = c4_arming(lp)               -- netvar / CC4 entity (may be blind)
+        if arming_live then state.arm_started = true end
+        -- v1.8: treat the bomb_beginplant event as arming too. The netvar read is blind on
+        -- some builds; without this the bot kept exec'ing slot5 mid-arm -> plant cancelled.
+        local arming = arming_live or state.arm_started
 
         -- not standing in the bomb zone (or the plant refuses to start) -> close the gap first
         local zone = in_bomb_zone(lp)
@@ -754,14 +776,19 @@ local function plantbot_tick(cmd)
                 local mv = compute_move(lp, lo, dir_yaw_xy(lo.x, lo.y, a.x, a.y), now, "PLANT")
                 apply_move(cmd, mv, now)
                 state.plant_hold_t = now            -- hold clock only starts once we are there
+                state.attack_since = 0              -- not pressing while we walk
                 state.diag = (zone == false) and "not in bomb zone -> closing" or "re-positioning on mark"
                 state.had_c4 = has_c4
                 return
             end
         end
 
-        -- take the bomb out ONLY before arming starts: a slot switch mid-arm cancels the plant
-        if (not arming) and (not has_c4) then equip_c4(now) end
+        -- v1.8: a slot switch mid-arm cancels the plant, and BOTH `arming` and `has_c4` come
+        -- from reads that can silently fail. So slot5 is now hard-locked the moment we have
+        -- been holding +attack for 0.3s — recovery goes through the reposition branch below,
+        -- which clears attack_since first.
+        local pressing_for = (state.attack_since or 0) > 0 and (now - state.attack_since) or 0
+        if (not arming) and (not has_c4) and pressing_for < 0.3 then equip_c4(now) end
 
         -- freeze completely and HOLD +attack. Any movement / duck / jump aborts the plant.
         local release = now < (state.rearm_until or 0)   -- brief release so a re-press registers
@@ -770,6 +797,8 @@ local function plantbot_tick(cmd)
         pcall(function() cmd.in_attack = (not release) end)
         pcall(function() cmd.in_jump = false end)
         pcall(function() cmd.in_duck = false end)
+        if release then state.attack_since = 0
+        elseif (state.attack_since or 0) == 0 then state.attack_since = now end
 
         local held = now - (state.plant_hold_t or 0)
         state.activity = "PLANT"
@@ -779,11 +808,12 @@ local function plantbot_tick(cmd)
         if bomb_is_planted() then
             -- the ONLY real completion signal (server side), v1.3 guessed from the weapon
             state.phase = "RETREAT"; state.diag = "planted -> retreat"
-        elseif state.arm_started and (not arming) and held > 1.0 then
+        elseif state.arm_read_ok and state.arm_started and (not arming_live) and held > 1.0 then
             -- arming stopped without a plant = aborted (bumped / damaged) -> release + re-press
             state.arm_started = false
             state.rearm_until = now + 0.2
             state.plant_hold_t = now
+            state.attack_since = 0
             state.aborts = (state.aborts or 0) + 1
             state.diag = "plant aborted -> re-arm"
         elseif (not state.arm_started) and held > 3.0 then
@@ -791,6 +821,7 @@ local function plantbot_tick(cmd)
             state.reposition_until = now + 0.6
             state.rearm_until = now + 0.2
             state.plant_hold_t = now
+            state.attack_since = 0          -- unlock slot5 for the recovery re-equip
             state.diag = "plant not starting -> re-position"
         elseif state.arm_started and held > 12.0 then
             state.phase = "RETREAT"; state.diag = "plant timeout -> retreat"
