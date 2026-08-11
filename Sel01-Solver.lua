@@ -1,11 +1,11 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 10.0                                   ║
+-- ║  Version: 10.1                                   ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 10.0
+-- @version 10.1
 -- @description v9.79 BF real-dominance ordering broadened to switch AA:
 --   * v9.78 only reordered the static/slow BF branch. This lobby's one-sided
 --     locks were aa=switch (idx=8 real 10R/0L still fired BF:opposite LEFT;
@@ -132,7 +132,7 @@
 --   * v9.26 drift-bump (alpha 0.55 on 5-10° diff) still handles small shifts.
 --   * v9.29 coach variants carry.
 
-local SEL01_VERSION = "10.0"
+local SEL01_VERSION = "10.1"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -1253,7 +1253,7 @@ sel01_session_desyncs = { cap = 20, head = 0, count = 0, dirty = true }
 -- V10.0: simulation-time burst telemetry for the double-tap / peek detector. Counts
 -- every burst we observe regardless of whether the gate fired, so the dump can answer
 -- "does this signal even exist in my lobby" before anyone tunes a threshold.
-sel01_dt_stats = { seen = 0, max = 0, b3 = 0, b6 = 0, air = 0, duck = 0, fired = 0 }
+sel01_dt_stats = { seen = 0, max = 0, b3 = 0, b6 = 0, air = 0, duck = 0, fired = 0, reject_gap = 0, reject_ctx = 0 }
 function session_push_desync(v)
     if not v or v < 5 or v > 58 then return end  -- V9.33: cap at 58 (max desync) so >58 reads can't bias the median high
     local r = sel01_session_desyncs
@@ -1444,6 +1444,8 @@ local log_copy_btn = g_logging:button("📋 Copy Last Logs (for share)", functio
         local d = sel01_dt_stats
         _cs_log_raw(string.format("[DT] bursts>=2: %d (>=3: %d, >=6: %d, max %d ticks) | airborne %d, ducking %d | windows opened: %d",
             d.seen, d.b3, d.b6, d.max, d.air, d.duck, d.fired))
+        _cs_log_raw(string.format("[DT] rejected: %d stale/dormant gap, %d no peek context (fake-lag noise)",
+            d.reject_gap or 0, d.reject_ctx or 0))
     end
     -- V9.95: animation-layer signal scoreboard. Compare the *-AnimGuess rows in MODE
     -- HIT-RATES below against plain *-Guess to judge whether the layers actually help.
@@ -1665,7 +1667,7 @@ local log_reset_session = g_logging:button("🗑 Reset Session Stats (in-memory)
     for k in pairs(session_stats.history) do session_stats.history[k] = nil end
     sel01_session_serverfails = 0  -- V9.50: clear server-fail filter counter
     sel01_session_spreadfails = 0  -- V9.72: clear spread-RNG filter counter
-    sel01_dt_stats = { seen = 0, max = 0, b3 = 0, b6 = 0, air = 0, duck = 0, fired = 0 }  -- V10.0
+    sel01_dt_stats = { seen = 0, max = 0, b3 = 0, b6 = 0, air = 0, duck = 0, fired = 0, reject_gap = 0, reject_ctx = 0 }  -- V10.0
     -- mode stats
     for k in pairs(mode_stats) do mode_stats[k] = nil end
     -- steam memory
@@ -5099,10 +5101,26 @@ local function resolve_player(p)
         pcall(function() st = p.m_flSimulationTime or 0 end)
         local ti = tick_cache.tickint or (1 / 64)
         local burst = 0
-        if s.prev_simtime and st > s.prev_simtime and ti > 0 then
+        -- V10.1: the burst is only meaningful between two CONSECUTIVE observations. If we
+        -- last saw this player 0.25s+ ago they were dormant behind a wall, and the
+        -- simulation-time delta measures the wall, not a charge. v10.0 telemetry caught
+        -- this loudly: max burst 7249 ticks (113 seconds) and 3331 windows opened out of
+        -- 10062 bursts — the response was effectively always on, which silently disabled
+        -- cancel-low-confidence for most of the session.
+        local fresh = s.prev_simtime_rt and (now_rt - s.prev_simtime_rt) <= 0.25
+        if fresh and s.prev_simtime and st > s.prev_simtime and ti > 0 then
             burst = math.floor((st - s.prev_simtime) / ti + 0.5)
+            -- a real tickbase charge cannot exceed ~1 second of ticks; anything past that
+            -- is a replication artifact, not a peek
+            if burst > 20 then
+                sel01_dt_stats.reject_gap = (sel01_dt_stats.reject_gap or 0) + 1
+                burst = 0
+            end
+        elseif not fresh then
+            sel01_dt_stats.reject_gap = (sel01_dt_stats.reject_gap or 0) + 1
         end
         if st ~= s.prev_simtime then s.prev_simtime = st end
+        s.prev_simtime_rt = now_rt
 
         local airborne = false
         pcall(function() airborne = bit.band(tonumber(p.m_fFlags) or 1, 1) == 0 end)
@@ -5123,13 +5141,24 @@ local function resolve_player(p)
             if duck_amt > 0.35 then d.duck = d.duck + 1 end
         end
 
-        -- V10.0: grounded double-taps count too. v9.99 required airborne-or-ducking, but
-        -- plenty of uncharge peeks happen flat-footed around a corner. The catch is that
-        -- steady fake-lag ALSO arrives in bursts, so a grounded peek needs a clearly
-        -- bigger jump (>=6 ticks, i.e. beyond a normal fake-lag limit of 5) before we
-        -- treat it as a charge release. Airborne / mid-air-duck keeps the looser bar,
-        -- since jumping while fake-lagging that hard is already the peek we care about.
-        local fire = (burst >= 3 and (airborne or duck_amt > 0.35)) or (burst >= 6)
+        -- V10.1: a burst alone is NOT a double-tap. Everyone in an HvH lobby fake-lags,
+        -- so bursts are the background noise of the whole server — v10.0 measured 10062
+        -- of them in one session. What separates an uncharge peek from steady fake-lag is
+        -- the INTENT around it: they are shooting, or they just came around a corner into
+        -- our face. So the burst now only opens the window together with a peek context:
+        --   * they fired at us within the last second (the counter-fire signal), or
+        --   * they are inside close range, where a materialising enemy is the duel
+        -- and a plain grounded burst has to be big (>=8) on top of that. This keeps the
+        -- response for the case it was built for while handing the ordinary fake-lagger
+        -- back to cancel-low-confidence, which is what earns the hit rate.
+        local hostile_recent = (s.last_hostile_fire or 0) > 0
+            and ((globals.tickcount or 0) - s.last_hostile_fire) <= 64
+        local close_ctx = (s.tmp_dist or 99999) <= (tick_cache.ui_close_range or 800) * 1.5
+        local peek_ctx  = hostile_recent or close_ctx
+        local fire = peek_ctx and ((burst >= 4 and (airborne or duck_amt > 0.35)) or burst >= 8)
+        if burst >= 4 and not peek_ctx then
+            sel01_dt_stats.reject_ctx = (sel01_dt_stats.reject_ctx or 0) + 1
+        end
         if fire then
             s.dtpeek_until = now_rt + 0.45
             s.dtpeek_n = (s.dtpeek_n or 0) + 1
@@ -6982,5 +7011,6 @@ _cs_log_color_raw("V9.97: TWO-SIDE keep-no-freeze — a confirmed two-side enemy
 _cs_log_color_raw("V9.98: MENU — nested sub-options + tooltips on every setting. NL's `item:create()` returns a MenuGroup attached to that item, so options that only matter while their parent is on now sit INDENTED under it instead of floating in a flat wall of ~40 switches: Baim Min-Damage + Hitbox under 'Force Baim After N', Classify Interval under 'AA-Classification', Prediction Ticks under 'Strong Prediction', HUD Position under 'Show HUD Panel', Label Colour under 'Show Enemy Labels', the whole ESP block under 'ESP Master', and Verbose + Debug under 'Console Logging'. Every setting also carries a plain-English `:tooltip()` explaining what it does and when to use it. Both APIs are pcall-guarded and fall back to the flat group / no tooltip on an older build. NOTE: nesting changes an element's stored path, so the moved switches reset to their defaults ONCE on this reload — click a preset to restore.")
 _cs_log_color_raw("V9.99: AIR-DUCK / DOUBLE-TAP UNCHARGE PEEK. The peek that beats us most reliably — jump, crouch mid-air, sit on a charged tickbase behind cover, release it and materialise already shooting. The tell is the SIMULATION-TIME BURST: a normal enemy advances one tick per tick, a charged one advances 3+ at once on release; paired with airborne or a mid-air duck that is a peek, not lag. Detection had to move ABOVE the air-branch, which returns early — so the v9.46 teleport detector below it never ran for an airborne enemy, exactly the case that matters. On detect, a 0.45s window: extrapolation off (a yaw rate sampled across the charged ticks cannot predict where the body lands), full-spread multipoint, NL safe-point relaxed, and the shot allowed through the low-confidence cancel + a hitchance floor of 20 — the same trade the counter-fire path already makes, because refusing to fire at a materialising double-tapper just loses the duel. Never touches min-damage (v9.18 ban) and never forces a hitbox: a mid-air crouch moves the head somewhere NL's own multi-hitbox handles better. On a sniper with Respect Manual on, the hitchance floor is skipped entirely. Side and EMA are untouched. ESP tags it 'dt' / 'dt^' (air-duck); toggle 'Double-Tap / Air-Duck Peek Response', on in every preset.")
 _cs_log_color_raw("V10.0: DT-peek reaches the ground + gets measured. (1) v9.99 required airborne-or-ducking, but plenty of uncharge peeks happen flat-footed around a corner. Grounded now counts too, at a higher bar (burst >= 6 ticks, beyond a normal fake-lag limit of 5) because steady fake-lag also arrives in bursts and would otherwise trigger constantly; airborne / mid-air-duck keeps the looser >= 3. (2) New [DT] telemetry line in the copy-dump counting EVERY simulation-time burst of 2+ ticks regardless of whether the gate fired, with the max burst length and how many windows opened. Tuning a threshold blind is how a feature ends up never firing with nobody noticing — if bursts is 0 the signal does not exist on this build; if bursts is high but windows is 0 the bar is simply too strict. Counter clears with Reset Session Stats.")
+_cs_log_color_raw("V10.1: DT-peek detector fixed by its own telemetry. The v10.0 [DT] line read 'bursts>=2: 10062, max 7249 ticks, windows opened: 3331' — a 7249-tick burst is 113 seconds, i.e. an enemy going dormant behind a wall and coming back, not a tickbase charge. Two failures: (1) the simulation-time delta was measured across dormancy gaps, so any re-appearance looked like an uncharge; (2) a burst on its own is the background noise of an HvH lobby, because everyone fake-lags — 3331 open windows meant cancel-low-confidence was effectively disabled for most of the session. Now the burst only counts between CONSECUTIVE observations (last seen <= 0.25s ago) and is discarded above 20 ticks, and it only opens the window together with a peek CONTEXT: they fired at us within the last second, or they are inside close range. A plain grounded burst additionally needs >= 8 ticks. The ordinary fake-lagger goes back to cancel-low-confidence, which is what earns the hit rate. New dump line counts both rejection reasons so the next session shows whether the gate now sits in the right place.")
 _cs_log_color_raw("Logging: " .. (log_enabled:get() and ("ON" .. (log_verbose:get() and " (verbose)" or ""))  or "OFF"))
 _cs_log_color_raw("=========================================")
