@@ -1,11 +1,11 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 10.9                                   ║
+-- ║  Version: 11.0                                   ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 10.9
+-- @version 11.0
 -- @description v9.79 BF real-dominance ordering broadened to switch AA:
 --   * v9.78 only reordered the static/slow BF branch. This lobby's one-sided
 --     locks were aa=switch (idx=8 real 10R/0L still fired BF:opposite LEFT;
@@ -132,7 +132,7 @@
 --   * v9.26 drift-bump (alpha 0.55 on 5-10° diff) still handles small shifts.
 --   * v9.29 coach variants carry.
 
-local SEL01_VERSION = "10.9"
+local SEL01_VERSION = "11.0"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -4568,7 +4568,17 @@ local function _pick_first_shot_impl(p, s, anim, eye_yaw, max_desync, preset)
                 if s.measured_desync > 5 and math.abs(sy_delta) < s.measured_desync then
                     local side = sy_delta >= 0 and 1 or -1
                     s.mode = "Static-ServerBoost"
-                    return eye_yaw + s.measured_desync * side
+                    -- V11.0: PER-SIDE magnitude. This path takes its SIDE from the server
+                    -- reconstruct but fired the GLOBAL EMA as its magnitude — on a bimodal
+                    -- enemy that average is wrong on BOTH sides. Exactly the bug v9.22
+                    -- fixed for Predicted-Alt, v9.54 for the serverfail retry and v9.92 for
+                    -- the Recall fast-path; this branch was simply never converted, and it
+                    -- shows: v10.9 dump had Static-ServerBoost at 10/13 (76.9%) while
+                    -- Static-Meas, which does use effective_desync, ran 50/53 (94.3%) — on
+                    -- a lobby holding two-mode enemies like idx=8 (L=32.6 / R=47.4).
+                    -- effective_desync falls back to the global EMA when that side has no
+                    -- samples, so one-sided enemies behave exactly as before.
+                    return eye_yaw + effective_desync(s, max_desync, side) * side
                 end
                 -- V10.3: a well-measured side outranks a wide server-yaw reconstruct
                 local sy2, clamped = clamp_learned_serveryaw(s, eye_yaw, sy)
@@ -4735,12 +4745,14 @@ local function _pick_first_shot_impl(p, s, anim, eye_yaw, max_desync, preset)
             -- one-sided enemy (real-dump idx=5: streak L=20 R=0, rebuild said R → boosted
             -- 29° R twice → 0/2). When learned dom (real hits / streak only) strongly
             -- contradicts, trust dom + use its per-side magnitude.
-            local mag = s.measured_desync
             local dom = learned_dom_side(s)
             if dom ~= 0 and dom ~= side then
                 side = dom
-                mag = effective_desync(s, max_desync, side)
             end
+            -- V11.0: per-side magnitude for the side we ended up on, not just for the
+            -- dom-conflict case. The global EMA was the default here for the same reason
+            -- it was in Static-ServerBoost — it predates the per-side split.
+            local mag = effective_desync(s, max_desync, side)
             s.mode = "Networked-Boost"
             return eye_yaw + mag * side
         end
@@ -7278,5 +7290,6 @@ _cs_log_color_raw("V10.6: bimodality must rest on REAL hits, never on seeded dat
 _cs_log_color_raw("V10.7: stale state outliving its evidence — the other half of v10.6. That version stopped SETTING s.bimodal without real hits, but a v10.6 dump still logged 'no-freeze: two-side' on an enemy at samples=0 sideL=0 sideR=0, because nothing ever CLEARED an old flag. Two fixes: (1) reset_state now clears bimodal, serverfail_streak and the pending-keep marker, so a dormancy gap cannot carry a verdict into a fresh engagement. (2) IDENTITY CHECK — PlayerState is keyed by ENTITY INDEX and CSGO reuses a slot the moment its occupant disconnects, so per-side magnitudes, real hit counts, streaks and flags learned about one player silently describe whoever takes that slot next, and the resolver acts on them at full confidence. Dormancy reset never caught this: a takeover can happen with no gap at all. The steam id is now compared per resolve and the whole entry is wiped when it changes. This class of bug is invisible in a hit-rate number — it just makes some enemies inexplicably worse than they should be.")
 _cs_log_color_raw("V10.8: the [KEEP] metric was measuring the wrong thing — my own instrument was biased. v10.4 asked 'which side did the next LANDED hit use', and across four sessions both buckets came out ~35% same-side, which looks like damning evidence against retry-same. But on a switch or jitter enemy the next hit comes from the other side because THE ENEMY ALTERNATES, not because the keep was wrong: the metric counts the enemy moving as a failure of our decision. Two changes make it answer the actual question. (1) It now scores the very NEXT SHOT after a keep, hit or miss — that is what the keep costs or buys. (2) It splits by aa_type, and the STATIC bucket is the one that can settle it, because a static enemy's side does not move on its own. New line: '[KEEP] next shot after a keep — STATIC bt<4 2/7 (29%), bt>=4 5/8 (63%) | MOVING ...'. A weak STATIC bt<4 number is real evidence to drop the low-backtrack freeze; the MOVING buckets are context only. Four sessions of data thrown away rather than acted on — a biased measurement is worse than none, because it is persuasive.")
 _cs_log_color_raw("V10.9: the unbiased [KEEP] metric answered — and it says the OPPOSITE of the biased one. First reading: STATIC bt<4 4/5 (80%), bt>=4 5/7 (71%), MOVING bt>=4 3/4. The shot right after a keep lands ~75-80%, so holding the side and re-firing the angle is EARNING its shot; the v10.4 metric's ~35% 'same side' was the enemy alternating, not our decision failing. The low-backtrack freeze stays. Four sessions of confident-looking data would have removed working behaviour. Two diagnostics fixes shipped instead: (1) the LearnedModel boot line now also requires its CONTENT to have changed — the 10s throttle worked but still let byte-identical repeats through, and three players re-booting in rotation filled roughly 60% of the 200-line ring in the v10.8 dump, pushing the actual hits and keeps out of the buffer. (2) resolved angles are normalized before being STORED; the applied yaw always was, but the stored copy carried values like 232.4 / -212.2 into snapshots and logs. No maths changes — every consumer already goes through NormalizeAngle — it just removes a latent trap.")
+_cs_log_color_raw("V11.0: the two BOOST paths never got the per-side magnitude conversion. Static-ServerBoost and Networked-Boost take their SIDE from the server-yaw reconstruct but fired the GLOBAL measured EMA as the magnitude — on a bimodal enemy that average is wrong on BOTH sides. This is the exact bug v9.22 fixed for Predicted-Alt, v9.54 for the serverfail retry and v9.92 for the Recall fast-path; these two branches were simply missed each time. The v10.9 dump makes the cost visible: Static-ServerBoost 10/13 (76.9%) against Static-Meas 50/53 (94.3%) in a lobby holding two-mode enemies like idx=8 at L=32.6 / R=47.4. Both now use effective_desync for whichever side they settled on, which falls back to the global EMA when that side has no samples, so one-sided enemies are unaffected. An audit found three more global-EMA sites — Static-Meas, Still-Meas, Networked-Meas — deliberately NOT converted: Static-Meas is the highest-volume mode in the build at 94.3%, and changing a path that works on theory alone is the same mistake as trusting the biased v10.4 metric, just smaller. They stay on the list until a dump shows them failing.")
 _cs_log_color_raw("Logging: " .. (log_enabled:get() and ("ON" .. (log_verbose:get() and " (verbose)" or ""))  or "OFF"))
 _cs_log_color_raw("=========================================")
