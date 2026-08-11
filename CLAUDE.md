@@ -4,13 +4,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-Three Neverlose **CSGO** (legacy build, NOT CS2) Lua scripts for HvH / rage play. Solver + Config run together inside the same NL client sandbox and communicate only via NL's own events/UI, never directly. WalkBot is a standalone movement bot (no cross-talk; aiming stays with the ragebot).
+Four Neverlose **CSGO** (legacy build, NOT CS2) Lua scripts for HvH / rage play. Solver + Config run together inside the same NL client sandbox and communicate only via NL's own events/UI, never directly. WalkBot and PlantBot are standalone bots (no cross-talk; aiming always stays with the ragebot).
 
 | Script | Role | Working copy | NL load path |
 |---|---|---|---|
-| **Sel01-Solver** (`Sel01-Solver.lua`, ~6100 lines, v9.79) | Resolver: per-player AA learning, JSON export, HUD/ESP overlay + top-right event ticker, FFI clipboard copy-logs, Sel01-Roast chat-spam, AA Advisor (in-menu panel + Coach-chat to CSGO say) | `C:\Users\Seltonmt\Desktop\sazz\aron\ownlua\Sel01-Solver.lua` | `E:\SteamLibrary\steamapps\common\Counter-Strike Global Offensive\nl\scripts\Sel01-Solver_59853.lua` |
-| **Sel01-Config** (`sel01_config.lua`, ~2000 lines, v3.29) | Companion: AA presets (Aggressive/Dynamic/Defensive/Spin), anti-resolver bundle (defensive on hit-taken, slow-walk boost, fake-lag variance, yaw base rotation, side-streak limit, magnitude jitter), anti-HS extras (pitch jitter, move-fakeduck), peek-boost hotkey, comprehensive Dump Debug Stats, hits-taken log with AA-state snapshots, kill/miss/hit event log top-left, watermark + indicators + rotating AA arrow | `C:\Users\Seltonmt\Desktop\sazz\aron\ownlua\sel01_config.lua` | `E:\SteamLibrary\steamapps\common\Counter-Strike Global Offensive\nl\scripts\sel01_config_59908.lua` |
-| **Sel01-WalkBot** (`Sel01-WalkBot.lua`, ~1200 lines, v1.7) | Standalone walk-bot — MOVEMENT only, aiming stays with the ragebot. CSGO nav-mesh A* routing (greedy trace-based fallback), distance-tiered engage (approach / hold-corner shoulder-peek / slow-walk peek / crouch-when-exposed), roam (nav route / HUNT last-seen enemy / leave-spawn / wander), auto-learn routes + bad-spots (persisted), no-jump by default, auto-primary-weapon | `C:\Users\Seltonmt\Desktop\sazz\aron\ownlua\Sel01-WalkBot.lua` | `E:\SteamLibrary\steamapps\common\Counter-Strike Global Offensive\nl\scripts\Sel01-WalkBot_60027.lua` |
+| **Sel01-Solver** (`Sel01-Solver.lua`, ~6870 lines, v10.3) | Resolver: per-player AA learning, JSON export, HUD/ESP overlay + top-right event ticker, FFI clipboard copy-logs, Sel01-Roast chat-spam, AA Advisor (in-menu panel + Coach-chat to CSGO say) | `C:\Users\Seltonmt\Desktop\sazz\aron\ownlua\Sel01-Solver.lua` | `E:\SteamLibrary\steamapps\common\Counter-Strike Global Offensive\nl\scripts\Sel01-Solver_59853.lua` |
+| **Sel01-Config** (`sel01_config.lua`, ~2530 lines, v3.32) | Companion: AA presets (Aggressive/Dynamic/Defensive/Spin), anti-resolver bundle (defensive on hit-taken, slow-walk boost, fake-lag variance, yaw base rotation, side-streak limit, magnitude jitter), anti-HS extras (pitch jitter, move-fakeduck), peek-boost hotkey, comprehensive Dump Debug Stats, hits-taken log with AA-state snapshots, kill/miss/hit event log top-left, watermark + indicators + rotating AA arrow | `C:\Users\Seltonmt\Desktop\sazz\aron\ownlua\sel01_config.lua` | `E:\SteamLibrary\steamapps\common\Counter-Strike Global Offensive\nl\scripts\sel01_config_59908.lua` |
+| **Sel01-WalkBot** (`Sel01-WalkBot.lua`, ~1420 lines, v2.2) | Standalone walk-bot — MOVEMENT only, aiming stays with the ragebot. CSGO nav-mesh A* routing (greedy trace-based fallback), distance-tiered engage (approach / hold-corner shoulder-peek / slow-walk peek / crouch-when-exposed), roam (nav route / HUNT last-seen enemy / leave-spawn / wander), auto-learn routes + bad-spots (persisted), no-jump by default, auto-primary-weapon | `C:\Users\Seltonmt\Desktop\sazz\aron\ownlua\Sel01-WalkBot.lua` | `E:\SteamLibrary\steamapps\common\Counter-Strike Global Offensive\nl\scripts\Sel01-WalkBot_60027.lua` |
+| **Sel01-PlantBot** (`Sel01-PlantBot.lua`, ~1300 lines, v1.10) | Standalone plant-bot. Mark an A spot + a safe spot per map, then GOTO_A → PLANT → RETREAT → DONE every round. Shares the WalkBot nav-mesh parser + A*; auto-joins T (only while dead). Diagnostic log ring + Dump button | `C:\Users\Seltonmt\Desktop\sazz\aron\ownlua\Sel01-PlantBot.lua` | `...\nl\scripts\Sel01-PlantBot_35563.lua` **and** `...\nl\scripts\plant_18.lua` (BOTH) |
 
 **Dual-copy rule (MANDATORY).** After every Edit/Write to either working copy, immediately overwrite the matching NL file (same path, no new files, no renames). PowerShell one-liner: `Copy-Item -Force -LiteralPath '<working>' -Destination '<nl-path>'`. The git repo only tracks working copies — the NL copies need the mirror so reload in NL picks up the change.
 
@@ -24,6 +25,9 @@ Three Neverlose **CSGO** (legacy build, NOT CS2) Lua scripts for HvH / rage play
 - Sel01-Solver: `local SEL01_VERSION = "X.Y"` + file-header `@version X.Y` + **decorative header box `Version: X.Y` (line 4)** + 3 visible mentions (load-banner, UI label, HUD corner)
 - Sel01-Config: `local SEL01_CFG_VERSION = "X.Y"` + file-header `@version X.Y` (no HUD mention; load banner reads constant directly)
 - Sel01-WalkBot: `local SEL01_WB_VERSION = "X.Y"` + file-header `Version: X.Y` + `@version X.Y` (HUD reads the constant)
+- Sel01-PlantBot: `local SEL01_PB_VERSION = "X.Y"` + file-header `Version: X.Y` + `@version X.Y` (HUD reads the constant)
+
+The whole bump is one PowerShell pass — `[IO.File]::ReadAllText` → three `.Replace(...)` → `WriteAllText`, then `luac -p`, then the copies. `Set-Content` can fail with "file is being used by another process" while NL has the mirror open; the `[IO.File]` API is what reliably works. Version compare in all four scripts is `vc_num` = `major * 1000 + minor`, so `10.0` (10000) correctly sorts above `9.99` (9099) — two-digit minors are safe.
 
 WalkBot runtime data (private, gitignored — same `nl/Sel01-WalkBot/` folder the navs are copied into):
 - Per-map learned route: `nl/Sel01-WalkBot/<map>.txt` (plain "x y z" lines, files.read-safe text)
@@ -45,6 +49,7 @@ Solver architecture + bug history + UI doc lives in `README.md`. NL API docs at 
 luac -p Sel01-Solver.lua    # resolver
 luac -p sel01_config.lua        # config
 luac -p Sel01-WalkBot.lua       # walk-bot
+luac -p Sel01-PlantBot.lua      # plant-bot
 ```
 
 `luac` from scoop (`C:\Users\Seltonmt\scoop\apps\lua\current\bin\luac.exe`). Must exit clean. No test infrastructure — runtime errors only surface when user reloads in NL and reports. After luac passes, **dual-copy to NL** (see paths table above) so the next NL reload sees the change.
@@ -54,6 +59,10 @@ luac -p Sel01-WalkBot.lua       # walk-bot
 ## Critical patterns (each has bitten before)
 
 **Forward-references kill closures.** NL UI callbacks (button bodies, `:set_callback`, `events.ragebot_target`, `events.render`) capture upvalues at parse-time. If referenced local is declared LATER, closure binds to GLOBAL (nil at call time). **Forward-decl block must be BEFORE any UI element referencing those names.** Currently at top (line ~135): `SteamMemory`, `LearnedModel`, `mode_stats`, `PlayerState`, `tick_cache`, `NormalizeAngle`, `mode_stats_update/dump`, `confidence`, `session_stats`, `record_player_shot`. Pattern: `local X = {}` at top, then `setmetatable(X, ...)` later. NEVER `local X = setmetatable({}, ...)` later (creates a new shadowing local).
+
+**A GLOBAL function called from a line ABOVE its definition is nil at load** (v10.2 shipped this and the whole Solver died with `attempt to call global 'ui_sub' (a nil value)`). Because the main chunk is at the 200-local cap, most new helpers are globals — and globals resolve at CALL time, which is fine for a function invoked later at runtime but fatal for one invoked during the top-to-bottom UI build. Rule: any global helper used while building the UI (`ui_sub`, `ui_tip`, …) must be **defined before the first UI element that calls it**. Runtime-only globals (`anim_side_get`, `anim_pol_feedback`, `apply_preset`) can sit anywhere. Same trap in reverse for `ui_tip(some_local, …)`: a LOCAL passed to a tooltip call placed above its `local x = …` line silently reads a nil global, so the tooltip is skipped without any error.
+
+**Main chunk is HARD at the 200-local ceiling.** Not "near" — adding a single top-level `local` fails the build with `too many local variables (limit is 200) in main function`, and so does a bare `for _, name in ipairs(...)` loop at top level (its control variables count). Declare new UI groups / helpers / state tables as module GLOBALS, or wrap the code in `pcall(function() ... end)` / `do ... end` so the locals live in an inner scope. Verify with `luac -p` after any top-level addition.
 
 **Combo `:get()` returns STRING, not index.** Use string compares or `combo_str()` / `mode_str()` / `baim_hb_id()` helpers. Never arithmetic on combo value. **Combo `:set()` also takes STRING** (the option label), not an index — passing an int silently fails or freezes the menu callback.
 
@@ -300,6 +309,15 @@ Always-on features (no toggle):
     - **V9.73-V9.77** — V9.74 jitter+defAA BF fix (`pick_bruteforce_angle` skips the `def_delta` cycle on `aa_type=="jitter"` — no stable defensive delta — and falls through to `BF:opposite`) + air-branch yields to a pending `BF:retry` (consumed only in `pick_bruteforce_angle`, the air `return` ate the tick). V9.76 **AA-classify oscillation-freeze**: an `A→B→A` revert (committing back to a type just left) freezes the classifier 5s regardless of timing — the V9.10 10s-window anti-flap missed slow `static↔switch` reverts. V9.77 **Networked-Boost side-conflict guard** (`RebuildServerYaw` side can flip wrong on a hard one-sided enemy; new `learned_dom_side(s)` — real hits + streak only, no seeded/passive — vetoes a wrong-side boost on ground + air) + **server-fail filter honesty** (`ack_serverfail_like`'s `err<=5` branch now also needs `bt>=4`; a `bt=0 err=0` kept-side miss is OUR switch/side misprediction, not netcode — was excusing ~14 keeps and inflating headline rate).
     - **V9.78-V9.79 (BF real-dominance ordering)** — `pick_bruteforce_angle` led every BF cycle with `"opposite"` (flip to `-last_shot_side`), which on a firmly one-sided enemy flips onto the side they have NEVER been on = guaranteed whiff (`BF:opposite` was the worst mode at 0%). New `one_sided` test (`real_left/right` ≥3-vs-0): sweep MAGNITUDE on the proven dominant side first, demote `"opposite"` to last. **V9.78** gated it to static/slow; **V9.79** broadened to ALL non-defensive aa_types (this lobby's one-sided locks were `aa=switch` and fell through to opposite-first). Genuine alternators (real hits on BOTH sides, e.g. `L=2 R=1`) keep opposite-first (V9.63).
 
+  - **V9.90-V10.3 (the recent arc — read this before touching the ack path)**:
+    - **V9.90 / V9.92 / V9.97 — the "keep-no-freeze" family.** On a KEEP the resolver both holds the side AND pins the next shot to the same side+magnitude (`resolver_note_serverfail_retry`). That only makes sense for a STABLE fake the server rejected. `err ≈ 0` merely proves we shot our own BELIEF — it is not evidence the belief was right. So the freeze is now dropped for: **jitter** blind (v9.90 flips outright) and learned (v9.92 keeps side, no freeze), **confirmed two-side enemies** at `bt <= 4` (v9.97), and **BF sweep probes** — `ack_angle_err > 25` from a real measurement can only be a deliberate off-angle, not a rejected belief (v10.3). High `bt` always keeps retry-same: that IS genuine stale-record netcode.
+    - **V9.95 animation-layer side read** (`anim_side_update` / `anim_side_get` / `anim_pol_feedback`, toggle `anim_side_tog`, default OFF). See the native-anim-API note in Critical patterns. Only replaces the coin-flip inside `*-Guess` fallbacks + `alt_side_pick`'s no-signal return; modes log as `*-AnimGuess` for direct A/B against plain `*-Guess`.
+    - **V9.96 preset refresh** — six toggles no preset had ever set (they inherited from whichever preset ran last). Also fixed a real ordering bug: `strat_hitbox`'s callback sets `exp_multipoint = false`, silently undoing an `exp_multipoint = true` set earlier in the SAME preset. Any preset that writes both an individual toggle and a `strat_*` combo must re-assert the toggle AFTER the combo.
+    - **V9.98 menu** — `item:create()` nesting + `:tooltip()` on every setting. Nesting changes an element's stored path, so moved elements reset to defaults ONCE.
+    - **V9.99-V10.1 double-tap / air-duck peek** (`exp_dtpeek`, default ON) — detects a charged-tickbase release via a **simulation-time burst** (enemy advances 3+ ticks of simulation in one update) plus a peek context. Opens a 0.45s window: no extrapolation, full-spread multipoint, safe-point off, shot allowed through cancel-low-confidence, hitchance floor 20 (skipped for sniper + respect-manual). Detection sits ABOVE the air-branch, which `return`s — that is why the v9.46 teleport detector below it never ran for airborne enemies. **V10.1 is the cautionary tale**: v10.0's own `[DT]` telemetry showed `max 7249 ticks` and 3331 windows opened, i.e. dormancy gaps read as charges and cancel-low-confidence effectively disabled all session. Bursts now only count between consecutive observations (<= 0.25s) capped at 20 ticks, and need a peek context (they fired at us, or close range). **Ship telemetry with any new gate.**
+    - **V10.2 animated clantag** (Solver, default ON) — CSGO TRIMS leading/trailing whitespace off a clan tag, so space-padded frames collapse to the same string (that is why the Config version only animated on one side and never wiped). Marquee scrolls over a visible dashed track; a frame is written only when it DIFFERS from the last one. Driven from `events.net_update_end`, never render. Turn the Config clantag off — two writers fight.
+    - **V10.3 `clamp_learned_serveryaw`** — the opposite end of the sample range from v9.86's first-contact clamp. With 4+ real hits on the shot side, a `RebuildServerYaw` magnitude more than 10° off that side's EMA is reconstruct noise (a genuine change moves the EMA within 2-3 hits via the v9.39 ramp). Keeps the server's SIDE, takes the learned magnitude, labels the mode `*-Clamp`.
+
 ## HUD-overlay anatomy
 
 When ESP enabled, `events.render` (10hz throttled compute, per-frame draw from `hud_cache`):
@@ -333,7 +351,7 @@ git push origin master
 
 If hook failure on commit: investigate root cause, fix, create NEW commit (don't amend — pre-commit hooks fail means commit didn't happen, amend would modify previous one).
 
-## Sel01-Config layout (`sel01_config.lua`, v3.29, ~2000 lines)
+## Sel01-Config layout (`sel01_config.lua`, v3.32, ~2530 lines)
 
 | Section | Purpose |
 |---|---|
@@ -424,7 +442,7 @@ The `Dump Debug Stats` button now emits 9 sections to chat in one click: SESSION
 - **Verified render/color API on this NL build** (use freely, still pcall for version variance): `render.rect(p1,p2,col, radius|{tl,tr,br,bl})` (4th-arg rounding), `render.blur(p1,p2,strength,alpha,radius)`, `render.push_clip_rect(p1,p2)`/`pop_clip_rect`, `render.gradient(p1,p2,c1,c2,c3,c4)`, `render.push_rotation(deg,centerVec)`/`pop_rotation`, `render.measure_text(font,flags,text)→vector`, `render.load_font(name,size,flags)`, `color():as_hsv(h,s,v)`, `color():lerp(other,frac)`, `color:alpha_modulate(f)`, `ui.get_alpha/get_position/get_size/get_icon/get_mouse_position`, `utils.net_channel().latency[1]/.loss[1]/.choke[1]`, `globals.choked_commands`. `rage.antiaim:get_rotation(true)` = fake yaw, `:get_rotation()` = real yaw (desync delta = `|real-fake|/2`).
 - **On-screen indicator design: minimal + centered, plain text** (v3.27, user iterated hard). JAG0YAW-style under-crosshair stack (title + movement state + few active states) beats big chip panels / left columns / cryptic abbreviations. Use readable names, smooth jumpy values (EMA), keep always-on internal states OFF the HUD.
 
-## Sel01-WalkBot architecture (`Sel01-WalkBot.lua`, v1.7)
+## Sel01-WalkBot architecture (`Sel01-WalkBot.lua`, v2.2, ~1420 lines)
 
 A standalone movement bot. ONE `events.createmove` handler (`walkbot_tick`) drives the local player via the cmd userdata; aiming is left to the ragebot. The whole decision tree is distance-tiered.
 
@@ -441,7 +459,7 @@ A standalone movement bot. ONE `events.createmove` handler (`walkbot_tick`) driv
 - **Default OFF: jumping** (`Allow Jumping`). Per user, the bot should never jump; bhop + step-up + wedge jumps are all gated behind it. New switches take their default immediately (NL has no persisted value yet), which is how a hard-default-off override reaches an existing user.
 - **Distance is king** — far enemy → ROAM/route, not beeline (rams walls, "thinks 3k is near"). Aggressive peek only when the enemy is genuinely visible; close-but-unseen → careful slow approach to gain the sightline.
 
-## Sel01-PlantBot (`Sel01-PlantBot.lua`, v1.9)
+## Sel01-PlantBot (`Sel01-PlantBot.lua`, v1.10, ~1300 lines)
 
 One `events.createmove` handler (`plantbot_tick`). You mark two spots per map (persisted in `nl/Sel01-PlantBot/<map>.txt`): the A plant spot + the safe spot. Loop: `GOTO_A` → `PLANT` → `RETREAT` → `DONE`, restarted every round.
 
