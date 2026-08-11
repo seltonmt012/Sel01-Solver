@@ -1,11 +1,11 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 10.6                                   ║
+-- ║  Version: 10.7                                   ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 10.6
+-- @version 10.7
 -- @description v9.79 BF real-dominance ordering broadened to switch AA:
 --   * v9.78 only reordered the static/slow BF branch. This lobby's one-sided
 --     locks were aa=switch (idx=8 real 10R/0L still fired BF:opposite LEFT;
@@ -132,7 +132,7 @@
 --   * v9.26 drift-bump (alpha 0.55 on 5-10° diff) still handles small shifts.
 --   * v9.29 coach variants carry.
 
-local SEL01_VERSION = "10.6"
+local SEL01_VERSION = "10.7"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -2906,6 +2906,15 @@ local function reset_state(s)
     s.anim_vote          = 0
     s.anim_sig           = nil
     s.anim_simtime       = nil
+    -- V10.7: the bimodal flag must not outlive the evidence that set it. PlayerState is
+    -- keyed by ENTITY INDEX, and slots are reused when someone disconnects and another
+    -- player takes that slot — so a flag set for the previous occupant silently applies to
+    -- the next one. That is how a v10.6 dump still shows "no-freeze: two-side" on an enemy
+    -- logged at samples=0 sideL=0 sideR=0: v10.6 correctly stopped SETTING bimodal without
+    -- real hits, but never cleared a stale one. Both halves are needed.
+    s.bimodal            = false
+    s.serverfail_streak  = 0
+    s.pending_keep_side  = nil
     resolver_clear_serverfail_retry(s)
 end
 
@@ -5064,6 +5073,24 @@ local function resolve_player(p)
             s.measured_right  = (s.measured_right or 0) * decay_factor
         end
     end
+    -- V10.7: IDENTITY CHECK. PlayerState is keyed by entity index, and CSGO reuses a slot
+    -- as soon as its occupant disconnects. Everything learned about the previous player —
+    -- per-side magnitudes, real hit counts, streaks, the bimodal flag — then silently
+    -- describes a stranger, and the resolver acts on it with full confidence. Dormancy
+    -- reset does not catch this: a slot can be taken over without any gap. Compare the
+    -- steam id and wipe the whole entry when it changes.
+    do
+        -- _learning_sid is the 6-pattern id chain; it returns nil when persistent
+        -- learning is off, in which case the check simply does not run.
+        local sid_now = _learning_sid(p)
+        if sid_now and s.sid_seen and sid_now ~= s.sid_seen then
+            cs_log_verbose("slot reuse idx=%d — new player in this slot, wiping learned state", p:get_index())
+            PlayerState[p:get_index()] = nil
+            s = get_state(p)
+        end
+        if sid_now then s.sid_seen = sid_now end
+    end
+
     -- dormancy reset: re-engagement = fresh state
     if s.last_seen > 0 and (now - s.last_seen) > (dormancy_reset_t:get() / 1000) then
         reset_state(s)
@@ -7215,5 +7242,6 @@ _cs_log_color_raw("V10.3: (0) LOAD FIX — v10.2 called ui_sub() from the clanta
 _cs_log_color_raw("V10.4: [KEEP] telemetry — is a low-backtrack KEEP worth its shot? Every keep holds the shot side AND schedules a retry of the same angle. The v10.3 dump argues both ways: 'KEEP err=0 bt<4 -> miss -> BF:opposite HIT' says the keep burned a shot (BF:opposite went 7/7 and BF:+90 3/3 that session), but 'KEEP err=0 bt<4 -> miss -> same angle HIT' says the server really was rejecting a correct angle twice. Roughly ten hand-read samples cannot settle that, and guessing here would trade one blind heuristic for another. So each keep now remembers its side, and the NEXT landed hit scores it: same side or opposite, bucketed by bt<4 vs bt>=4. A low-bt bucket dominated by OPPOSITE means the freeze should go; dominated by SAME means retry-same earns it. No aim change this version — measurement first, exactly like the v10.0 [DT] line that exposed the dormancy-gap bug.")
 _cs_log_color_raw("V10.5: chasing 'hits fine but feels less clean' at 85.2%. (1) DT-peek context tightened — close range ALONE is not a peek context, it is most of the game. The v10.4 dump opened 4396 windows across a 61-shot session, so cancel-low-confidence stayed suspended through nearly every close fight and marginal shots the filter would have held back got taken: exactly the reported feel. Close range now only counts together with the airborne/ducking posture the feature is named after; being shot at still qualifies alone (counter-fire). (2) Passive-side keep needs CLEAR dominance and never outranks real data. A bare 2:1 passive split is close to noise — real dump idx=8 had 323R vs 158L (2.04:1), pinned RIGHT, kept it through three misses, and the enemy finished 5 real hits LEFT / 0 right. Now 3:1, and a single real hit on the other side vetoes the passive read outright. (3) The KEEP log line printed 'retry same' unconditionally, including when the no-freeze path had just cleared the retry — a v10.3 dump reads 'err=55.9 ... retry same' for a BF probe that was actually released. A log that contradicts the code is worse than no log; it costs a debugging session. It now reports which branch ran.")
 _cs_log_color_raw("V10.6: bimodality must rest on REAL hits, never on seeded data. s.bimodal was set from samples_left/right, which include passive and learned-boot entries — so an enemy we had NEVER hit could be flagged bimodal purely because its two seeded EMAs differed by more than 12 degrees. That flag makes two_side_switcher true in the ack path, handing a zero-evidence enemy both the v9.63 keep-the-side branch and the v9.97 no-freeze. Real dump v10.5: idx=2 logged 'no-freeze: two-side' three times at samples=0 sideL=0 sideR=0, off nothing but a learned boot of L=21.7 / R=25.6. Now it needs 2+ REAL hits on each side. Same principle the resolver has had to relearn three times already — v9.45 seed-only keep, v9.48 alt_side_pick real dominance, v10.5 passive dominance: seeded data never decides. Also: v10.5's DT tightening worked, windows fell from 4396 to 813 with 1279 bursts rejected as fake-lag noise.")
+_cs_log_color_raw("V10.7: stale state outliving its evidence — the other half of v10.6. That version stopped SETTING s.bimodal without real hits, but a v10.6 dump still logged 'no-freeze: two-side' on an enemy at samples=0 sideL=0 sideR=0, because nothing ever CLEARED an old flag. Two fixes: (1) reset_state now clears bimodal, serverfail_streak and the pending-keep marker, so a dormancy gap cannot carry a verdict into a fresh engagement. (2) IDENTITY CHECK — PlayerState is keyed by ENTITY INDEX and CSGO reuses a slot the moment its occupant disconnects, so per-side magnitudes, real hit counts, streaks and flags learned about one player silently describe whoever takes that slot next, and the resolver acts on them at full confidence. Dormancy reset never caught this: a takeover can happen with no gap at all. The steam id is now compared per resolve and the whole entry is wiped when it changes. This class of bug is invisible in a hit-rate number — it just makes some enemies inexplicably worse than they should be.")
 _cs_log_color_raw("Logging: " .. (log_enabled:get() and ("ON" .. (log_verbose:get() and " (verbose)" or ""))  or "OFF"))
 _cs_log_color_raw("=========================================")
