@@ -4,4 +4,4 @@
 solver=9.94
 config=3.32
 walkbot=2.2
-plantbot=1.9
+plantbot=1.10

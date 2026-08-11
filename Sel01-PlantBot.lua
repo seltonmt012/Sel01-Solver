@@ -1,12 +1,12 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-PlantBot                                    ║
--- ║  Version: 1.9                                      ║
+-- ║  Version: 1.10                                      ║
 -- ║  One job: walk to a marked A spot, plant the C4,   ║
 -- ║  walk to a marked safe spot, done. Auto-picks T.   ║
 -- ║  by seltonmt01                                     ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-PlantBot
--- @version 1.9
+-- @version 1.10
 -- @author seltonmt01
 -- @description Standalone plant-bot. You MARK two spots once (persisted per map):
 --   the A plant spot + the safe spot. Then it loops every round:
@@ -18,7 +18,7 @@
 --   Movement ONLY — aiming stays with the ragebot. While idle/done it does NOT touch
 --   the cmd, so your normal keys work.
 
-local SEL01_PB_VERSION = "1.9"
+local SEL01_PB_VERSION = "1.10"
 
 local ffi_ok, ffi = pcall(require, "ffi")
 
@@ -86,6 +86,14 @@ local state = {
     logs         = {},          -- ring buffer of decision lines (Dump button)
     goal_d_prev  = nil,         -- last heartbeat distance to the current goal
     repaths      = 0,
+    -- v1.10 anti-oscillation
+    avoid_yaw    = nil,         -- committed avoid heading
+    avoid_until  = 0,           -- hold it until this time (stops avoid/duck flapping)
+    duck_until   = 0,           -- committed duck-pass window
+    prog_d       = nil,         -- best goal distance seen since the last progress stamp
+    prog_t       = 0,
+    nav_ban_n    = 0,           -- dead route nodes banned in a row
+    nav_off_until = 0,          -- mesh parked (straight-line) until this time
 }
 
 -- button drains (module globals: closures run before `state` helpers bind)
@@ -281,6 +289,12 @@ local function run_reset(why)
     state.jump_until       = 0
     state.diag             = why or "reset"
     state.goal_d_prev      = nil
+    state.prog_d           = nil
+    state.prog_t           = 0
+    state.nav_ban_n        = 0
+    state.nav_off_until    = 0
+    state.avoid_until      = 0
+    state.duck_until       = 0
     pb_log("reset", 0, "RUN RESET (%s)", why or "reset")
 end
 
@@ -492,6 +506,18 @@ local function nav_nearest(x, y)
     return best
 end
 
+-- v1.10: areas the no-progress breaker proved unreachable (wall / wrong floor between us
+-- and that center). Banned for a few seconds so A* routes AROUND them instead of handing
+-- back the same impossible node every 1.5s.
+local nav_ban = {}
+local function nav_banned(id)
+    local t = nav_ban[id]
+    if not t then return false end
+    local now = 0; pcall(function() now = globals.realtime end)
+    if now > t then nav_ban[id] = nil; return false end
+    return true
+end
+
 -- A* over the area graph -> ordered list of area centers
 local function nav_astar(startId, goalId)
     local areas = nav.areas
@@ -514,7 +540,7 @@ local function nav_astar(startId, goalId)
         local ca = areas[cur]
         for _, nb in ipairs(ca.conns) do
             local na = areas[nb]
-            if na and not closed[nb] then
+            if na and not closed[nb] and not nav_banned(nb) then
                 local dx, dy = ca.x - na.x, ca.y - na.y
                 local tg = g[cur] + math.sqrt(dx * dx + dy * dy)
                 if not g[nb] or tg < g[nb] then
@@ -549,6 +575,12 @@ local function nav_dir(lp, lo, gx, gy, now)
     if not (use and nav.ok) then
         state.nav_path_len = 0
         pb_log("nav_off", 5.0, "nav unused (%s) -> straight line", use and tostring(nav.err) or "toggle off")
+        return dir_yaw_xy(lo.x, lo.y, gx, gy)
+    end
+    -- v1.10: the breaker parks the mesh for a few seconds after repeated dead nodes
+    if now < (state.nav_off_until or 0) then
+        state.nav_path_len = 0; state.nav_path = nil
+        pb_log("nav_park", 2.0, "nav parked %.1fs more (dead nodes) -> straight line", state.nav_off_until - now)
         return dir_yaw_xy(lo.x, lo.y, gx, gy)
     end
     local ga = nav_nearest(gx, gy)
@@ -657,43 +689,87 @@ local function compute_move(lp, lo, want_yaw, now, base_act)
     end
 
     local look = math.min(probe * 2.2, 130)
-    if not probe_clear(lp, lo, want_yaw, look) and crouch_passable(lp, lo, want_yaw, probe) then
-        state.pass_crouch = true; state.block = "duck-pass"; state.diag = base_act .. " duck-pass"
-        pb_log("duck", 1.0, "%s duck-pass (low gap ahead, want=%.0f)", base_act, want_yaw)
-    elseif not probe_clear(lp, lo, want_yaw, look) then
-        state.block = "front"
-        local found = false
-        local order = state.avoid_dir >= 0 and { 1, -1 } or { -1, 1 }
-        for _, s in ipairs(order) do
-            for _, ang in ipairs({ 20, 40, 60, 80, 105, 135 }) do
-                if probe_clear(lp, lo, want_yaw + s * ang, probe) then
-                    move_yaw = want_yaw + s * ang; state.avoid_dir = s; found = true; break
-                end
-            end
-            if found then break end
-        end
-        if found then
-            state.diag = string.format("%s avoid %+.0f", base_act, move_yaw - want_yaw)
-            pb_log("avoid", 0.5, "%s AVOID %+.0f (want=%.0f -> go=%.0f) hspd=%.0f @(%.0f,%.0f)",
-                   base_act, move_yaw - want_yaw, want_yaw, move_yaw, hspd, lo.x, lo.y)
+
+    -- v1.10 COMMIT WINDOWS. Re-deciding duck-vs-avoid every single tick made the bot
+    -- bounce at one specific corner: the standing probe (z+40/z+62, 121u) failed, the fan
+    -- picked a near-backwards angle east, two ticks later the crouch ray (z+18, 55u) was
+    -- clear so it ducked west again — AVOID/duck/AVOID/duck at 4Hz, forever. Once a
+    -- workaround is picked we now HOLD it while it stays clear.
+    local decided = false
+    if now < (state.duck_until or 0) then
+        if crouch_passable(lp, lo, want_yaw, probe) then
+            state.pass_crouch = true; state.block = "duck-hold"
+            state.diag = base_act .. " duck-pass (hold)"
+            decided = true
         else
-            state.block = "boxed"
-            if aj and can_step_up(lp, lo, want_yaw, probe) then
-                state.jump_until = now + 0.12; state.activity = "JUMP"; state.block = "step"
-                state.diag = base_act .. " step-up jump"
-                pb_log("step", 0.5, "%s step-up jump (want=%.0f)", base_act, want_yaw)
+            state.duck_until = 0
+        end
+    end
+    if (not decided) and now < (state.avoid_until or 0) and state.avoid_yaw then
+        if probe_clear(lp, lo, state.avoid_yaw, probe) then
+            move_yaw = state.avoid_yaw; state.block = "avoid-hold"
+            state.diag = string.format("%s avoid %+.0f (hold)", base_act, norm_ang(state.avoid_yaw - want_yaw))
+            decided = true
+        else
+            state.avoid_until = 0
+        end
+    end
+
+    if (not decided) and not probe_clear(lp, lo, want_yaw, look) then
+        if crouch_passable(lp, lo, want_yaw, probe) then
+            state.pass_crouch = true; state.block = "duck-pass"; state.duck_until = now + 0.45
+            state.diag = base_act .. " duck-pass"
+            pb_log("duck", 1.0, "%s duck-pass (low gap ahead, want=%.0f) hold 0.45s", base_act, want_yaw)
+        else
+            state.block = "front"
+            local found = false
+            local order = state.avoid_dir >= 0 and { 1, -1 } or { -1, 1 }
+            -- v1.10: fan capped at 100 deg. 135 was effectively BACKWARDS — that is the
+            -- "runs away from the goal" half of the corner ping-pong.
+            for _, s in ipairs(order) do
+                for _, ang in ipairs({ 20, 40, 60, 80, 100 }) do
+                    if probe_clear(lp, lo, want_yaw + s * ang, probe) then
+                        move_yaw = want_yaw + s * ang; state.avoid_dir = s; found = true; break
+                    end
+                end
+                if found then break end
+            end
+            if found then
+                state.avoid_yaw = move_yaw; state.avoid_until = now + 0.6
+                state.diag = string.format("%s avoid %+.0f", base_act, move_yaw - want_yaw)
+                pb_log("avoid", 0.5, "%s AVOID %+.0f (want=%.0f -> go=%.0f) hspd=%.0f @(%.0f,%.0f) hold 0.6s",
+                       base_act, move_yaw - want_yaw, want_yaw, move_yaw, hspd, lo.x, lo.y)
             else
-                move_yaw = want_yaw + (state.avoid_dir ~= 0 and state.avoid_dir or 1) * 110
-                state.diag = base_act .. " boxed WALL -> turn"
-                pb_log("boxed", 0.5, "%s BOXED — no clear fan angle, want=%.0f -> turn %.0f hspd=%.0f @(%.0f,%.0f)",
-                       base_act, want_yaw, move_yaw, hspd, lo.x, lo.y)
+                state.block = "boxed"
+                if aj and can_step_up(lp, lo, want_yaw, probe) then
+                    state.jump_until = now + 0.12; state.activity = "JUMP"; state.block = "step"
+                    state.diag = base_act .. " step-up jump"
+                    pb_log("step", 0.5, "%s step-up jump (want=%.0f)", base_act, want_yaw)
+                else
+                    -- wall-slide: stay as close to the wanted heading as the geometry
+                    -- allows (90 sideways) instead of the old 110 backwards turn, and
+                    -- commit to it so it cannot flap against duck-pass next tick.
+                    local side = (state.avoid_dir ~= 0 and state.avoid_dir) or 1
+                    if not probe_clear(lp, lo, want_yaw + side * 90, probe)
+                       and probe_clear(lp, lo, want_yaw - side * 90, probe) then
+                        side = -side; state.avoid_dir = side
+                    end
+                    move_yaw = norm_ang(want_yaw + side * 90)
+                    state.avoid_yaw = move_yaw; state.avoid_until = now + 0.5
+                    state.diag = base_act .. " boxed WALL -> slide"
+                    pb_log("boxed", 0.5, "%s BOXED — no fan angle <=100, want=%.0f -> slide %.0f hspd=%.0f @(%.0f,%.0f)",
+                           base_act, want_yaw, move_yaw, hspd, lo.x, lo.y)
+                end
             end
         end
     end
 
     if state.last_origin then
         local moved = v_len2d(vector(lo.x - state.last_origin.x, lo.y - state.last_origin.y, 0))
-        if moved < 1.5 then
+        -- v1.10: `moved < 1.5` per tick == under ~96 u/s, so DUCK-WALKING (~85 u/s) read as
+        -- stuck every tick -> strafe -> "recovered after 0.0s" spam, which fed the corner
+        -- oscillation. Real wedging always parks the velocity, so require that too.
+        if moved < 1.5 and hspd < 60 then
             if state.stuck_since == 0 then state.stuck_since = now end
             local dur = now - state.stuck_since
             if dur > 1.2 then
@@ -1043,6 +1119,45 @@ local function plantbot_tick(cmd)
     -- 2s heartbeat: the goal distance TREND is what exposes a route problem — a rising
     -- distance while travelling means the bot is walking away from the goal (nav node
     -- behind us / avoid fan turned us around), which is the log line to look for.
+    -- ── v1.10 NO-PROGRESS BREAKER ──
+    -- The corner case the logs showed: a route node sits behind a wall / on another floor,
+    -- so the bot shuffles in front of it forever while the goal distance never drops. No
+    -- amount of local avoidance fixes an impossible node — the ROUTE has to change. If we
+    -- fail to gain 40u toward the goal for 3s while travelling, the head node is declared
+    -- dead: ban its area for 12s (A* routes around it) and force an immediate re-path.
+    -- Three dead nodes in a row = the mesh is lying about this area, park it and walk
+    -- straight-line for 8s.
+    if state.phase == "GOTO_A" or state.phase == "RETREAT" then
+        local g = (state.phase == "RETREAT") and state.safe_spot or state.a_spot
+        local gd = dist2d(lo.x, lo.y, g.x, g.y)
+        if (state.prog_d == nil) or gd < (state.prog_d - 40) then
+            state.prog_d = gd; state.prog_t = now; state.nav_ban_n = 0
+        elseif (now - (state.prog_t or now)) > 3.0 then
+            local dead = nil
+            if state.nav_path and #state.nav_path > 0 and state.nav_path[1].id then
+                dead = state.nav_path[1].id
+                nav_ban[dead] = now + 12
+                table.remove(state.nav_path, 1)
+            end
+            state.nav_path_t = 0                     -- force a re-path on the next call
+            state.prog_d = gd; state.prog_t = now
+            state.avoid_until = 0; state.duck_until = 0
+            state.avoid_dir = -((state.avoid_dir ~= 0) and state.avoid_dir or 1)
+            state.nav_ban_n = (state.nav_ban_n or 0) + 1
+            if state.nav_ban_n >= 3 then
+                state.nav_off_until = now + 8; state.nav_ban_n = 0
+                state.nav_path = nil
+                pb_log("dead", 0, "3 dead nodes in a row @(%.0f,%.0f) d=%.0f -> nav PARKED 8s, straight-line",
+                       lo.x, lo.y, gd)
+            else
+                pb_log("dead", 0, "NO PROGRESS 3s @(%.0f,%.0f) d=%.0f -> ban area %s (12s) + re-path (#%d)",
+                       lo.x, lo.y, gd, tostring(dead), state.nav_ban_n)
+            end
+        end
+    else
+        state.prog_d = nil
+    end
+
     -- self-throttled: pb_log ALWAYS pushes to the ring, so an un-gated 64Hz heartbeat
     -- would flush every useful line out of the 160-line buffer.
     if (now - (state.hb_t or 0)) >= 2.0
