@@ -1,11 +1,11 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 9.98                                   ║
+-- ║  Version: 9.99                                   ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 9.98
+-- @version 9.99
 -- @description v9.79 BF real-dominance ordering broadened to switch AA:
 --   * v9.78 only reordered the static/slow BF branch. This lobby's one-sided
 --     locks were aa=switch (idx=8 real 10R/0L still fired BF:opposite LEFT;
@@ -132,7 +132,7 @@
 --   * v9.26 drift-bump (alpha 0.55 on 5-10° diff) still handles small shifts.
 --   * v9.29 coach variants carry.
 
-local SEL01_VERSION = "9.98"
+local SEL01_VERSION = "9.99"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -518,6 +518,10 @@ g_experimental:button("Dump Pose Calibration", function() pcall(pose_cal_dump) e
 -- REAL yaw, so their per-tick deltas give a SIDE without ever having hit them.
 -- Only replaces the coin-flip inside *-Guess fallbacks; magnitude stays ours.
 -- Default OFF so the v9.94 baseline is A/B comparable.
+-- V9.99: air-duck / double-tap uncharge peek response. GLOBAL (200-local cap). Default
+-- ON — it only widens the shot on an enemy who is provably mid-peek.
+exp_dtpeek = g_experimental:switch(accent .. ui.get_icon"bolt" .. accent .. "  Double-Tap / Air-Duck Peek Response", true)
+ui_tip(exp_dtpeek, "Catches the classic jump - crouch - charge - uncharge peek. When an enemy's simulation time jumps several ticks at once while airborne or ducking, they just released a charged tickbase and are already shooting: the resolver stops extrapolating, goes full-spread multipoint, drops NL's safe-point and lets the shot through the low-confidence cancel. Never changes min-damage, and leaves a sniper's hitchance alone while Respect Manual is on.")
 anim_side_tog = g_experimental:switch(accent .. ui.get_icon"flask" .. accent .. "  [EXP] Animation-Layer Side Read", false)
 g_experimental:button("Dump Anim-Layer Polarity", function() pcall(anim_pol_dump) end)
 ui_tip(anim_side_tog,  "Reads the enemy's animation layers, which the SERVER writes against their real yaw, and votes on the per-tick change to pick a desync side without ever having hit them. Replaces the coin-flip in the guess fallbacks only. Modes show up as *-AnimGuess in the dump so you can compare them against plain *-Guess.")
@@ -2172,6 +2176,10 @@ local function apply_preset(name)
     safe_set(pose_cal_tog,   false)
     safe_set(pose_use_tog,   false)
     safe_set(anim_side_tog,  false)
+    -- V9.99: the double-tap / air-duck peek response belongs in every preset — it only
+    -- fires on an enemy who is provably mid-peek, and losing that duel is worse than the
+    -- occasional wide shot.
+    safe_set(exp_dtpeek,     true)
     if name == "aggressive" then
         safe_set(resolver.enable,    true)
         safe_set(resolver_mode,      "Aggressive")
@@ -4172,6 +4180,9 @@ local function _pick_first_shot_impl(p, s, anim, eye_yaw, max_desync, preset)
         -- V9.46 gate 5: no extrapolation across a teleport-peek — yaw_rate from before
         -- the blink does not predict where the body lands after it.
         if s.tp_peek_active then can_predict = false end
+        -- V9.99 gate 6: same reasoning for a double-tap uncharge — a yaw rate sampled
+        -- across the charged ticks says nothing about where the body ends up.
+        if s.dtpeek_active then can_predict = false end
 
         if can_predict then
             local ui_ticks = exp_predict_ticks and exp_predict_ticks:get() or 2
@@ -5050,6 +5061,52 @@ local function resolve_player(p)
     -- BEFORE any branch that picks an angle (the air-branch returns early).
     pcall(anim_side_update, s, p, now)
 
+    -- ═══ V9.99: AIR-DUCK / DOUBLE-TAP UNCHARGE PEEK ════════════════════════════
+    -- The peek that beats us most reliably: jump, crouch mid-air (fake-duck), sit on a
+    -- charged tickbase behind cover, then release it — the enemy materialises already
+    -- shooting, several ticks of simulation arriving in ONE update.
+    --
+    -- The tell is the simulation-time BURST. A normal enemy advances one tick per tick;
+    -- a charged one advances 3+ at once the moment they uncharge. Paired with airborne
+    -- or a mid-air duck, that is a peek, not lag.
+    --
+    -- This must live ABOVE the air-branch — that branch `return`s, so the v9.46 teleport
+    -- detector below it never ran for an airborne enemy at all, which is exactly the
+    -- case we care about here.
+    --
+    -- Nothing here touches the side or the EMA. It only time-boxes a 0.45s window that
+    -- (a) stops extrapolating (a yaw rate sampled across a charge tells us nothing about
+    -- where they land), (b) forces full-spread multipoint, and (c) lets the shot through
+    -- the low-confidence cancel — the same trade the counter-fire path already makes,
+    -- because refusing to fire at a materialising double-tapper just means we die first.
+    do
+        local now_rt = globals.realtime or 0
+        local st = 0
+        pcall(function() st = p.m_flSimulationTime or 0 end)
+        local ti = tick_cache.tickint or (1 / 64)
+        local burst = 0
+        if s.prev_simtime and st > s.prev_simtime and ti > 0 then
+            burst = math.floor((st - s.prev_simtime) / ti + 0.5)
+        end
+        if st ~= s.prev_simtime then s.prev_simtime = st end
+
+        local airborne = false
+        pcall(function() airborne = bit.band(tonumber(p.m_fFlags) or 1, 1) == 0 end)
+        local duck_amt = 0
+        pcall(function() duck_amt = anim.m_flDuckAmount or 0 end)
+        local air_duck = airborne and duck_amt > 0.35
+
+        if burst >= 3 and (airborne or duck_amt > 0.35) then
+            s.dtpeek_until = now_rt + 0.45
+            s.dtpeek_n = (s.dtpeek_n or 0) + 1
+            cs_log_verbose("DT-peek idx=%d burst=%d ticks air=%s duck=%.2f%s → no-extrap + full multipoint + fire-through 0.45s",
+                           p:get_index(), burst, tostring(airborne), duck_amt,
+                           air_duck and " AIR-DUCK" or "")
+        end
+        s.air_duck = air_duck
+    end
+    s.dtpeek_active = (s.dtpeek_until or 0) > (globals.realtime or 0)
+
     -- V9.74: a scheduled BF:retry (from the server-fail KEEP path) is consumed ONLY
     -- inside pick_bruteforce_angle, which the air-branch below short-circuits with an
     -- unconditional `return`. So when an enemy went airborne the same tick a retry was
@@ -5816,7 +5873,7 @@ pcall(function()
                 -- Widen to full spread when this target is already flagged stale-record.
                 pcall(function() ctx:override_multipoint(true) end)
                 -- V9.46: full spread when stale-record-flagged OR mid teleport-peek blink.
-                pcall(function() ctx:override_multipoint_scale((s and (s.backtrack_resistant or s.tp_peek_active)) and 1.0 or 0.85) end)
+                pcall(function() ctx:override_multipoint_scale((s and (s.backtrack_resistant or s.tp_peek_active or s.dtpeek_active)) and 1.0 or 0.85) end)
             end
             cs_log_verbose("close-priority idx=%d dist=%.0f reason=%s hc=%d (eff=%d) wc=%s",
                            target:get_index(), target_dist, priority_reason, priority_hc, effective_hc, tostring(wc))
@@ -5874,8 +5931,33 @@ pcall(function()
                            target:get_index(), intel.conf, intel.samples)
         end
 
+        -- V9.99: DOUBLE-TAP / AIR-DUCK PEEK RESPONSE. The enemy uncharged a tickbase and
+        -- is already shooting; a cancelled shot here is a lost duel, so this mirrors the
+        -- counter-fire trade — open the hitchance floor, drop NL's safe-point and go full
+        -- multipoint, but NEVER touch min-damage (the global v9.18 ban) and never force a
+        -- hitbox: mid-air crouch moves the head somewhere NL's own multi-hitbox handles
+        -- better than we could. On a sniper with "respect manual" on, the hitchance floor
+        -- is skipped entirely — that preset exists to keep your own NL Selection intact,
+        -- so it only gets the multipoint + safe-point relaxation.
+        local dtpeek_active = false
+        if s and s.dtpeek_active and exp_dtpeek and exp_dtpeek:get() then
+            dtpeek_active = true
+            local wc_dt = get_weapon_class()
+            local respect_sniper = (wc_dt == "sniper") and exp_respect_man and exp_respect_man:get()
+            pcall(function() ctx:override_safe_point(false) end)
+            pcall(function() ctx:override_multipoint(true) end)
+            pcall(function() ctx:override_multipoint_scale(1.0) end)
+            if not respect_sniper then
+                pcall(function() ctx:override_hitchance(20) end)
+            end
+            cs_log_verbose("DT-peek response idx=%d air_duck=%s%s → multipoint full + safepoint off%s",
+                           target:get_index(), tostring(s.air_duck),
+                           (s.dtpeek_n and (" n=" .. s.dtpeek_n) or ""),
+                           respect_sniper and " (sniper: hitchance untouched)" or " + hc floor 20")
+        end
+
         -- V3+V5+V6: CANCEL LOW-CONFIDENCE — intel-aware (known mode-match = trust)
-        if not counter_fire_active and exp_cancel_conf and exp_cancel_conf:get() and s then
+        if not counter_fire_active and not dtpeek_active and exp_cancel_conf and exp_cancel_conf:get() and s then
             local sd = resolve_stddev(s)
             local wc = get_weapon_class()
             local in_peek_window = false
@@ -6244,6 +6326,7 @@ local esp_paint_handler = function()
                 if (s.serverfail_misses or 0) > 0 then tag = tag .. string.format("⚠×%d ", s.serverfail_misses) end
                 if s.backtrack_resistant then tag = tag .. "bt " end
                 if s.tp_peek_active then tag = tag .. "pk " end
+                if s.dtpeek_active then tag = tag .. (s.air_duck and "dt^ " or "dt ") end  -- V9.99: dt^ = air-duck
                 s._espc_tag = tag
             end
             local conf = s._espc_conf or 0
@@ -6862,5 +6945,6 @@ _cs_log_color_raw("V9.74: jitter+defAA BF fix + dump visibility + air/BF:retry g
 _cs_log_color_raw("V9.95: [EXP, default OFF] ANIMATION-LAYER SIDE READ — a desync side that needs NO prior hit, closing our single biggest gap (first contact, Air, never-hit explore all coin-flip until now). NL exposes p:get_anim_state() and p:get_anim_overlay(i) natively (no FFI): the enemy's animation layers are authored SERVER-SIDE against their REAL yaw and replicated verbatim, so the fake yaw does not colour them like it colours m_flGoalFeetYaw. anim_side_update() reads layers 3/4/6/7/8 + the LEAN pose each fresh simulation tick and votes on the per-tick DELTAS in a priority cascade (MOVEMENT_MOVE weight first, then its weight_delta_rate / playback_rate, then STRAFECHANGE / WHOLE_BODY / JUMP_OR_FALL / lean, with ADJUST weight as steady-state fallback). DELTAS, never absolutes — that is exactly why our m_flPoseParameter[11] body-yaw attempt died on this build: a sign-of-change needs no calibration. Each signal's POLARITY is learned, not assumed: every confirmed hit scores the signal that was live, and one that disagrees with reality flips itself after 6+ samples. Wired ONLY into the coin-flip fallbacks (Static-Guess / Networked-Guess / Air-Guess / LBY-Snap-Guess / alt_side_pick's no-signal return), never over real evidence; magnitude stays ours. Modes log as *-AnimGuess so the dump's MODE HIT-RATES compares them directly against plain *-Guess, plus an [ANIM] polarity scoreboard line.")
 _cs_log_color_raw("V9.97: TWO-SIDE keep-no-freeze — a confirmed two-side enemy (real hits on BOTH sides, or bimodal) no longer re-fires the identical angle after a low-bt KEEP. v9.63 keeps the side here deliberately (flipping on the alternation's own noise corrupts last_hit_side/dom), but the keep ALSO scheduled a serverfail retry of the same side+magnitude — so an enemy that had already switched sides ate two shots at the side it left. err~0 with bt~0 is not netcode evidence; it only proves we shot our own belief, which on a two-side enemy says nothing about which side is live this shot. Real dump v9.95: idx=2 (L=12@38.9 R=4@47.0) kept -39.7 err=0.0 bt=0 twice, both missed, then BF:+90 HIT at +90; idx=3 (L=5 R=2) kept -36.1 err=0.3 bt=0, missed, then BF:opposite HIT at +31. Side bookkeeping unchanged — only the magnitude/side freeze is dropped so the v9.63 L/R BF sweep gets the very next shot. bt>4 untouched (genuine stale-record netcode, retry-same still correct). Same shape as the v9.92 jitter no-freeze.")
 _cs_log_color_raw("V9.98: MENU — nested sub-options + tooltips on every setting. NL's `item:create()` returns a MenuGroup attached to that item, so options that only matter while their parent is on now sit INDENTED under it instead of floating in a flat wall of ~40 switches: Baim Min-Damage + Hitbox under 'Force Baim After N', Classify Interval under 'AA-Classification', Prediction Ticks under 'Strong Prediction', HUD Position under 'Show HUD Panel', Label Colour under 'Show Enemy Labels', the whole ESP block under 'ESP Master', and Verbose + Debug under 'Console Logging'. Every setting also carries a plain-English `:tooltip()` explaining what it does and when to use it. Both APIs are pcall-guarded and fall back to the flat group / no tooltip on an older build. NOTE: nesting changes an element's stored path, so the moved switches reset to their defaults ONCE on this reload — click a preset to restore.")
+_cs_log_color_raw("V9.99: AIR-DUCK / DOUBLE-TAP UNCHARGE PEEK. The peek that beats us most reliably — jump, crouch mid-air, sit on a charged tickbase behind cover, release it and materialise already shooting. The tell is the SIMULATION-TIME BURST: a normal enemy advances one tick per tick, a charged one advances 3+ at once on release; paired with airborne or a mid-air duck that is a peek, not lag. Detection had to move ABOVE the air-branch, which returns early — so the v9.46 teleport detector below it never ran for an airborne enemy, exactly the case that matters. On detect, a 0.45s window: extrapolation off (a yaw rate sampled across the charged ticks cannot predict where the body lands), full-spread multipoint, NL safe-point relaxed, and the shot allowed through the low-confidence cancel + a hitchance floor of 20 — the same trade the counter-fire path already makes, because refusing to fire at a materialising double-tapper just loses the duel. Never touches min-damage (v9.18 ban) and never forces a hitbox: a mid-air crouch moves the head somewhere NL's own multi-hitbox handles better. On a sniper with Respect Manual on, the hitchance floor is skipped entirely. Side and EMA are untouched. ESP tags it 'dt' / 'dt^' (air-duck); toggle 'Double-Tap / Air-Duck Peek Response', on in every preset.")
 _cs_log_color_raw("Logging: " .. (log_enabled:get() and ("ON" .. (log_verbose:get() and " (verbose)" or ""))  or "OFF"))
 _cs_log_color_raw("=========================================")
