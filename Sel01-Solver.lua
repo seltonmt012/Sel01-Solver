@@ -1,11 +1,11 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 10.8                                   ║
+-- ║  Version: 10.9                                   ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 10.8
+-- @version 10.9
 -- @description v9.79 BF real-dominance ordering broadened to switch AA:
 --   * v9.78 only reordered the static/slow BF branch. This lobby's one-sided
 --     locks were aa=switch (idx=8 real 10R/0L still fired BF:opposite LEFT;
@@ -132,7 +132,7 @@
 --   * v9.26 drift-bump (alpha 0.55 on 5-10° diff) still handles small shifts.
 --   * v9.29 coach variants carry.
 
-local SEL01_VERSION = "10.8"
+local SEL01_VERSION = "10.9"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -5187,8 +5187,17 @@ local function resolve_player(p)
             sel01_boot_log_t = sel01_boot_log_t or {}
             local now_rt = globals.realtime or 0
             local _bidx = p:get_index()
-            if (now_rt - (sel01_boot_log_t[_bidx] or 0)) > 10 then
+            -- V10.9: the 10s throttle works, but it still let through byte-identical
+            -- repeats — three players re-booting in rotation filled roughly 60% of the
+            -- 200-line ring in the v10.8 dump with lines carrying no new information,
+            -- pushing the actual hits and keeps out of the buffer. A boot line is only
+            -- worth space when its CONTENT changed.
+            sel01_boot_log_last = sel01_boot_log_last or {}
+            local _bsig = string.format("%d|%.1f|%d|%.1f|%d|%d", lsl, ldl, lsr, ldr,
+                                        (lrn.dom or 0), lrn.hits or 0)
+            if (now_rt - (sel01_boot_log_t[_bidx] or 0)) > 10 and sel01_boot_log_last[_bidx] ~= _bsig then
                 sel01_boot_log_t[_bidx] = now_rt
+                sel01_boot_log_last[_bidx] = _bsig
                 cs_log_verbose("LearnedModel boot idx=%d L=%d(%.1f°) R=%d(%.1f°) dom=%d hits=%d best{j=%s s=%s sw=%s}",
                                p:get_index(), lsl, ldl, lsr, ldr, (lrn.dom or 0), lrn.hits or 0,
                                tostring(lrn.best_jitter), tostring(lrn.best_static), tostring(lrn.best_switch))
@@ -5481,7 +5490,7 @@ local function resolve_player(p)
             server_yaw = anim.m_flEyeYaw + air_guess_mag * fallback_side
         end
         s.last_eye_yaw  = anim.m_flEyeYaw
-        s.last_resolved = server_yaw
+        s.last_resolved = NormalizeAngle(server_yaw)  -- V10.9: store normalized
         -- V9.33: push to recent_resolved (mirrors the ground path) so cancel-conf's
         -- stddev gate + confidence() reflect AIR volatility, not stale ground data.
         local now_ct = tick_cache.curtime or 0
@@ -5694,7 +5703,11 @@ local function resolve_player(p)
 
     -- store for measured-desync learning in aim_ack
     s.last_eye_yaw  = eye_yaw
-    s.last_resolved = angle
+    -- V10.9: normalize before STORING. The applied yaw was already normalized, but the
+    -- stored copy was not, so snapshots and logs carried values like 232.4 / -212.2.
+    -- Every consumer computes its delta through NormalizeAngle, so this changes no maths
+    -- — it removes a latent trap for any future comparison that forgets to.
+    s.last_resolved = NormalizeAngle(angle)
 
     -- V3: recent-resolved ring buffer (last 5) for confidence detection
     local now_ct = tick_cache.curtime or 0
@@ -7264,5 +7277,6 @@ _cs_log_color_raw("V10.5: chasing 'hits fine but feels less clean' at 85.2%. (1)
 _cs_log_color_raw("V10.6: bimodality must rest on REAL hits, never on seeded data. s.bimodal was set from samples_left/right, which include passive and learned-boot entries — so an enemy we had NEVER hit could be flagged bimodal purely because its two seeded EMAs differed by more than 12 degrees. That flag makes two_side_switcher true in the ack path, handing a zero-evidence enemy both the v9.63 keep-the-side branch and the v9.97 no-freeze. Real dump v10.5: idx=2 logged 'no-freeze: two-side' three times at samples=0 sideL=0 sideR=0, off nothing but a learned boot of L=21.7 / R=25.6. Now it needs 2+ REAL hits on each side. Same principle the resolver has had to relearn three times already — v9.45 seed-only keep, v9.48 alt_side_pick real dominance, v10.5 passive dominance: seeded data never decides. Also: v10.5's DT tightening worked, windows fell from 4396 to 813 with 1279 bursts rejected as fake-lag noise.")
 _cs_log_color_raw("V10.7: stale state outliving its evidence — the other half of v10.6. That version stopped SETTING s.bimodal without real hits, but a v10.6 dump still logged 'no-freeze: two-side' on an enemy at samples=0 sideL=0 sideR=0, because nothing ever CLEARED an old flag. Two fixes: (1) reset_state now clears bimodal, serverfail_streak and the pending-keep marker, so a dormancy gap cannot carry a verdict into a fresh engagement. (2) IDENTITY CHECK — PlayerState is keyed by ENTITY INDEX and CSGO reuses a slot the moment its occupant disconnects, so per-side magnitudes, real hit counts, streaks and flags learned about one player silently describe whoever takes that slot next, and the resolver acts on them at full confidence. Dormancy reset never caught this: a takeover can happen with no gap at all. The steam id is now compared per resolve and the whole entry is wiped when it changes. This class of bug is invisible in a hit-rate number — it just makes some enemies inexplicably worse than they should be.")
 _cs_log_color_raw("V10.8: the [KEEP] metric was measuring the wrong thing — my own instrument was biased. v10.4 asked 'which side did the next LANDED hit use', and across four sessions both buckets came out ~35% same-side, which looks like damning evidence against retry-same. But on a switch or jitter enemy the next hit comes from the other side because THE ENEMY ALTERNATES, not because the keep was wrong: the metric counts the enemy moving as a failure of our decision. Two changes make it answer the actual question. (1) It now scores the very NEXT SHOT after a keep, hit or miss — that is what the keep costs or buys. (2) It splits by aa_type, and the STATIC bucket is the one that can settle it, because a static enemy's side does not move on its own. New line: '[KEEP] next shot after a keep — STATIC bt<4 2/7 (29%), bt>=4 5/8 (63%) | MOVING ...'. A weak STATIC bt<4 number is real evidence to drop the low-backtrack freeze; the MOVING buckets are context only. Four sessions of data thrown away rather than acted on — a biased measurement is worse than none, because it is persuasive.")
+_cs_log_color_raw("V10.9: the unbiased [KEEP] metric answered — and it says the OPPOSITE of the biased one. First reading: STATIC bt<4 4/5 (80%), bt>=4 5/7 (71%), MOVING bt>=4 3/4. The shot right after a keep lands ~75-80%, so holding the side and re-firing the angle is EARNING its shot; the v10.4 metric's ~35% 'same side' was the enemy alternating, not our decision failing. The low-backtrack freeze stays. Four sessions of confident-looking data would have removed working behaviour. Two diagnostics fixes shipped instead: (1) the LearnedModel boot line now also requires its CONTENT to have changed — the 10s throttle worked but still let byte-identical repeats through, and three players re-booting in rotation filled roughly 60% of the 200-line ring in the v10.8 dump, pushing the actual hits and keeps out of the buffer. (2) resolved angles are normalized before being STORED; the applied yaw always was, but the stored copy carried values like 232.4 / -212.2 into snapshots and logs. No maths changes — every consumer already goes through NormalizeAngle — it just removes a latent trap.")
 _cs_log_color_raw("Logging: " .. (log_enabled:get() and ("ON" .. (log_verbose:get() and " (verbose)" or ""))  or "OFF"))
 _cs_log_color_raw("=========================================")
