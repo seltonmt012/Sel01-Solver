@@ -1,11 +1,11 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 9.94                                   ║
+-- ║  Version: 9.95                                   ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 9.94
+-- @version 9.95
 -- @description v9.79 BF real-dominance ordering broadened to switch AA:
 --   * v9.78 only reordered the static/slow BF branch. This lobby's one-sided
 --     locks were aa=switch (idx=8 real 10R/0L still fired BF:opposite LEFT;
@@ -132,7 +132,7 @@
 --   * v9.26 drift-bump (alpha 0.55 on 5-10° diff) still handles small shifts.
 --   * v9.29 coach variants carry.
 
-local SEL01_VERSION = "9.94"
+local SEL01_VERSION = "9.95"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -470,6 +470,13 @@ pose_use_tog    = g_experimental:switch(accent .. ui.get_icon"flask"     .. acce
 onshot_flip_tog = g_experimental:switch(accent .. ui.get_icon"bolt"      .. accent .. "  On-Shot Side-Flip Learn", false)
 switch_pred_tog = g_experimental:switch(accent .. ui.get_icon"clock"     .. accent .. "  Switch-Period Side Predict", false)
 g_experimental:button("Dump Pose Calibration", function() pcall(pose_cal_dump) end)
+-- V9.95: animation-layer side read. Uses NL's native p:get_anim_state() +
+-- p:get_anim_overlay(i) — the layers are authored server-side against the enemy's
+-- REAL yaw, so their per-tick deltas give a SIDE without ever having hit them.
+-- Only replaces the coin-flip inside *-Guess fallbacks; magnitude stays ours.
+-- Default OFF so the v9.94 baseline is A/B comparable.
+anim_side_tog = g_experimental:switch(accent .. ui.get_icon"flask" .. accent .. "  [EXP] Animation-Layer Side Read", false)
+g_experimental:button("Dump Anim-Layer Polarity", function() pcall(anim_pol_dump) end)
 
 -- ─── ESP / HUD dedicated group ─────────────────────────
 local esp_master       = g_esp:switch(accent .. ui.get_icon"bullseye"  .. accent .. "  ESP Master (on/off)", true)
@@ -1238,7 +1245,10 @@ function alt_side_pick(s)
     if sr >= sl + 2 then return  1 end
     if (s.last_hit_side or 0) > 0 then return -1 end
     if (s.last_hit_side or 0) < 0 then return  1 end
-    return 0
+    -- V9.95: nothing learned at all — before returning "no signal" (caller then
+    -- coin-flips), ask the animation layers. Last resort only, so a real dominance
+    -- or a real last-hit side always wins over it.
+    return anim_side_get(s)
 end
 
 -- V9.77: STRONG learned-dominance side from REAL data only (real hits + streak),
@@ -1343,6 +1353,19 @@ local log_copy_btn = g_logging:button("📋 Copy Last Logs (for share)", functio
     local spf = sel01_session_spreadfails or 0
     if spf > 0 then
         _cs_log_raw(string.format("[SESSION] %d spread misses filtered (bullet RNG, angle accepted)", spf))
+    end
+    -- V9.95: animation-layer signal scoreboard. Compare the *-AnimGuess rows in MODE
+    -- HIT-RATES below against plain *-Guess to judge whether the layers actually help.
+    if anim_side_tog and anim_side_tog:get() then
+        local parts = {}
+        for _, k in ipairs({ "w6", "wdr6", "p6", "w7", "w8", "w4", "lean", "w3" }) do
+            local e = anim_pol[k]
+            if e and (e.ok + e.bad) > 0 then
+                parts[#parts + 1] = string.format("%s%+d %d/%d", k, e.sign, e.ok, e.ok + e.bad)
+            end
+        end
+        _cs_log_raw(string.format("[ANIM] layer-side ON — polarity: %s",
+            (#parts > 0) and table.concat(parts, "  ") or "no hits scored yet"))
     end
 
     -- mode hit-rates + AUTO-SUGGESTIONS
@@ -2697,6 +2720,11 @@ local function reset_state(s)
     s.fs_cached_angle    = nil
     s.guess_cached_side  = nil
     s.guess_cached_miss  = nil
+    -- V9.95: layer deltas from before a dormancy gap describe a different situation
+    s.anim_prev          = nil
+    s.anim_vote          = 0
+    s.anim_sig           = nil
+    s.anim_simtime       = nil
     resolver_clear_serverfail_retry(s)
 end
 
@@ -3248,6 +3276,9 @@ events.aim_ack:set(function(event)
         if pose_cal_tog and pose_cal_tog:get() and hit_side ~= 0 then
             pcall(pose_cal_record, Ent, hit_side)
         end
+        -- V9.95: score the animation-layer signal that was live when we fired, so a
+        -- signal whose sign convention is backwards on this build corrects itself.
+        if hit_side ~= 0 then pcall(anim_pol_feedback, s, hit_side) end
         -- update measured-desync EMA (global + per-side)
         if src_res ~= 0 and src_eye ~= 0 then
             local actual = math.abs(NormalizeAngle(src_res - src_eye))
@@ -3815,6 +3846,161 @@ local function extrapolate_yaw(s, current_yaw)
     return current_yaw + extra
 end
 
+-- ═══ V9.95: ANIMATION-LAYER SIDE READ ══════════════════════════════════════
+-- A side signal that needs NO prior hit on the enemy — our single biggest gap
+-- (first contact, Air, never-hit explore all coin-flip today).
+--
+-- WHY IT WORKS: the enemy's animation layers are authored SERVER-SIDE against
+-- their REAL yaw and replicated to us verbatim. The fake yaw does not colour
+-- them the same way it colours m_flGoalFeetYaw. So the per-tick CHANGE in the
+-- move/adjust/strafe layers encodes which way the body actually turned.
+--
+-- WHY DELTAS, NEVER ABSOLUTES: our m_flPoseParameter[11] body-yaw attempt died
+-- on this build because the absolute pose->degrees mapping never held (see
+-- project_pose_param_deadend). A sign-of-change needs no calibration at all.
+--
+-- NL exposes both reads natively — no FFI, no vtable offsets:
+--   p:get_anim_state()      -> eye_yaw, abs_yaw, anim_duck_amount, ...
+--   p:get_anim_overlay(i)   -> weight, playback_rate, cycle, prev_cycle,
+--                              weight_delta_rate, sequence
+-- CS:GO layer indices used here: 3 ADJUST, 4 JUMP_OR_FALL, 6 MOVEMENT_MOVE,
+-- 7 STRAFECHANGE, 8 WHOLE_BODY, 12 LEAN.
+--
+-- POLARITY IS LEARNED, NOT ASSUMED. Each signal starts with the conventional
+-- sign but every confirmed HIT scores it; a signal that disagrees with reality
+-- flips itself. That way a wrong assumption costs a handful of shots instead of
+-- silently poisoning every guess for the whole session.
+anim_pol = {
+    w6   = { sign =  1, ok = 0, bad = 0 },   -- MOVEMENT_MOVE weight    (primary)
+    wdr6 = { sign =  1, ok = 0, bad = 0 },   -- .. weight_delta_rate
+    p6   = { sign =  1, ok = 0, bad = 0 },   -- .. playback_rate
+    w4   = { sign =  1, ok = 0, bad = 0 },   -- JUMP_OR_FALL weight
+    w7   = { sign =  1, ok = 0, bad = 0 },   -- STRAFECHANGE weight
+    w8   = { sign = -1, ok = 0, bad = 0 },   -- WHOLE_BODY weight (inverted by convention)
+    w3   = { sign =  1, ok = 0, bad = 0 },   -- ADJUST weight (steady-state fallback)
+    lean = { sign =  1, ok = 0, bad = 0 },   -- LEAN pose delta
+}
+function anim_overlay_get(p, i)
+    local ok, l = pcall(function() return p:get_anim_overlay(i) end)
+    if not ok or type(l) ~= "table" and type(l) ~= "userdata" then return nil end
+    return l
+end
+function anim_state_get(p)
+    local ok, a = pcall(function() return p:get_anim_state() end)
+    if not ok or not a then return nil end
+    return a
+end
+
+-- one resolve tick of evidence. Cheap-exits when the toggle is off.
+function anim_side_update(s, p, now)
+    if not (anim_side_tog and anim_side_tog:get()) then return end
+
+    -- a choked / duplicate tick carries no new server data: its deltas are all
+    -- zero and would only dilute the vote.
+    local st = 0
+    pcall(function() st = p.m_flSimulationTime or 0 end)
+    if st == (s.anim_simtime or -1) then return end
+    s.anim_simtime = st
+
+    local a = anim_state_get(p)
+    if not a then return end
+    local eye, abs = a.eye_yaw, a.abs_yaw
+    if type(eye) ~= "number" or type(abs) ~= "number" then return end
+    -- the server's own feet-vs-eye direction; the layer deltas say whether the
+    -- body is moving WITH it or against it.
+    local base = NormalizeAngle(abs - eye) >= 0 and 1 or -1
+
+    local l3 = anim_overlay_get(p, 3)
+    local l4 = anim_overlay_get(p, 4)
+    local l6 = anim_overlay_get(p, 6)
+    local l7 = anim_overlay_get(p, 7)
+    local l8 = anim_overlay_get(p, 8)
+    if not l6 then return end
+    local lean = 0
+    pcall(function()
+        local pp = p.m_flPoseParameter
+        if pp and pp[2] then lean = (pp[2] - 0.5) * 2 end
+    end)
+
+    local cur = {
+        w3 = (l3 and l3.weight) or 0, w4 = (l4 and l4.weight) or 0,
+        w6 = l6.weight or 0, p6 = l6.playback_rate or 0,
+        wdr6 = l6.weight_delta_rate or 0,
+        w7 = (l7 and l7.weight) or 0, w8 = (l8 and l8.weight) or 0,
+        lean = lean,
+    }
+    local prev = s.anim_prev
+    s.anim_prev = cur
+    if not prev then return end            -- first sample only seeds the baseline
+
+    local d = {}
+    for k, v in pairs(cur) do d[k] = v - (prev[k] or 0) end
+
+    -- priority cascade: the strongest, least ambiguous signal wins the tick.
+    local sig, raw
+    if math.abs(d.w6) > 0.05 then          sig, raw = "w6",   (d.w6 > 0 and 1 or -1) * base
+    elseif math.abs(d.wdr6) > 0.35 then    sig, raw = "wdr6", (d.wdr6 > 0 and 1 or -1)
+    elseif math.abs(d.p6) > 0.20 then      sig, raw = "p6",   (d.p6 > 0 and 1 or -1)
+    elseif math.abs(d.w7) > 0.03 then      sig, raw = "w7",   (d.w7 > 0 and 1 or -1)
+    elseif math.abs(d.w8) > 0.03 then      sig, raw = "w8",   (d.w8 > 0 and 1 or -1)
+    elseif math.abs(d.w4) > 0.03 then      sig, raw = "w4",   base
+    elseif math.abs(d.lean) > 0.02 then    sig, raw = "lean", (d.lean > 0 and 1 or -1)
+    elseif (cur.w3 or 0) > 0.40 then       sig, raw = "w3",   base
+    end
+    if not sig then
+        -- no evidence this tick: bleed the vote toward neutral so stale evidence
+        -- cannot outlive the situation that produced it
+        s.anim_vote = (s.anim_vote or 0) * 0.90
+        return
+    end
+
+    local vote = raw * (anim_pol[sig].sign or 1)
+    s.anim_vote = (s.anim_vote or 0) * 0.60 + vote * 0.40
+    s.anim_sig  = sig
+    s.anim_side_t = now
+end
+
+-- smoothed read: -1 left / +1 right / 0 = no usable signal
+function anim_side_get(s)
+    if not (anim_side_tog and anim_side_tog:get()) then return 0 end
+    local v = s.anim_vote or 0
+    if math.abs(v) < 0.35 then return 0 end
+    local now = 0
+    pcall(function() now = globals.curtime or 0 end)
+    if (now - (s.anim_side_t or -9)) > 0.5 then return 0 end   -- evidence went stale
+    return v > 0 and 1 or -1
+end
+
+-- confirmed-hit scoring: flips a signal whose convention is backwards on this build
+function anim_pol_feedback(s, hit_side)
+    if not (anim_side_tog and anim_side_tog:get()) then return end
+    if not s.anim_sig or hit_side == 0 then return end
+    local now = 0
+    pcall(function() now = globals.curtime or 0 end)
+    if (now - (s.anim_side_t or -9)) > 1.0 then return end
+    local e = anim_pol[s.anim_sig]
+    if not e then return end
+    local pred = (s.anim_vote or 0) >= 0 and 1 or -1
+    if pred == hit_side then e.ok = e.ok + 1 else e.bad = e.bad + 1 end
+    if (e.ok + e.bad) >= 6 and e.bad > e.ok * 1.5 then
+        e.sign = -e.sign
+        e.ok, e.bad = 0, 0
+        cs_log_verbose("Anim-layer polarity FLIPPED for %s (now %+d) — convention was backwards",
+                       s.anim_sig, e.sign)
+    end
+end
+
+function anim_pol_dump()
+    cs_log("── Anim-Layer polarity (V9.95) ──")
+    local order = { "w6", "wdr6", "p6", "w7", "w8", "w4", "lean", "w3" }
+    for _, k in ipairs(order) do
+        local e = anim_pol[k]
+        local n = e.ok + e.bad
+        cs_log(string.format("  %-5s sign %+d   %d/%d correct%s",
+            k, e.sign, e.ok, n, n == 0 and "  (no hits scored yet)" or ""))
+    end
+end
+
 local function _pick_first_shot_impl(p, s, anim, eye_yaw, max_desync, preset)
     -- best-guess side for per-side effective_desync
     local guess_side = s.last_hit_side ~= 0 and s.last_hit_side
@@ -4111,6 +4297,13 @@ local function _pick_first_shot_impl(p, s, anim, eye_yaw, max_desync, preset)
                     or (s.hit_streak_right >= s.hit_streak_left and 1 or -1)
             end
             s.mode = "Static-Guess"
+            -- V9.95: with no hit-derived side of our own, the animation layers beat a
+            -- coin-flip. Never overrides real evidence (corrections / a real hit side).
+            local asd = anim_side_get(s)
+            if asd ~= 0 and math.abs(corr_diff) < 2 and s.last_hit_side == 0 then
+                side = asd
+                s.mode = "Static-AnimGuess"
+            end
             return eye_yaw + adaptive_guess_mag() * side
         elseif s.aa_type == "jitter" and s.last_hit_side ~= 0 then
             s.mode = "Jitter-Cls"
@@ -4130,7 +4323,12 @@ local function _pick_first_shot_impl(p, s, anim, eye_yaw, max_desync, preset)
         -- V6: harden — if server-yaw returned eye_yaw (no info), fallback to guess
         if math.abs(NormalizeAngle(sy - eye_yaw)) < 5 then
             local side = s.last_hit_side ~= 0 and s.last_hit_side or 1
-            s.mode = "Networked-Guess"
+            -- V9.95: `or 1` was a hard-coded RIGHT coin-flip on first contact
+            if s.last_hit_side == 0 then
+                local asd = anim_side_get(s)
+                if asd ~= 0 then side = asd; s.mode = "Networked-AnimGuess" end
+            end
+            if s.mode ~= "Networked-AnimGuess" then s.mode = "Networked-Guess" end
             return eye_yaw + adaptive_guess_mag() * side
         end
         s.mode = "Networked"
@@ -4149,6 +4347,11 @@ local function _pick_first_shot_impl(p, s, anim, eye_yaw, max_desync, preset)
         --   does not cause 3 misses in a row before BF takes over.
         if not lby or math.abs(NormalizeAngle(lby - eye_yaw)) < 5 then
             local side = s.last_hit_side ~= 0 and s.last_hit_side or 1
+            -- V9.95: same first-contact coin-flip as the other guess paths
+            if s.last_hit_side == 0 then
+                local asd = anim_side_get(s)
+                if asd ~= 0 then side = asd end
+            end
             local mag
             if s.measured_desync and s.measured_desync >= 10 then
                 mag = s.measured_desync
@@ -4275,13 +4478,22 @@ local function _pick_first_shot_impl(p, s, anim, eye_yaw, max_desync, preset)
         if s.yaw_rate and math.abs(s.yaw_rate) > 30 then
             side = s.yaw_rate > 0 and -1 or 1
         else
-            s._eng_count = (s._eng_count or 0) + 1
-            side = (s._eng_count % 2 == 0) and 1 or -1
+            -- V9.95: this is THE coin-flip branch — nothing learned, nothing spinning.
+            -- The animation layers are the only real evidence available here.
+            local asd = anim_side_get(s)
+            if asd ~= 0 then
+                side = asd
+                s._anim_guess = true
+            else
+                s._eng_count = (s._eng_count or 0) + 1
+                side = (s._eng_count % 2 == 0) and 1 or -1
+            end
         end
     end
     s.guess_cached_side = side
     s.guess_cached_miss = s.missed
-    s.mode = "Networked-Guess"
+    s.mode = s._anim_guess and "Networked-AnimGuess" or "Networked-Guess"
+    s._anim_guess = nil
     return eye_yaw + adaptive_guess_mag() * side
 end
 
@@ -4705,6 +4917,10 @@ local function resolve_player(p)
     local anim = GetAnimStateCached(p)
     if not anim or anim == false then return end
 
+    -- V9.95: feed the animation-layer side signal one tick of evidence. Must run
+    -- BEFORE any branch that picks an angle (the air-branch returns early).
+    pcall(anim_side_update, s, p, now)
+
     -- V9.74: a scheduled BF:retry (from the server-fail KEEP path) is consumed ONLY
     -- inside pick_bruteforce_angle, which the air-branch below short-circuits with an
     -- unconditional `return`. So when an enemy went airborne the same tick a retry was
@@ -4841,6 +5057,13 @@ local function resolve_player(p)
             if pose_read_tog and pose_read_tog:get() then
                 local pd = read_pose_desync(p)
                 if pd then fallback_side = (pd >= 0) and 1 or -1; s.mode = "Air-PoseGuess" end
+            end
+            -- V9.95: Air has always been the weakest mode precisely because there is no
+            -- ground evidence to fall back on. The animation layers keep updating in air.
+            local asd_air = anim_side_get(s)
+            if asd_air ~= 0 and (s.real_left or 0) + (s.real_right or 0) == 0 then
+                fallback_side = asd_air
+                s.mode = "Air-AnimGuess"
             end
             -- V9.37: HIGH air magnitude prior (was the lobby median, which undershot air)
             server_yaw = anim.m_flEyeYaw + air_guess_mag * fallback_side
@@ -6507,5 +6730,6 @@ _cs_log_color_raw("V9.62: serverfail-retry magnitude USE-SITE guard (V9.44 fixed
 _cs_log_color_raw("V9.61: sticky AA-classification for well-learned enemies — once we've HIT an enemy 4+ times (real_active), reclassifying its AA type on borderline yaw_cache noise just thrashes the resolver mode/label every few seconds (logs: idx=5 still+slow enemy flapped jitter<->static 6+ times while hitting 4/4; the slow flap dodged the 10s anti-flap window). Cold enemies stay responsive (7 evals / 2s lock); learned ones now need 14 consecutive evals + 4s lock to flip. measured_desync + side adapt independently so slower aa_type ≠ worse aim — pure smoothness. No hit-path change.")
 _cs_log_color_raw("V9.60: 'Air*' no longer pollutes best_mode storage — Air/Air-Alt/Air-CorrFlip are POSITIONAL (enemy airborne), not an AA-pattern, but were saved as best_static/best_switch when an enemy was hit mid-air. The known-player fast-path never uses them (only acts on Static/Jitter) so zero benefit, but intel.mode_match compared the grounded resolve (e.g. Static-Meas) against the stored 'Air' → false mismatch → +15 conf cancel threshold → good shots cancelled on known enemies (logs: idx=3 sw=Air, name_369738400 s=Air). Added '^Air' to the save-filter + the load migration (same V9.0 precedent that dropped BF:/*-Guess). Stats/cancel only, no aim-path change.")
 _cs_log_color_raw("V9.74: jitter+defAA BF fix + dump visibility + air/BF:retry guard (v9.73 logs). (1) pick_bruteforce_angle SKIPS the def_delta (BF:def+) cycle when aa_type=='jitter' — jitter oscillates between two yaw positions so there is NO stable defensive delta; BF:def+ kept whiffing (idx=3 0/1) while BF:opposite (full opposite hemisphere) is what catches jitter. Falls through to the standard BF oscillation; aim_ack logs the jitter+defAA+no-samples case. (2) copy-dump [P] lines now show passive_n_left/right as pL=/pR= so the v9.72 passive-side-keep is verifiable from a dump. (3) resolve_player air-branch YIELDS to a pending BF:retry — the retry is consumed only inside pick_bruteforce_angle, which the air-branch short-circuits with an unconditional return, so a KEEP-scheduled retry that coincided with the enemy going airborne was eaten (idx=14 KEEP scheduled, logged mode=Air not BF:retry). (4) IMPROVEMENT HINTS: jitter+defAA hint + 0-real/30+passive-obs hint.")
+_cs_log_color_raw("V9.95: [EXP, default OFF] ANIMATION-LAYER SIDE READ — a desync side that needs NO prior hit, closing our single biggest gap (first contact, Air, never-hit explore all coin-flip until now). NL exposes p:get_anim_state() and p:get_anim_overlay(i) natively (no FFI): the enemy's animation layers are authored SERVER-SIDE against their REAL yaw and replicated verbatim, so the fake yaw does not colour them like it colours m_flGoalFeetYaw. anim_side_update() reads layers 3/4/6/7/8 + the LEAN pose each fresh simulation tick and votes on the per-tick DELTAS in a priority cascade (MOVEMENT_MOVE weight first, then its weight_delta_rate / playback_rate, then STRAFECHANGE / WHOLE_BODY / JUMP_OR_FALL / lean, with ADJUST weight as steady-state fallback). DELTAS, never absolutes — that is exactly why our m_flPoseParameter[11] body-yaw attempt died on this build: a sign-of-change needs no calibration. Each signal's POLARITY is learned, not assumed: every confirmed hit scores the signal that was live, and one that disagrees with reality flips itself after 6+ samples. Wired ONLY into the coin-flip fallbacks (Static-Guess / Networked-Guess / Air-Guess / LBY-Snap-Guess / alt_side_pick's no-signal return), never over real evidence; magnitude stays ours. Modes log as *-AnimGuess so the dump's MODE HIT-RATES compares them directly against plain *-Guess, plus an [ANIM] polarity scoreboard line.")
 _cs_log_color_raw("Logging: " .. (log_enabled:get() and ("ON" .. (log_verbose:get() and " (verbose)" or ""))  or "OFF"))
 _cs_log_color_raw("=========================================")
