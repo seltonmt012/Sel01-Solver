@@ -1,12 +1,12 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-PlantBot                                    ║
--- ║  Version: 1.8                                      ║
+-- ║  Version: 1.9                                      ║
 -- ║  One job: walk to a marked A spot, plant the C4,   ║
 -- ║  walk to a marked safe spot, done. Auto-picks T.   ║
 -- ║  by seltonmt01                                     ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-PlantBot
--- @version 1.8
+-- @version 1.9
 -- @author seltonmt01
 -- @description Standalone plant-bot. You MARK two spots once (persisted per map):
 --   the A plant spot + the safe spot. Then it loops every round:
@@ -18,7 +18,7 @@
 --   Movement ONLY — aiming stays with the ragebot. While idle/done it does NOT touch
 --   the cmd, so your normal keys work.
 
-local SEL01_PB_VERSION = "1.8"
+local SEL01_PB_VERSION = "1.9"
 
 local ffi_ok, ffi = pcall(require, "ffi")
 
@@ -79,8 +79,13 @@ local state = {
     nav_map      = nil,
     nav_path     = nil,         -- cached A* route (list of area centers)
     nav_goal_id  = nil,
+    nav_start_id = nil,         -- area we last re-pathed FROM (churn detection)
     nav_path_t   = 0,
     nav_path_len = 0,
+    -- v1.9 diagnostics
+    logs         = {},          -- ring buffer of decision lines (Dump button)
+    goal_d_prev  = nil,         -- last heartbeat distance to the current goal
+    repaths      = 0,
 }
 
 -- button drains (module globals: closures run before `state` helpers bind)
@@ -88,6 +93,7 @@ _pb_mark_a    = false
 _pb_mark_safe = false
 _pb_clear     = false
 _pb_print_pos = false
+_pb_dumplog   = false
 
 -- ─── UI ──────────────────────────────────────────────────
 local TAB = "Sel01-PlantBot"
@@ -101,7 +107,7 @@ if not ok_ui or not g_main then
     pcall(function() g_hud  = g_main end)
 end
 
-local pb_enable, pb_radius, pb_speed, pb_jump, pb_probe, pb_safe_radius, pb_autot, pb_hud, pb_debug, pb_nav
+local pb_enable, pb_radius, pb_speed, pb_jump, pb_probe, pb_safe_radius, pb_autot, pb_hud, pb_debug, pb_nav, pb_bhop
 pcall(function()
     pb_enable      = g_main:switch("Enable PlantBot")
     pb_autot       = g_main:switch("Auto-Join T (pick T every round)")
@@ -112,17 +118,47 @@ pcall(function()
     pb_radius      = g_main:slider("A-Site Plant Radius", 60, 600, 120)
     pb_safe_radius = g_main:slider("Safe-Spot Arrive Radius", 80, 600, 180)
     pb_speed       = g_main:slider("Move Speed", 50, 450, 450)
-    pb_jump        = g_main:switch("Allow Jumping (OFF = never jumps)")
+    pb_jump        = g_main:switch("Allow Jumping (obstacles / step-up / wedge escape)")
+    pb_bhop        = g_main:switch("Bunny-Hop on long open stretches (faster travel)")
     pb_probe       = g_main:slider("Obstacle Probe (units)", 20, 140, 55)
     pb_hud         = g_hud:switch("HUD Overlay")
-    pb_debug       = g_hud:switch("Debug Info")
+    pb_debug       = g_hud:switch("Debug Info (live phase/stuck/nav console logs)")
     g_hud:button("Print My Pos (console)", function() _pb_print_pos = true end)
+    g_hud:button("Dump PlantBot Logs (console)", function() _pb_dumplog = true end)
     g_hud:label(" ")
     pb_vc_label    = g_hud:label("\aAAAAAAFFv" .. SEL01_PB_VERSION .. " — checking for updates...")
 end)
 pcall(function() if pb_nav then pb_nav:set(true) end end)
+pcall(function() if pb_bhop then pb_bhop:set(true) end end)
 pcall(function() if pb_hud then pb_hud:set(true) end end)
 pcall(function() if pb_autot then pb_autot:set(true) end end)
+
+-- ─── v1.9 diagnostic log ring (WalkBot pattern) ──────────
+-- Every interesting decision (phase change, nav re-path, avoid / boxed / wedge, plant
+-- arming) lands in `state.logs` ALWAYS, so a run can be diagnosed after the fact via the
+-- Dump button. When "Debug Info" is on it ALSO prints live to the game console, throttled
+-- per message KEY so one recurring event can't spam. Writer multi-fallback client.log ->
+-- print (Solver pattern). `pb_debug` is a local declared above; this closure reads it at
+-- call time so the ref stays live.
+local PB_LOG_CAP = 160
+local pb_log_last = {}
+local function pb_console(text)
+    if not pcall(function() client.log(text) end) then pcall(function() print(text) end) end
+end
+local function pb_log(key, throttle, fmt, ...)
+    local now = 0; pcall(function() now = globals.realtime end)
+    local msg = (select('#', ...) > 0) and string.format(fmt, ...) or fmt
+    local r = state.logs
+    r[#r + 1] = string.format("[%7.1f] %s", now, msg)
+    if #r > PB_LOG_CAP then table.remove(r, 1) end
+    local dbg = false
+    pcall(function() dbg = pb_debug and pb_debug:get() end)
+    if not dbg then return end
+    if (now - (pb_log_last[key] or -1e9)) >= (throttle or 0) then
+        pb_log_last[key] = now
+        pb_console(string.format("[PB %5.1f] %s", now, msg))
+    end
+end
 
 -- ─── NL helpers (pcall-guarded for version variance) ─────
 local function get_lp_any()
@@ -142,6 +178,13 @@ local function get_origin(ent)
     local o = nil
     pcall(function() o = ent.m_vecOrigin end)
     return o
+end
+-- horizontal speed — logs only (the stuck detector still works off origin delta)
+local function hspeed_of(ent)
+    local v = nil
+    pcall(function() v = ent.m_vecVelocity end)
+    if not v then return 0 end
+    return v_len2d(v)
 end
 
 local function exec(c)
@@ -237,6 +280,8 @@ local function run_reset(why)
     state.escape_until     = 0
     state.jump_until       = 0
     state.diag             = why or "reset"
+    state.goal_d_prev      = nil
+    pb_log("reset", 0, "RUN RESET (%s)", why or "reset")
 end
 
 -- event.userid -> is that me? (object identity, JAG0YAW pattern — never read enemy props)
@@ -481,29 +526,6 @@ local function nav_astar(startId, goalId)
     return nil
 end
 
--- yaw toward a world goal, ROUTED through the mesh when loaded, else straight line.
--- Path cached per goal-area, re-pathed every 1.5s, nodes popped as we reach them.
-local function nav_dir(lo, gx, gy, now)
-    local use = false
-    pcall(function() use = pb_nav and pb_nav:get() end)
-    if not (use and nav.ok) then state.nav_path_len = 0; return dir_yaw_xy(lo.x, lo.y, gx, gy) end
-    local ga = nav_nearest(gx, gy)
-    local sa = nav_nearest(lo.x, lo.y)
-    if not (ga and sa) then state.nav_path_len = 0; return dir_yaw_xy(lo.x, lo.y, gx, gy) end
-    if state.nav_goal_id ~= ga.id or not state.nav_path or (now - (state.nav_path_t or 0)) > 1.5 then
-        state.nav_path = nav_astar(sa.id, ga.id)
-        state.nav_goal_id = ga.id
-        state.nav_path_t = now
-    end
-    local path = state.nav_path
-    if not path or #path == 0 then state.nav_path_len = 0; return dir_yaw_xy(lo.x, lo.y, gx, gy) end
-    while #path > 1 and dist2d(lo.x, lo.y, path[1].x, path[1].y) < 130 do table.remove(path, 1) end
-    state.nav_path_len = #path
-    -- last node reached: aim at the real mark, not the area center
-    if #path <= 1 then return dir_yaw_xy(lo.x, lo.y, gx, gy) end
-    return dir_yaw_xy(lo.x, lo.y, path[1].x, path[1].y)
-end
-
 -- ─── obstacle traces (world geometry only — NOT players) ─
 local PROBE_MASK = 0x400B
 local function probe_clear(lp, lo, yaw_deg, dist)
@@ -518,6 +540,80 @@ local function probe_clear(lp, lo, yaw_deg, dist)
     end
     return ray(40) and ray(62)
 end
+
+-- yaw toward a world goal, ROUTED through the mesh when loaded, else straight line.
+-- Path cached per goal-area, re-pathed every 1.5s, nodes popped as we reach them.
+local function nav_dir(lp, lo, gx, gy, now)
+    local use = false
+    pcall(function() use = pb_nav and pb_nav:get() end)
+    if not (use and nav.ok) then
+        state.nav_path_len = 0
+        pb_log("nav_off", 5.0, "nav unused (%s) -> straight line", use and tostring(nav.err) or "toggle off")
+        return dir_yaw_xy(lo.x, lo.y, gx, gy)
+    end
+    local ga = nav_nearest(gx, gy)
+    local sa = nav_nearest(lo.x, lo.y)
+    if not (ga and sa) then
+        state.nav_path_len = 0
+        pb_log("nav_area", 3.0, "no nav area under %s -> straight line", (not sa) and "ME" or "GOAL")
+        return dir_yaw_xy(lo.x, lo.y, gx, gy)
+    end
+    if state.nav_goal_id ~= ga.id or not state.nav_path or (now - (state.nav_path_t or 0)) > 1.5 then
+        local prev_start = state.nav_start_id
+        state.nav_path = nav_astar(sa.id, ga.id)
+        state.nav_goal_id = ga.id
+        state.nav_start_id = sa.id
+        state.nav_path_t = now
+        state.repaths = (state.repaths or 0) + 1
+        if not state.nav_path then
+            pb_log("nav_fail", 1.0, "A* FAILED start=%d goal=%d (areas=%d) -> straight line", sa.id, ga.id, nav.count or 0)
+        else
+            pb_log("nav_path", 1.0, "re-path #%d start=%d%s goal=%d -> %d nodes (first %.0f,%.0f d=%.0f)",
+                   state.repaths, sa.id, (prev_start and prev_start ~= sa.id) and "*" or "",
+                   ga.id, #state.nav_path, state.nav_path[1].x, state.nav_path[1].y,
+                   dist2d(lo.x, lo.y, state.nav_path[1].x, state.nav_path[1].y))
+        end
+    end
+    local path = state.nav_path
+    if not path or #path == 0 then state.nav_path_len = 0; return dir_yaw_xy(lo.x, lo.y, gx, gy) end
+
+    -- v1.9 ANTI-PING-PONG. A* always returns the START area as node 1, and an area center
+    -- can sit 200-300u BEHIND us when we stand at that area's edge (exactly the situation
+    -- just before a corner). The old code only popped nodes closer than 130u, so the bot
+    -- turned around, walked back to its own area center, popped it, and walked forward
+    -- again — the "goes back right before the corner, then forward again" oscillation,
+    -- restarted by every 1.5s re-path. Three pop rules now run after every (re)path:
+    --   1. the node of the area we are STANDING in is never a target
+    --   2. a leading node that a LATER node beats on straight-line distance is a detour
+    --      backwards -> skip it, but only when that later node is trace-clear (never cut
+    --      a corner through a wall)
+    --   3. the usual reach-radius pop
+    local popped, skipped = 0, 0
+    if #path > 1 and path[1].id == sa.id then table.remove(path, 1); popped = popped + 1 end
+    while #path > 1 do
+        local d1 = dist2d(lo.x, lo.y, path[1].x, path[1].y)
+        local d2 = dist2d(lo.x, lo.y, path[2].x, path[2].y)
+        if d1 < 130 then
+            table.remove(path, 1); popped = popped + 1
+        elseif d2 <= d1 and probe_clear(lp, lo, dir_yaw_xy(lo.x, lo.y, path[2].x, path[2].y), math.min(d2, 200)) then
+            table.remove(path, 1); popped = popped + 1; skipped = skipped + 1
+        else
+            break
+        end
+    end
+    if popped > 0 then
+        pb_log("nav_pop", 0.5, "advanced +%d node(s)%s, %d left, next (%.0f,%.0f) d=%.0f",
+               popped, (skipped > 0) and string.format(" [%d backward skipped]", skipped) or "",
+               #path, path[1].x, path[1].y, dist2d(lo.x, lo.y, path[1].x, path[1].y))
+    end
+    state.nav_path_len = #path
+    state.nav_node_d = dist2d(lo.x, lo.y, path[1].x, path[1].y)
+    -- last node reached: aim at the real mark, not the area center
+    if #path <= 1 then return dir_yaw_xy(lo.x, lo.y, gx, gy) end
+    return dir_yaw_xy(lo.x, lo.y, path[1].x, path[1].y)
+end
+
+-- (probe_clear + PROBE_MASK live above nav_dir — the path-pop rules trace too)
 local function crouch_passable(lp, lo, yaw_deg, dist)
     local rad = math.rad(yaw_deg)
     local dx, dy = math.cos(rad) * dist, math.sin(rad) * dist
@@ -549,16 +645,21 @@ local function compute_move(lp, lo, want_yaw, now, base_act)
     state.block = "clear"
     state.pass_crouch = false
 
+    local hspd = hspeed_of(lp)
+
     if state.escape_yaw and now < (state.escape_until or 0) then
         state.activity = "STUCK"; state.block = "escape"; state.diag = base_act .. " hard-escape"
         if aj then state.jump_until = math.max(state.jump_until or 0, now + 0.10) end
         state.last_origin = lo
+        pb_log("escape", 0.5, "%s ESCAPE-HOLD yaw=%.0f (%.2fs left) hspd=%.0f @(%.0f,%.0f)",
+               base_act, state.escape_yaw, (state.escape_until or 0) - now, hspd, lo.x, lo.y)
         return state.escape_yaw
     end
 
     local look = math.min(probe * 2.2, 130)
     if not probe_clear(lp, lo, want_yaw, look) and crouch_passable(lp, lo, want_yaw, probe) then
         state.pass_crouch = true; state.block = "duck-pass"; state.diag = base_act .. " duck-pass"
+        pb_log("duck", 1.0, "%s duck-pass (low gap ahead, want=%.0f)", base_act, want_yaw)
     elseif not probe_clear(lp, lo, want_yaw, look) then
         state.block = "front"
         local found = false
@@ -573,14 +674,19 @@ local function compute_move(lp, lo, want_yaw, now, base_act)
         end
         if found then
             state.diag = string.format("%s avoid %+.0f", base_act, move_yaw - want_yaw)
+            pb_log("avoid", 0.5, "%s AVOID %+.0f (want=%.0f -> go=%.0f) hspd=%.0f @(%.0f,%.0f)",
+                   base_act, move_yaw - want_yaw, want_yaw, move_yaw, hspd, lo.x, lo.y)
         else
             state.block = "boxed"
             if aj and can_step_up(lp, lo, want_yaw, probe) then
                 state.jump_until = now + 0.12; state.activity = "JUMP"; state.block = "step"
                 state.diag = base_act .. " step-up jump"
+                pb_log("step", 0.5, "%s step-up jump (want=%.0f)", base_act, want_yaw)
             else
                 move_yaw = want_yaw + (state.avoid_dir ~= 0 and state.avoid_dir or 1) * 110
                 state.diag = base_act .. " boxed WALL -> turn"
+                pb_log("boxed", 0.5, "%s BOXED — no clear fan angle, want=%.0f -> turn %.0f hspd=%.0f @(%.0f,%.0f)",
+                       base_act, want_yaw, move_yaw, hspd, lo.x, lo.y)
             end
         end
     end
@@ -600,13 +706,22 @@ local function compute_move(lp, lo, want_yaw, now, base_act)
                 state.diag = base_act .. " WEDGED -> hard escape"
                 move_yaw = state.escape_yaw
                 state.stuck_since = now
+                state.wedges = (state.wedges or 0) + 1
+                pb_log("wedge", 0, "%s WEDGED #%d @(%.0f,%.0f) hspd=%.0f moved=%.1f want=%.0f block=%s -> escape %.0f for 0.8s",
+                       base_act, state.wedges, lo.x, lo.y, hspd, moved, want_yaw, state.block, state.escape_yaw)
             elseif dur > 0.35 then
                 state.activity = "STUCK"
                 move_yaw = want_yaw + (state.avoid_dir ~= 0 and state.avoid_dir or 1) * 90
                 if aj and can_step_up(lp, lo, want_yaw, probe) then state.jump_until = now + 0.15 end
                 state.diag = base_act .. " stuck -> strafe"
+                pb_log("strafe", 0.5, "%s stuck %.1fs (moved=%.1f hspd=%.0f) -> strafe %+.0f",
+                       base_act, dur, moved, hspd, move_yaw - want_yaw)
             end
         else
+            if state.stuck_since ~= 0 then
+                pb_log("unstuck", 0.5, "%s recovered after %.1fs (moved=%.1f hspd=%.0f)",
+                       base_act, now - state.stuck_since, moved, hspd)
+            end
             state.stuck_since = 0
         end
     end
@@ -614,12 +729,60 @@ local function compute_move(lp, lo, want_yaw, now, base_act)
     return move_yaw
 end
 
-local function apply_move(cmd, move_yaw, now)
+-- v1.9 bunny-hop on long OPEN stretches. The bot walks the same route every round, so
+-- once the lane ahead is provably clear it is free speed. Hard-gated off anywhere it
+-- would cost time or break something: near a corner (short forward probe / a shoulder
+-- blocked / the heading just changed), while avoiding / ducking / wedged, near the next
+-- nav node, and near the goal — a jump on the plant spot cancels the arm.
+local function bhop_ok(lp, lo, yaw, now, goal_d)
+    local on = false
+    pcall(function() on = pb_bhop and pb_bhop:get() end)
+    if not on then return false end
+    if state.block ~= "clear" or state.activity == "STUCK" or state.pass_crouch then return false end
+    if state.escape_yaw and now < (state.escape_until or 0) then return false end
+    if (goal_d or 0) < 400 then return false end
+    if state.nav_path_len > 0 and (state.nav_node_d or 1e9) < 220 then return false end
+    -- a fresh turn means we are ON a corner right now -> walk it, hop after it
+    if math.abs(norm_ang(yaw - (state.bhop_yaw or yaw))) > 25 then
+        state.bhop_yaw = yaw; state.bhop_steady_t = now; return false
+    end
+    state.bhop_yaw = yaw
+    if (now - (state.bhop_steady_t or 0)) < 0.4 then return false end
+    -- geometry: long lane ahead AND both shoulders open = not a corner / doorway
+    if not probe_clear(lp, lo, yaw, 360) then return false end
+    if not (probe_clear(lp, lo, yaw + 35, 170) and probe_clear(lp, lo, yaw - 35, 170)) then return false end
+    return true
+end
+
+local function apply_move(cmd, move_yaw, now, lp, lo, goal_d)
     local spd = 450
     pcall(function() spd = pb_speed:get() end)
     pcall(function() cmd.move_yaw = move_yaw; cmd.forwardmove = spd; cmd.sidemove = 0 end)
     if state.pass_crouch then pcall(function() cmd.in_duck = true end) end
     if now < (state.jump_until or 0) then pcall(function() cmd.in_jump = true end) end
+
+    if lp and lo and bhop_ok(lp, lo, move_yaw, now, goal_d) then
+        local onground = true
+        pcall(function() onground = bit.band(tonumber(lp.m_fFlags) or 1, 1) == 1 end)
+        if onground then
+            pcall(function() cmd.in_jump = true end)
+        else
+            -- light auto air-strafe keeps the speed we gained
+            if (now - (state.bhop_flip_t or 0)) > 0.25 then
+                state.bhop_side = -(state.bhop_side or 1); state.bhop_flip_t = now
+            end
+            pcall(function() cmd.sidemove = (state.bhop_side or 1) * 450 end)
+        end
+        if not state.bhop_on then
+            pb_log("bhop", 0, "BHOP start (%s) yaw=%.0f goal_d=%.0f node_d=%.0f",
+                   state.phase, move_yaw, goal_d or -1, state.nav_node_d or -1)
+        end
+        state.bhop_on = true
+        state.activity = "BHOP"
+    elseif state.bhop_on then
+        pb_log("bhop", 0, "BHOP stop (block=%s act=%s goal_d=%.0f)", state.block, state.activity, goal_d or -1)
+        state.bhop_on = false
+    end
 end
 
 -- ─── main tick ───────────────────────────────────────────
@@ -640,6 +803,17 @@ local function plantbot_tick(cmd)
 
     local now = 0
     pcall(function() now = globals.realtime end)
+
+    -- drain the Dump-Logs button (works whether the bot is enabled or not)
+    if _pb_dumplog then
+        _pb_dumplog = false
+        pb_console(string.format("──── PlantBot v%s log dump (%d lines) ────", SEL01_PB_VERSION, #state.logs))
+        pb_console(string.format("map=%s phase=%s act=%s nav=%s aborts=%d wedges=%d repaths=%d",
+            tostring(state.mapname), tostring(state.phase), tostring(state.activity),
+            tostring(nav.err), state.aborts or 0, state.wedges or 0, state.repaths or 0))
+        for _, ln in ipairs(state.logs) do pb_console(ln) end
+        pb_console("──── end PlantBot log dump ────")
+    end
 
     -- drain mark buttons (use current origin, alive or not — you stand on the spot)
     if _pb_mark_a or _pb_mark_safe or _pb_print_pos or _pb_clear then
@@ -733,13 +907,18 @@ local function plantbot_tick(cmd)
     if respawned or state.phase == "IDLE" or state.phase == "NEED_MARK" then
         run_reset("run start")
         state.phase = "GOTO_A"; state.diag = "run start"
+        pb_log("phase", 0, "PHASE -> GOTO_A (%s) @(%.0f,%.0f) A=(%.0f,%.0f) d=%.0f nav=%s",
+               respawned and "respawn" or "enabled", lo.x, lo.y, state.a_spot.x, state.a_spot.y,
+               dist2d(lo.x, lo.y, state.a_spot.x, state.a_spot.y), tostring(nav.err))
     end
 
     local has_c4 = active_is_c4(lp)
 
     -- bomb already down (we planted it, or a teammate did) -> nothing left but retreat
     if (state.phase == "GOTO_A" or state.phase == "PLANT") and bomb_is_planted() then
+        pb_log("phase", 0, "PHASE %s -> RETREAT (bomb is down)", state.phase)
         state.phase = "RETREAT"; state.diag = "bomb is down -> retreat"
+        state.goal_d_prev = nil
     end
 
     -- ── state machine ──
@@ -754,11 +933,13 @@ local function plantbot_tick(cmd)
             state.arm_started = false; state.rearm_until = 0; state.reposition_until = 0
             state.attack_since = 0
             state.diag = "at A -> planting"
+            state.goal_d_prev = nil
+            pb_log("phase", 0, "PHASE GOTO_A -> PLANT (d=%.0f <= r=%.0f) @(%.0f,%.0f)", d, radius, lo.x, lo.y)
             return
         end
         -- routed through the nav mesh when loaded (real map path), else straight line
-        local mv = compute_move(lp, lo, nav_dir(lo, a.x, a.y, now), now, "GOTO_A")
-        apply_move(cmd, mv, now)
+        local mv = compute_move(lp, lo, nav_dir(lp, lo, a.x, a.y, now), now, "GOTO_A")
+        apply_move(cmd, mv, now, lp, lo, d)
 
     elseif state.phase == "PLANT" then
         local arming_live = c4_arming(lp)               -- netvar / CC4 entity (may be blind)
@@ -774,10 +955,13 @@ local function plantbot_tick(cmd)
             if dist2d(lo.x, lo.y, a.x, a.y) > 25 then
                 equip_c4(now)
                 local mv = compute_move(lp, lo, dir_yaw_xy(lo.x, lo.y, a.x, a.y), now, "PLANT")
-                apply_move(cmd, mv, now)
+                apply_move(cmd, mv, now)            -- never bhop here (jump = plant cancelled)
                 state.plant_hold_t = now            -- hold clock only starts once we are there
                 state.attack_since = 0              -- not pressing while we walk
                 state.diag = (zone == false) and "not in bomb zone -> closing" or "re-positioning on mark"
+                pb_log("plant_move", 1.0, "PLANT %s (d=%.0f zone=%s)",
+                       (zone == false) and "not in bomb zone -> closing" or "re-positioning",
+                       dist2d(lo.x, lo.y, a.x, a.y), tostring(zone))
                 state.had_c4 = has_c4
                 return
             end
@@ -805,9 +989,15 @@ local function plantbot_tick(cmd)
         state.diag = arming and string.format("arming %.1fs — holding", held)
                     or (release and "re-press +attack" or "holding +attack")
 
+        pb_log("plant", 1.0, "PLANT hold %.1fs arming=%s(live=%s read_ok=%s) zone=%s c4=%s press=%.1fs",
+               held, tostring(arming), tostring(arming_live), tostring(state.arm_read_ok),
+               tostring(zone), tostring(has_c4), pressing_for)
+
         if bomb_is_planted() then
             -- the ONLY real completion signal (server side), v1.3 guessed from the weapon
             state.phase = "RETREAT"; state.diag = "planted -> retreat"
+            state.goal_d_prev = nil
+            pb_log("phase", 0, "PHASE PLANT -> RETREAT (BOMB PLANTED after %.1fs, %d aborts)", held, state.aborts or 0)
         elseif state.arm_read_ok and state.arm_started and (not arming_live) and held > 1.0 then
             -- arming stopped without a plant = aborted (bumped / damaged) -> release + re-press
             state.arm_started = false
@@ -816,6 +1006,7 @@ local function plantbot_tick(cmd)
             state.attack_since = 0
             state.aborts = (state.aborts or 0) + 1
             state.diag = "plant aborted -> re-arm"
+            pb_log("abort", 0, "PLANT ABORTED #%d after %.1fs -> release 0.2s + re-press", state.aborts, held)
         elseif (not state.arm_started) and held > 3.0 then
             -- +attack does nothing here (wrong spot / bomb not out) -> step back onto the mark
             state.reposition_until = now + 0.6
@@ -823,8 +1014,12 @@ local function plantbot_tick(cmd)
             state.plant_hold_t = now
             state.attack_since = 0          -- unlock slot5 for the recovery re-equip
             state.diag = "plant not starting -> re-position"
+            pb_log("noplant", 0, "+attack did nothing for 3.0s (zone=%s c4=%s) -> re-position on mark",
+                   tostring(zone), tostring(has_c4))
         elseif state.arm_started and held > 12.0 then
             state.phase = "RETREAT"; state.diag = "plant timeout -> retreat"
+            state.goal_d_prev = nil
+            pb_log("phase", 0, "PHASE PLANT -> RETREAT (TIMEOUT 12s, plant never completed)")
         end
 
     elseif state.phase == "RETREAT" then
@@ -834,14 +1029,38 @@ local function plantbot_tick(cmd)
         pcall(function() arrive = pb_safe_radius:get() end)
         if d <= arrive then
             state.phase = "DONE"; state.activity = "DONE"; state.diag = "at safe spot -> done"
+            pb_log("phase", 0, "PHASE RETREAT -> DONE (d=%.0f <= %.0f)", d, arrive)
             return
         end
-        local mv = compute_move(lp, lo, nav_dir(lo, s.x, s.y, now), now, "RETREAT")
-        apply_move(cmd, mv, now)
+        local mv = compute_move(lp, lo, nav_dir(lp, lo, s.x, s.y, now), now, "RETREAT")
+        apply_move(cmd, mv, now, lp, lo, d)
 
     else -- DONE: release control (your WASD works), wait for next respawn to loop
         state.activity = "DONE"; state.diag = "done — waiting next round"
         -- no cmd writes
+    end
+
+    -- 2s heartbeat: the goal distance TREND is what exposes a route problem — a rising
+    -- distance while travelling means the bot is walking away from the goal (nav node
+    -- behind us / avoid fan turned us around), which is the log line to look for.
+    -- self-throttled: pb_log ALWAYS pushes to the ring, so an un-gated 64Hz heartbeat
+    -- would flush every useful line out of the 160-line buffer.
+    if (now - (state.hb_t or 0)) >= 2.0
+       and (state.phase == "GOTO_A" or state.phase == "RETREAT" or state.phase == "PLANT") then
+        state.hb_t = now
+        local g = (state.phase == "RETREAT") and state.safe_spot or state.a_spot
+        local gd = g and dist2d(lo.x, lo.y, g.x, g.y) or -1
+        local trend = "?"
+        if state.goal_d_prev then
+            local dd = gd - state.goal_d_prev
+            trend = (dd < -8) and string.format("closing %.0f", -dd)
+                 or ((dd > 8) and string.format("AWAY +%.0f", dd) or "flat")
+        end
+        pb_log("hb", 0, "%s d=%.0f (%s) @(%.0f,%.0f) hspd=%.0f act=%s block=%s nav=%d node_d=%.0f bhop=%s | %s",
+               state.phase, gd, trend, lo.x, lo.y, hspeed_of(lp), tostring(state.activity),
+               tostring(state.block), state.nav_path_len or 0, state.nav_node_d or -1,
+               tostring(state.bhop_on or false), tostring(state.diag))
+        state.goal_d_prev = gd
     end
 
     state.had_c4 = has_c4
@@ -1045,4 +1264,7 @@ log("1) Stand on the A plant spot -> click 'Mark A Spot'.")
 log("2) Stand on the safe spot    -> click 'Mark Safe Spot'.")
 log("3) Enable PlantBot. It walks A -> plants -> retreats -> loops each round.")
 log("Auto-Join T keeps you on Terrorists through the team-select menu.")
+log("v1.9: 'Debug Info' = live console logs, 'Dump PlantBot Logs' = last 160 decisions.")
+log("v1.9: nav anti-ping-pong (no more walking back right before a corner) + bhop on")
+log("      long open stretches (never near a corner, never on the plant spot).")
 log("==============================================")
