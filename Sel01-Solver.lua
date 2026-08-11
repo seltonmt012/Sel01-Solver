@@ -1,11 +1,11 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 10.2                                   ║
+-- ║  Version: 10.3                                   ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 10.2
+-- @version 10.3
 -- @description v9.79 BF real-dominance ordering broadened to switch AA:
 --   * v9.78 only reordered the static/slow BF branch. This lobby's one-sided
 --     locks were aa=switch (idx=8 real 10R/0L still fired BF:opposite LEFT;
@@ -132,7 +132,7 @@
 --   * v9.26 drift-bump (alpha 0.55 on 5-10° diff) still handles small shifts.
 --   * v9.29 coach variants carry.
 
-local SEL01_VERSION = "10.2"
+local SEL01_VERSION = "10.3"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -362,6 +362,28 @@ TAB_ADV  = ui.get_icon"feather"    .. "  Advanced"
 -- of resolver fine-control and diagnostics, and the log buttons are what you reach for
 -- mid-match. Perf-Info moved along with it (it is read-only diagnostics too).
 TAB_LOG  = ui.get_icon"terminal"   .. "  Logs / Debug"
+-- V9.98 UI helpers — MUST be defined before the first UI element uses them. They are
+-- globals (main chunk is at the 200-local cap) and globals resolve at CALL time, so a
+-- call placed above the definition hits nil at load: v10.2 shipped exactly that bug
+-- ("attempt to call global 'ui_sub'" at the clantag block, which sits above the old
+-- definition site). Definitions now lead the whole UI section.
+--
+-- ui_sub: `item:create()` returns a MenuGroup attached to that item, so dependent
+-- options render indented underneath it. pcall-guarded with a fallback to the flat
+-- group so an older build still builds a working menu.
+function ui_sub(parent, fallback)
+    local ok, g = pcall(function() return parent:create() end)
+    if ok and g then return g end
+    return fallback
+end
+-- ui_tip: tooltips are set as their OWN statement, never chained into an assignment —
+-- `:tooltip(v)` is a setter and does not reliably return the item, so
+-- `local x = g:switch(...):tooltip("..")` would leave x nil.
+function ui_tip(item, text)
+    if not item then return end
+    pcall(function() item:tooltip(text) end)
+end
+
 local g_main         = ui.create(TAB_MAIN, "Main",              1)
 local g_smart        = ui.create(TAB_MAIN, "Smart Strategy",    2)
 local g_resolver     = ui.create(TAB_CORE, "Resolver Core",     1)
@@ -433,21 +455,6 @@ local dormancy_reset_t = g_aggro:slider(accent .. ui.get_icon"clock"    .. accen
 -- V9.98 UI: `item:create()` returns a MenuGroup attached to that item, so options that
 -- only matter while their parent is active can live INDENTED underneath it instead of
 -- floating in a flat wall of switches. Confirmed API (docs + gingersense / unskilled),
--- but pcall-guarded with a fallback to the flat group so an older build still builds a
--- working menu. GLOBAL (main chunk is at the 200-local cap).
-function ui_sub(parent, fallback)
-    local ok, g = pcall(function() return parent:create() end)
-    if ok and g then return g end
-    return fallback
-end
--- V9.98: tooltips are set as their OWN statement, never chained into the assignment —
--- `:tooltip(v)` is a setter and does not reliably return the item, so
--- `local x = g:switch(...):tooltip("..")` would leave x nil.
-function ui_tip(item, text)
-    if not item then return end
-    pcall(function() item:tooltip(text) end)
-end
-
 -- Brute-force / Baim
 local force_baim_n     = g_baim:slider(accent .. ui.get_icon"skull"     .. accent .. "  Force Baim After N misses", 0, 5, 2)
 g_baim_sub             = ui_sub(force_baim_n, g_baim)
@@ -1300,6 +1307,25 @@ end
 -- one hit Still-Meas/measured paths take over. Never clamps UP (can't worsen a shot).
 -- (logs v9.85/v9.86: idx=7 Still-Server samples=0 fired 48.4° into a ~15-20° desync
 --  enemy → miss; the enemy's true desync sat well under the lobby median across 2 dumps.)
+-- V10.3: the OTHER end of the sample range from clamp_firstcontact_serveryaw. Once an
+-- enemy is well-measured on a side, RebuildServerYaw disagreeing with that measurement by
+-- a wide margin is reconstruct noise, not a genuine change — a real magnitude change
+-- moves the EMA, which the v9.39 alpha ramp already tracks within 2-3 hits.
+-- Real dump v10.1: idx=2 had FOURTEEN consecutive right-side hits at 17.9° (per-side EMA
+-- 17.6, conf 100) and Static-Server-Recall fired 31.9° — err 14.3, missed. Keep the
+-- server's SIDE (it is usually right) and take the learned magnitude.
+-- Returns the yaw plus true when it clamped, so the caller can label the mode honestly.
+function clamp_learned_serveryaw(s, eye_yaw, sy)
+    local delta = NormalizeAngle(sy - eye_yaw)
+    local side  = delta >= 0 and 1 or -1
+    local reals = (side > 0) and (s.real_right or 0) or (s.real_left or 0)
+    if reals < 4 then return sy, false end
+    local meas = (side > 0) and (s.measured_right or 0) or (s.measured_left or 0)
+    if meas <= 5 then return sy, false end
+    if math.abs(math.abs(delta) - meas) <= 10 then return sy, false end
+    return eye_yaw + meas * side, true
+end
+
 function clamp_firstcontact_serveryaw(eye_yaw, sy, samples)
     if (samples or 0) > 0 then return sy end
     local delta = NormalizeAngle(sy - eye_yaw)
@@ -3306,11 +3332,20 @@ events.aim_ack:set(function(event)
                 -- Keep the side bookkeeping (v9.63 stands), just refuse to freeze the
                 -- angle, so the v9.63 L/R BF sweep gets the very next shot. bt > 4 is left
                 -- alone — that is real stale-record netcode where retry-same is correct.
+                -- V10.3: a BF sweep probe is not a belief the server rejected. BF fires
+                -- deliberate off-angles (+-90, +-58, +-35) to find the enemy; when one
+                -- misses, the sweep must CONTINUE, not freeze on the probe and re-fire it.
+                -- An angle error this far from any measurement can only be a probe.
+                -- Real dump v10.1: idx=6 "KEEP side=-1 our=-90.0 meas=29.8 err=60.2" —
+                -- the -90 probe got pinned as the retry angle and the sweep stalled for
+                -- four straight misses.
                 local keep_no_freeze, nf_why = false, nil
                 if s.aa_type == "jitter" and bt <= 8 then
                     keep_no_freeze, nf_why = true, "jitter"
                 elseif two_side_switcher and bt <= 4 then
                     keep_no_freeze, nf_why = true, "two-side"
+                elseif ack_measured > 5 and ack_angle_err > 25 then
+                    keep_no_freeze, nf_why = true, "bf-probe"
                 end
                 if keep_no_freeze then
                     resolver_clear_serverfail_retry(s)
@@ -4450,8 +4485,10 @@ local function _pick_first_shot_impl(p, s, anim, eye_yaw, max_desync, preset)
                     s.mode = "Static-ServerBoost"
                     return eye_yaw + s.measured_desync * side
                 end
-                s.mode = "Static-Server"
-                return sy
+                -- V10.3: a well-measured side outranks a wide server-yaw reconstruct
+                local sy2, clamped = clamp_learned_serveryaw(s, eye_yaw, sy)
+                s.mode = clamped and "Static-ServerClamp" or "Static-Server"
+                return sy2
             end
             -- 3) FALLBACK: server-yaw == eye_yaw (no info). Guess ±29° via streak/default
             -- V7.8: correction-aware — if last shots correction-missed on one side, flip
@@ -4498,8 +4535,10 @@ local function _pick_first_shot_impl(p, s, anim, eye_yaw, max_desync, preset)
             if s.mode ~= "Networked-AnimGuess" then s.mode = "Networked-Guess" end
             return eye_yaw + adaptive_guess_mag() * side
         end
-        s.mode = "Networked"
-        return sy
+        -- V10.3: same learned-magnitude guard as the Static-Server path
+        local sy2, clamped = clamp_learned_serveryaw(s, eye_yaw, sy)
+        s.mode = clamped and "Networked-Clamp" or "Networked"
+        return sy2
     end
 
     -- LBY snap: enemy just shot → server yaw locked to eye
@@ -4620,8 +4659,10 @@ local function _pick_first_shot_impl(p, s, anim, eye_yaw, max_desync, preset)
             s.mode = "Networked-Boost"
             return eye_yaw + mag * side
         end
-        s.mode = "Networked"
-        return sy
+        -- V10.3: same learned-magnitude guard as the Static-Server path
+        local sy2, clamped = clamp_learned_serveryaw(s, eye_yaw, sy)
+        s.mode = clamped and "Networked-Clamp" or "Networked"
+        return sy2
     end
     -- server-yaw too weak: use measured if available (V9.24: 2→1), else streak/default
     if (s.desync_samples or 0) >= 1 and (s.measured_desync or 0) > 5 then
@@ -7107,5 +7148,6 @@ _cs_log_color_raw("V10.0: DT-peek reaches the ground + gets measured. (1) v9.99 
 _cs_log_color_raw("V10.1: DT-peek detector fixed by its own telemetry. The v10.0 [DT] line read 'bursts>=2: 10062, max 7249 ticks, windows opened: 3331' — a 7249-tick burst is 113 seconds, i.e. an enemy going dormant behind a wall and coming back, not a tickbase charge. Two failures: (1) the simulation-time delta was measured across dormancy gaps, so any re-appearance looked like an uncharge; (2) a burst on its own is the background noise of an HvH lobby, because everyone fake-lags — 3331 open windows meant cancel-low-confidence was effectively disabled for most of the session. Now the burst only counts between CONSECUTIVE observations (last seen <= 0.25s ago) and is discarded above 20 ticks, and it only opens the window together with a peek CONTEXT: they fired at us within the last second, or they are inside close range. A plain grounded burst additionally needs >= 8 ticks. The ordinary fake-lagger goes back to cancel-low-confidence, which is what earns the hit rate. New dump line counts both rejection reasons so the next session shows whether the gate now sits in the right place.")
 _cs_log_color_raw("V10.2: ANIMATED CLANTAG in the Solver, on by default. The Sel01-Config one animated badly because CSGO TRIMS leading and trailing whitespace off a clan tag — space-padded frames collapse to the same string, so the motion only ever showed on one side and old text never wiped. Fixes: the Marquee scrolls over a visible dashed TRACK instead of spaces so every frame is genuinely different, and a frame is only written when it DIFFERS from the last one written (the game throttles tag updates; spamming identical values is what produces a half-updated tag). Typewriter types itself in and deletes itself again for a clean in/out. Driven from events.net_update_end — common.set_clan_tag is a game-state write and is silently ignored on the render thread — with an alias walk that NEVER falls back to createmove, which the Solver already owns. The tag is cleared once on toggle-off and on shutdown. Turn the Sel01-Config clantag OFF: two scripts writing the tag will fight over it.")
 _cs_log_color_raw("Clantag: " .. ((sel01_ct_tog and sel01_ct_tog:get()) and ("ON via " .. tostring(sel01_ct_hook or "no hook found")) or "OFF"))
+_cs_log_color_raw("V10.3: (0) LOAD FIX — v10.2 called ui_sub() from the clantag block that sits ABOVE the definition. Globals resolve at CALL time, so the whole script died at load with 'attempt to call global ui_sub (a nil value)'. Both UI helpers now lead the UI section. (1) A well-measured side outranks a wide server-yaw reconstruct. clamp_learned_serveryaw is the other end of the sample range from the v9.86 first-contact clamp: with 4+ real hits on the shot side and a per-side EMA, a RebuildServerYaw magnitude more than 10 degrees off that EMA is reconstruct noise — a genuine change moves the EMA, which the v9.39 alpha ramp tracks in 2-3 hits. Keeps the server's SIDE, takes the learned magnitude, labels the mode *-Clamp so the dump shows how often it bites. Real dump v10.1: idx=2 had FOURTEEN straight right-side hits at 17.9 (EMA 17.6, conf 100) and Static-Server-Recall fired 31.9 — err 14.3, missed. (2) A BF sweep probe is not a rejected belief. BF fires deliberate off-angles to find the enemy; when one misses the sweep must CONTINUE, not pin the probe as the retry angle. An angle error above 25 degrees from a real measurement can only be a probe, so it now takes the keep-no-freeze path. Real dump: idx=6 'KEEP side=-1 our=-90.0 meas=29.8 err=60.2' stalled the sweep for four straight misses.")
 _cs_log_color_raw("Logging: " .. (log_enabled:get() and ("ON" .. (log_verbose:get() and " (verbose)" or ""))  or "OFF"))
 _cs_log_color_raw("=========================================")
