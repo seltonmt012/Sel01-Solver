@@ -1,11 +1,11 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 9.99                                   ║
+-- ║  Version: 10.0                                   ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 9.99
+-- @version 10.0
 -- @description v9.79 BF real-dominance ordering broadened to switch AA:
 --   * v9.78 only reordered the static/slow BF branch. This lobby's one-sided
 --     locks were aa=switch (idx=8 real 10R/0L still fired BF:opposite LEFT;
@@ -132,7 +132,7 @@
 --   * v9.26 drift-bump (alpha 0.55 on 5-10° diff) still handles small shifts.
 --   * v9.29 coach variants carry.
 
-local SEL01_VERSION = "9.99"
+local SEL01_VERSION = "10.0"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -1250,6 +1250,10 @@ end
 -- previously used hardcoded ±29°. User's lobby modal desync was ~37-38° so 29°
 -- under-shot constantly. Adaptive median catches up automatically.
 sel01_session_desyncs = { cap = 20, head = 0, count = 0, dirty = true }
+-- V10.0: simulation-time burst telemetry for the double-tap / peek detector. Counts
+-- every burst we observe regardless of whether the gate fired, so the dump can answer
+-- "does this signal even exist in my lobby" before anyone tunes a threshold.
+sel01_dt_stats = { seen = 0, max = 0, b3 = 0, b6 = 0, air = 0, duck = 0, fired = 0 }
 function session_push_desync(v)
     if not v or v < 5 or v > 58 then return end  -- V9.33: cap at 58 (max desync) so >58 reads can't bias the median high
     local r = sel01_session_desyncs
@@ -1431,6 +1435,15 @@ local log_copy_btn = g_logging:button("📋 Copy Last Logs (for share)", functio
     local spf = sel01_session_spreadfails or 0
     if spf > 0 then
         _cs_log_raw(string.format("[SESSION] %d spread misses filtered (bullet RNG, angle accepted)", spf))
+    end
+    -- V10.0: double-tap / peek detector telemetry. `bursts` counts every simulation-time
+    -- jump of 2+ ticks we saw; `fired` counts how many opened a response window. If
+    -- bursts is 0 the signal does not exist on this build and the feature is dead weight;
+    -- if bursts is high but fired is 0 the threshold is simply too strict.
+    do
+        local d = sel01_dt_stats
+        _cs_log_raw(string.format("[DT] bursts>=2: %d (>=3: %d, >=6: %d, max %d ticks) | airborne %d, ducking %d | windows opened: %d",
+            d.seen, d.b3, d.b6, d.max, d.air, d.duck, d.fired))
     end
     -- V9.95: animation-layer signal scoreboard. Compare the *-AnimGuess rows in MODE
     -- HIT-RATES below against plain *-Guess to judge whether the layers actually help.
@@ -1652,6 +1665,7 @@ local log_reset_session = g_logging:button("🗑 Reset Session Stats (in-memory)
     for k in pairs(session_stats.history) do session_stats.history[k] = nil end
     sel01_session_serverfails = 0  -- V9.50: clear server-fail filter counter
     sel01_session_spreadfails = 0  -- V9.72: clear spread-RNG filter counter
+    sel01_dt_stats = { seen = 0, max = 0, b3 = 0, b6 = 0, air = 0, duck = 0, fired = 0 }  -- V10.0
     -- mode stats
     for k in pairs(mode_stats) do mode_stats[k] = nil end
     -- steam memory
@@ -5096,12 +5110,33 @@ local function resolve_player(p)
         pcall(function() duck_amt = anim.m_flDuckAmount or 0 end)
         local air_duck = airborne and duck_amt > 0.35
 
-        if burst >= 3 and (airborne or duck_amt > 0.35) then
+        -- V10.0 instrumentation: record what the burst signal actually looks like in a
+        -- real lobby, INDEPENDENT of whether the gate fires. Tuning a threshold blind is
+        -- how you end up with a feature that never triggers and nobody notices.
+        if burst >= 2 then
+            local d = sel01_dt_stats
+            d.seen = d.seen + 1
+            if burst > d.max then d.max = burst end
+            if burst >= 3 then d.b3 = d.b3 + 1 end
+            if burst >= 6 then d.b6 = d.b6 + 1 end
+            if airborne then d.air = d.air + 1 end
+            if duck_amt > 0.35 then d.duck = d.duck + 1 end
+        end
+
+        -- V10.0: grounded double-taps count too. v9.99 required airborne-or-ducking, but
+        -- plenty of uncharge peeks happen flat-footed around a corner. The catch is that
+        -- steady fake-lag ALSO arrives in bursts, so a grounded peek needs a clearly
+        -- bigger jump (>=6 ticks, i.e. beyond a normal fake-lag limit of 5) before we
+        -- treat it as a charge release. Airborne / mid-air-duck keeps the looser bar,
+        -- since jumping while fake-lagging that hard is already the peek we care about.
+        local fire = (burst >= 3 and (airborne or duck_amt > 0.35)) or (burst >= 6)
+        if fire then
             s.dtpeek_until = now_rt + 0.45
             s.dtpeek_n = (s.dtpeek_n or 0) + 1
+            sel01_dt_stats.fired = sel01_dt_stats.fired + 1
             cs_log_verbose("DT-peek idx=%d burst=%d ticks air=%s duck=%.2f%s → no-extrap + full multipoint + fire-through 0.45s",
                            p:get_index(), burst, tostring(airborne), duck_amt,
-                           air_duck and " AIR-DUCK" or "")
+                           air_duck and " AIR-DUCK" or (airborne and " AIR" or " GROUND"))
         end
         s.air_duck = air_duck
     end
@@ -6946,5 +6981,6 @@ _cs_log_color_raw("V9.95: [EXP, default OFF] ANIMATION-LAYER SIDE READ — a des
 _cs_log_color_raw("V9.97: TWO-SIDE keep-no-freeze — a confirmed two-side enemy (real hits on BOTH sides, or bimodal) no longer re-fires the identical angle after a low-bt KEEP. v9.63 keeps the side here deliberately (flipping on the alternation's own noise corrupts last_hit_side/dom), but the keep ALSO scheduled a serverfail retry of the same side+magnitude — so an enemy that had already switched sides ate two shots at the side it left. err~0 with bt~0 is not netcode evidence; it only proves we shot our own belief, which on a two-side enemy says nothing about which side is live this shot. Real dump v9.95: idx=2 (L=12@38.9 R=4@47.0) kept -39.7 err=0.0 bt=0 twice, both missed, then BF:+90 HIT at +90; idx=3 (L=5 R=2) kept -36.1 err=0.3 bt=0, missed, then BF:opposite HIT at +31. Side bookkeeping unchanged — only the magnitude/side freeze is dropped so the v9.63 L/R BF sweep gets the very next shot. bt>4 untouched (genuine stale-record netcode, retry-same still correct). Same shape as the v9.92 jitter no-freeze.")
 _cs_log_color_raw("V9.98: MENU — nested sub-options + tooltips on every setting. NL's `item:create()` returns a MenuGroup attached to that item, so options that only matter while their parent is on now sit INDENTED under it instead of floating in a flat wall of ~40 switches: Baim Min-Damage + Hitbox under 'Force Baim After N', Classify Interval under 'AA-Classification', Prediction Ticks under 'Strong Prediction', HUD Position under 'Show HUD Panel', Label Colour under 'Show Enemy Labels', the whole ESP block under 'ESP Master', and Verbose + Debug under 'Console Logging'. Every setting also carries a plain-English `:tooltip()` explaining what it does and when to use it. Both APIs are pcall-guarded and fall back to the flat group / no tooltip on an older build. NOTE: nesting changes an element's stored path, so the moved switches reset to their defaults ONCE on this reload — click a preset to restore.")
 _cs_log_color_raw("V9.99: AIR-DUCK / DOUBLE-TAP UNCHARGE PEEK. The peek that beats us most reliably — jump, crouch mid-air, sit on a charged tickbase behind cover, release it and materialise already shooting. The tell is the SIMULATION-TIME BURST: a normal enemy advances one tick per tick, a charged one advances 3+ at once on release; paired with airborne or a mid-air duck that is a peek, not lag. Detection had to move ABOVE the air-branch, which returns early — so the v9.46 teleport detector below it never ran for an airborne enemy, exactly the case that matters. On detect, a 0.45s window: extrapolation off (a yaw rate sampled across the charged ticks cannot predict where the body lands), full-spread multipoint, NL safe-point relaxed, and the shot allowed through the low-confidence cancel + a hitchance floor of 20 — the same trade the counter-fire path already makes, because refusing to fire at a materialising double-tapper just loses the duel. Never touches min-damage (v9.18 ban) and never forces a hitbox: a mid-air crouch moves the head somewhere NL's own multi-hitbox handles better. On a sniper with Respect Manual on, the hitchance floor is skipped entirely. Side and EMA are untouched. ESP tags it 'dt' / 'dt^' (air-duck); toggle 'Double-Tap / Air-Duck Peek Response', on in every preset.")
+_cs_log_color_raw("V10.0: DT-peek reaches the ground + gets measured. (1) v9.99 required airborne-or-ducking, but plenty of uncharge peeks happen flat-footed around a corner. Grounded now counts too, at a higher bar (burst >= 6 ticks, beyond a normal fake-lag limit of 5) because steady fake-lag also arrives in bursts and would otherwise trigger constantly; airborne / mid-air-duck keeps the looser >= 3. (2) New [DT] telemetry line in the copy-dump counting EVERY simulation-time burst of 2+ ticks regardless of whether the gate fired, with the max burst length and how many windows opened. Tuning a threshold blind is how a feature ends up never firing with nobody noticing — if bursts is 0 the signal does not exist on this build; if bursts is high but windows is 0 the bar is simply too strict. Counter clears with Reset Session Stats.")
 _cs_log_color_raw("Logging: " .. (log_enabled:get() and ("ON" .. (log_verbose:get() and " (verbose)" or ""))  or "OFF"))
 _cs_log_color_raw("=========================================")
