@@ -1,11 +1,11 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 9.95                                   ║
+-- ║  Version: 9.96                                   ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 9.95
+-- @version 9.96
 -- @description v9.79 BF real-dominance ordering broadened to switch AA:
 --   * v9.78 only reordered the static/slow BF branch. This lobby's one-sided
 --     locks were aa=switch (idx=8 real 10R/0L still fired BF:opposite LEFT;
@@ -132,7 +132,7 @@
 --   * v9.26 drift-bump (alpha 0.55 on 5-10° diff) still handles small shifts.
 --   * v9.29 coach variants carry.
 
-local SEL01_VERSION = "9.95"
+local SEL01_VERSION = "9.96"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -2086,6 +2086,18 @@ end
 local function apply_preset(name)
     -- v9.59: every preset forces HUD position Top-Left (user default)
     safe_set(esp_hud_pos, "Top-Left")
+    -- V9.96: settings every preset agrees on, so a preset click always lands on a
+    -- deterministic state instead of inheriting whatever the last one left behind.
+    --  * pose_read / pose_cal — the ABSOLUTE pose-param body_yaw read is a proven
+    --    dead-end on this build (no index sustained separation over ~25 real hits).
+    --    Calibration also costs a 24-index loop on every hit. v9.95's animation-layer
+    --    DELTAS replace the whole idea; keep both pose paths off everywhere.
+    --  * anim_side_tog — the v9.95 layer read stays OFF in every preset so v9.94
+    --    remains the A/B baseline. Flip it on yourself to test.
+    safe_set(pose_read_tog,  false)
+    safe_set(pose_cal_tog,   false)
+    safe_set(pose_use_tog,   false)
+    safe_set(anim_side_tog,  false)
     if name == "aggressive" then
         safe_set(resolver.enable,    true)
         safe_set(resolver_mode,      "Aggressive")
@@ -2116,12 +2128,17 @@ local function apply_preset(name)
         safe_set(strat_predict,      "Normal")
         safe_set(strat_visual,       "Standard (ESP + HUD)")
         safe_set(strat_hitbox,       "Head Bias")
-        -- V9.67: new levers — pose-collect (data, harmless), on-shot flip (aggressive)
-        safe_set(pose_cal_tog,       true)
-        safe_set(pose_use_tog,       false)
         safe_set(onshot_flip_tog,    true)
         safe_set(switch_pred_tog,    false)
-        _cs_log_color_raw("✓ PRESET: AGGRESSIVE — Head-bias (hc=40 mindmg=25), chest-baim after 3 misses, all V4 ON")
+        -- V9.96: v9.31 + v9.51 toggles no preset ever touched (they kept whatever the
+        -- previous preset left). Aggressive wants the head-pref on locked targets and
+        -- the shot feedback on the model, but not the wedge lines (visual noise while
+        -- pushing).
+        safe_set(exp_lock_headpref,  true)
+        safe_set(esp_flash,          true)
+        safe_set(esp_enh,            true)
+        safe_set(esp_wedge,          false)
+        _cs_log_color_raw("✓ PRESET: AGGRESSIVE — multipoint head-bias, chest-baim after 3 misses, prediction ON")
     elseif name == "defensive" then
         safe_set(resolver.enable,    true)
         safe_set(resolver_mode,      "Defensive")
@@ -2152,11 +2169,15 @@ local function apply_preset(name)
         safe_set(strat_predict,      "Off")
         safe_set(strat_visual,       "None")
         safe_set(strat_hitbox,       "NL Default (manual)")
-        -- V9.67: defensive = aim stays safe — collect pose data only, no aim-changing levers
-        safe_set(pose_cal_tog,       true)
-        safe_set(pose_use_tog,       false)
         safe_set(onshot_flip_tog,    false)
         safe_set(switch_pred_tog,    false)
+        -- V9.96: defensive means NL's safe-point choice is respected, so the locked-target
+        -- head-pref (which relaxes exactly that) must be off. Visual Style "None" now also
+        -- clears the on-model extras instead of leaving them from the previous preset.
+        safe_set(exp_lock_headpref,  false)
+        safe_set(esp_flash,          false)
+        safe_set(esp_enh,            false)
+        safe_set(esp_wedge,          false)
         _cs_log_color_raw("✓ PRESET: DEFENSIVE — Safe-point, baim after 4 misses, cancel-low-confidence ON")
     elseif name == "dynamic" then
         safe_set(resolver.enable,    true)
@@ -2189,10 +2210,12 @@ local function apply_preset(name)
         safe_set(strat_visual,       "Standard (ESP + HUD)")
         safe_set(strat_hitbox,       "Head + Chest Fallback")
         -- V9.67: dynamic = the experimental showcase — all learning levers incl switch-period
-        safe_set(pose_cal_tog,       true)
-        safe_set(pose_use_tog,       false)
         safe_set(onshot_flip_tog,    true)
         safe_set(switch_pred_tog,    true)
+        safe_set(exp_lock_headpref,  true)
+        safe_set(esp_flash,          true)
+        safe_set(esp_enh,            true)
+        safe_set(esp_wedge,          false)
         _cs_log_color_raw("✓ PRESET: DYNAMIC — Adaptive, balanced, auto-per-weapon, all V4 ON")
     elseif name == "nospread" then
         safe_set(resolver.enable,    true)
@@ -2224,11 +2247,14 @@ local function apply_preset(name)
         safe_set(strat_predict,      "Aggressive")
         safe_set(strat_visual,       "Minimal (HUD only)")
         safe_set(strat_hitbox,       "NoSpread (head always)")
-        -- V9.67: nospread is aggressive — collect pose + on-shot flip (side still matters)
-        safe_set(pose_cal_tog,       true)
-        safe_set(pose_use_tog,       false)
+        -- V9.67: nospread is aggressive — on-shot flip (side still matters)
         safe_set(onshot_flip_tog,    true)
         safe_set(switch_pred_tog,    false)
+        -- V9.96: "Minimal (HUD only)" means exactly that — no on-model extras
+        safe_set(exp_lock_headpref,  true)
+        safe_set(esp_flash,          false)
+        safe_set(esp_enh,            false)
+        safe_set(esp_wedge,          false)
         _cs_log_color_raw("✓ PRESET: NOSPREAD — head-only forever, hitchance 1%%, min-dmg 100, multipoint OFF")
         _cs_log_color_raw("  Aktiviere im NL-menu: Hitchance 1, Min-Damage 100, Disable safepoint")
     elseif name == "ssg_pro" then
@@ -2264,6 +2290,13 @@ local function apply_preset(name)
         safe_set(strat_predict,      "Aggressive")
         safe_set(strat_visual,       "Full (everything)")
         safe_set(strat_hitbox,       "NL Default (manual)")
+        -- V9.96 ORDER FIX: strat_hitbox's callback sets exp_multipoint=false for
+        -- "NL Default (manual)", which silently undid the exp_multipoint=true above —
+        -- the exact opposite of this preset's stated intent (keep NL's Head+Chest+Stomach
+        -- multipoint alive). Re-assert AFTER the combo so intent wins regardless of
+        -- whether NL fires callbacks on a programmatic :set.
+        safe_set(exp_multipoint,     true)
+        safe_set(exp_respect_man,    true)
         safe_set(esp_master,         true)
         safe_set(esp_show_labels,    true)
         safe_set(esp_show_confbar,   true)
@@ -2271,19 +2304,16 @@ local function apply_preset(name)
         safe_set(esp_wedge,          true)   -- V9.51: SSG-Pro shows the full on-model visual suite
         safe_set(esp_flash,          true)
         safe_set(esp_enh,            true)
-        -- V9.67 BALANCED: pose-collect ON (auto-calibrates the body_yaw index in the
-        -- background — pure observation, zero aim change) + on-shot flip ON (well-gated,
-        -- common in HvH). pose-USE + switch-period stay OFF until validated — flip them
-        -- on yourself after 'Dump Pose Calibration' shows a clean >85% index. The toggle-
-        -- less v9.65 perf, v9.66 prediction rework + v9.67 speed-bucket are already active.
-        safe_set(pose_cal_tog,       true)
-        safe_set(pose_use_tog,       false)
+        safe_set(exp_lock_headpref,  true)   -- V9.96: precision preset wants heads on locked targets
+        -- V9.96: on-shot flip stays ON (well-gated, common in HvH). Pose calibration is
+        -- retired (dead end on this build) — the v9.95 animation-layer side read replaces
+        -- it and is opt-in via the Experimental tab.
         safe_set(onshot_flip_tog,    true)
         safe_set(switch_pred_tog,    false)
-        _cs_log_color_raw("✓ PRESET: SSG-PRO v9.67 — hc=72/dmg=100/multi-hitbox + HEAD-FOCUS, now with v9.65-67")
-        _cs_log_color_raw("  Preserves: hitchance, min-damage, safe-points 'Prefer'")
-        _cs_log_color_raw("  v9.65-67: cached server-yaw (perf), unified+decel-damped prediction, speed-bucket desync")
-        _cs_log_color_raw("  Levers: pose-collect ON (auto-calibrate) + on-shot flip ON; pose-USE/switch OFF until you validate the dump")
+        _cs_log_color_raw("✓ PRESET: SSG-PRO v9.96 — respects your NL Selection: hc=72 / dmg=100 / Head+Chest+Stomach / safe-points 'Prefer'")
+        _cs_log_color_raw("  Resolver: per-side desync, extrapolation (3 ticks), cancel-low-confidence, steam-memory, full ESP suite")
+        _cs_log_color_raw("  Baim only after 5 misses (dmg 80, chest). Locked-target head-pref ON.")
+        _cs_log_color_raw("  Levers: on-shot flip ON. Pose paths retired; [EXP] Animation-Layer Side Read is opt-in.")
     elseif name == "head_only" then
         -- V7.9: Headshot-Only on normal (spread) servers — head every shot, reasonable hc
         safe_set(resolver.enable,    true)
@@ -2315,9 +2345,11 @@ local function apply_preset(name)
         safe_set(strat_visual,       "Standard (ESP + HUD)")
         safe_set(strat_hitbox,       "Head Only")
         safe_set(exp_head_strict,    true)        -- V7.9: every shot head
-        -- V9.67: precision spread — collect pose + on-shot flip (correct side = the head)
-        safe_set(pose_cal_tog,       true)
-        safe_set(pose_use_tog,       false)
+        -- V9.67: precision spread — on-shot flip (correct side = the head)
+        safe_set(exp_lock_headpref,  true)
+        safe_set(esp_flash,          true)
+        safe_set(esp_enh,            true)
+        safe_set(esp_wedge,          false)
         safe_set(onshot_flip_tog,    true)
         safe_set(switch_pred_tog,    false)
         _cs_log_color_raw("✓ PRESET: HEADSHOT-ONLY (Spread) — head-only forever, normal server spread, no baim, no chest fallback")
