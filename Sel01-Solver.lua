@@ -1,11 +1,11 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 11.0                                   ║
+-- ║  Version: 11.1                                   ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 11.0
+-- @version 11.1
 -- @description v9.79 BF real-dominance ordering broadened to switch AA:
 --   * v9.78 only reordered the static/slow BF branch. This lobby's one-sided
 --     locks were aa=switch (idx=8 real 10R/0L still fired BF:opposite LEFT;
@@ -132,7 +132,7 @@
 --   * v9.26 drift-bump (alpha 0.55 on 5-10° diff) still handles small shifts.
 --   * v9.29 coach variants carry.
 
-local SEL01_VERSION = "11.0"
+local SEL01_VERSION = "11.1"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -1464,14 +1464,17 @@ local log_copy_btn = g_logging:button("📋 Copy Last Logs (for share)", functio
     -- rejected (stale backtrack record) are excluded from the hit-rate above — show how
     -- many were filtered so the headline % is trustworthy + the netcode load is visible.
     local sf = sel01_session_serverfails or 0
-    if sf > 0 then
-        local raw_shots = sess_total + sf
-        _cs_log_raw(string.format("[SESSION] %d server-fails filtered (correct angle, server rejected) — raw %d/%d = %.1f%% before filter",
-            sf, session_stats.total_hits or 0, raw_shots,
-            raw_shots > 0 and (session_stats.total_hits / raw_shots * 100) or 0))
-    end
     -- V9.72: same readout for spread-RNG misses (filtered from stats since v9.72)
     local spf = sel01_session_spreadfails or 0
+    if sf > 0 then
+        -- V11.1 (B5): the raw count skipped the spread-filtered shots, so "raw 33/50" was
+        -- short by however many the v9.72 filter had removed. Both filters hide shots from
+        -- the headline number; the raw line has to add both back or it isn't raw.
+        local raw_shots = sess_total + sf + spf
+        _cs_log_raw(string.format("[SESSION] %d server-fails filtered (correct angle, server rejected) — raw %d/%d = %.1f%% before filter (incl. %d spread)",
+            sf, session_stats.total_hits or 0, raw_shots,
+            raw_shots > 0 and (session_stats.total_hits / raw_shots * 100) or 0, spf))
+    end
     if spf > 0 then
         _cs_log_raw(string.format("[SESSION] %d spread misses filtered (bullet RNG, angle accepted)", spf))
     end
@@ -1586,11 +1589,16 @@ local log_copy_btn = g_logging:button("📋 Copy Last Logs (for share)", functio
             local e = r.e
             local total = (e.hits or 0) + (e.miss or 0)
             local rate = total > 0 and ((e.hits or 0) / total * 100) or 0
-            _cs_log_raw(string.format("[L] %s hits=%d/%d (%.0f%%) L=%d/%.1f° R=%d/%.1f° dom=%d best{j=%s s=%s sw=%s}",
+            -- V11.1 (B1): passive counts printed separately. When they lived in sl/sr the
+            -- only tell was "side count > hit count", which is exactly how the corruption
+            -- went unnoticed for eleven versions.
+            _cs_log_raw(string.format("[L] %s hits=%d/%d (%.0f%%) L=%d/%.1f° R=%d/%.1f° pass{L=%d/%.1f° R=%d/%.1f°} dom=%d best{j=%s s=%s sw=%s}",
                 tostring(r.sid):sub(1, 30),
                 e.hits or 0, total, rate,
                 e.sl or 0, e.dl or 0,
                 e.sr or 0, e.dr or 0,
+                e.psl or 0, e.pdl or 0,
+                e.psr or 0, e.pdr or 0,
                 e.dom or 0,
                 tostring(e.best_jitter or ""), tostring(e.best_static or ""), tostring(e.best_switch or "")))
         end
@@ -1962,6 +1970,11 @@ local function build_json_dump()
             samples_right = e.sr or 0,
             desync_left   = e.dl or 0,
             desync_right  = e.dr or 0,
+            -- V11.1 (B1): passive observations, kept apart from the hit-derived counts
+            passive_n_left    = e.psl or 0,
+            passive_n_right   = e.psr or 0,
+            passive_left      = e.pdl or 0,
+            passive_right     = e.pdr or 0,
             dominant_side = e.dom or 0,
             last_seen     = e.last_seen or 0,
             best_static   = e.best_static or "",
@@ -2057,6 +2070,38 @@ local function learning_load()
                 learning_dirty = true
                 _cs_log_color_raw("✓ Migrated " .. migrated .. " corrupted best-mode fields")
             end
+            -- V11.1 (B1) MIGRATION: existing files hold passive seeds inside sl/sr, which
+            -- boot reads back as real hits. They are separable: learning_update_hit bumps
+            -- exactly one side per hit, so sl + sr can never legitimately exceed hits. Any
+            -- excess is passive — move it into psl/psr, keeping the magnitude, and clamp
+            -- the real counts to what the hit total can actually support. An entry with
+            -- hits == 0 is passive in its entirety.
+            local mig_p = 0
+            for _, e in pairs(LearnedModel) do
+                local sl, sr, h = tonumber(e.sl) or 0, tonumber(e.sr) or 0, tonumber(e.hits) or 0
+                if (sl + sr) > h then
+                    if (e.psl or 0) == 0 and sl > 0 then e.psl = sl; e.pdl = e.dl or 0 end
+                    if (e.psr or 0) == 0 and sr > 0 then e.psr = sr; e.pdr = e.dr or 0 end
+                    if h <= 0 then
+                        e.sl, e.sr = 0, 0
+                        e.dl, e.dr = 0, 0
+                        e.dom = 0
+                    else
+                        -- keep the side split, scale it down to the provable hit count
+                        local f = h / (sl + sr)
+                        e.sl = math.floor(sl * f)
+                        e.sr = math.floor(sr * f)
+                        if e.sl <= 0 then e.dl = 0 end
+                        if e.sr <= 0 then e.dr = 0 end
+                    end
+                    mig_p = mig_p + 1
+                end
+            end
+            if mig_p > 0 then
+                learning_dirty = true
+                _cs_log_color_raw("✓ V11.1: split passive seeds out of the hit counts on " ..
+                                  mig_p .. " players (side count exceeded hit count)")
+            end
             local count = 0
             for _ in pairs(LearnedModel) do count = count + 1 end
             _cs_log_color_raw("✓ Loaded persistent model: " .. count .. " players")
@@ -2119,22 +2164,42 @@ local function learning_update_hit(p, side, desync_value, aa_type, mode)
     local sid = _learning_sid(p); if not sid then return end
     local e = LearnedModel[sid]
     if not e then
-        e = {dl=0, dr=0, sl=0, sr=0, dom=0, hits=0, miss=0, last_seen=0,
-             best_jitter="", best_static="", best_switch="", best_spinner=""}
+        e = {dl=0, dr=0, sl=0, sr=0, pdl=0, pdr=0, psl=0, psr=0, dom=0, hits=0, miss=0,
+             last_seen=0, best_jitter="", best_static="", best_switch="", best_spinner=""}
         LearnedModel[sid] = e
     end
+    -- V11.1 (B2): the persisted per-side EMA had none of the three acceleration layers
+    -- the in-memory EMA grew (v9.39 sample ramp, v9.26 drift bump, v9.30 hard reset) —
+    -- it blended every hit at a flat 0.20 forever. Two costs: a returning enemy's stored
+    -- magnitude aged out of date across sessions while the Recall fast-path kept firing
+    -- it, and (worse) the passive seed below used to write sl/sr = 1, so the FIRST real
+    -- hit moved the stored value only 20% away from a passive guess. Passive counts now
+    -- live in psl/psr (B1) and the ramp makes early real hits dominate.
+    local n_side = (side > 0 and (e.sr or 0)) or (side < 0 and (e.sl or 0)) or 0
     local alpha = 0.20
+    if n_side <= 1 then alpha = 0.55
+    elseif n_side <= 3 then alpha = 0.42
+    elseif n_side <= 6 then alpha = 0.30 end
+    local prev = (side > 0 and (e.dr or 0)) or (side < 0 and (e.dl or 0)) or 0
+    -- v9.30 equivalent: a genuine AA-preset switch replaces the stored value outright
+    -- instead of crawling toward it over five sessions.
+    if n_side >= 3 and prev > 5 and math.abs(desync_value - prev) > 12 then alpha = 1.0 end
     if side > 0 then
-        e.dr = e.sr == 0 and desync_value or (e.dr * (1 - alpha) + desync_value * alpha)
-        e.sr = math.min(e.sr + 1, 999)
+        e.dr = (e.sr or 0) == 0 and desync_value or (e.dr * (1 - alpha) + desync_value * alpha)
+        e.sr = math.min((e.sr or 0) + 1, 999)
     elseif side < 0 then
-        e.dl = e.sl == 0 and desync_value or (e.dl * (1 - alpha) + desync_value * alpha)
-        e.sl = math.min(e.sl + 1, 999)
+        e.dl = (e.sl or 0) == 0 and desync_value or (e.dl * (1 - alpha) + desync_value * alpha)
+        e.sl = math.min((e.sl or 0) + 1, 999)
     end
     e.hits = (e.hits or 0) + 1
     e.last_seen = globals.realtime or 0
-    if e.sr > e.sl + 3 then e.dom = 1
-    elseif e.sl > e.sr + 3 then e.dom = -1 end
+    -- V11.1 (B3): dom was `if / elseif` with no else — once it went ±1 it could never
+    -- return to neutral, even after the counts equalised. Boot feeds dom straight into
+    -- last_hit_side, so a stale verdict from one session steered the first shot of every
+    -- later one. Recompute it from the current counts every time, including the tie.
+    if (e.sr or 0) > (e.sl or 0) + 3 then e.dom = 1
+    elseif (e.sl or 0) > (e.sr or 0) + 3 then e.dom = -1
+    else e.dom = 0 end
     -- V6 + V8.9 + V9.0: per-aa-type best-mode tracking
     -- V9.0: filter unreliable "fallback" modes (BF:, *-Guess) — they're emergency paths not stable best-modes
     if aa_type and mode then
@@ -5139,13 +5204,19 @@ local function resolve_player(p)
         -- the whole resolve (boot is pcall'd), leaving the enemy unresolved that tick.
         local lsl, lsr = (lrn and lrn.sl or 0), (lrn and lrn.sr or 0)
         local ldl, ldr = (lrn and lrn.dl or 0), (lrn and lrn.dr or 0)
+        -- V11.1 (B1): passive-only knowledge, kept apart from the hit-derived counts.
+        local lpsl, lpsr = (lrn and lrn.psl or 0), (lrn and lrn.psr or 0)
+        local lpdl, lpdr = (lrn and lrn.pdl or 0), (lrn and lrn.pdr or 0)
         -- V9.82: boot gate lowered 5 -> 2. A thinly-saved player (e.g. learned.lua entry
         -- with 1-3 total hits) never booted, so on reload it re-learned from zero and the
         -- ESP conf bar dropped to 0 despite having saved data. The per-side EMA fills below
         -- still require lsl/lsr >= 2 individually, so a 2-total enemy seeds real_*/dom/best
         -- (enough to restore the bar + dominance) without claiming a per-side magnitude it
         -- doesn't have. Continuity for ANY saved player, not just well-sampled ones.
-        if lrn and (lsl + lsr) >= 2 then
+        -- V11.1 (B1): a passively-observed enemy now carries zero in sl/sr, so the gate
+        -- has to admit passive entries too or the v8.6 passive-persist would write a file
+        -- nothing ever reads back. It boots into the PASSIVE fields below, not the real ones.
+        if lrn and (lsl + lsr + ((lpsl + lpsr) > 0 and 2 or 0)) >= 2 then
             -- FIX #5: don't clobber session-learned data on re-track. reset_state keeps
             -- measured_left/right + real_* (only transient counters wiped), but this boot
             -- overwrote the live per-side EMAs with the OLDER persistent LearnedModel values
@@ -5173,6 +5244,17 @@ local function resolve_player(p)
             -- count them as real. Seed when we hold no session real hit on that side yet.
             if not _has_sess_l and lsl >= 1 then s.real_left  = math.min(lsl, 10) end
             if not _has_sess_r and lsr >= 1 then s.real_right = math.min(lsr, 10) end
+            -- V11.1 (B1): restore passive knowledge into the PASSIVE fields. Same data
+            -- the old code smuggled in through sl/sr, now landing where effective_desync's
+            -- passive branch and the v9.72 passive-side-keep already expect it — without
+            -- claiming a hit that never happened. Session observations always win.
+            if lpdl > 5 and (s.passive_left or 0) == 0 then s.passive_left = lpdl end
+            if lpdr > 5 and (s.passive_right or 0) == 0 then s.passive_right = lpdr end
+            if (s.passive_samples or 0) == 0 and (lpsl + lpsr) > 0 then
+                s.passive_n_left  = math.min(lpsl, 999)
+                s.passive_n_right = math.min(lpsr, 999)
+                s.passive_samples = math.min(lpsl + lpsr, 999)
+            end
             -- V9.82: seed last_seen so confidence()'s age penalty (up to -30 when last_seen
             -- reads as 0 = "dormant forever") doesn't tank the bar on the first frame after
             -- a reload boot. resolve_player updates it every tick afterwards.
@@ -5210,8 +5292,9 @@ local function resolve_player(p)
             if (now_rt - (sel01_boot_log_t[_bidx] or 0)) > 10 and sel01_boot_log_last[_bidx] ~= _bsig then
                 sel01_boot_log_t[_bidx] = now_rt
                 sel01_boot_log_last[_bidx] = _bsig
-                cs_log_verbose("LearnedModel boot idx=%d L=%d(%.1f°) R=%d(%.1f°) dom=%d hits=%d best{j=%s s=%s sw=%s}",
+                cs_log_verbose("LearnedModel boot idx=%d L=%d(%.1f°) R=%d(%.1f°) dom=%d hits=%d pass{L=%d(%.1f°) R=%d(%.1f°)} best{j=%s s=%s sw=%s}",
                                p:get_index(), lsl, ldl, lsr, ldr, (lrn.dom or 0), lrn.hits or 0,
+                               lpsl, lpdl, lpsr, lpdr,
                                tostring(lrn.best_jitter), tostring(lrn.best_static), tostring(lrn.best_switch))
             end
         end
@@ -5777,15 +5860,31 @@ local function resolve_player(p)
                 if sid then
                     local e = LearnedModel[sid]
                     if not e then
-                        e = {dl=0, dr=0, sl=0, sr=0, dom=0, hits=0, miss=0, last_seen=0,
+                        e = {dl=0, dr=0, sl=0, sr=0, pdl=0, pdr=0, psl=0, psr=0, dom=0,
+                             hits=0, miss=0, last_seen=0,
                              best_jitter="", best_static="", best_switch="", best_spinner=""}
                         LearnedModel[sid] = e
                     end
-                    -- merge passive data without overriding hit-based numbers
+                    -- V11.1 (B1): passive observations get their OWN fields. They used to
+                    -- be written into sl/sr/dl/dr — the same fields learning_update_hit
+                    -- fills from confirmed hits — with the count set to 1. Boot then read
+                    -- sl/sr back as REAL hits (v9.81 seeds s.real_left/right from them, on
+                    -- the stated assumption that "learning_update_hit only bumps them on a
+                    -- confirmed hit"), so a never-shot enemy came back claiming real hits.
+                    -- Everything gated on real evidence fired on passive noise: the v9.45
+                    -- seed-only keep guard (real_active >= 1), v9.48 alt_side_pick real
+                    -- dominance, the v9.78 one_sided BF ordering (real >= 3), the
+                    -- confidence real-sample cap and the v10.6 "bimodality needs real
+                    -- hits" rule. The v11.0 dump shows the corruption directly:
+                    -- name_48690_3 hits=1 with L=2 R=1, name_293117816_15 hits=12 with
+                    -- L=6 R=8 — side counts above the hit count can only be passive.
+                    -- Passive data is still worth persisting; it just has to say so.
                     local pl, pr = s.passive_left or 0, s.passive_right or 0
-                    if e.sl == 0 and pl > 5 then e.dl = pl; e.sl = 1 end
-                    if e.sr == 0 and pr > 5 then e.dr = pr; e.sr = 1 end
-                    if e.dom == 0 then
+                    if pl > 5 then e.pdl = pl; e.psl = math.min(s.passive_n_left or 1, 999) end
+                    if pr > 5 then e.pdr = pr; e.psr = math.min(s.passive_n_right or 1, 999) end
+                    -- dom stays HIT-derived. With no hits on record, a passive lean is the
+                    -- only signal there is, so seed it then — but never over hit data.
+                    if e.dom == 0 and (e.hits or 0) == 0 then
                         if pr > pl * 1.3 then e.dom = 1
                         elseif pl > pr * 1.3 then e.dom = -1 end
                     end
@@ -7291,5 +7390,6 @@ _cs_log_color_raw("V10.7: stale state outliving its evidence — the other half 
 _cs_log_color_raw("V10.8: the [KEEP] metric was measuring the wrong thing — my own instrument was biased. v10.4 asked 'which side did the next LANDED hit use', and across four sessions both buckets came out ~35% same-side, which looks like damning evidence against retry-same. But on a switch or jitter enemy the next hit comes from the other side because THE ENEMY ALTERNATES, not because the keep was wrong: the metric counts the enemy moving as a failure of our decision. Two changes make it answer the actual question. (1) It now scores the very NEXT SHOT after a keep, hit or miss — that is what the keep costs or buys. (2) It splits by aa_type, and the STATIC bucket is the one that can settle it, because a static enemy's side does not move on its own. New line: '[KEEP] next shot after a keep — STATIC bt<4 2/7 (29%), bt>=4 5/8 (63%) | MOVING ...'. A weak STATIC bt<4 number is real evidence to drop the low-backtrack freeze; the MOVING buckets are context only. Four sessions of data thrown away rather than acted on — a biased measurement is worse than none, because it is persuasive.")
 _cs_log_color_raw("V10.9: the unbiased [KEEP] metric answered — and it says the OPPOSITE of the biased one. First reading: STATIC bt<4 4/5 (80%), bt>=4 5/7 (71%), MOVING bt>=4 3/4. The shot right after a keep lands ~75-80%, so holding the side and re-firing the angle is EARNING its shot; the v10.4 metric's ~35% 'same side' was the enemy alternating, not our decision failing. The low-backtrack freeze stays. Four sessions of confident-looking data would have removed working behaviour. Two diagnostics fixes shipped instead: (1) the LearnedModel boot line now also requires its CONTENT to have changed — the 10s throttle worked but still let byte-identical repeats through, and three players re-booting in rotation filled roughly 60% of the 200-line ring in the v10.8 dump, pushing the actual hits and keeps out of the buffer. (2) resolved angles are normalized before being STORED; the applied yaw always was, but the stored copy carried values like 232.4 / -212.2 into snapshots and logs. No maths changes — every consumer already goes through NormalizeAngle — it just removes a latent trap.")
 _cs_log_color_raw("V11.0: the two BOOST paths never got the per-side magnitude conversion. Static-ServerBoost and Networked-Boost take their SIDE from the server-yaw reconstruct but fired the GLOBAL measured EMA as the magnitude — on a bimodal enemy that average is wrong on BOTH sides. This is the exact bug v9.22 fixed for Predicted-Alt, v9.54 for the serverfail retry and v9.92 for the Recall fast-path; these two branches were simply missed each time. The v10.9 dump makes the cost visible: Static-ServerBoost 10/13 (76.9%) against Static-Meas 50/53 (94.3%) in a lobby holding two-mode enemies like idx=8 at L=32.6 / R=47.4. Both now use effective_desync for whichever side they settled on, which falls back to the global EMA when that side has no samples, so one-sided enemies are unaffected. An audit found three more global-EMA sites — Static-Meas, Still-Meas, Networked-Meas — deliberately NOT converted: Static-Meas is the highest-volume mode in the build at 94.3%, and changing a path that works on theory alone is the same mistake as trusting the biased v10.4 metric, just smaller. They stay on the list until a dump shows them failing.")
+_cs_log_color_raw("V11.1: the persistent player model was recording passive guesses as confirmed hits. The v8.6 passive-persist wrote its observations into sl/sr/dl/dr — the same fields learning_update_hit fills from real hits — with the count set to 1, and the v9.81 boot reads sl/sr back as REAL hits on the stated assumption that only a confirmed hit can bump them. So a never-shot enemy returned claiming real hit data, and every guard built on real evidence fired on passive noise: the v9.45 seed-only keep (real_active>=1), v9.48 alt_side_pick real-dominance, the v9.78 one_sided BF ordering, the confidence real-sample cap, the v10.6 'bimodality needs real hits' rule. The v11.0 dump shows it plainly — name_48690_3 hits=1 with L=2 R=1, name_293117816_15 hits=12 with L=6 R=8; a side count above the hit count can only be passive. Passive data now lives in psl/psr/pdl/pdr, boots into the PASSIVE fields (so it stays useful without lying), and old files are migrated on load by the same arithmetic: sl+sr can never exceed hits, so the excess is passive. Two more from the same audit: the persisted EMA finally gets the v9.39 sample ramp + a v9.30-style hard reset (it blended at a flat 0.20 forever, and after a passive seed the first REAL hit moved the stored value only 20%), and e.dom gets its missing else-branch — once it went to +/-1 nothing could ever return it to neutral, and boot feeds it straight into last_hit_side. Plus: the [SESSION] raw line now adds spread-filtered shots back too, and the dump prints passive counts separately, which is the tell that was missing for eleven versions.")
 _cs_log_color_raw("Logging: " .. (log_enabled:get() and ("ON" .. (log_verbose:get() and " (verbose)" or ""))  or "OFF"))
 _cs_log_color_raw("=========================================")
