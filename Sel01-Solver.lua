@@ -1,11 +1,11 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 11.1                                   ║
+-- ║  Version: 11.2                                   ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 11.1
+-- @version 11.2
 -- @description v9.79 BF real-dominance ordering broadened to switch AA:
 --   * v9.78 only reordered the static/slow BF branch. This lobby's one-sided
 --     locks were aa=switch (idx=8 real 10R/0L still fired BF:opposite LEFT;
@@ -132,7 +132,7 @@
 --   * v9.26 drift-bump (alpha 0.55 on 5-10° diff) still handles small shifts.
 --   * v9.29 coach variants carry.
 
-local SEL01_VERSION = "11.1"
+local SEL01_VERSION = "11.2"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -540,6 +540,9 @@ g_experimental:button("Dump Pose Calibration", function() pcall(pose_cal_dump) e
 -- ON — it only widens the shot on an enemy who is provably mid-peek.
 exp_dtpeek = g_experimental:switch(accent .. ui.get_icon"bolt" .. accent .. "  Double-Tap / Air-Duck Peek Response", true)
 ui_tip(exp_dtpeek, "Catches the classic jump - crouch - charge - uncharge peek. When an enemy's simulation time jumps several ticks at once while airborne or ducking, they just released a charged tickbase and are already shooting: the resolver stops extrapolating, goes full-spread multipoint, drops NL's safe-point and lets the shot through the low-confidence cancel. Never changes min-damage, and leaves a sniper's hitchance alone while Respect Manual is on.")
+-- V11.2: silent fake-flick response. GLOBAL (main chunk is at the 200-local cap).
+exp_silentflick = g_experimental:switch(accent .. ui.get_icon"bolt" .. accent .. "  Silent Fake-Flick Response", true)
+ui_tip(exp_silentflick, "Catches the SILENT fake flick, where the 90-degree flick rides the hidden / defensive record so the enemy's model never visibly moves. The give-away is the server's own feet yaw sitting further from their eyes than a body yaw can legally reach (over 65 degrees, the cap is 58), plus their raw eye angle disagreeing with their animation. Both are only counted while the enemy stands still and is not turning, so a genuine flick-turn cannot trigger it. Six of them flags the enemy: the first shot then goes to the MEASURED excursion instead of the eyes, the brute-force cycle sweeps that angle first, and passive learning pauses so the fake magnitude does not poison what has been learned about them.")
 anim_side_tog = g_experimental:switch(accent .. ui.get_icon"flask" .. accent .. "  [EXP] Animation-Layer Side Read", false)
 g_experimental:button("Dump Anim-Layer Polarity", function() pcall(anim_pol_dump) end)
 ui_tip(anim_side_tog,  "Reads the enemy's animation layers, which the SERVER writes against their real yaw, and votes on the per-tick change to pick a desync side without ever having hit them. Replaces the coin-flip in the guess fallbacks only. Modes show up as *-AnimGuess in the dump so you can compare them against plain *-Guess.")
@@ -1561,10 +1564,15 @@ local log_copy_btn = g_logging:button("📋 Copy Last Logs (for share)", functio
             else _cs_log_raw("[P] (format error idx=" .. tostring(idx) .. ")") end
             -- V8.8: extended per-player detail (slow/still flags, correction L/R, streak, yaw_rate, last_hit_side, dist, miss-rate)
             pcall(function()
-                _cs_log_raw(string.format("    └ flags{slow=%s still=%s def=%s lby=%s ff=%s/%d} streak{L=%d R=%d} corr{L=%d R=%d} yaw_rate=%.1f last_hit=%d dist=%.0f miss_rate=%.0f%% p_hits=%d/%d",
+                _cs_log_raw(string.format("    └ flags{slow=%s still=%s def=%s lby=%s ff=%s/%d silent=%s/w%d/n%d/%.0f°%+d} streak{L=%d R=%d} corr{L=%d R=%d} yaw_rate=%.1f last_hit=%d dist=%.0f miss_rate=%.0f%% p_hits=%d/%d",
                     tostring(s.is_slow_target), tostring(s.is_stationary or false),
                     tostring(s.defensive_aa), tostring(s.lby_snap),
                     tostring(s.fake_flick or false), tonumber(s.ff_score) or 0,
+                    -- V11.2 silent-flick telemetry: flag / wide-band hits / netvar hits /
+                    -- measured excursion + side. Tells which tell fired (or that neither did).
+                    tostring(s.ff_silent or false), tonumber(s.ff_wide_n) or 0,
+                    tonumber(s.ff_net_n) or 0, tonumber(s.ff_wide_mag) or 0,
+                    tonumber(s.ff_wide_side) or 0,
                     tonumber(s.hit_streak_left) or 0, tonumber(s.hit_streak_right) or 0,
                     tonumber(s.correction_left) or 0, tonumber(s.correction_right) or 0,
                     tonumber(s.yaw_rate) or 0, tonumber(s.last_hit_side) or 0,
@@ -2896,6 +2904,23 @@ setmetatable(PlayerState, {__index = function(t, k)
         ff_base_eye       = nil,       -- slow baseline eye yaw (resting, non-flick ticks)
         ff_last_t         = 0,         -- time of last confirmed flick (auto-clear)
         ff_pending        = false,     -- saw a near-±90 excursion, awaiting return-to-base
+        -- V11.2: SILENT fake-flick. The v9.88 detector above needs a VISIBLE eye
+        -- round-trip. A silent flick never shows one — the ±90 rides the hidden /
+        -- defensive record, so the rendered model stands still. Two independent
+        -- tells, both already available every resolve tick:
+        --   ff_wide_n — |m_flGoalFeetYaw - eye| landed in the physically impossible
+        --               66..125 band (legit body yaw is capped at ±58)
+        --   ff_net_n  — the raw netvar m_angEyeAngles disagrees with the animstate
+        --               eye by ~90 (angle arrived, animation never followed it)
+        ff_wide_n         = 0,
+        ff_net_n          = 0,
+        ff_wide_mag       = nil,       -- EMA of the measured excursion magnitude
+        ff_wide_side      = 0,         -- sign of the last measured excursion
+        ff_wide_t         = 0,         -- realtime of last wide obs (freshness + decay)
+        ff_silent         = false,     -- flagged: silent flick confirmed
+        -- V11.2: per-engagement blind-explore burn memory (side ping-pong fix)
+        expl_l            = false,
+        expl_r            = false,
         -- AA classification
         aa_type           = "switch",
         aa_classify_cd    = 0,
@@ -3355,10 +3380,24 @@ events.aim_ack:set(function(event)
                     do_flip = false
                     cs_log_verbose("passive-side keep idx=%d side=%d pn{L=%d R=%d} err=%.1f (magnitude miss, side passively confirmed)",
                                    Ent:get_index(), ack_shot_side, pnl, pnr, ack_angle_err)
+                elseif (ack_shot_side > 0 and s.expl_l) or (ack_shot_side < 0 and s.expl_r) then
+                    -- V11.2: BOTH sides already explored-and-missed this engagement, so
+                    -- flipping just walks back onto the side that already whiffed. Real
+                    -- dump idx=1 (samples=0, passive 241L/388R = below the 3:1 bar so no
+                    -- p_dom): miss 1 FLIP->R, miss 2 FLIP->L — a pure L/R ping-pong that
+                    -- never once questioned the MAGNITUDE, while it was firing 41-43 in a
+                    -- lobby whose honest modal is ~30. With both sides burned the side is
+                    -- no longer the open question: keep it and let the BF cycle sweep
+                    -- magnitude. A hit clears the burn flags (fresh engagement).
+                    do_flip = false
+                    cs_log_verbose("both-sides-burned idx=%d keep side=%d err=%.1f — BF sweeps magnitude instead of L/R ping-pong",
+                                   Ent:get_index(), ack_shot_side, ack_angle_err)
                 else
                     do_flip = true
                 end
             end
+            -- V11.2: burn the side we just missed on (per-engagement, cleared on hit).
+            if ack_shot_side > 0 then s.expl_r = true else s.expl_l = true end
             -- V9.49: never-hit explore. The bt>8 / bt>6 keep branches above rest on pure
             -- passive seed when we have NEVER hit this enemy (real_active==0) — both the
             -- side AND the magnitude are unconfirmed guesses. A genuine stale record gets
@@ -3790,6 +3829,7 @@ events.aim_ack:set(function(event)
                   s.mode, s.measured_desync, s.last_hit_side)
         end
         s.missed = 0
+        s.expl_l, s.expl_r = false, false  -- V11.2: new engagement, un-burn both sides
         s.bf_cached_missed = nil  -- clear BF cache so next miss recomputes fresh
         s.bf_cached_angle  = nil
         s.fs_cached_time   = nil  -- clear FS cache so re-engagement re-evaluates
@@ -4365,6 +4405,20 @@ local function _pick_first_shot_impl(p, s, anim, eye_yaw, max_desync, preset)
     if speed2d > 320 then speed2d = 0 end  -- CS2 max run speed ≈ 260, anything above = glitch
     s.last_speed2d = speed2d  -- V9.67 #C: shot-time speed for the desync speed-bucket
     local close = preset.close_boost and s.tmp_close
+
+    -- V11.2: SILENT FAKE-FLICK first-shot path. Until now a flagged flicker only got
+    -- ±90 from the BF cycle, i.e. AFTER the first shot had already been thrown away —
+    -- and blind ±90 at that, when the server told us the real excursion. Shoot the
+    -- LEARNED magnitude on the LEARNED side straight away. Requires a fresh flag
+    -- (< 3s) so a stale one can never send a normal enemy 90° off.
+    if exp_silentflick and exp_silentflick:get() and s.ff_silent
+       and (globals.realtime or 0) - (s.ff_wide_t or 0) < 3 then
+        local ff_mag  = s.ff_wide_mag or 90
+        local ff_side = s.ff_wide_side ~= 0 and s.ff_wide_side
+                        or (guess_side ~= 0 and guess_side or 1)
+        s.mode = "Flick-Meas"
+        return NormalizeAngle(eye_yaw + ff_mag * ff_side)
+    end
 
     -- V9.66 #1: keep the RAW eye for the sanity bound below. extrapolate_yaw applies
     -- the lerp+ping/2 interp-compensation and is the FALLBACK when full prediction is
@@ -5002,7 +5056,13 @@ local function pick_bruteforce_angle(s, anim, eye_yaw, max_desync, p, preset)
     -- with ±90 (both signs), lead with the side opposite our last shot, then fall back to the
     -- normal wide magnitudes. Purely additive: unflagged enemies keep the list chosen above.
     if s.fake_flick then
-        if s.last_shot_side == 1 then
+        -- V11.2: a MEASURED excursion side outranks "opposite our last shot" — the
+        -- server told us which way the hidden yaw went, so lead with it.
+        if s.ff_silent and (s.ff_wide_side or 0) ~= 0 then
+            bf_list = (s.ff_wide_side > 0)
+                      and {"+90", "-90", "opposite", "+58", "-58", "0"}
+                      or  {"-90", "+90", "opposite", "+58", "-58", "0"}
+        elseif s.last_shot_side == 1 then
             bf_list = {"-90", "+90", "opposite", "+58", "-58", "0"}
         else
             bf_list = {"+90", "-90", "opposite", "+58", "-58", "0"}
@@ -5038,8 +5098,10 @@ local function pick_bruteforce_angle(s, anim, eye_yaw, max_desync, p, preset)
         result = eye_yaw + desync * kind_side
     elseif kind == "desync"   then result = eye_yaw + desync
     elseif kind == "-desync"  then result = eye_yaw - desync
-    elseif kind == "+90"      then result = eye_yaw + 90   -- V9.87: fake-flick hidden-yaw
-    elseif kind == "-90"      then result = eye_yaw - 90   -- V9.87: fake-flick hidden-yaw
+    -- V9.87 fake-flick hidden-yaw. V11.2: when the silent-flick detector has actually
+    -- MEASURED the excursion off the server's feet-yaw, sweep that instead of a blind 90.
+    elseif kind == "+90"      then result = eye_yaw + (s.ff_wide_mag or 90)
+    elseif kind == "-90"      then result = eye_yaw - (s.ff_wide_mag or 90)
     elseif kind == "+58"      then result = eye_yaw + 58
     elseif kind == "-58"      then result = eye_yaw - 58
     elseif kind == "+45"      then result = eye_yaw + 45
@@ -5788,6 +5850,23 @@ local function resolve_player(p)
                 s.fake_flick = (s.ff_score or 0) >= 4
             end
         end
+
+        -- V11.2: SILENT-FLICK tell #2 — the raw netvar eye angle vs the animstate eye.
+        -- A normal turn moves both together. A hidden-yaw record delivers an eye angle
+        -- the client's animation update never consumes, so for a tick the two disagree
+        -- by ~90 while the model visibly stands still. Gated the same way as the wide
+        -- band below: standing + not turning, so a genuine fast flick-turn (where the
+        -- animstate legitimately lags the netvar) can't score.
+        if s.aa_type ~= "spin" and spd < 140 and math.abs(s.yaw_rate or 0) < 90 then
+            local ok_ne, ne = pcall(function() return p.m_angEyeAngles end)
+            if ok_ne and ne and ne.y then
+                local d_na = math.abs(NormalizeAngle(ne.y - eye_yaw))
+                if d_na >= 60 and d_na <= 130 then
+                    s.ff_net_n  = math.min((s.ff_net_n or 0) + 1, 30)
+                    s.ff_wide_t = now_rt
+                end
+            end
+        end
     end
 
     if s.missed == 0 then
@@ -5818,7 +5897,43 @@ local function resolve_player(p)
     local ok_pass, server_goal_pre = pcall(function() return anim.m_flGoalFeetYaw end)
     if ok_pass and server_goal_pre then
         local server_desync = NormalizeAngle(server_goal_pre - anim.m_flEyeYaw)
-        if math.abs(server_desync) >= 3 and math.abs(server_desync) <= 65 then
+        local sd_abs = math.abs(server_desync)
+        -- V11.2: SILENT-FLICK tell #1 — the band this filter used to DISCARD.
+        -- Legit body yaw is hard-capped at ±58, so |goal_feet - eye| in 66..125 is
+        -- physically impossible for a normal fake: it means the server built the feet
+        -- yaw off an eye angle we are not seeing = a hidden-yaw record. That is exactly
+        -- what a silent fake flick produces, and the old `<= 65` gate dropped every one
+        -- of them on the floor. Now it is EVIDENCE, and the excursion magnitude + sign
+        -- are learned so the response shoots a MEASURED angle instead of a blind ±90.
+        -- Guards (both required): standing (goal_feet legitimately lags a running body)
+        -- and not turning (a fast turn makes LBY lag past 65 all on its own, and a
+        -- spinner does it every tick — the reason this is not just `> 65`).
+        local ff_ok = s.aa_type ~= "spin" and (s.last_speed2d or 0) < 140
+                      and math.abs(s.yaw_rate or 0) < 90
+        local now_ff = globals.realtime or 0
+        if ff_ok and sd_abs >= 66 and sd_abs <= 125 then
+            s.ff_wide_n    = math.min((s.ff_wide_n or 0) + 1, 30)
+            s.ff_wide_side = server_desync > 0 and 1 or -1
+            s.ff_wide_mag  = s.ff_wide_mag and (s.ff_wide_mag * 0.80 + sd_abs * 0.20) or sd_abs
+            s.ff_wide_t    = now_ff
+        elseif (s.ff_wide_n or 0) > 0 and now_ff - (s.ff_wide_t or 0) > 2 then
+            s.ff_wide_n = s.ff_wide_n - 1                       -- decay when it stops
+            s.ff_net_n  = math.max(0, (s.ff_net_n or 0) - 1)
+            s.ff_wide_t = now_ff
+        end
+        -- 6 confirmed impossible-band observations (or netvar disagreements) inside a
+        -- 3s window. Normal play produces ZERO — the band cannot be reached legally.
+        s.ff_silent = ((s.ff_wide_n or 0) >= 6 or (s.ff_net_n or 0) >= 6)
+                      and (now_ff - (s.ff_wide_t or 0)) < 3
+        if s.ff_silent then s.fake_flick = true end             -- feeds BF ±90 + ⚡FF tag
+        -- V11.2: CONTAMINATION GUARD. While a flick is live the visible eye is not the
+        -- base the server used, so every passive sample computed off it is garbage —
+        -- and passive samples SEED measured_desync (line below) for never-hit enemies.
+        -- Real-dump idx=1: 629 passive obs seeded R=52.8° while the persisted honest
+        -- average for that player is 35.5°, and both shots at ~41-43° missed. Freeze
+        -- passive learning instead of poisoning the EMA; the persisted seed survives.
+        -- (Must NOT early-return here — the resolved yaw is applied below this block.)
+        if (not s.ff_silent) and sd_abs >= 3 and sd_abs <= 65 then
             -- accumulate passive samples (slower alpha than hit-EMA, lower weight)
             local p_side = server_desync > 0 and 1 or -1
             local p_mag  = math.abs(server_desync)
@@ -7391,5 +7506,6 @@ _cs_log_color_raw("V10.8: the [KEEP] metric was measuring the wrong thing — my
 _cs_log_color_raw("V10.9: the unbiased [KEEP] metric answered — and it says the OPPOSITE of the biased one. First reading: STATIC bt<4 4/5 (80%), bt>=4 5/7 (71%), MOVING bt>=4 3/4. The shot right after a keep lands ~75-80%, so holding the side and re-firing the angle is EARNING its shot; the v10.4 metric's ~35% 'same side' was the enemy alternating, not our decision failing. The low-backtrack freeze stays. Four sessions of confident-looking data would have removed working behaviour. Two diagnostics fixes shipped instead: (1) the LearnedModel boot line now also requires its CONTENT to have changed — the 10s throttle worked but still let byte-identical repeats through, and three players re-booting in rotation filled roughly 60% of the 200-line ring in the v10.8 dump, pushing the actual hits and keeps out of the buffer. (2) resolved angles are normalized before being STORED; the applied yaw always was, but the stored copy carried values like 232.4 / -212.2 into snapshots and logs. No maths changes — every consumer already goes through NormalizeAngle — it just removes a latent trap.")
 _cs_log_color_raw("V11.0: the two BOOST paths never got the per-side magnitude conversion. Static-ServerBoost and Networked-Boost take their SIDE from the server-yaw reconstruct but fired the GLOBAL measured EMA as the magnitude — on a bimodal enemy that average is wrong on BOTH sides. This is the exact bug v9.22 fixed for Predicted-Alt, v9.54 for the serverfail retry and v9.92 for the Recall fast-path; these two branches were simply missed each time. The v10.9 dump makes the cost visible: Static-ServerBoost 10/13 (76.9%) against Static-Meas 50/53 (94.3%) in a lobby holding two-mode enemies like idx=8 at L=32.6 / R=47.4. Both now use effective_desync for whichever side they settled on, which falls back to the global EMA when that side has no samples, so one-sided enemies are unaffected. An audit found three more global-EMA sites — Static-Meas, Still-Meas, Networked-Meas — deliberately NOT converted: Static-Meas is the highest-volume mode in the build at 94.3%, and changing a path that works on theory alone is the same mistake as trusting the biased v10.4 metric, just smaller. They stay on the list until a dump shows them failing.")
 _cs_log_color_raw("V11.1: the persistent player model was recording passive guesses as confirmed hits. The v8.6 passive-persist wrote its observations into sl/sr/dl/dr — the same fields learning_update_hit fills from real hits — with the count set to 1, and the v9.81 boot reads sl/sr back as REAL hits on the stated assumption that only a confirmed hit can bump them. So a never-shot enemy returned claiming real hit data, and every guard built on real evidence fired on passive noise: the v9.45 seed-only keep (real_active>=1), v9.48 alt_side_pick real-dominance, the v9.78 one_sided BF ordering, the confidence real-sample cap, the v10.6 'bimodality needs real hits' rule. The v11.0 dump shows it plainly — name_48690_3 hits=1 with L=2 R=1, name_293117816_15 hits=12 with L=6 R=8; a side count above the hit count can only be passive. Passive data now lives in psl/psr/pdl/pdr, boots into the PASSIVE fields (so it stays useful without lying), and old files are migrated on load by the same arithmetic: sl+sr can never exceed hits, so the excess is passive. Two more from the same audit: the persisted EMA finally gets the v9.39 sample ramp + a v9.30-style hard reset (it blended at a flat 0.20 forever, and after a passive seed the first REAL hit moved the stored value only 20%), and e.dom gets its missing else-branch — once it went to +/-1 nothing could ever return it to neutral, and boot feeds it straight into last_hit_side. Plus: the [SESSION] raw line now adds spread-filtered shots back too, and the dump prints passive counts separately, which is the tell that was missing for eleven versions.")
+_cs_log_color_raw("V11.2: SILENT fake flick. The v9.88 detector only sees a flick that shows up in the enemy's VISIBLE eye angle — out to ~90 and back. A silent flick never does: the offset rides the hidden / defensive record (11_fakeflick.lua does exactly this — Hidden yaw ON, hidden pitch 89, hidden yaw offset -90, force_defensive every 7th command), so the model stands perfectly still while the server builds the feet yaw off an angle we never see. It was invisible to every path in the resolver, and worse, the evidence was being thrown away: passive learning discards |goal_feet - eye| above 65 degrees, which is precisely the band a hidden-yaw record produces (a legal body yaw is capped at 58, so that band is physically impossible to reach honestly). It is now counted, not discarded, and the excursion magnitude + side are learned from it — a second tell (the raw m_angEyeAngles disagreeing with the animstate eye by ~90) feeds the same counter. Both are only scored while the enemy is standing and not turning, because a fast turn makes the feet yaw lag past 65 all by itself and a spinner does it every tick. Six observations inside 3s flags them, and then: the FIRST shot goes to the measured excursion (mode Flick-Meas) instead of arriving 90 degrees off and only reaching plus/minus 90 after the BF cycle had already burned the opener, the BF cycle sweeps the measured magnitude on the measured side first, and passive learning pauses so the flick cannot poison the EMA — real-dump idx=1 had 629 passive observations seeding 52.8 degrees against that same player's honest persisted 35.5, then missed twice at 41-43. Also fixed from that dump: the blind-explore side ping-pong. idx=1 missed, flipped L to R, missed, flipped R back to L — straight back onto the side that had just whiffed, with the magnitude never once questioned. Sides now burn per engagement; once both have missed the side is no longer the open question, so it is kept and the BF cycle sweeps magnitude instead. A hit clears the burn.")
 _cs_log_color_raw("Logging: " .. (log_enabled:get() and ("ON" .. (log_verbose:get() and " (verbose)" or ""))  or "OFF"))
 _cs_log_color_raw("=========================================")
