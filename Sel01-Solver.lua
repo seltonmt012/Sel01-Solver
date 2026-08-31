@@ -1,12 +1,15 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 11.7                                   ║
+-- ║  Version: 11.8                                   ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 11.7
--- @description v11.7 dump-driven: Still-BFGuess leaked into best_static (Recall
+-- @version 11.8
+-- @description v11.8 90° hits count as SIDE evidence, not magnitude. BF:+90 /
+--   flick land at 80-90, the 65° EMA cap dropped real_*/persist hits, so idx=12
+--   had two +90 HITs and persist 0/1 with last_hit=R and real=0.
+-- @description-prev v11.7 dump-driven: Still-BFGuess leaked into best_static (Recall
 --   mismatch); Flick-Meas fired on the 3s flag not this-tick's wide band;
 --   hard-reset left real_* high so conf never dropped; Air never got +Peek.
 -- @description-prev v11.6 passive-observe nearby off-FOV + simtime-gated learning
@@ -148,7 +151,7 @@
 --   * v9.26 drift-bump (alpha 0.55 on 5-10° diff) still handles small shifts.
 --   * v9.29 coach variants carry.
 
-local SEL01_VERSION = "11.7"
+local SEL01_VERSION = "11.8"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -1694,12 +1697,7 @@ local log_copy_btn = g_logging:button("📋 Copy Last Logs (for share)", functio
             -- V11.5: [P] was samples (seeded+real) without real L/R, sid, bimodal,
             -- stand/move, or shot-history — every dump needed a reconstruction to tell
             -- a 17-hit lock from a passive-seeded stranger. sid_seen joins [P] to [L].
-            local pname, psid = "-", tostring(s.sid_seen or ""):sub(1, 22)
-            pcall(function()
-                local p = entity.get(tonumber(idx))
-                if p and p.get_name then pname = tostring(p:get_name() or "-") end
-            end)
-            pname = pname:gsub("%s+", ""):sub(1, 12)
+            local pname, psid = tostring(s.disp_name or "-"):gsub("%s+", ""):sub(1, 12), tostring(s.sid_seen or ""):sub(1, 22)
             if pname == "" then pname = "-" end
             local hist = ""
             pcall(function()
@@ -2404,6 +2402,13 @@ local function learning_update_hit(p, side, desync_value, aa_type, mode, speed2d
     -- hit moved the stored value only 20% away from a passive guess. Passive counts now
     -- live in psl/psr (B1) and the ramp makes early real hits dominate.
     local n_side = (side > 0 and (e.sr or 0)) or (side < 0 and (e.sl or 0)) or 0
+    -- V11.8: |delta|>65 is a flick / BF:+90 hit, not legal desync. Count the side
+    -- so persist hits=0/1 after two +90 HITs (dump idx=12) can't happen; leave dl/dr
+    -- as the legal EMA so Recall doesn't start firing 80° at a 20° body.
+    if (desync_value or 0) > 65 then
+        if side > 0 then e.sr = math.min((e.sr or 0) + 1, 999)
+        elseif side < 0 then e.sl = math.min((e.sl or 0) + 1, 999) end
+    else
     local alpha = 0.20
     if n_side <= 1 then alpha = 0.55
     elseif n_side <= 3 then alpha = 0.42
@@ -2418,6 +2423,7 @@ local function learning_update_hit(p, side, desync_value, aa_type, mode, speed2d
     elseif side < 0 then
         e.dl = (e.sl or 0) == 0 and desync_value or (e.dl * (1 - alpha) + desync_value * alpha)
         e.sl = math.min((e.sl or 0) + 1, 999)
+    end
     end
     e.hits = (e.hits or 0) + 1
     e.last_seen = globals.realtime or 0
@@ -3922,6 +3928,27 @@ events.aim_ack:set(function(event)
         -- update measured-desync EMA (global + per-side)
         if src_res ~= 0 and src_eye ~= 0 then
             local actual = math.abs(NormalizeAngle(src_res - src_eye))
+            -- V11.8: BF:+90 / flick hits land at 80-90°, above the legal 65° EMA cap.
+            -- Dump idx=12: two BF:+90 HITs, persist 0/1, real=0, last_hit=R from the
+            -- 90° shot — side evidence thrown away, next resolve trusted a ghost side.
+            -- Count SIDE always; blend MAGNITUDE only when it's a legal desync.
+            if actual >= 1 then
+                if hit_side > 0 then
+                    s.real_right = math.min((s.real_right or 0) + 1, 99)
+                elseif hit_side < 0 then
+                    s.real_left  = math.min((s.real_left or 0) + 1, 99)
+                end
+                local _spd_side = s.last_speed2d or 0
+                if hit_side ~= 0 then
+                    if _spd_side < 80 then
+                        if hit_side > 0 then s.stand_n_r = math.min((s.stand_n_r or 0) + 1, 99)
+                        else                 s.stand_n_l = math.min((s.stand_n_l or 0) + 1, 99) end
+                    else
+                        if hit_side > 0 then s.move_n_r = math.min((s.move_n_r or 0) + 1, 99)
+                        else                 s.move_n_l = math.min((s.move_n_l or 0) + 1, 99) end
+                    end
+                end
+            end
             if actual >= 1 and actual <= 65 then
                 -- V9.26: drift-bump. Default alpha 0.30 (slow EMA, anti-noise).
                 -- When the latest hit's actual differs from the current EMA by
@@ -3980,24 +4007,6 @@ events.aim_ack:set(function(event)
                 else
                     s.n_move = math.min((s.n_move or 0) + 1, 99)
                     s.measured_move = s.measured_move and (s.measured_move * 0.7 + actual * 0.3) or actual
-                end
-                -- V9.31: count real (hit-derived) samples side-independently, OUTSIDE
-                -- the per-side guard, so confidence is not capped at 50 when the
-                -- per-side-desync toggle is OFF (real_left/right gate the conf cap).
-                if hit_side > 0 then
-                    s.real_right = math.min((s.real_right or 0) + 1, 99)
-                elseif hit_side < 0 then
-                    s.real_left  = math.min((s.real_left or 0) + 1, 99)
-                end
-                -- V11.4: session stand/move SIDE counts (persist is written in learning_update_hit)
-                if hit_side ~= 0 then
-                    if (_spd or 0) < 80 then
-                        if hit_side > 0 then s.stand_n_r = math.min((s.stand_n_r or 0) + 1, 99)
-                        else                 s.stand_n_l = math.min((s.stand_n_l or 0) + 1, 99) end
-                    else
-                        if hit_side > 0 then s.move_n_r = math.min((s.move_n_r or 0) + 1, 99)
-                        else                 s.move_n_l = math.min((s.move_n_l or 0) + 1, 99) end
-                    end
                 end
                 -- per-side EMA (V9.26: own drift-bump per side too)
                 -- V9.30: per-side hard-reset on big switch >10° too.
@@ -4145,7 +4154,7 @@ events.aim_ack:set(function(event)
             -- V4+V6: feed persistent learning with aa_type + winning mode
             if hit_side ~= 0 and src_res ~= 0 and src_eye ~= 0 then
                 local actual = math.abs(NormalizeAngle(src_res - src_eye))
-                if actual >= 1 and actual <= 65 then
+                if actual >= 1 then
                     learning_update_hit(Ent, hit_side, actual, s.aa_type, s.mode, s.last_speed2d)
                 end
             end
@@ -5792,6 +5801,10 @@ local function resolve_player(p)
         s.learned_booted = true
     end
     s.last_seen = now
+    pcall(function()
+        local n = p:get_name()
+        if n and n ~= "" then s.disp_name = n end
+    end)
 
     -- FOV + distance cull (perf, skip offscreen/far enemies)
     if tick_cache.valid then
@@ -7923,6 +7936,6 @@ _cs_log_color_raw("V10.9: the unbiased [KEEP] metric answered — and it says th
 _cs_log_color_raw("V11.0: the two BOOST paths never got the per-side magnitude conversion. Static-ServerBoost and Networked-Boost take their SIDE from the server-yaw reconstruct but fired the GLOBAL measured EMA as the magnitude — on a bimodal enemy that average is wrong on BOTH sides. This is the exact bug v9.22 fixed for Predicted-Alt, v9.54 for the serverfail retry and v9.92 for the Recall fast-path; these two branches were simply missed each time. The v10.9 dump makes the cost visible: Static-ServerBoost 10/13 (76.9%) against Static-Meas 50/53 (94.3%) in a lobby holding two-mode enemies like idx=8 at L=32.6 / R=47.4. Both now use effective_desync for whichever side they settled on, which falls back to the global EMA when that side has no samples, so one-sided enemies are unaffected. An audit found three more global-EMA sites — Static-Meas, Still-Meas, Networked-Meas — deliberately NOT converted: Static-Meas is the highest-volume mode in the build at 94.3%, and changing a path that works on theory alone is the same mistake as trusting the biased v10.4 metric, just smaller. They stay on the list until a dump shows them failing.")
 _cs_log_color_raw("V11.1: the persistent player model was recording passive guesses as confirmed hits. The v8.6 passive-persist wrote its observations into sl/sr/dl/dr — the same fields learning_update_hit fills from real hits — with the count set to 1, and the v9.81 boot reads sl/sr back as REAL hits on the stated assumption that only a confirmed hit can bump them. So a never-shot enemy returned claiming real hit data, and every guard built on real evidence fired on passive noise: the v9.45 seed-only keep (real_active>=1), v9.48 alt_side_pick real-dominance, the v9.78 one_sided BF ordering, the confidence real-sample cap, the v10.6 'bimodality needs real hits' rule. The v11.0 dump shows it plainly — name_48690_3 hits=1 with L=2 R=1, name_293117816_15 hits=12 with L=6 R=8; a side count above the hit count can only be passive. Passive data now lives in psl/psr/pdl/pdr, boots into the PASSIVE fields (so it stays useful without lying), and old files are migrated on load by the same arithmetic: sl+sr can never exceed hits, so the excess is passive. Two more from the same audit: the persisted EMA finally gets the v9.39 sample ramp + a v9.30-style hard reset (it blended at a flat 0.20 forever, and after a passive seed the first REAL hit moved the stored value only 20%), and e.dom gets its missing else-branch — once it went to +/-1 nothing could ever return it to neutral, and boot feeds it straight into last_hit_side. Plus: the [SESSION] raw line now adds spread-filtered shots back too, and the dump prints passive counts separately, which is the tell that was missing for eleven versions.")
 _cs_log_color_raw("V11.2: SILENT fake flick. The v9.88 detector only sees a flick that shows up in the enemy's VISIBLE eye angle — out to ~90 and back. A silent flick never does: the offset rides the hidden / defensive record (11_fakeflick.lua does exactly this — Hidden yaw ON, hidden pitch 89, hidden yaw offset -90, force_defensive every 7th command), so the model stands perfectly still while the server builds the feet yaw off an angle we never see. It was invisible to every path in the resolver, and worse, the evidence was being thrown away: passive learning discards |goal_feet - eye| above 65 degrees, which is precisely the band a hidden-yaw record produces (a legal body yaw is capped at 58, so that band is physically impossible to reach honestly). It is now counted, not discarded, and the excursion magnitude + side are learned from it — a second tell (the raw m_angEyeAngles disagreeing with the animstate eye by ~90) feeds the same counter. Both are only scored while the enemy is standing and not turning, because a fast turn makes the feet yaw lag past 65 all by itself and a spinner does it every tick. Six observations inside 3s flags them, and then: the FIRST shot goes to the measured excursion (mode Flick-Meas) instead of arriving 90 degrees off and only reaching plus/minus 90 after the BF cycle had already burned the opener, the BF cycle sweeps the measured magnitude on the measured side first, and passive learning pauses so the flick cannot poison the EMA — real-dump idx=1 had 629 passive observations seeding 52.8 degrees against that same player's honest persisted 35.5, then missed twice at 41-43. Also fixed from that dump: the blind-explore side ping-pong. idx=1 missed, flipped L to R, missed, flipped R back to L — straight back onto the side that had just whiffed, with the magnitude never once questioned. Sides now burn per engagement; once both have missed the side is no longer the open question, so it is kept and the BF cycle sweeps magnitude instead. A hit clears the burn.")
-_cs_log_color_raw("V11.7: dump-driven. (1) Still-BFGuess leaked into best_static — `%-Guess$` needs a hyphen immediately before Guess, but Still-BFGuess has it before BF. idx=13 stored it; mode_match then false-mismatched grounded resolves and raised the cancel threshold (v9.60 Air class). Filter is now `Guess` anywhere + load migrates old files. (2) Flick-Meas fired on the 3s ff_silent flag, not this tick's wide band: idx=4 8 real R @19° ate Flick-Meas L -80 between flicks (Air was correctly at +20). First shot now needs ff_wide_now. (3) v9.30 hard-reset decimated samples_* so conf would drop; confidence() reads real_*, so idx=8 sat at real=4 samp=3 conf=61 miss_rate=43% after a mag switch. real_* on that side now decimates too. (4) Air-branch +Peek — this lobby's peeks were Air 16/18, ground +Peek never ran.")
+_cs_log_color_raw("V11.8: 90° hits count as SIDE, not magnitude. The 65° EMA cap (legal desync is 58) also skipped real_*/persist/stand-move, so a BF:+90 HIT was invisible to the learner. Dump idx=12: two BF:+90 HITs at 80-85°, persist 0/1, real=0, last_hit=R from the 90° shot — next resolve trusted a ghost side. idx=11 last_hit=R with the only real hit on L. Side/hits now always count; dl/dr EMA still ignores >65 so Recall doesn't start firing 80° at a 20° body. Dump names come from resolve-time p:get_name() (entity.get(idx) showed BitchyBaboon on watro's sid).")
 _cs_log_color_raw("Logging: " .. (log_enabled:get() and ("ON" .. (log_verbose:get() and " (verbose)" or ""))  or "OFF"))
 _cs_log_color_raw("=========================================")
