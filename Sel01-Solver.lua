@@ -1,12 +1,15 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 11.6                                   ║
+-- ║  Version: 11.7                                   ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 11.6
--- @description v11.6 passive-observe nearby off-FOV + simtime-gated learning
+-- @version 11.7
+-- @description v11.7 dump-driven: Still-BFGuess leaked into best_static (Recall
+--   mismatch); Flick-Meas fired on the 3s flag not this-tick's wide band;
+--   hard-reset left real_* high so conf never dropped; Air never got +Peek.
+-- @description-prev v11.6 passive-observe nearby off-FOV + simtime-gated learning
 --   + first-window peek lead. FOV cull used to skip the whole resolve, so an
 --   enemy standing next to you was never passively learned and yaw_rate was
 --   cold the tick they peeked in. Peek predictor needed 4 consistent samples,
@@ -145,7 +148,7 @@
 --   * v9.26 drift-bump (alpha 0.55 on 5-10° diff) still handles small shifts.
 --   * v9.29 coach variants carry.
 
-local SEL01_VERSION = "11.6"
+local SEL01_VERSION = "11.7"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -1682,8 +1685,11 @@ local log_copy_btn = g_logging:button("📋 Copy Last Logs (for share)", functio
     local pc = 0
     pcall(function()
         for idx, s in pairs(PlayerState) do
-            -- V8.1: skip idx=0 + Init players (world/spec entities spam)
-            if not (tonumber(idx) == 0 or (s.mode == "Init" and (s.samples_left or 0) + (s.samples_right or 0) == 0)) then
+            -- V8.1: skip idx=0 + Init. V11.7: skip leftover slots with no shots and
+            -- almost no passive (dump showed 73 tracked / 7 real players).
+            if not (tonumber(idx) == 0 or (s.mode == "Init" and (s.samples_left or 0) + (s.samples_right or 0) == 0)
+                    or (((s.p_hits or 0) + (s.p_miss or 0) == 0) and (s.passive_samples or 0) < 80
+                        and (s.real_left or 0) + (s.real_right or 0) == 0)) then
             pc = pc + 1
             -- V11.5: [P] was samples (seeded+real) without real L/R, sid, bimodal,
             -- stand/move, or shot-history — every dump needed a reconstruction to tell
@@ -2270,7 +2276,10 @@ local function learning_load()
                         if v:find("%-Recall") then v = v:gsub("%-Recall", ""); migrated = migrated + 1 end
                         -- V9.0: drop unreliable fallback modes stored as "best"
                         -- V9.60: also drop positional "Air*" (see save-filter rationale)
-                        if v:find("^BF:") or v:find("%-Guess$") or v:find("^Air") then
+                        -- V11.7: `%-Guess$` missed Still-BFGuess (the hyphen is before BF,
+                        -- not Guess). Dump idx=13 had best_static=Still-BFGuess → mode_match
+                        -- false → +15 conf cancel. Same class as v9.60 Air*.
+                        if v:find("^BF:") or v:find("Guess") or v:find("^Air") then
                             v = ""
                             migrated = migrated + 1
                         end
@@ -2446,7 +2455,7 @@ local function learning_update_hit(p, side, desync_value, aa_type, mode, speed2d
         -- not an AA-pattern. Stored as best_static/best_switch it never triggers the fast-path
         -- (3400 only acts on Static/Jitter) but DOES break intel.mode_match on grounded resolves
         -- (4435) → false mismatch → +15 conf cancel threshold → good shots cancelled. Pure liability.
-        local is_fallback = clean:find("^BF:") or clean:find("%-Guess$") or clean:find("^Air") or clean == "Init"
+        local is_fallback = clean:find("^BF:") or clean:find("Guess") or clean:find("^Air") or clean == "Init"
         if not is_fallback then
             -- V11.4: sticky vote, not last-write-wins. A single Static-Server hit after
             -- 20 Static-Meas hits used to replace the best and Recall fired the worse mode.
@@ -3944,6 +3953,14 @@ events.aim_ack:set(function(event)
                     -- NOT hard-reset the global on every alternation (that thrashes).
                     s.measured_desync = actual
                     s.desync_samples = math.max(2, math.floor(s.desync_samples * 0.4))
+                    -- V11.7: v9.30 said "decimate so confidence drops". confidence()
+                    -- keys on real_* not samples_*, so idx=8 sat at real=4 / samp=3 /
+                    -- conf=61 / miss_rate=43% after a mag switch. Drop the shot side.
+                    if hit_side > 0 then
+                        s.real_right = math.max(1, math.floor((s.real_right or 1) * 0.4))
+                    elseif hit_side < 0 then
+                        s.real_left = math.max(1, math.floor((s.real_left or 1) * 0.4))
+                    end
                     cs_log_verbose("AA-switch hard-reset idx=%d global EMA %.1f → %.1f (diff=%.1f, samples↓)",
                                    Ent:get_index(), prev_emag, actual, diff)
                 else
@@ -3993,6 +4010,7 @@ events.aim_ack:set(function(event)
                         elseif s.samples_right >= 3 and diff_r > 10 then
                             s.measured_right = actual
                             s.samples_right = math.max(2, math.floor(s.samples_right * 0.4))
+                            s.real_right = math.max(1, math.floor((s.real_right or 1) * 0.4))
                             cs_log_verbose("AA-switch hard-reset idx=%d R-side %.1f → %.1f (diff=%.1f)",
                                            Ent:get_index(), prev, actual, diff_r)
                         else
@@ -4013,6 +4031,7 @@ events.aim_ack:set(function(event)
                         elseif s.samples_left >= 3 and diff_l > 10 then
                             s.measured_left = actual
                             s.samples_left = math.max(2, math.floor(s.samples_left * 0.4))
+                            s.real_left = math.max(1, math.floor((s.real_left or 1) * 0.4))
                             cs_log_verbose("AA-switch hard-reset idx=%d L-side %.1f → %.1f (diff=%.1f)",
                                            Ent:get_index(), prev, actual, diff_l)
                         else
@@ -4684,8 +4703,12 @@ local function _pick_first_shot_impl(p, s, anim, eye_yaw, max_desync, preset)
     -- V11.3: ff_wide_side is now read on THIS tick (moved above the resolve), not the
     -- previous one — which is what makes the alternating "Silent" mode resolvable: we
     -- read the side the server is using right now instead of predicting a coin flip.
-    if exp_silentflick and exp_silentflick:get() and s.ff_silent
-       and (globals.realtime or 0) - (s.ff_wide_t or 0) < 3 then
+    -- V11.7: THIS tick must be in the impossible band. The 3s ff_silent flag kept
+    -- Flick-Meas firing at ±80 on ticks where they sat at their 19° legal desync
+    -- (dump idx=4: 8 real R @19°, Flick-Meas L -80 miss then a later -80 hit —
+    -- Air at +20 was the body, 80 was only the flick ticks). BF ±90 still uses
+    -- the 3s flag; first shot must not.
+    if exp_silentflick and exp_silentflick:get() and s.ff_silent and s.ff_wide_now then
         local ff_mag  = s.ff_wide_mag or 90
         local ff_side = s.ff_wide_side ~= 0 and s.ff_wide_side
                         or (guess_side ~= 0 and guess_side or 1)
@@ -6065,6 +6088,26 @@ local function resolve_player(p)
             -- V9.37: HIGH air magnitude prior (was the lobby median, which undershot air)
             server_yaw = anim.m_flEyeYaw + air_guess_mag * fallback_side
         end
+        -- V11.7: air peek lead. Ground +Peek lives in pick_first_shot, which this
+        -- branch never reaches. Dump v11.6: Air 16/18, ZERO +Peek in 24 shots —
+        -- the peeks were airborne. Same 1-tick cap, slightly higher yaw_rate bar
+        -- because air yaw is noisier.
+        do
+            local sp = 0
+            pcall(function()
+                local v = p.m_vecVelocity
+                sp = math.sqrt((v.x or 0)^2 + (v.y or 0)^2)
+            end)
+            if math.abs(s.yaw_rate or 0) > 120 and sp > 80
+               and not s.jittering and (s.tmp_dist or 9999) < 1500
+               and not s.tp_peek_active and not s.dtpeek_active then
+                local lead = (s.yaw_rate or 0) * ((tick_cache and tick_cache.tickint) or (1 / 64))
+                if math.abs(lead) >= 2 and math.abs(lead) <= 18 then
+                    server_yaw = NormalizeAngle(server_yaw + lead)
+                    s.mode = tostring(s.mode or "Air") .. "+Peek"
+                end
+            end
+        end
         s.last_eye_yaw  = anim.m_flEyeYaw
         s.last_resolved = NormalizeAngle(server_yaw)  -- V10.9: store normalized
         -- V9.33: push to recent_resolved (mirrors the ground path) so cancel-conf's
@@ -6234,6 +6277,7 @@ local function resolve_player(p)
     do
         local now_rt = globals.realtime or 0
         local spd = s.last_speed2d or 0
+        s.ff_wide_now = false
         if s.aa_type == "spin" then
             s.fake_flick = false                       -- spinner eye advances continuously
         elseif spd < 140 then
@@ -6321,6 +6365,7 @@ local function resolve_player(p)
                 local sd = NormalizeAngle(gf - eye_yaw)
                 local sda = math.abs(sd)
                 if sda >= 66 and sda <= 178 then
+                    s.ff_wide_now = true
                     local sgn = sd > 0 and 1 or -1
                     -- a SIGN CHANGE between wide observations is the Silent-mode tell.
                     -- Default mode holds one sign and produces zero flips.
@@ -7878,6 +7923,6 @@ _cs_log_color_raw("V10.9: the unbiased [KEEP] metric answered — and it says th
 _cs_log_color_raw("V11.0: the two BOOST paths never got the per-side magnitude conversion. Static-ServerBoost and Networked-Boost take their SIDE from the server-yaw reconstruct but fired the GLOBAL measured EMA as the magnitude — on a bimodal enemy that average is wrong on BOTH sides. This is the exact bug v9.22 fixed for Predicted-Alt, v9.54 for the serverfail retry and v9.92 for the Recall fast-path; these two branches were simply missed each time. The v10.9 dump makes the cost visible: Static-ServerBoost 10/13 (76.9%) against Static-Meas 50/53 (94.3%) in a lobby holding two-mode enemies like idx=8 at L=32.6 / R=47.4. Both now use effective_desync for whichever side they settled on, which falls back to the global EMA when that side has no samples, so one-sided enemies are unaffected. An audit found three more global-EMA sites — Static-Meas, Still-Meas, Networked-Meas — deliberately NOT converted: Static-Meas is the highest-volume mode in the build at 94.3%, and changing a path that works on theory alone is the same mistake as trusting the biased v10.4 metric, just smaller. They stay on the list until a dump shows them failing.")
 _cs_log_color_raw("V11.1: the persistent player model was recording passive guesses as confirmed hits. The v8.6 passive-persist wrote its observations into sl/sr/dl/dr — the same fields learning_update_hit fills from real hits — with the count set to 1, and the v9.81 boot reads sl/sr back as REAL hits on the stated assumption that only a confirmed hit can bump them. So a never-shot enemy returned claiming real hit data, and every guard built on real evidence fired on passive noise: the v9.45 seed-only keep (real_active>=1), v9.48 alt_side_pick real-dominance, the v9.78 one_sided BF ordering, the confidence real-sample cap, the v10.6 'bimodality needs real hits' rule. The v11.0 dump shows it plainly — name_48690_3 hits=1 with L=2 R=1, name_293117816_15 hits=12 with L=6 R=8; a side count above the hit count can only be passive. Passive data now lives in psl/psr/pdl/pdr, boots into the PASSIVE fields (so it stays useful without lying), and old files are migrated on load by the same arithmetic: sl+sr can never exceed hits, so the excess is passive. Two more from the same audit: the persisted EMA finally gets the v9.39 sample ramp + a v9.30-style hard reset (it blended at a flat 0.20 forever, and after a passive seed the first REAL hit moved the stored value only 20%), and e.dom gets its missing else-branch — once it went to +/-1 nothing could ever return it to neutral, and boot feeds it straight into last_hit_side. Plus: the [SESSION] raw line now adds spread-filtered shots back too, and the dump prints passive counts separately, which is the tell that was missing for eleven versions.")
 _cs_log_color_raw("V11.2: SILENT fake flick. The v9.88 detector only sees a flick that shows up in the enemy's VISIBLE eye angle — out to ~90 and back. A silent flick never does: the offset rides the hidden / defensive record (11_fakeflick.lua does exactly this — Hidden yaw ON, hidden pitch 89, hidden yaw offset -90, force_defensive every 7th command), so the model stands perfectly still while the server builds the feet yaw off an angle we never see. It was invisible to every path in the resolver, and worse, the evidence was being thrown away: passive learning discards |goal_feet - eye| above 65 degrees, which is precisely the band a hidden-yaw record produces (a legal body yaw is capped at 58, so that band is physically impossible to reach honestly). It is now counted, not discarded, and the excursion magnitude + side are learned from it — a second tell (the raw m_angEyeAngles disagreeing with the animstate eye by ~90) feeds the same counter. Both are only scored while the enemy is standing and not turning, because a fast turn makes the feet yaw lag past 65 all by itself and a spinner does it every tick. Six observations inside 3s flags them, and then: the FIRST shot goes to the measured excursion (mode Flick-Meas) instead of arriving 90 degrees off and only reaching plus/minus 90 after the BF cycle had already burned the opener, the BF cycle sweeps the measured magnitude on the measured side first, and passive learning pauses so the flick cannot poison the EMA — real-dump idx=1 had 629 passive observations seeding 52.8 degrees against that same player's honest persisted 35.5, then missed twice at 41-43. Also fixed from that dump: the blind-explore side ping-pong. idx=1 missed, flipped L to R, missed, flipped R back to L — straight back onto the side that had just whiffed, with the magnitude never once questioned. Sides now burn per engagement; once both have missed the side is no longer the open question, so it is kept and the BF cycle sweeps magnitude instead. A hit clears the burn.")
-_cs_log_color_raw("V11.6: passive learning + peek prediction. (1) FOV cull used to skip the WHOLE resolve — an enemy next to you, just off-screen, was never passively learned and their yaw_rate went cold, so the tick they peeked into 110° was a stranger with rate=0. Nearby (<2000u) off-FOV now still runs update_jitter + passive_learn + anim_side (no angle override). (2) Passive counted choked createmove ticks as new samples (dumps: 500-600 obs that were the same goal_feet repeated); now unique m_flSimulationTime only, early alpha 0.35 so 8 real simticks actually converge, side-seed at 12 unique with a 1.5x lean. (3) Peek predictor needed yaw_rate_consistent (4 samples) + conf>=40, so a 4-8 tick corner swing never got a lead. New +Peek: 1 tick of yaw_rate when they're running a one-way swing at <1500u, not jittering, not a spinner — capped 3-22° so junk rates can't throw the shot. Shows as mode+Peek in the ACK dump. 8+ unique passive obs also unlocks the main predictor (was samples<1 hard block).")
+_cs_log_color_raw("V11.7: dump-driven. (1) Still-BFGuess leaked into best_static — `%-Guess$` needs a hyphen immediately before Guess, but Still-BFGuess has it before BF. idx=13 stored it; mode_match then false-mismatched grounded resolves and raised the cancel threshold (v9.60 Air class). Filter is now `Guess` anywhere + load migrates old files. (2) Flick-Meas fired on the 3s ff_silent flag, not this tick's wide band: idx=4 8 real R @19° ate Flick-Meas L -80 between flicks (Air was correctly at +20). First shot now needs ff_wide_now. (3) v9.30 hard-reset decimated samples_* so conf would drop; confidence() reads real_*, so idx=8 sat at real=4 samp=3 conf=61 miss_rate=43% after a mag switch. real_* on that side now decimates too. (4) Air-branch +Peek — this lobby's peeks were Air 16/18, ground +Peek never ran.")
 _cs_log_color_raw("Logging: " .. (log_enabled:get() and ("ON" .. (log_verbose:get() and " (verbose)" or ""))  or "OFF"))
 _cs_log_color_raw("=========================================")
