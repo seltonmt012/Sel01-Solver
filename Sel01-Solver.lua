@@ -1,12 +1,25 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 11.3                                   ║
+-- ║  Version: 11.6                                   ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 11.3
--- @description v9.79 BF real-dominance ordering broadened to switch AA:
+-- @version 11.6
+-- @description v11.6 passive-observe nearby off-FOV + simtime-gated learning
+--   + first-window peek lead. FOV cull used to skip the whole resolve, so an
+--   enemy standing next to you was never passively learned and yaw_rate was
+--   cold the tick they peeked in. Peek predictor needed 4 consistent samples,
+--   so a 4-8 tick corner swing never got a lead.
+-- @description-prev v11.4 player-model first-contact + sticky best + stand/move side:
+--   Persistent learning saved every hit but ONLY booted after a dormancy gap, so the
+--   first peek of a known player this session (and after reload / round-restart slot
+--   reuse) was a cold Guess/Networked shot. Boot now runs on FIRST SIGHT. Typical
+--   aa_type is persisted and seeded so Recall uses the right bucket instead of the
+--   default "switch". best_* is a sticky vote (one stray hit no longer overwrites
+--   Static-Meas). Stand vs move side is learned separately — many AA presets invert
+--   when running. SteamMemory uses the same 6-pattern sid as LearnedModel.
+-- @description-prev v9.79 BF real-dominance ordering broadened to switch AA:
 --   * v9.78 only reordered the static/slow BF branch. This lobby's one-sided
 --     locks were aa=switch (idx=8 real 10R/0L still fired BF:opposite LEFT;
 --     idx=12 9R/0L fired BF:opposite LEFT) — switch fell through to the
@@ -132,7 +145,7 @@
 --   * v9.26 drift-bump (alpha 0.55 on 5-10° diff) still handles small shifts.
 --   * v9.29 coach variants carry.
 
-local SEL01_VERSION = "11.3"
+local SEL01_VERSION = "11.6"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -1262,6 +1275,56 @@ local function log_buffer_iter()
     return out
 end
 
+-- V11.5: compact per-shot ACK ring. The 📋 dump's event log mixes boot/cull/verbose
+-- with hits, and the angel HIT/MISS lines omit idx / delta / err / KEEP-vs-FLIP /
+-- real L/R — so every dump had to be reconstructed by hand. This ring is filled from
+-- aim_ack regardless of verbose/debug, 24 shots, one fixed line each.
+sel01_ack_ring  = { cap = 24, head = 0, count = 0 }
+sel01_ack_stats = { hit = 0, miss = 0, keep = 0, flip = 0, spread = 0, netcode = 0, nofreeze = 0, other = 0 }
+function sel01_ack_reset()
+    local r = sel01_ack_ring
+    for i = 1, r.cap do r[i] = nil end
+    r.head, r.count = 0, 0
+    sel01_ack_stats = { hit = 0, miss = 0, keep = 0, flip = 0, spread = 0, netcode = 0, nofreeze = 0, other = 0 }
+end
+function sel01_ack_push(kind, idx, name, mode, aa, side, delta, meas, err, bt, hc, verdict, rl, rr)
+    name = tostring(name or "-"):gsub("%s+", ""):sub(1, 12)
+    if name == "" then name = "-" end
+    local side_s = (side or 0) > 0 and "R" or ((side or 0) < 0 and "L" or "·")
+    local err_s = (err == nil or err == math.huge) and "-" or string.format("%.1f", err)
+    local line = string.format(
+        "[ACK] %s idx=%d %s mode=%s aa=%s %s d=%+.1f meas=%.1f err=%s bt=%d hc=%d %s real=%d/%d",
+        kind, tonumber(idx) or 0, name, tostring(mode or "?"), tostring(aa or "?"),
+        side_s, tonumber(delta) or 0, tonumber(meas) or 0, err_s,
+        tonumber(bt) or 0, tonumber(hc) or 0, tostring(verdict or ""),
+        tonumber(rl) or 0, tonumber(rr) or 0)
+    local r = sel01_ack_ring
+    r.head = (r.head % r.cap) + 1
+    r[r.head] = line
+    if r.count < r.cap then r.count = r.count + 1 end
+    local st = sel01_ack_stats
+    if kind == "HIT" then
+        st.hit = st.hit + 1
+    else
+        st.miss = st.miss + 1
+        local v = tostring(verdict or "")
+        if v == "KEEP" then st.keep = st.keep + 1
+        elseif v == "FLIP" then st.flip = st.flip + 1
+        elseif v == "SPREAD" then st.spread = st.spread + 1
+        elseif v == "NETCODE" then st.netcode = st.netcode + 1
+        elseif v:find("^NOFREEZE") then st.nofreeze = st.nofreeze + 1
+        else st.other = st.other + 1 end
+    end
+end
+function sel01_ack_iter()
+    local r, out = sel01_ack_ring, {}
+    for i = 1, r.count do
+        local i2 = ((r.head - r.count + i - 1) % r.cap) + 1
+        out[#out + 1] = r[i2]
+    end
+    return out
+end
+
 -- V9.19: SESSION-ROLLING DESYNC RING + adaptive guess-magnitude helper.
 -- Declared as MODULE GLOBALS (no `local`) because main-chunk is already near
 -- the Lua 5.1 200-local limit. Globals are looked up in _G; tiny overhead per
@@ -1394,6 +1457,50 @@ function learned_dom_side(s)
     return 0
 end
 
+-- V11.4: CONTEXT SIDE. Magnitude already has stand/move buckets (v9.67 #C); SIDE did not.
+-- A lot of AA (and our own Config's move-desync / slow-walk boost) invert when the
+-- enemy starts running, so last_hit_side from a standing duel is the WRONG first
+-- shot the moment they peek-walk. Needs a 2+ lead in THIS context (same bar as
+-- learned_dom_side) — balanced / undersampled returns 0 and the caller keeps
+-- last_hit_side. Never used by *-Alt paths (those already pick the other side).
+function learned_context_side(s)
+    if not s then return 0 end
+    local spd = s.last_speed2d or 0
+    local sl, sr
+    if spd < 80 then
+        sl, sr = s.stand_n_l or 0, s.stand_n_r or 0
+    else
+        sl, sr = s.move_n_l or 0, s.move_n_r or 0
+    end
+    if (sl + sr) < 2 then return 0 end
+    if sr >= sl + 2 then return  1 end
+    if sl >= sr + 2 then return -1 end
+    return 0
+end
+function learned_pick_side(s)
+    local cs = learned_context_side(s)
+    if cs ~= 0 then return cs end
+    if s and (s.last_hit_side or 0) ~= 0 then return s.last_hit_side end
+    return 1
+end
+-- Sticky last-write with hysteresis: one stray hit cannot replace a well-sampled
+-- best-mode / typical-aa. Matching value increments; a different value decrements
+-- and only replaces once the old count has drained to 1.
+function learning_sticky_set(e, key, nkey, value)
+    if not e or not value or value == "" then return end
+    if e[key] == value then
+        e[nkey] = math.min((e[nkey] or 1) + 1, 99)
+    else
+        local n = e[nkey] or 0
+        if n <= 1 then
+            e[key] = value
+            e[nkey] = 1
+        else
+            e[nkey] = n - 1
+        end
+    end
+end
+
 local log_copy_btn = g_logging:button("📋 Copy Last Logs (for share)", function()
     -- V8.2: intercept _cs_log_raw / _cs_log_color_raw so we collect dump to file too
     local _dump_lines = {}
@@ -1427,6 +1534,13 @@ local log_copy_btn = g_logging:button("📋 Copy Last Logs (for share)", functio
         _cs_log_raw(string.format("[SMART] learn=%s predict=%s visual=%s hitbox=%s",
             tostring(strat_learning:get()), tostring(strat_predict:get()),
             tostring(strat_visual:get()), tostring(strat_hitbox:get())))
+        _cs_log_raw(string.format("[V11] persist=%s steamMem=%s perside=%s animSide=%s silentFlick=%s dtpeek=%s guessMag=%.1f",
+            tostring(exp_persistent_lm:get()), tostring(exp_steam_mem:get()),
+            tostring(exp_perside_desync:get()),
+            tostring(anim_side_tog and anim_side_tog:get()),
+            tostring(exp_silentflick and exp_silentflick:get()),
+            tostring(exp_dtpeek and exp_dtpeek:get()),
+            adaptive_guess_mag()))
     end)
 
     -- V7.5: LEARNING DIAGNOSTICS (key data for improvement suggestions)
@@ -1439,8 +1553,8 @@ local log_copy_btn = g_logging:button("📋 Copy Last Logs (for share)", functio
             persistent_total_samples = persistent_total_samples + (e.sl or 0) + (e.sr or 0)
         end
     end)
-    _cs_log_raw(string.format("[LEARN] Persistent: %d players saved, %d total hits, %d desync samples",
-        persistent_count, persistent_total_hits, persistent_total_samples))
+    _cs_log_raw(string.format("[LEARN] Persistent: %d players saved, %d total hits, %d desync samples | lobby-median guess=%.1f°",
+        persistent_count, persistent_total_hits, persistent_total_samples, adaptive_guess_mag()))
     -- in-memory stats
     local mem_players, mem_samples, mem_passive = 0, 0, 0
     local mem_locked, mem_known = 0, 0
@@ -1507,6 +1621,14 @@ local log_copy_btn = g_logging:button("📋 Copy Last Logs (for share)", functio
         _cs_log_raw(string.format("[KEEP] next shot after a keep — STATIC bt<4 %s, bt>=4 %s | MOVING(switch/jitter) bt<4 %s, bt>=4 %s",
             _kb(k.stat.lo), _kb(k.stat.hi), _kb(k.mov.lo), _kb(k.mov.hi)))
     end
+    -- V11.5: session ACK tally — KEEP/FLIP/NETCODE/SPREAD without hand-counting the log
+    do
+        local a = sel01_ack_stats
+        local tot = (a.hit or 0) + (a.miss or 0)
+        _cs_log_raw(string.format("[ACK] %d hit / %d miss (%d shots) | KEEP %d  FLIP %d  NETCODE %d  SPREAD %d  NOFREEZE %d  other %d",
+            a.hit or 0, a.miss or 0, tot, a.keep or 0, a.flip or 0, a.netcode or 0,
+            a.spread or 0, a.nofreeze or 0, a.other or 0))
+    end
     -- V9.95: animation-layer signal scoreboard. Compare the *-AnimGuess rows in MODE
     -- HIT-RATES below against plain *-Guess to judge whether the layers actually help.
     if anim_side_tog and anim_side_tog:get() then
@@ -1541,6 +1663,19 @@ local log_copy_btn = g_logging:button("📋 Copy Last Logs (for share)", functio
         _cs_log_raw(string.format("[TIP] ⚠ Weak: %s (%.0f%%, %d shots) — consider tuning/disabling",
             worst_mode, worst_rate, worst_total))
     end
+    do
+        local fs_h, fs_t, bf_h, bf_t = 0, 0, 0, 0
+        for _, r in ipairs(rows) do
+            if tostring(r.mode):find("^BF:") then
+                bf_h = bf_h + r.hits; bf_t = bf_t + r.total
+            else
+                fs_h = fs_h + r.hits; fs_t = fs_t + r.total
+            end
+        end
+        _cs_log_raw(string.format("[STATS] first-shot %d/%d = %.0f%%  |  BF %d/%d = %.0f%%",
+            fs_h, fs_t, fs_t > 0 and (fs_h / fs_t * 100) or 0,
+            bf_h, bf_t, bf_t > 0 and (bf_h / bf_t * 100) or 0))
+    end
 
     -- player snapshot
     _cs_log_raw("--- TRACKED PLAYERS ---")
@@ -1550,71 +1685,112 @@ local log_copy_btn = g_logging:button("📋 Copy Last Logs (for share)", functio
             -- V8.1: skip idx=0 + Init players (world/spec entities spam)
             if not (tonumber(idx) == 0 or (s.mode == "Init" and (s.samples_left or 0) + (s.samples_right or 0) == 0)) then
             pc = pc + 1
-            -- V8.0: defensive tonumber + pcall around format (avoid userdata crash)
+            -- V11.5: [P] was samples (seeded+real) without real L/R, sid, bimodal,
+            -- stand/move, or shot-history — every dump needed a reconstruction to tell
+            -- a 17-hit lock from a passive-seeded stranger. sid_seen joins [P] to [L].
+            local pname, psid = "-", tostring(s.sid_seen or ""):sub(1, 22)
+            pcall(function()
+                local p = entity.get(tonumber(idx))
+                if p and p.get_name then pname = tostring(p:get_name() or "-") end
+            end)
+            pname = pname:gsub("%s+", ""):sub(1, 12)
+            if pname == "" then pname = "-" end
+            local hist = ""
+            pcall(function()
+                for i = 1, #(s.shot_history or {}) do
+                    local k = s.shot_history[i]
+                    hist = hist .. (k == "hit" and "H" or (k == "serverfail" and "N" or "M"))
+                end
+            end)
+            if hist == "" then hist = "-" end
             local ok, line = pcall(string.format,
-                "[P] idx=%d mode=%s aa=%s miss=%d L=%d/%.1f R=%d/%.1f pass=%d pL=%d pR=%d conf=%d boot=%s",
-                tonumber(idx) or 0, tostring(s.mode), tostring(s.aa_type), tonumber(s.missed) or 0,
-                tonumber(s.samples_left) or 0, tonumber(s.measured_left) or 0,
-                tonumber(s.samples_right) or 0, tonumber(s.measured_right) or 0,
-                tonumber(s.passive_samples) or 0,
-                tonumber(s.passive_n_left) or 0, tonumber(s.passive_n_right) or 0,  -- V9.74: passive-side-keep visibility
+                "[P] idx=%d %s sid=%s mode=%s aa=%s miss=%d conf=%d real=L%d/%.0f R%d/%.0f samp=L%d R%d meas=%.1f bimod=%s boot=%s",
+                tonumber(idx) or 0, pname, psid,
+                tostring(s.mode), tostring(s.aa_type), tonumber(s.missed) or 0,
                 tonumber(confidence(s)) or 0,
-                s.boot_best_modes and "yes" or "no")
+                tonumber(s.real_left) or 0, tonumber(s.measured_left) or 0,
+                tonumber(s.real_right) or 0, tonumber(s.measured_right) or 0,
+                tonumber(s.samples_left) or 0, tonumber(s.samples_right) or 0,
+                tonumber(s.measured_desync) or 0,
+                s.bimodal and "Y" or "N",
+                s.learned_booted and "Y" or "N")
             if ok then _cs_log_raw(line)
             else _cs_log_raw("[P] (format error idx=" .. tostring(idx) .. ")") end
-            -- V8.8: extended per-player detail (slow/still flags, correction L/R, streak, yaw_rate, last_hit_side, dist, miss-rate)
             pcall(function()
-                _cs_log_raw(string.format("    └ flags{slow=%s still=%s def=%s lby=%s ff=%s/%d silent=%s/w%d/n%d/%.0f°%+d alt=%s/%d} streak{L=%d R=%d} corr{L=%d R=%d} yaw_rate=%.1f last_hit=%d dist=%.0f miss_rate=%.0f%% p_hits=%d/%d",
+                _cs_log_raw(string.format("    └ flags{slow=%s still=%s def=%s lby=%s ff=%s/%d silent=%s/w%d/n%d/%.0f°%+d alt=%s/%d} streak{L=%d R=%d} corr{L=%d R=%d} yaw_rate=%.1f last_hit=%d dist=%.0f miss_rate=%.0f%% p_hits=%d/%d sf=%d spr=%d btRes=%s stand=%d/%d move=%d/%d hist=%s pass=%d pL=%d pR=%d",
                     tostring(s.is_slow_target), tostring(s.is_stationary or false),
                     tostring(s.defensive_aa), tostring(s.lby_snap),
                     tostring(s.fake_flick or false), tonumber(s.ff_score) or 0,
-                    -- V11.2 silent-flick telemetry: flag / wide-band hits / netvar hits /
-                    -- measured excursion + side. Tells which tell fired (or that neither did).
                     tostring(s.ff_silent or false), tonumber(s.ff_wide_n) or 0,
                     tonumber(s.ff_net_n) or 0, tonumber(s.ff_wide_mag) or 0,
                     tonumber(s.ff_wide_side) or 0,
-                    -- V11.3: alt=true means the "Silent" flick mode (side flips every
-                    -- send); alt=false with a live flag means "Default" (one-sided).
                     tostring(s.ff_alt or false), tonumber(s.ff_flips) or 0,
                     tonumber(s.hit_streak_left) or 0, tonumber(s.hit_streak_right) or 0,
                     tonumber(s.correction_left) or 0, tonumber(s.correction_right) or 0,
                     tonumber(s.yaw_rate) or 0, tonumber(s.last_hit_side) or 0,
                     tonumber(s.tmp_dist) or 0, tonumber(s.recent_miss_rate) or 0,
-                    tonumber(s.p_hits) or 0, tonumber(s.p_miss) or 0))
+                    tonumber(s.p_hits) or 0, tonumber(s.p_miss) or 0,
+                    tonumber(s.serverfail_misses) or 0, tonumber(s.spread_misses) or 0,
+                    s.backtrack_resistant and "Y" or "N",
+                    tonumber(s.stand_n_l) or 0, tonumber(s.stand_n_r) or 0,
+                    tonumber(s.move_n_l) or 0, tonumber(s.move_n_r) or 0,
+                    hist,
+                    tonumber(s.passive_samples) or 0,
+                    tonumber(s.passive_n_left) or 0, tonumber(s.passive_n_right) or 0))
             end)
             end  -- end skip-idx-0 filter
         end
     end)
     if pc == 0 then _cs_log_raw("[P] (no tracked players)") end
 
-    -- V8.8: top-5 learned players (most hits) from persistent model
-    _cs_log_raw("--- TOP-5 LEARNED PLAYERS (persistent) ---")
+    -- V11.5: top-12 + any sid currently tracked (the interesting enemy is often not top-5)
+    _cs_log_raw("--- LEARNED PLAYERS (persistent) ---")
     pcall(function()
+        local tracked = {}
+        for _, s in pairs(PlayerState) do
+            if s.sid_seen then tracked[s.sid_seen] = true end
+        end
         local list = {}
         for sid, e in pairs(LearnedModel) do
             table.insert(list, {sid=sid, e=e})
         end
         table.sort(list, function(a, b) return (a.e.hits or 0) > (b.e.hits or 0) end)
-        for i = 1, math.min(5, #list) do
-            local r = list[i]
+        local shown = {}
+        local function _print_l(r, tag)
+            if shown[r.sid] then return end
+            shown[r.sid] = true
             local e = r.e
             local total = (e.hits or 0) + (e.miss or 0)
             local rate = total > 0 and ((e.hits or 0) / total * 100) or 0
-            -- V11.1 (B1): passive counts printed separately. When they lived in sl/sr the
-            -- only tell was "side count > hit count", which is exactly how the corruption
-            -- went unnoticed for eleven versions.
-            _cs_log_raw(string.format("[L] %s hits=%d/%d (%.0f%%) L=%d/%.1f° R=%d/%.1f° pass{L=%d/%.1f° R=%d/%.1f°} dom=%d best{j=%s s=%s sw=%s}",
+            _cs_log_raw(string.format("[L]%s %s hits=%d/%d (%.0f%%) L=%d/%.1f° R=%d/%.1f° pass{L=%d/%.1f° R=%d/%.1f°} dom=%d aa=%s stand=%d/%d move=%d/%d best{j=%s s=%s sw=%s}",
+                tag or "",
                 tostring(r.sid):sub(1, 30),
                 e.hits or 0, total, rate,
                 e.sl or 0, e.dl or 0,
                 e.sr or 0, e.dr or 0,
                 e.psl or 0, e.pdl or 0,
                 e.psr or 0, e.pdr or 0,
-                e.dom or 0,
+                e.dom or 0, tostring(e.aa or ""),
+                e.ssl or 0, e.ssr or 0, e.msl or 0, e.msr or 0,
                 tostring(e.best_jitter or ""), tostring(e.best_static or ""), tostring(e.best_switch or "")))
+        end
+        for i = 1, math.min(12, #list) do _print_l(list[i], "") end
+        for _, r in ipairs(list) do
+            if tracked[r.sid] then _print_l(r, "*") end
         end
         if #list == 0 then _cs_log_raw("[L] (no persistent entries — steam_id may be failing)") end
     end)
+
+    -- V11.5: compact last-24 shots — read THIS before the noisy event log
+    do
+        local acks = sel01_ack_iter()
+        _cs_log_raw("--- LAST " .. #acks .. " SHOTS (ACK ring) ---")
+        if #acks == 0 then
+            _cs_log_raw("[ACK] (empty — no aim_ack yet this session)")
+        else
+            for _, line in ipairs(acks) do _cs_log_raw(line) end
+        end
+    end
 
     -- recent log buffer (V9.3: ring-buffer iter, insertion-order)
     local _buf_list = log_buffer_iter()
@@ -1649,6 +1825,19 @@ local log_copy_btn = g_logging:button("📋 Copy Last Logs (for share)", functio
                 local pn = (s.passive_n_left or 0) + (s.passive_n_right or 0)
                 if (s.missed or 0) >= 2 and real_active == 0 and pn >= 30 then
                     _cs_log_raw(string.format("[HINT] idx=%d 0 real hits but %d passive obs — passive-side-keep may activate; fire more to build real samples", tonumber(idx) or 0, pn))
+                end
+                local sl, sr = tonumber(s.stand_n_l) or 0, tonumber(s.stand_n_r) or 0
+                local ml, mr = tonumber(s.move_n_l) or 0, tonumber(s.move_n_r) or 0
+                if sl + sr >= 2 and ml + mr >= 2 then
+                    local ss = sr >= sl + 2 and 1 or (sl >= sr + 2 and -1 or 0)
+                    local ms = mr >= ml + 2 and 1 or (ml >= mr + 2 and -1 or 0)
+                    if ss ~= 0 and ms ~= 0 and ss ~= ms then
+                        _cs_log_raw(string.format("[HINT] idx=%d STAND side != MOVE side (stand L/R=%d/%d move L/R=%d/%d) — context pick should fire",
+                            tonumber(idx) or 0, sl, sr, ml, mr))
+                    end
+                end
+                if (s.samples_left or 0) + (s.samples_right or 0) >= 2 and real_active == 0 then
+                    _cs_log_raw(string.format("[HINT] idx=%d samples>0 but real=0 — live EMAs are seeded, not hits", tonumber(idx) or 0))
                 end
             end
         end
@@ -1713,6 +1902,7 @@ local log_reset_learn  = g_logging:button("🗑 Reset Learning Data (persistent)
     -- also wipe in-memory per-player boot data so next engagement re-learns fresh
     for _, s in pairs(PlayerState) do
         s.boot_best_modes  = nil
+        s.learned_booted   = false  -- V11.4: next resolve re-boots (now from empty model)
         s.measured_left    = 0
         s.measured_right   = 0
         s.samples_left     = 0
@@ -1724,6 +1914,10 @@ local log_reset_learn  = g_logging:button("🗑 Reset Learning Data (persistent)
         s.passive_right    = nil
         s.passive_n_left   = 0   -- V9.72
         s.passive_n_right  = 0   -- V9.72
+        s.stand_n_l        = 0   -- V11.4
+        s.stand_n_r        = 0
+        s.move_n_l         = 0
+        s.move_n_r         = 0
         s.correction_left  = 0
         s.correction_right = 0
     end
@@ -1740,6 +1934,7 @@ local log_reset_session = g_logging:button("🗑 Reset Session Stats (in-memory)
     for k in pairs(session_stats.history) do session_stats.history[k] = nil end
     sel01_session_serverfails = 0  -- V9.50: clear server-fail filter counter
     sel01_session_spreadfails = 0  -- V9.72: clear spread-RNG filter counter
+    pcall(sel01_ack_reset)
     sel01_dt_stats = { seen = 0, max = 0, b3 = 0, b6 = 0, air = 0, duck = 0, fired = 0, reject_gap = 0, reject_ctx = 0 }
 sel01_keep_stats = { stat = { lo = { hit = 0, miss = 0 }, hi = { hit = 0, miss = 0 } },
                      mov  = { lo = { hit = 0, miss = 0 }, hi = { hit = 0, miss = 0 } } }  -- V10.0
@@ -1988,6 +2183,12 @@ local function build_json_dump()
             passive_right     = e.pdr or 0,
             dominant_side = e.dom or 0,
             last_seen     = e.last_seen or 0,
+            typical_aa    = e.aa or "",
+            typical_aa_n  = e.aa_n or 0,
+            stand_left    = e.ssl or 0,
+            stand_right   = e.ssr or 0,
+            move_left     = e.msl or 0,
+            move_right    = e.msr or 0,
             best_static   = e.best_static or "",
             best_jitter   = e.best_jitter or "",
             best_switch   = e.best_switch or "",
@@ -2130,8 +2331,10 @@ local function learning_save()
 end
 
 local _sid_fail_logged = false
-local function _learning_sid(p)
-    if not (exp_persistent_lm and exp_persistent_lm:get()) then return nil end
+-- V11.4: SID chain without the persist-toggle gate. SteamMemory used only
+-- p:get_steam_id() and was empty on this NL build (falls through to name-hash);
+-- the identity-check (slot reuse) was also skipped whenever persist was off.
+function player_sid(p)
     if not p then return nil end
     local sid
     -- V7.7: expanded fallback chain (6 patterns)
@@ -2169,14 +2372,19 @@ local function _learning_sid(p)
     end
     return tostring(sid)
 end
+local function _learning_sid(p)
+    if not (exp_persistent_lm and exp_persistent_lm:get()) then return nil end
+    return player_sid(p)
+end
 
 local learning_cleanup  -- forward-decl, defined below
-local function learning_update_hit(p, side, desync_value, aa_type, mode)
+local function learning_update_hit(p, side, desync_value, aa_type, mode, speed2d)
     local sid = _learning_sid(p); if not sid then return end
     local e = LearnedModel[sid]
     if not e then
         e = {dl=0, dr=0, sl=0, sr=0, pdl=0, pdr=0, psl=0, psr=0, dom=0, hits=0, miss=0,
-             last_seen=0, best_jitter="", best_static="", best_switch="", best_spinner=""}
+             last_seen=0, best_jitter="", best_static="", best_switch="", best_spinner="",
+             aa="", aa_n=0, ssl=0, ssr=0, msl=0, msr=0}
         LearnedModel[sid] = e
     end
     -- V11.1 (B2): the persisted per-side EMA had none of the three acceleration layers
@@ -2211,10 +2419,28 @@ local function learning_update_hit(p, side, desync_value, aa_type, mode)
     if (e.sr or 0) > (e.sl or 0) + 3 then e.dom = 1
     elseif (e.sl or 0) > (e.sr or 0) + 3 then e.dom = -1
     else e.dom = 0 end
+    -- V11.4: typical AA-type sticky vote. Boot seeds s.aa_type from this so the
+    -- known-player Recall fast-path looks up the RIGHT bucket (best_static vs
+    -- best_switch) on first sight instead of the PlayerState default "switch".
+    if aa_type == "static" or aa_type == "jitter" or aa_type == "switch" or aa_type == "spinner" then
+        learning_sticky_set(e, "aa", "aa_n", aa_type)
+    end
+    -- V11.4: stand vs move SIDE. Same split v9.67 already does for magnitude.
+    -- speed2d is the shot-time speed passed from aim_ack (don't call get_state —
+    -- it's a later local and would bind the global nil).
+    if side ~= 0 then
+        if (speed2d or 0) < 80 then
+            if side > 0 then e.ssr = math.min((e.ssr or 0) + 1, 999)
+            else             e.ssl = math.min((e.ssl or 0) + 1, 999) end
+        else
+            if side > 0 then e.msr = math.min((e.msr or 0) + 1, 999)
+            else             e.msl = math.min((e.msl or 0) + 1, 999) end
+        end
+    end
     -- V6 + V8.9 + V9.0: per-aa-type best-mode tracking
     -- V9.0: filter unreliable "fallback" modes (BF:, *-Guess) — they're emergency paths not stable best-modes
     if aa_type and mode then
-        local clean = tostring(mode):gsub("%+Pred", ""):gsub("%-DefInv", ""):gsub("%-Recall", "")
+        local clean = tostring(mode):gsub("%+Pred", ""):gsub("%+Peek", ""):gsub("%-DefInv", ""):gsub("%-Recall", "")
         -- V9.0: don't save brute-force or guess modes as "best" — they're fallbacks, not patterns
         -- V9.60: also filter "Air*" — Air/Air-Alt/Air-CorrFlip are POSITIONAL (enemy airborne),
         -- not an AA-pattern. Stored as best_static/best_switch it never triggers the fast-path
@@ -2222,8 +2448,10 @@ local function learning_update_hit(p, side, desync_value, aa_type, mode)
         -- (4435) → false mismatch → +15 conf cancel threshold → good shots cancelled. Pure liability.
         local is_fallback = clean:find("^BF:") or clean:find("%-Guess$") or clean:find("^Air") or clean == "Init"
         if not is_fallback then
+            -- V11.4: sticky vote, not last-write-wins. A single Static-Server hit after
+            -- 20 Static-Meas hits used to replace the best and Recall fired the worse mode.
             local key = "best_" .. tostring(aa_type)
-            e[key] = clean
+            learning_sticky_set(e, key, key .. "_n", clean)
         end
     end
     learning_dirty = true
@@ -2955,6 +3183,12 @@ setmetatable(PlayerState, {__index = function(t, k)
         -- V9.1: track REAL hit-based samples separate from seeded (passive boot)
         real_left         = 0,
         real_right        = 0,
+        -- V11.4: first-sight boot flag + stand/move side counts (context-conditioned)
+        learned_booted    = false,
+        stand_n_l         = 0,
+        stand_n_r         = 0,
+        move_n_l          = 0,
+        move_n_r          = 0,
         -- V9.3: defensive-AA delta fingerprint (jump magnitude on spread-miss)
         def_delta         = 0,
         def_samples       = 0,
@@ -3010,6 +3244,7 @@ local function reset_state(s)
     s.anim_vote          = 0
     s.anim_sig           = nil
     s.anim_simtime       = nil
+    s.pass_simtime       = nil  -- V11.6: unique-tick gate for passive learning
     -- V10.7: the bimodal flag must not outlive the evidence that set it. PlayerState is
     -- keyed by ENTITY INDEX, and slots are reused when someone disconnects and another
     -- player takes that slot — so a flag set for the previous occupant silently applies to
@@ -3226,6 +3461,7 @@ events.aim_ack:set(function(event)
         -- miss counters (mode-blacklist already exempts these — this finishes the job).
         -- s.missed still increments so BF cycle + force-baim escalation keep advancing.
         local server_fail_keep = false
+        local ack_verdict = tostring(reason or "?")  -- V11.5: KEEP/FLIP/NETCODE/SPREAD for the ACK ring
         -- V9.9-B: 2-MISS MODE-BLACKLIST — track misses per mode within engagement.
         -- After 2 misses with same base mode, blacklist it for 3 ticks so alternate path runs.
         if not ack_serverfail_like and reason ~= "spread" then  -- V9.72: spread = bullet RNG, not the mode's fault
@@ -3439,6 +3675,7 @@ events.aim_ack:set(function(event)
                 cs_log_verbose("correction-miss idx=%d shot_side=%d FLIP->%d err=%.1f side_bad=%s L=%d R=%d",
                                Ent:get_index(), ack_shot_side, s.last_hit_side, ack_angle_err,
                                tostring(ack_side_bad), s.correction_left, s.correction_right)
+                ack_verdict = "FLIP"
             else
                 -- angle was correct, server rejected it → server-side / fake-lag fail.
                 -- KEEP the side. Repeated fails flag a hard fake-lagger.
@@ -3538,6 +3775,7 @@ events.aim_ack:set(function(event)
                                Ent:get_index(), ack_shot_side, ack_delta, ack_side_measured, ack_angle_err, bt,
                                s.serverfail_streak,
                                keep_no_freeze and ("no-freeze: " .. nf_why .. " → BF sweeps") or "retry same")
+                ack_verdict = keep_no_freeze and ("NOFREEZE:" .. tostring(nf_why)) or "KEEP"
             end
           else
             -- FIX #4: conf<15 — correction skipped, BF cycle sweeps sides (no flip/keep/retry)
@@ -3604,6 +3842,12 @@ events.aim_ack:set(function(event)
             pcall(function() _hb = EV_HB[event.wanted_hitgroup or event.hitgroup or -1] end)
             pcall(cs_event_miss, Ent:get_index(), _nm, _hb, reason, 0, bt, _hc,
                   s.mode, s.measured_desync)
+            local _v = ack_verdict
+            if server_fail_keep then _v = "NETCODE"
+            elseif reason == "spread" then _v = "SPREAD" end
+            pcall(sel01_ack_push, "MISS", Ent:get_index(), _nm, s.mode, s.aa_type,
+                  ack_shot_side, ack_delta, ack_side_measured, ack_angle_err, bt, _hc, _v,
+                  s.real_left or 0, s.real_right or 0)
         end
     else
         -- V9.9-B: clear mode-blacklist + miss-counter on HIT (mode proven working)
@@ -3728,6 +3972,16 @@ events.aim_ack:set(function(event)
                 elseif hit_side < 0 then
                     s.real_left  = math.min((s.real_left or 0) + 1, 99)
                 end
+                -- V11.4: session stand/move SIDE counts (persist is written in learning_update_hit)
+                if hit_side ~= 0 then
+                    if (_spd or 0) < 80 then
+                        if hit_side > 0 then s.stand_n_r = math.min((s.stand_n_r or 0) + 1, 99)
+                        else                 s.stand_n_l = math.min((s.stand_n_l or 0) + 1, 99) end
+                    else
+                        if hit_side > 0 then s.move_n_r = math.min((s.move_n_r or 0) + 1, 99)
+                        else                 s.move_n_l = math.min((s.move_n_l or 0) + 1, 99) end
+                    end
+                end
                 -- per-side EMA (V9.26: own drift-bump per side too)
                 -- V9.30: per-side hard-reset on big switch >10° too.
                 if exp_perside_desync and exp_perside_desync:get() then
@@ -3836,6 +4090,11 @@ events.aim_ack:set(function(event)
             pcall(function() _hb = EV_HB[event.hitgroup or -1] end)
             pcall(cs_event_hit, Ent:get_index(), _nm, _hb, _dmg, bt, _hc,
                   s.mode, s.measured_desync, s.last_hit_side)
+            local _dlt = NormalizeAngle((src_res or 0) - (src_eye or 0))
+            pcall(sel01_ack_push, "HIT", Ent:get_index(), _nm, s.mode, s.aa_type,
+                  hit_side ~= 0 and hit_side or s.last_hit_side, _dlt,
+                  s.measured_desync, 0, bt, _hc, "HIT",
+                  s.real_left or 0, s.real_right or 0)
         end
         s.missed = 0
         s.expl_l, s.expl_r = false, false  -- V11.2: new engagement, un-burn both sides
@@ -3868,7 +4127,7 @@ events.aim_ack:set(function(event)
             if hit_side ~= 0 and src_res ~= 0 and src_eye ~= 0 then
                 local actual = math.abs(NormalizeAngle(src_res - src_eye))
                 if actual >= 1 and actual <= 65 then
-                    learning_update_hit(Ent, hit_side, actual, s.aa_type, s.mode)
+                    learning_update_hit(Ent, hit_side, actual, s.aa_type, s.mode, s.last_speed2d)
                 end
             end
         end
@@ -3974,8 +4233,11 @@ end
 -- ─── Steam-ID memory (experimental C2) ────────────────────
 get_steam_mem = function(p)
     if not (exp_steam_mem and exp_steam_mem:get()) then return nil end
-    local ok, sid = pcall(function() return p:get_steam_id() end)
-    if not ok or not sid then return nil end
+    -- V11.4: same 6-pattern sid as LearnedModel. p:get_steam_id() alone is empty
+    -- on this NL build, so SteamMemory never keyed a player and first-contact
+    -- side-seed was a coin-flip even for enemies we'd already hit this match.
+    local sid = player_sid(p)
+    if not sid then return nil end
     local m = SteamMemory[sid]
     if m == nil then
         m = {hits_left = 0, hits_right = 0, total_misses = 0, dominant_side = 0}
@@ -4400,10 +4662,6 @@ function anim_pol_dump()
 end
 
 local function _pick_first_shot_impl(p, s, anim, eye_yaw, max_desync, preset)
-    -- best-guess side for per-side effective_desync
-    local guess_side = s.last_hit_side ~= 0 and s.last_hit_side
-                       or (s.hit_streak_right >= s.hit_streak_left and 1 or -1)
-    local desync = effective_desync(s, max_desync, guess_side)
     local vx, vy = 0, 0
     pcall(function()
         local v = p.m_vecVelocity
@@ -4413,6 +4671,9 @@ local function _pick_first_shot_impl(p, s, anim, eye_yaw, max_desync, preset)
     -- clamp insane velocity from NL netvar glitches (respawn/teleport spikes 1000+ u/s)
     if speed2d > 320 then speed2d = 0 end  -- CS2 max run speed ≈ 260, anything above = glitch
     s.last_speed2d = speed2d  -- V9.67 #C: shot-time speed for the desync speed-bucket
+    -- V11.4: context side AFTER this-tick speed, so stand/move pick is current
+    local guess_side = learned_pick_side(s)
+    local desync = effective_desync(s, max_desync, guess_side)
     local close = preset.close_boost and s.tmp_close
 
     -- V11.2: SILENT FAKE-FLICK first-shot path. Until now a flagged flicker only got
@@ -4454,7 +4715,10 @@ local function _pick_first_shot_impl(p, s, anim, eye_yaw, max_desync, preset)
         -- V8.0 gate 3: slow-walker → no extrapolation
         if s.is_slow_target then can_predict = false end
         -- V8.1 gate 4: no extrapolation on first engagement (samples < 1)
-        if ((s.samples_left or 0) + (s.samples_right or 0)) < 1 then can_predict = false end
+        -- V11.6: 8+ UNIQUE passive obs (simtime-gated) is enough to unlock a small
+        -- lead — waiting for a hit before predicting is how peek first-contacts miss.
+        if ((s.samples_left or 0) + (s.samples_right or 0)) < 1
+           and (s.passive_samples or 0) < 8 then can_predict = false end
         -- V9.46 gate 5: no extrapolation across a teleport-peek — yaw_rate from before
         -- the blink does not predict where the body lands after it.
         if s.tp_peek_active then can_predict = false end
@@ -4536,6 +4800,22 @@ local function _pick_first_shot_impl(p, s, anim, eye_yaw, max_desync, preset)
                 s.mode = (s.mode or "") .. "+Pred"
                 s.last_used_pred_ticks = ticks
             end
+        elseif not s.tp_peek_active and not s.dtpeek_active
+           and not s.jittering and s.aa_type ~= "spinner" and s.aa_type ~= "spin"
+           and math.abs(s.yaw_rate or 0) > 90
+           and (s.last_speed2d or 0) > 80
+           and (s.tmp_dist or 9999) < 1500 then
+            -- V11.6: FIRST-WINDOW PEEK LEAD. A corner swing is 4-8 ticks; the main
+            -- predictor needs yaw_rate_consistent (4 samples) + conf>=40, so it never
+            -- fires for the peek we actually take. One tick of yaw_rate on top of the
+            -- interp-comp already in eye_yaw — capped so a junk rate can't throw 40°.
+            local tickint = (tick_cache and tick_cache.tickint) or (1 / 64)
+            local lead = (s.yaw_rate or 0) * tickint
+            if math.abs(lead) >= 2 and math.abs(lead) <= 22 then
+                eye_yaw = eye_yaw + lead
+                s._peek_led = true
+                s.last_used_pred_ticks = 1
+            end
         end
     end
 
@@ -4578,7 +4858,7 @@ local function _pick_first_shot_impl(p, s, anim, eye_yaw, max_desync, preset)
             end
             if not blacklisted and (best:find("Static") or best:find("Jitter%-Cls") or best:find("Jitter%-Lock")) then
                 if s.measured_desync > 5 then
-                    local side = s.last_hit_side ~= 0 and s.last_hit_side or 1
+                    local side = learned_pick_side(s)
                     s.mode = clean .. "-Recall"
                     -- V9.92: PER-SIDE magnitude (same fix v9.22 made for Predicted-Alt).
                     -- This path fired the GLOBAL EMA on whichever side we last hit — on a
@@ -4628,7 +4908,7 @@ local function _pick_first_shot_impl(p, s, anim, eye_yaw, max_desync, preset)
             end
             -- if server-yaw useless but we have measured, use it on best side
             if s.desync_samples >= 1 and s.measured_desync > 5 then
-                local side = s.last_hit_side ~= 0 and s.last_hit_side or 1
+                local side = learned_pick_side(s)
                 s.mode = "Still-Meas"
                 return eye_yaw + s.measured_desync * side
             end
@@ -4687,7 +4967,7 @@ local function _pick_first_shot_impl(p, s, anim, eye_yaw, max_desync, preset)
         if s.aa_type == "static" then
             -- 1) measured desync × known side (best case)
             if s.desync_samples >= 2 and s.measured_desync > 5 then
-                local side = s.last_hit_side ~= 0 and s.last_hit_side or 1
+                local side = learned_pick_side(s)
                 s.mode = "Static-Meas"
                 return eye_yaw + s.measured_desync * side
             end
@@ -5226,6 +5506,84 @@ function read_pose_desync(p)
     return deg
 end
 
+-- V11.6: PASSIVE LEARNING, one unique simulation tick. Extracted so the nearby
+-- off-FOV observe path can call it without picking an angle. Choked/duplicate
+-- createmove ticks used to count as new samples (dumps showed 500-600 "obs" that
+-- were the same goal_feet repeated) — the EMA crawled and the 8/20 seed gates
+-- fired on noise. Gate on m_flSimulationTime like anim_side_update.
+function passive_learn_tick(p, s, anim)
+    if not p or not s or not anim then return end
+    if s.ff_silent then return end
+    local st = 0
+    pcall(function() st = p.m_flSimulationTime or 0 end)
+    if st == 0 or st == (s.pass_simtime or -1) then return end
+    s.pass_simtime = st
+
+    local ok_pass, server_goal_pre = pcall(function() return anim.m_flGoalFeetYaw end)
+    if not ok_pass or not server_goal_pre then return end
+    local server_desync = NormalizeAngle(server_goal_pre - (anim.m_flEyeYaw or 0))
+    local sd_abs = math.abs(server_desync)
+    if sd_abs < 3 or sd_abs > 65 then return end
+
+    local p_side = server_desync > 0 and 1 or -1
+    local p_mag  = sd_abs
+    if switch_pred_tog and switch_pred_tog:get() then
+        pcall(switch_period_observe, s, p_side, globals.realtime or 0)
+    end
+    s.passive_samples = (s.passive_samples or 0) + 1
+    -- V11.6: early unique samples weight heavier so 8 real simticks actually
+    -- converge (flat 0.08 meant the first sample still dominated at seed time).
+    local n = s.passive_samples
+    local a = 0.08
+    if n <= 8 then a = 0.35
+    elseif n <= 20 then a = 0.18 end
+    if p_side > 0 then
+        s.passive_right = s.passive_right and (s.passive_right * (1 - a) + p_mag * a) or p_mag
+        s.passive_n_right = (s.passive_n_right or 0) + 1
+    else
+        s.passive_left = s.passive_left and (s.passive_left * (1 - a) + p_mag * a) or p_mag
+        s.passive_n_left = (s.passive_n_left or 0) + 1
+    end
+    if s.passive_samples >= 8 and (s.desync_samples or 0) == 0 then
+        s.measured_desync = math.max(s.passive_left or 0, s.passive_right or 0)
+    end
+    -- V11.6: side-seed at 12 UNIQUE simticks (was 20 choked createmoves) + 1.5× lean
+    -- (was 1.3). Unique ticks are slower to accumulate, so the old 20 felt like a
+    -- second of staring; 12 real updates is ~0.2s of actually seeing them.
+    if s.passive_samples >= 12 and (s.samples_left or 0) + (s.samples_right or 0) == 0 then
+        local pl, pr = s.passive_left or 0, s.passive_right or 0
+        if pr > pl * 1.5 and pr >= 15 then
+            s.measured_right = pr; s.samples_right = 2
+            if s.last_hit_side == 0 then s.last_hit_side = 1 end
+        elseif pl > pr * 1.5 and pl >= 15 then
+            s.measured_left = pl; s.samples_left = 2
+            if s.last_hit_side == 0 then s.last_hit_side = -1 end
+        end
+    end
+    if s.passive_samples == 16 or (s.passive_samples > 16 and s.passive_samples % 32 == 0) then
+        local sid = _learning_sid(p)
+        if sid then
+            local e = LearnedModel[sid]
+            if not e then
+                e = {dl=0, dr=0, sl=0, sr=0, pdl=0, pdr=0, psl=0, psr=0, dom=0,
+                     hits=0, miss=0, last_seen=0,
+                     best_jitter="", best_static="", best_switch="", best_spinner="",
+                     aa="", aa_n=0, ssl=0, ssr=0, msl=0, msr=0}
+                LearnedModel[sid] = e
+            end
+            local pl, pr = s.passive_left or 0, s.passive_right or 0
+            if pl > 5 then e.pdl = pl; e.psl = math.min(s.passive_n_left or 1, 999) end
+            if pr > 5 then e.pdr = pr; e.psr = math.min(s.passive_n_right or 1, 999) end
+            if e.dom == 0 and (e.hits or 0) == 0 then
+                if pr > pl * 1.5 then e.dom = 1
+                elseif pl > pr * 1.5 then e.dom = -1 end
+            end
+            e.last_seen = globals.realtime or 0
+            learning_dirty = true
+        end
+    end
+end
+
 local function resolve_player(p)
     if not can_resolve(p) then return end
 
@@ -5251,9 +5609,10 @@ local function resolve_player(p)
     -- reset does not catch this: a slot can be taken over without any gap. Compare the
     -- steam id and wipe the whole entry when it changes.
     do
-        -- _learning_sid is the 6-pattern id chain; it returns nil when persistent
-        -- learning is off, in which case the check simply does not run.
-        local sid_now = _learning_sid(p)
+        -- V11.4: player_sid (no persist gate). Slot reuse is an identity problem,
+        -- not a learning-toggle problem — a taken-over index with persist OFF
+        -- used to keep the previous occupant's per-side EMAs at full confidence.
+        local sid_now = player_sid(p)
         if sid_now and s.sid_seen and sid_now ~= s.sid_seen then
             cs_log_verbose("slot reuse idx=%d — new player in this slot, wiping learned state", p:get_index())
             PlayerState[p:get_index()] = nil
@@ -5262,12 +5621,23 @@ local function resolve_player(p)
         if sid_now then s.sid_seen = sid_now end
     end
 
-    -- dormancy reset: re-engagement = fresh state
-    if s.last_seen > 0 and (now - s.last_seen) > (dormancy_reset_t:get() / 1000) then
+    -- V11.4: FIRST-SIGHT boot. Persistent learning saved every hit but this block
+    -- used to run ONLY after a dormancy gap (`last_seen > 0 AND idle > threshold`).
+    -- On first contact this session (and after reload / round-restart slot reuse)
+    -- last_seen is 0, so a known 17-hit enemy ate a cold Guess/Networked shot until
+    -- they peeked off-screen 400ms and came back. resolverx seeds SideMemory on
+    -- first contact for the same reason. Dormancy still reset_state + re-boots
+    -- (FIX #5 keeps session EMAs). first_sight never reset_state.
+    local first_sight = not s.learned_booted
+    local dormant = s.last_seen > 0 and (now - s.last_seen) > (dormancy_reset_t:get() / 1000)
+    if dormant then
         reset_state(s)
+    end
+    if dormant or first_sight then
         -- boot last_hit_side from steam-memory if available
         local mem = get_steam_mem(p)
-        if mem and mem.dominant_side ~= 0 then
+        if mem and mem.dominant_side ~= 0
+           and (s.real_left or 0) + (s.real_right or 0) == 0 then
             s.last_hit_side = mem.dominant_side
             cs_log_verbose("Steam mem boot idx=%d side=%d", p:get_index(), mem.dominant_side)
         end
@@ -5349,6 +5719,28 @@ local function resolve_player(p)
                 switch  = lrn.best_switch,
                 spinner = lrn.best_spinner,
             }
+            -- V11.4: seed typical aa_type on FIRST SIGHT only. Default PlayerState
+            -- aa_type is "switch", so Recall looked up best_switch for a historically
+            -- static player until classify hysteresis committed (7 evals + 2s). After
+            -- dormancy the live classifier is more recent — don't overwrite it.
+            if first_sight then
+                local laa = lrn.aa
+                if (laa == "static" or laa == "jitter" or laa == "switch" or laa == "spinner")
+                   and (lrn.aa_n or 0) >= 2 then
+                    s.aa_type = laa
+                    s.pending_aa_type = laa
+                    s.aa_committed_at = globals.realtime or 0
+                end
+            end
+            -- V11.4: stand/move side counts. Session observations win (FIX #5 shape).
+            if (s.stand_n_l or 0) + (s.stand_n_r or 0) == 0 then
+                s.stand_n_l = math.min(lrn.ssl or 0, 10)
+                s.stand_n_r = math.min(lrn.ssr or 0, 10)
+            end
+            if (s.move_n_l or 0) + (s.move_n_r or 0) == 0 then
+                s.move_n_l = math.min(lrn.msl or 0, 10)
+                s.move_n_r = math.min(lrn.msr or 0, 10)
+            end
             -- V8.9: throttle boot log — only log if 10s+ since last (prevent spam on dormancy churn)
             -- V9.72: throttle keyed OUTSIDE PlayerState — the dormancy reset RECREATES s,
             -- wiping s.last_boot_log, so peek-flicker logged the same boot 3× (real-dump).
@@ -5361,17 +5753,20 @@ local function resolve_player(p)
             -- pushing the actual hits and keeps out of the buffer. A boot line is only
             -- worth space when its CONTENT changed.
             sel01_boot_log_last = sel01_boot_log_last or {}
-            local _bsig = string.format("%d|%.1f|%d|%.1f|%d|%d", lsl, ldl, lsr, ldr,
-                                        (lrn.dom or 0), lrn.hits or 0)
+            local _bsig = string.format("%d|%.1f|%d|%.1f|%d|%d|%s|%s", lsl, ldl, lsr, ldr,
+                                        (lrn.dom or 0), lrn.hits or 0, tostring(lrn.aa or ""),
+                                        first_sight and "fs" or "re")
             if (now_rt - (sel01_boot_log_t[_bidx] or 0)) > 10 and sel01_boot_log_last[_bidx] ~= _bsig then
                 sel01_boot_log_t[_bidx] = now_rt
                 sel01_boot_log_last[_bidx] = _bsig
-                cs_log_verbose("LearnedModel boot idx=%d L=%d(%.1f°) R=%d(%.1f°) dom=%d hits=%d pass{L=%d(%.1f°) R=%d(%.1f°)} best{j=%s s=%s sw=%s}",
+                cs_log_verbose("LearnedModel boot idx=%d L=%d(%.1f°) R=%d(%.1f°) dom=%d hits=%d aa=%s %s pass{L=%d(%.1f°) R=%d(%.1f°)} best{j=%s s=%s sw=%s}",
                                p:get_index(), lsl, ldl, lsr, ldr, (lrn.dom or 0), lrn.hits or 0,
+                               tostring(lrn.aa or ""), first_sight and "first-sight" or "re-engage",
                                lpsl, lpdl, lpsr, lpdr,
                                tostring(lrn.best_jitter), tostring(lrn.best_static), tostring(lrn.best_switch))
             end
         end
+        s.learned_booted = true
     end
     s.last_seen = now
 
@@ -5395,7 +5790,19 @@ local function resolve_player(p)
         local to_yaw = math.deg(math.atan2(dy, dx))
         local fov = math.abs(NormalizeAngle(to_yaw - tick_cache.lp_yaw))
         if fov > 110 then
-            cs_log_verbose("CULL fov=%d idx=%d", math.floor(fov), p:get_index())
+            -- V11.6: nearby off-FOV still OBSERVE. The old return skipped anim +
+            -- yaw_rate + passive entirely, so an enemy next to you was a stranger the
+            -- tick they peeked into 110° — cold AA model AND yaw_rate=0, which is
+            -- exactly the peek this resolver is supposed to hit. Dist < 2000 = duel
+            -- range; further behind-you is still culled (no point tracking spawn).
+            if s.tmp_dist < 2000 then
+                local anim = GetAnimStateCached(p)
+                if anim and anim ~= false then
+                    pcall(update_jitter, p, s)
+                    pcall(anim_side_update, s, p, now)
+                    pcall(passive_learn_tick, p, s, anim)
+                end
+            end
             return
         end
     else
@@ -5946,6 +6353,12 @@ local function resolve_player(p)
     else
         angle = pick_bruteforce_angle(s, anim, eye_yaw, max_desync, p, preset)
     end
+    -- V11.6: named first-shot branches overwrite s.mode, so +Peek has to be
+    -- re-attached after the pick or the dump never shows the peek lead firing.
+    if s._peek_led then
+        s.mode = tostring(s.mode or "") .. "+Peek"
+        s._peek_led = nil
+    end
 
     -- store for measured-desync learning in aim_ack
     s.last_eye_yaw  = eye_yaw
@@ -5964,99 +6377,9 @@ local function resolve_player(p)
     if _re then _re.a = angle; _re.t = now_ct
     else s.recent_resolved[_ri] = {a = angle, t = now_ct} end
 
-    -- V7.1: PASSIVE LEARNING — read server's predicted feet_yaw BEFORE override
-    -- This is what the server actually computes for this enemy's desync, no shooting needed
-    local ok_pass, server_goal_pre = pcall(function() return anim.m_flGoalFeetYaw end)
-    if ok_pass and server_goal_pre then
-        local server_desync = NormalizeAngle(server_goal_pre - anim.m_flEyeYaw)
-        local sd_abs = math.abs(server_desync)
-        -- V11.3: the silent-flick WIDE-BAND read moved OUT of here and up into the
-        -- detector block, so it now runs BEFORE the angle is picked instead of one tick
-        -- behind it. Against the alternating "Silent" mode that is the whole ball game —
-        -- see the comment there. This block keeps only the passive EMA it always owned.
-        -- V11.2: CONTAMINATION GUARD. While a flick is live the visible eye is not the
-        -- base the server used, so every passive sample computed off it is garbage —
-        -- and passive samples SEED measured_desync (line below) for never-hit enemies.
-        -- Real-dump idx=1: 629 passive obs seeded R=52.8° while the persisted honest
-        -- average for that player is 35.5°, and both shots at ~41-43° missed. Freeze
-        -- passive learning instead of poisoning the EMA; the persisted seed survives.
-        -- (Must NOT early-return here — the resolved yaw is applied below this block.)
-        if (not s.ff_silent) and sd_abs >= 3 and sd_abs <= 65 then
-            -- accumulate passive samples (slower alpha than hit-EMA, lower weight)
-            local p_side = server_desync > 0 and 1 or -1
-            local p_mag  = math.abs(server_desync)
-            -- V9.67 #B: the server's predicted feet-yaw gives the live fake side every
-            -- tick — feed the switch-period detector so it can time the flips.
-            if switch_pred_tog and switch_pred_tog:get() then
-                pcall(switch_period_observe, s, p_side, globals.realtime or 0)
-            end
-            s.passive_samples = (s.passive_samples or 0) + 1
-            if p_side > 0 then
-                s.passive_right = s.passive_right and
-                    (s.passive_right * 0.92 + p_mag * 0.08) or p_mag
-                s.passive_n_right = (s.passive_n_right or 0) + 1  -- V9.72: per-side obs count
-            else
-                s.passive_left = s.passive_left and
-                    (s.passive_left * 0.92 + p_mag * 0.08) or p_mag
-                s.passive_n_left = (s.passive_n_left or 0) + 1   -- V9.72: per-side obs count
-            end
-            -- if no measured (no hit yet), seed measured_desync from passive after 8 obs
-            if s.passive_samples >= 8 and s.desync_samples == 0 then
-                s.measured_desync = math.max(s.passive_left or 0, s.passive_right or 0)
-            end
-            -- V8.0 + V9.1: stronger passive seeding — V9.1 noise floor 15° (was 5°)
-            if s.passive_samples >= 20 and (s.samples_left or 0) + (s.samples_right or 0) == 0 then
-                local pl, pr = s.passive_left or 0, s.passive_right or 0
-                -- V9.1: don't seed from sub-15° passive (likely glancing/network noise)
-                if pr > pl * 1.3 and pr >= 15 then
-                    s.measured_right = pr; s.samples_right = 2
-                    if s.last_hit_side == 0 then s.last_hit_side = 1 end
-                elseif pl > pr * 1.3 and pl >= 15 then
-                    s.measured_left = pl; s.samples_left = 2
-                    if s.last_hit_side == 0 then s.last_hit_side = -1 end
-                end
-            end
-            -- V8.6: persist passive observation to file (without needing a hit)
-            -- After 30+ passive obs, write seed entry so next match remembers this enemy
-            if s.passive_samples == 30 or (s.passive_samples > 30 and s.passive_samples % 60 == 0) then
-                local sid = _learning_sid(p)
-                if sid then
-                    local e = LearnedModel[sid]
-                    if not e then
-                        e = {dl=0, dr=0, sl=0, sr=0, pdl=0, pdr=0, psl=0, psr=0, dom=0,
-                             hits=0, miss=0, last_seen=0,
-                             best_jitter="", best_static="", best_switch="", best_spinner=""}
-                        LearnedModel[sid] = e
-                    end
-                    -- V11.1 (B1): passive observations get their OWN fields. They used to
-                    -- be written into sl/sr/dl/dr — the same fields learning_update_hit
-                    -- fills from confirmed hits — with the count set to 1. Boot then read
-                    -- sl/sr back as REAL hits (v9.81 seeds s.real_left/right from them, on
-                    -- the stated assumption that "learning_update_hit only bumps them on a
-                    -- confirmed hit"), so a never-shot enemy came back claiming real hits.
-                    -- Everything gated on real evidence fired on passive noise: the v9.45
-                    -- seed-only keep guard (real_active >= 1), v9.48 alt_side_pick real
-                    -- dominance, the v9.78 one_sided BF ordering (real >= 3), the
-                    -- confidence real-sample cap and the v10.6 "bimodality needs real
-                    -- hits" rule. The v11.0 dump shows the corruption directly:
-                    -- name_48690_3 hits=1 with L=2 R=1, name_293117816_15 hits=12 with
-                    -- L=6 R=8 — side counts above the hit count can only be passive.
-                    -- Passive data is still worth persisting; it just has to say so.
-                    local pl, pr = s.passive_left or 0, s.passive_right or 0
-                    if pl > 5 then e.pdl = pl; e.psl = math.min(s.passive_n_left or 1, 999) end
-                    if pr > 5 then e.pdr = pr; e.psr = math.min(s.passive_n_right or 1, 999) end
-                    -- dom stays HIT-derived. With no hits on record, a passive lean is the
-                    -- only signal there is, so seed it then — but never over hit data.
-                    if e.dom == 0 and (e.hits or 0) == 0 then
-                        if pr > pl * 1.3 then e.dom = 1
-                        elseif pl > pr * 1.3 then e.dom = -1 end
-                    end
-                    e.last_seen = globals.realtime or 0
-                    learning_dirty = true
-                end
-            end
-        end
-    end
+    -- V7.1 / V11.6: PASSIVE LEARNING — unique simticks only, before the override.
+    -- Must NOT return here: the resolved yaw is applied below this call.
+    pcall(passive_learn_tick, p, s, anim)
 
     anim.m_flGoalFeetYaw = NormalizeAngle(angle)
 
@@ -7555,6 +7878,6 @@ _cs_log_color_raw("V10.9: the unbiased [KEEP] metric answered — and it says th
 _cs_log_color_raw("V11.0: the two BOOST paths never got the per-side magnitude conversion. Static-ServerBoost and Networked-Boost take their SIDE from the server-yaw reconstruct but fired the GLOBAL measured EMA as the magnitude — on a bimodal enemy that average is wrong on BOTH sides. This is the exact bug v9.22 fixed for Predicted-Alt, v9.54 for the serverfail retry and v9.92 for the Recall fast-path; these two branches were simply missed each time. The v10.9 dump makes the cost visible: Static-ServerBoost 10/13 (76.9%) against Static-Meas 50/53 (94.3%) in a lobby holding two-mode enemies like idx=8 at L=32.6 / R=47.4. Both now use effective_desync for whichever side they settled on, which falls back to the global EMA when that side has no samples, so one-sided enemies are unaffected. An audit found three more global-EMA sites — Static-Meas, Still-Meas, Networked-Meas — deliberately NOT converted: Static-Meas is the highest-volume mode in the build at 94.3%, and changing a path that works on theory alone is the same mistake as trusting the biased v10.4 metric, just smaller. They stay on the list until a dump shows them failing.")
 _cs_log_color_raw("V11.1: the persistent player model was recording passive guesses as confirmed hits. The v8.6 passive-persist wrote its observations into sl/sr/dl/dr — the same fields learning_update_hit fills from real hits — with the count set to 1, and the v9.81 boot reads sl/sr back as REAL hits on the stated assumption that only a confirmed hit can bump them. So a never-shot enemy returned claiming real hit data, and every guard built on real evidence fired on passive noise: the v9.45 seed-only keep (real_active>=1), v9.48 alt_side_pick real-dominance, the v9.78 one_sided BF ordering, the confidence real-sample cap, the v10.6 'bimodality needs real hits' rule. The v11.0 dump shows it plainly — name_48690_3 hits=1 with L=2 R=1, name_293117816_15 hits=12 with L=6 R=8; a side count above the hit count can only be passive. Passive data now lives in psl/psr/pdl/pdr, boots into the PASSIVE fields (so it stays useful without lying), and old files are migrated on load by the same arithmetic: sl+sr can never exceed hits, so the excess is passive. Two more from the same audit: the persisted EMA finally gets the v9.39 sample ramp + a v9.30-style hard reset (it blended at a flat 0.20 forever, and after a passive seed the first REAL hit moved the stored value only 20%), and e.dom gets its missing else-branch — once it went to +/-1 nothing could ever return it to neutral, and boot feeds it straight into last_hit_side. Plus: the [SESSION] raw line now adds spread-filtered shots back too, and the dump prints passive counts separately, which is the tell that was missing for eleven versions.")
 _cs_log_color_raw("V11.2: SILENT fake flick. The v9.88 detector only sees a flick that shows up in the enemy's VISIBLE eye angle — out to ~90 and back. A silent flick never does: the offset rides the hidden / defensive record (11_fakeflick.lua does exactly this — Hidden yaw ON, hidden pitch 89, hidden yaw offset -90, force_defensive every 7th command), so the model stands perfectly still while the server builds the feet yaw off an angle we never see. It was invisible to every path in the resolver, and worse, the evidence was being thrown away: passive learning discards |goal_feet - eye| above 65 degrees, which is precisely the band a hidden-yaw record produces (a legal body yaw is capped at 58, so that band is physically impossible to reach honestly). It is now counted, not discarded, and the excursion magnitude + side are learned from it — a second tell (the raw m_angEyeAngles disagreeing with the animstate eye by ~90) feeds the same counter. Both are only scored while the enemy is standing and not turning, because a fast turn makes the feet yaw lag past 65 all by itself and a spinner does it every tick. Six observations inside 3s flags them, and then: the FIRST shot goes to the measured excursion (mode Flick-Meas) instead of arriving 90 degrees off and only reaching plus/minus 90 after the BF cycle had already burned the opener, the BF cycle sweeps the measured magnitude on the measured side first, and passive learning pauses so the flick cannot poison the EMA — real-dump idx=1 had 629 passive observations seeding 52.8 degrees against that same player's honest persisted 35.5, then missed twice at 41-43. Also fixed from that dump: the blind-explore side ping-pong. idx=1 missed, flipped L to R, missed, flipped R back to L — straight back onto the side that had just whiffed, with the magnitude never once questioned. Sides now burn per engagement; once both have missed the side is no longer the open question, so it is kept and the BF cycle sweeps magnitude instead. A hit clears the burn.")
-_cs_log_color_raw("V11.3: found where 'silent fake flick' actually comes from, and it changes the fix. It is not a forum term — it is a Mode in angelnbone_7.lua, sitting in the NL scripts folder the whole time: Defensive Flick with Mode = Default or Silent. Both build the SAME defensive entry (yaw_offset = flick_yaw, 0-180 with 120 default, hidden = true, body_yaw = true, force_defensive every 7th command). The only difference is four lines: Silent flips the offset's SIGN on every un-choked send. Default leans one way and is learnable; Silent cancels itself out, which is why the model never drifts to a side and looks like it is not moving, and why any resolver that averages the side — this one included — converges to exactly zero information about it. The v11.2 response learned a side EMA, so against Silent it was a coin flip. The counter is not a better predictor, it is to stop predicting: m_flGoalFeetYaw already carries the CURRENT tick's hidden side and is readable BEFORE we commit an angle, so the wide-band read moved from after pick_first_shot to before it. The flick response now fires the side the server is using this tick and Silent's alternation stops mattering. Band also widened to 178 to cover the full 0-180 flick_yaw slider (v11.2 stopped at 125), and sign changes are counted so the dump reports alt=true (Silent) vs alt=false (Default) — telemetry only, nothing depends on it.")
+_cs_log_color_raw("V11.6: passive learning + peek prediction. (1) FOV cull used to skip the WHOLE resolve — an enemy next to you, just off-screen, was never passively learned and their yaw_rate went cold, so the tick they peeked into 110° was a stranger with rate=0. Nearby (<2000u) off-FOV now still runs update_jitter + passive_learn + anim_side (no angle override). (2) Passive counted choked createmove ticks as new samples (dumps: 500-600 obs that were the same goal_feet repeated); now unique m_flSimulationTime only, early alpha 0.35 so 8 real simticks actually converge, side-seed at 12 unique with a 1.5x lean. (3) Peek predictor needed yaw_rate_consistent (4 samples) + conf>=40, so a 4-8 tick corner swing never got a lead. New +Peek: 1 tick of yaw_rate when they're running a one-way swing at <1500u, not jittering, not a spinner — capped 3-22° so junk rates can't throw the shot. Shows as mode+Peek in the ACK dump. 8+ unique passive obs also unlocks the main predictor (was samples<1 hard block).")
 _cs_log_color_raw("Logging: " .. (log_enabled:get() and ("ON" .. (log_verbose:get() and " (verbose)" or ""))  or "OFF"))
 _cs_log_color_raw("=========================================")
