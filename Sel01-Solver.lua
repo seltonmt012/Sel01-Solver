@@ -1,12 +1,14 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 11.10                                  ║
+-- ║  Version: 11.11                                  ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 11.10
--- @description v11.10 Networked rebuild-side veto + Jitter-Cls needs a real hit.
+-- @version 11.11
+-- @description v11.11 dump [NET] ping + ACK-bt so high-ping sessions are not
+--   read as resolver faults. No aim change.
+-- @description-prev v11.10 Networked rebuild-side veto + Jitter-Cls needs a real hit.
 --   Dump v11.8 idx=3 HIT Networked R +13.5 then Networked L -11.7 against the
 --   only real hit (Aggressive first_shot=networked skips Static-Server-Dom).
 --   idx=10 Jitter-Cls R with real=0 (last_hit from persist.dom / steam-mem).
@@ -158,7 +160,7 @@
 --   * v9.26 drift-bump (alpha 0.55 on 5-10° diff) still handles small shifts.
 --   * v9.29 coach variants carry.
 
-local SEL01_VERSION = "11.10"
+local SEL01_VERSION = "11.11"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -1554,6 +1556,23 @@ local log_copy_btn = g_logging:button("📋 Copy Last Logs (for share)", functio
             tostring(exp_silentflick and exp_silentflick:get()),
             tostring(exp_dtpeek and exp_dtpeek:get()),
             adaptive_guess_mag()))
+        -- V11.11: ping + ACK backtrack sit in the dump so a high-ping session
+        -- is not read as a resolver fault. ping_ms is last createmove sample
+        -- (0 if dumped from menu with no tick); ACK-bt is the session tell.
+        do
+            local ping = tonumber(tick_cache.ping_ms) or 0
+            local n, sum, mx, hi = 0, 0, 0, 0
+            for _, line in ipairs(sel01_ack_iter()) do
+                local bt = tonumber(tostring(line):match(" bt=(%d+)")) or 0
+                n = n + 1
+                sum = sum + bt
+                if bt > mx then mx = bt end
+                if bt >= 8 then hi = hi + 1 end
+            end
+            _cs_log_raw(string.format("[NET] ping=%.0fms  ack-bt avg=%.1f max=%d  high-bt(>=8)=%d/%d%s",
+                ping, n > 0 and (sum / n) or 0, mx, hi, n,
+                ping >= 80 and "  HIGH-PING" or (hi * 2 >= n and n > 0 and "  HIGH-BT" or "")))
+        end
     end)
 
     -- V7.5: LEARNING DIAGNOSTICS (key data for improvement suggestions)
@@ -8001,5 +8020,6 @@ _cs_log_color_raw("V11.1: the persistent player model was recording passive gues
 _cs_log_color_raw("V11.2: SILENT fake flick. The v9.88 detector only sees a flick that shows up in the enemy's VISIBLE eye angle — out to ~90 and back. A silent flick never does: the offset rides the hidden / defensive record (11_fakeflick.lua does exactly this — Hidden yaw ON, hidden pitch 89, hidden yaw offset -90, force_defensive every 7th command), so the model stands perfectly still while the server builds the feet yaw off an angle we never see. It was invisible to every path in the resolver, and worse, the evidence was being thrown away: passive learning discards |goal_feet - eye| above 65 degrees, which is precisely the band a hidden-yaw record produces (a legal body yaw is capped at 58, so that band is physically impossible to reach honestly). It is now counted, not discarded, and the excursion magnitude + side are learned from it — a second tell (the raw m_angEyeAngles disagreeing with the animstate eye by ~90) feeds the same counter. Both are only scored while the enemy is standing and not turning, because a fast turn makes the feet yaw lag past 65 all by itself and a spinner does it every tick. Six observations inside 3s flags them, and then: the FIRST shot goes to the measured excursion (mode Flick-Meas) instead of arriving 90 degrees off and only reaching plus/minus 90 after the BF cycle had already burned the opener, the BF cycle sweeps the measured magnitude on the measured side first, and passive learning pauses so the flick cannot poison the EMA — real-dump idx=1 had 629 passive observations seeding 52.8 degrees against that same player's honest persisted 35.5, then missed twice at 41-43. Also fixed from that dump: the blind-explore side ping-pong. idx=1 missed, flipped L to R, missed, flipped R back to L — straight back onto the side that had just whiffed, with the magnitude never once questioned. Sides now burn per engagement; once both have missed the side is no longer the open question, so it is kept and the BF cycle sweeps magnitude instead. A hit clears the burn.")
 _cs_log_color_raw("V11.9: never-hit + high backtrack no longer freezes a coin-flip seed. Console: missed 666 Predicted 31°/32° correction bt=22 then 15, hc 100/89 — dump idx=10 real=0, passive 58L/63R, last_hit=R from seed. `bt>8 → KEEP` fired before the seed-only else, so v9.49 explore (2 KEEPs) never ran before they died. bt>8 and meas-keep now need a real hit; 50/50 never-hit flips on the first miss. Also: BF:opposite uses last_resolved-eye when last_shot_side is 0 (idx=7 Air R miss flipped to L, opposite shot R again). Static-Server vetoes a rebuild side that conflicts with 1-hit real dominance (idx=15 HIT R +23.8 then Static-Server L -44.7).")
 _cs_log_color_raw("V11.10: Networked rebuild-side veto + Jitter-Cls needs a real hit. Dump v11.8: idx=3 HIT Networked R +13.5 then Networked L -11.7 against the only real hit — Aggressive first_shot=networked returns the raw reconstruct and never hits Static-Server-Dom / Networked-Boost (clamp_learned needs 4 reals, Boost needs +2 lead). Both Networked returns now use the same resolver_side_conflicts veto (mode Networked-Dom). idx=10 666 Jitter-Cls R with real=0: last_hit_side was booted from persist.dom/steam-mem; Jitter-Cls/Jitter-Lock now require a confirmed hit before locking.")
+_cs_log_color_raw("V11.11: copy-dump [NET] line — ping_ms + ACK-ring backtrack avg/max/high-bt count. High-ping sessions were being read as resolver faults; the dump now carries the tell. No aim change.")
 _cs_log_color_raw("Logging: " .. (log_enabled:get() and ("ON" .. (log_verbose:get() and " (verbose)" or ""))  or "OFF"))
 _cs_log_color_raw("=========================================")
