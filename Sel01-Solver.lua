@@ -1,12 +1,16 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 11.9                                   ║
+-- ║  Version: 11.10                                  ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 11.9
--- @description v11.9 never-hit high-bt no longer freezes a coin-flip seed. 666
+-- @version 11.10
+-- @description v11.10 Networked rebuild-side veto + Jitter-Cls needs a real hit.
+--   Dump v11.8 idx=3 HIT Networked R +13.5 then Networked L -11.7 against the
+--   only real hit (Aggressive first_shot=networked skips Static-Server-Dom).
+--   idx=10 Jitter-Cls R with real=0 (last_hit from persist.dom / steam-mem).
+-- @description-prev v11.9 never-hit high-bt no longer freezes a coin-flip seed. 666
 --   Predicted 31° ×2 correction bt=22/15, real=0, passive 58/63, died before
 --   the v9.49 explore (needs 2 KEEPs). bt>8 KEEP now requires a real hit.
 -- @description-prev v11.8 90° hits count as SIDE evidence, not magnitude. BF:+90 /
@@ -154,7 +158,7 @@
 --   * v9.26 drift-bump (alpha 0.55 on 5-10° diff) still handles small shifts.
 --   * v9.29 coach variants carry.
 
-local SEL01_VERSION = "11.9"
+local SEL01_VERSION = "11.10"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -5067,7 +5071,13 @@ local function _pick_first_shot_impl(p, s, anim, eye_yaw, max_desync, preset)
                 s.mode = "Static-AnimGuess"
             end
             return eye_yaw + adaptive_guess_mag() * side
-        elseif s.aa_type == "jitter" and s.last_hit_side ~= 0 then
+        elseif s.aa_type == "jitter" and s.last_hit_side ~= 0
+           and ((s.real_left or 0) + (s.real_right or 0)) >= 1 then
+            -- V11.10: last_hit_side is also booted from persist.dom / steam-mem
+            -- with zero real hits. Jitter-Cls is "lock onto last HIT side" —
+            -- without a hit it is a Guess wearing a lock label.
+            -- Dump v11.8 idx=10 666: Jitter-Cls R +30.6 real=0 then FLIP,
+            -- persist dom=1 from seed. Need a confirmed hit before locking.
             s.mode = "Jitter-Cls"
             return eye_yaw + desync * s.last_hit_side
         elseif s.aa_type == "spinner" and s.yaw_rate and math.abs(s.yaw_rate) > 60 then
@@ -5095,6 +5105,20 @@ local function _pick_first_shot_impl(p, s, anim, eye_yaw, max_desync, preset)
         end
         -- V10.3: same learned-magnitude guard as the Static-Server path
         local sy2, clamped = clamp_learned_serveryaw(s, eye_yaw, sy)
+        -- V11.10: same 1-hit side veto as Static-Server-Dom. Aggressive
+        -- `first_shot=="networked"` returns the raw reconstruct HERE and never
+        -- reaches the fallback Networked-Boost / Static-Server-Dom path.
+        -- Dump v11.8 idx=3 HIT Networked R +13.5 then Networked L -11.7
+        -- against the only real hit; recovered via BF:+90 R. clamp_learned
+        -- needs 4 reals; Boost uses learned_dom_side (+2 lead) — 1-vs-0 skipped both.
+        do
+            local rside = NormalizeAngle(sy2 - eye_yaw) >= 0 and 1 or -1
+            if resolver_side_conflicts(s, rside) then
+                local side = s.last_hit_side ~= 0 and s.last_hit_side or -rside
+                s.mode = "Networked-Dom"
+                return eye_yaw + effective_desync(s, max_desync, side) * side
+            end
+        end
         s.mode = clamped and "Networked-Clamp" or "Networked"
         return sy2
     end
@@ -5138,7 +5162,9 @@ local function _pick_first_shot_impl(p, s, anim, eye_yaw, max_desync, preset)
     -- V8.7: ONLY fire for true jitter aa_type — switch enemies trip jittering flag but
     -- should use Predicted-Alt path instead (their side oscillates per shot)
     if s.jittering and preset.jitter_lock and s.last_hit_side ~= 0
-       and s.aa_type == "jitter" then
+       and s.aa_type == "jitter"
+       and ((s.real_left or 0) + (s.real_right or 0)) >= 1 then
+        -- V11.10: same real-hit gate as Jitter-Cls (seeded last_hit is not a lock)
         s.mode = "Jitter-Lock"
         return eye_yaw + desync * s.last_hit_side
     end
@@ -5221,6 +5247,15 @@ local function _pick_first_shot_impl(p, s, anim, eye_yaw, max_desync, preset)
         end
         -- V10.3: same learned-magnitude guard as the Static-Server path
         local sy2, clamped = clamp_learned_serveryaw(s, eye_yaw, sy)
+        -- V11.10: same 1-hit side veto (fallback Networked, non-Aggressive presets)
+        do
+            local rside = NormalizeAngle(sy2 - eye_yaw) >= 0 and 1 or -1
+            if resolver_side_conflicts(s, rside) then
+                local side = s.last_hit_side ~= 0 and s.last_hit_side or -rside
+                s.mode = "Networked-Dom"
+                return eye_yaw + effective_desync(s, max_desync, side) * side
+            end
+        end
         s.mode = clamped and "Networked-Clamp" or "Networked"
         return sy2
     end
@@ -7965,5 +8000,6 @@ _cs_log_color_raw("V11.0: the two BOOST paths never got the per-side magnitude c
 _cs_log_color_raw("V11.1: the persistent player model was recording passive guesses as confirmed hits. The v8.6 passive-persist wrote its observations into sl/sr/dl/dr — the same fields learning_update_hit fills from real hits — with the count set to 1, and the v9.81 boot reads sl/sr back as REAL hits on the stated assumption that only a confirmed hit can bump them. So a never-shot enemy returned claiming real hit data, and every guard built on real evidence fired on passive noise: the v9.45 seed-only keep (real_active>=1), v9.48 alt_side_pick real-dominance, the v9.78 one_sided BF ordering, the confidence real-sample cap, the v10.6 'bimodality needs real hits' rule. The v11.0 dump shows it plainly — name_48690_3 hits=1 with L=2 R=1, name_293117816_15 hits=12 with L=6 R=8; a side count above the hit count can only be passive. Passive data now lives in psl/psr/pdl/pdr, boots into the PASSIVE fields (so it stays useful without lying), and old files are migrated on load by the same arithmetic: sl+sr can never exceed hits, so the excess is passive. Two more from the same audit: the persisted EMA finally gets the v9.39 sample ramp + a v9.30-style hard reset (it blended at a flat 0.20 forever, and after a passive seed the first REAL hit moved the stored value only 20%), and e.dom gets its missing else-branch — once it went to +/-1 nothing could ever return it to neutral, and boot feeds it straight into last_hit_side. Plus: the [SESSION] raw line now adds spread-filtered shots back too, and the dump prints passive counts separately, which is the tell that was missing for eleven versions.")
 _cs_log_color_raw("V11.2: SILENT fake flick. The v9.88 detector only sees a flick that shows up in the enemy's VISIBLE eye angle — out to ~90 and back. A silent flick never does: the offset rides the hidden / defensive record (11_fakeflick.lua does exactly this — Hidden yaw ON, hidden pitch 89, hidden yaw offset -90, force_defensive every 7th command), so the model stands perfectly still while the server builds the feet yaw off an angle we never see. It was invisible to every path in the resolver, and worse, the evidence was being thrown away: passive learning discards |goal_feet - eye| above 65 degrees, which is precisely the band a hidden-yaw record produces (a legal body yaw is capped at 58, so that band is physically impossible to reach honestly). It is now counted, not discarded, and the excursion magnitude + side are learned from it — a second tell (the raw m_angEyeAngles disagreeing with the animstate eye by ~90) feeds the same counter. Both are only scored while the enemy is standing and not turning, because a fast turn makes the feet yaw lag past 65 all by itself and a spinner does it every tick. Six observations inside 3s flags them, and then: the FIRST shot goes to the measured excursion (mode Flick-Meas) instead of arriving 90 degrees off and only reaching plus/minus 90 after the BF cycle had already burned the opener, the BF cycle sweeps the measured magnitude on the measured side first, and passive learning pauses so the flick cannot poison the EMA — real-dump idx=1 had 629 passive observations seeding 52.8 degrees against that same player's honest persisted 35.5, then missed twice at 41-43. Also fixed from that dump: the blind-explore side ping-pong. idx=1 missed, flipped L to R, missed, flipped R back to L — straight back onto the side that had just whiffed, with the magnitude never once questioned. Sides now burn per engagement; once both have missed the side is no longer the open question, so it is kept and the BF cycle sweeps magnitude instead. A hit clears the burn.")
 _cs_log_color_raw("V11.9: never-hit + high backtrack no longer freezes a coin-flip seed. Console: missed 666 Predicted 31°/32° correction bt=22 then 15, hc 100/89 — dump idx=10 real=0, passive 58L/63R, last_hit=R from seed. `bt>8 → KEEP` fired before the seed-only else, so v9.49 explore (2 KEEPs) never ran before they died. bt>8 and meas-keep now need a real hit; 50/50 never-hit flips on the first miss. Also: BF:opposite uses last_resolved-eye when last_shot_side is 0 (idx=7 Air R miss flipped to L, opposite shot R again). Static-Server vetoes a rebuild side that conflicts with 1-hit real dominance (idx=15 HIT R +23.8 then Static-Server L -44.7).")
+_cs_log_color_raw("V11.10: Networked rebuild-side veto + Jitter-Cls needs a real hit. Dump v11.8: idx=3 HIT Networked R +13.5 then Networked L -11.7 against the only real hit — Aggressive first_shot=networked returns the raw reconstruct and never hits Static-Server-Dom / Networked-Boost (clamp_learned needs 4 reals, Boost needs +2 lead). Both Networked returns now use the same resolver_side_conflicts veto (mode Networked-Dom). idx=10 666 Jitter-Cls R with real=0: last_hit_side was booted from persist.dom/steam-mem; Jitter-Cls/Jitter-Lock now require a confirmed hit before locking.")
 _cs_log_color_raw("Logging: " .. (log_enabled:get() and ("ON" .. (log_verbose:get() and " (verbose)" or ""))  or "OFF"))
 _cs_log_color_raw("=========================================")
