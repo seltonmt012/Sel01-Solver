@@ -1,12 +1,14 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 11.11                                  ║
+-- ║  Version: 11.12                                  ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 11.11
--- @description v11.11 dump [NET] ping + ACK-bt so high-ping sessions are not
+-- @version 11.12
+-- @description v11.12 ping on every ACK / HIT-FULL / MISS-FULL / correction-miss
+--   line (HIGH when ping>=80). Dump is self-describing. No aim change.
+-- @description-prev v11.11 dump [NET] ping + ACK-bt so high-ping sessions are not
 --   read as resolver faults. No aim change.
 -- @description-prev v11.10 Networked rebuild-side veto + Jitter-Cls needs a real hit.
 --   Dump v11.8 idx=3 HIT Networked R +13.5 then Networked L -11.7 against the
@@ -160,7 +162,7 @@
 --   * v9.26 drift-bump (alpha 0.55 on 5-10° diff) still handles small shifts.
 --   * v9.29 coach variants carry.
 
-local SEL01_VERSION = "11.11"
+local SEL01_VERSION = "11.12"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -1307,11 +1309,15 @@ function sel01_ack_push(kind, idx, name, mode, aa, side, delta, meas, err, bt, h
     if name == "" then name = "-" end
     local side_s = (side or 0) > 0 and "R" or ((side or 0) < 0 and "L" or "·")
     local err_s = (err == nil or err == math.huge) and "-" or string.format("%.1f", err)
+    -- V11.12: stamp ping on every ACK so a dump is self-describing (high ping
+    -- vs resolver). HIGH when ping>=80 — scannable in LAST 15 SHOTS.
+    local ping = math.floor(tonumber(tick_cache and tick_cache.ping_ms) or 0)
+    local ping_s = ping >= 80 and string.format("ping=%d HIGH", ping) or string.format("ping=%d", ping)
     local line = string.format(
-        "[ACK] %s idx=%d %s mode=%s aa=%s %s d=%+.1f meas=%.1f err=%s bt=%d hc=%d %s real=%d/%d",
+        "[ACK] %s idx=%d %s mode=%s aa=%s %s d=%+.1f meas=%.1f err=%s bt=%d hc=%d %s %s real=%d/%d",
         kind, tonumber(idx) or 0, name, tostring(mode or "?"), tostring(aa or "?"),
         side_s, tonumber(delta) or 0, tonumber(meas) or 0, err_s,
-        tonumber(bt) or 0, tonumber(hc) or 0, tostring(verdict or ""),
+        tonumber(bt) or 0, tonumber(hc) or 0, ping_s, tostring(verdict or ""),
         tonumber(rl) or 0, tonumber(rr) or 0)
     local r = sel01_ack_ring
     r.head = (r.head % r.cap) + 1
@@ -1562,16 +1568,26 @@ local log_copy_btn = g_logging:button("📋 Copy Last Logs (for share)", functio
         do
             local ping = tonumber(tick_cache.ping_ms) or 0
             local n, sum, mx, hi = 0, 0, 0, 0
+            local psum, pmax, phi = 0, 0, 0
             for _, line in ipairs(sel01_ack_iter()) do
-                local bt = tonumber(tostring(line):match(" bt=(%d+)")) or 0
+                local sline = tostring(line)
+                local bt = tonumber(sline:match(" bt=(%d+)")) or 0
+                local p = tonumber(sline:match(" ping=(%d+)")) or 0
                 n = n + 1
                 sum = sum + bt
                 if bt > mx then mx = bt end
                 if bt >= 8 then hi = hi + 1 end
+                psum = psum + p
+                if p > pmax then pmax = p end
+                if p >= 80 then phi = phi + 1 end
             end
-            _cs_log_raw(string.format("[NET] ping=%.0fms  ack-bt avg=%.1f max=%d  high-bt(>=8)=%d/%d%s",
-                ping, n > 0 and (sum / n) or 0, mx, hi, n,
-                ping >= 80 and "  HIGH-PING" or (hi * 2 >= n and n > 0 and "  HIGH-BT" or "")))
+            if ping < 1 and n > 0 then ping = psum / n end
+            local tag = ""
+            if ping >= 80 or (n > 0 and phi * 2 >= n) then tag = "  HIGH-PING"
+            elseif hi * 2 >= n and n > 0 then tag = "  HIGH-BT" end
+            _cs_log_raw(string.format("[NET] ping=%.0fms (ack avg=%.0f max=%d high=%d/%d)  ack-bt avg=%.1f max=%d  high-bt(>=8)=%d/%d%s",
+                ping, n > 0 and (psum / n) or 0, pmax, phi, n,
+                n > 0 and (sum / n) or 0, mx, hi, n, tag))
         end
     end)
 
@@ -3718,9 +3734,10 @@ events.aim_ack:set(function(event)
                 s.guess_cached_side = nil
                 resolver_clear_serverfail_retry(s)
                 s.serverfail_streak = 0
-                cs_log_verbose("correction-miss idx=%d shot_side=%d FLIP->%d err=%.1f side_bad=%s L=%d R=%d",
+                cs_log_verbose("correction-miss idx=%d shot_side=%d FLIP->%d err=%.1f side_bad=%s L=%d R=%d ping=%.0f bt=%d",
                                Ent:get_index(), ack_shot_side, s.last_hit_side, ack_angle_err,
-                               tostring(ack_side_bad), s.correction_left, s.correction_right)
+                               tostring(ack_side_bad), s.correction_left, s.correction_right,
+                               tick_cache.ping_ms or 0, bt)
                 ack_verdict = "FLIP"
             else
                 -- angle was correct, server rejected it → server-side / fake-lag fail.
@@ -3817,9 +3834,9 @@ events.aim_ack:set(function(event)
                 -- retry same" for a BF probe that was in fact released. A log that
                 -- contradicts the code is worse than no log; it sent me hunting a bug that
                 -- had already been fixed.
-                cs_log_verbose("correction-miss idx=%d KEEP side=%d our=%.1f meas=%.1f err=%.1f bt=%d (fail #%d, %s)",
+                cs_log_verbose("correction-miss idx=%d KEEP side=%d our=%.1f meas=%.1f err=%.1f bt=%d ping=%.0f (fail #%d, %s)",
                                Ent:get_index(), ack_shot_side, ack_delta, ack_side_measured, ack_angle_err, bt,
-                               s.serverfail_streak,
+                               tick_cache.ping_ms or 0, s.serverfail_streak,
                                keep_no_freeze and ("no-freeze: " .. nf_why .. " → BF sweeps") or "retry same")
                 ack_verdict = keep_no_freeze and ("NOFREEZE:" .. tostring(nf_why)) or "KEEP"
             end
@@ -3874,12 +3891,13 @@ events.aim_ack:set(function(event)
         -- V9.1: skip Init-mode debug log
         if s.mode ~= "Init" then
             cs_log_debug(
-                "MISS-FULL idx=%d reason=%s mode=%s aa=%s missCount=%d eye=%.1f resolved=%.1f delta=%.1f measDesync=%.1f samples=%d sideL=%d sideR=%d defAA=%s",
+                "MISS-FULL idx=%d reason=%s mode=%s aa=%s missCount=%d eye=%.1f resolved=%.1f delta=%.1f measDesync=%.1f samples=%d sideL=%d sideR=%d defAA=%s ping=%.0f bt=%d",
                 Ent:get_index(), tostring(reason), tostring(s.mode), tostring(s.aa_type),
                 s.missed, s.last_eye_yaw, s.last_resolved,
                 NormalizeAngle(s.last_resolved - s.last_eye_yaw),
                 s.measured_desync, s.desync_samples,
-                s.hit_streak_left, s.hit_streak_right, tostring(s.defensive_aa)
+                s.hit_streak_left, s.hit_streak_right, tostring(s.defensive_aa),
+                tick_cache.ping_ms or 0, bt
             )
             -- V9.89: angel-style event log — gather name / wanted-hitbox / hc from the ack
             local _nm, _hb, _hc = nil, nil, 0
@@ -4134,12 +4152,13 @@ events.aim_ack:set(function(event)
         -- V9.1: skip Init-mode debug log (useless eye=0 resolved=0 entries)
         if s.mode ~= "Init" then
             cs_log_debug(
-                "HIT-FULL idx=%d mode=%s aa=%s missesBefore=%d eye=%.1f resolved=%.1f actualDelta=%.1f measDesync=%.1f samples=%d L=%d R=%d",
+                "HIT-FULL idx=%d mode=%s aa=%s missesBefore=%d eye=%.1f resolved=%.1f actualDelta=%.1f measDesync=%.1f samples=%d L=%d R=%d ping=%.0f bt=%d",
                 Ent:get_index(), tostring(s.mode), tostring(s.aa_type), s.missed,
                 s.last_eye_yaw, s.last_resolved,
                 NormalizeAngle(s.last_resolved - s.last_eye_yaw),
                 s.measured_desync, s.desync_samples,
-                s.hit_streak_left, s.hit_streak_right
+                s.hit_streak_left, s.hit_streak_right,
+                tick_cache.ping_ms or 0, bt
             )
             -- V9.89: angel-style event log — gather name / hitbox / dmg / hc from the ack
             local _nm, _hb, _dmg, _hc = nil, nil, 0, 0
@@ -8021,5 +8040,6 @@ _cs_log_color_raw("V11.2: SILENT fake flick. The v9.88 detector only sees a flic
 _cs_log_color_raw("V11.9: never-hit + high backtrack no longer freezes a coin-flip seed. Console: missed 666 Predicted 31°/32° correction bt=22 then 15, hc 100/89 — dump idx=10 real=0, passive 58L/63R, last_hit=R from seed. `bt>8 → KEEP` fired before the seed-only else, so v9.49 explore (2 KEEPs) never ran before they died. bt>8 and meas-keep now need a real hit; 50/50 never-hit flips on the first miss. Also: BF:opposite uses last_resolved-eye when last_shot_side is 0 (idx=7 Air R miss flipped to L, opposite shot R again). Static-Server vetoes a rebuild side that conflicts with 1-hit real dominance (idx=15 HIT R +23.8 then Static-Server L -44.7).")
 _cs_log_color_raw("V11.10: Networked rebuild-side veto + Jitter-Cls needs a real hit. Dump v11.8: idx=3 HIT Networked R +13.5 then Networked L -11.7 against the only real hit — Aggressive first_shot=networked returns the raw reconstruct and never hits Static-Server-Dom / Networked-Boost (clamp_learned needs 4 reals, Boost needs +2 lead). Both Networked returns now use the same resolver_side_conflicts veto (mode Networked-Dom). idx=10 666 Jitter-Cls R with real=0: last_hit_side was booted from persist.dom/steam-mem; Jitter-Cls/Jitter-Lock now require a confirmed hit before locking.")
 _cs_log_color_raw("V11.11: copy-dump [NET] line — ping_ms + ACK-ring backtrack avg/max/high-bt count. High-ping sessions were being read as resolver faults; the dump now carries the tell. No aim change.")
+_cs_log_color_raw("V11.12: ping stamped on every ACK + HIT-FULL/MISS-FULL + correction-miss line (HIGH when ping>=80). [NET] also averages per-shot ping from the ACK ring. Dump is self-describing — no need to mention ping in chat. No aim change.")
 _cs_log_color_raw("Logging: " .. (log_enabled:get() and ("ON" .. (log_verbose:get() and " (verbose)" or ""))  or "OFF"))
 _cs_log_color_raw("=========================================")
