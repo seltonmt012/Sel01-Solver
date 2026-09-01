@@ -1,12 +1,15 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 11.8                                   ║
+-- ║  Version: 11.9                                   ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 11.8
--- @description v11.8 90° hits count as SIDE evidence, not magnitude. BF:+90 /
+-- @version 11.9
+-- @description v11.9 never-hit high-bt no longer freezes a coin-flip seed. 666
+--   Predicted 31° ×2 correction bt=22/15, real=0, passive 58/63, died before
+--   the v9.49 explore (needs 2 KEEPs). bt>8 KEEP now requires a real hit.
+-- @description-prev v11.8 90° hits count as SIDE evidence, not magnitude. BF:+90 /
 --   flick land at 80-90, the 65° EMA cap dropped real_*/persist hits, so idx=12
 --   had two +90 HITs and persist 0/1 with last_hit=R and real=0.
 -- @description-prev v11.7 dump-driven: Still-BFGuess leaked into best_static (Recall
@@ -151,7 +154,7 @@
 --   * v9.26 drift-bump (alpha 0.55 on 5-10° diff) still handles small shifts.
 --   * v9.29 coach variants carry.
 
-local SEL01_VERSION = "11.8"
+local SEL01_VERSION = "11.9"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -3611,9 +3614,14 @@ events.aim_ack:set(function(event)
             -- above are handled by BF sweep; this catches the one-sided lock.)
             elseif s.aa_type == "switch" and ack_angle_err < 2.0 and (s.serverfail_streak or 0) >= 2 then do_flip = true  -- FIX #1
             elseif ack_side_bad and (ack_measured <= 5 or ack_angle_err > 10) then do_flip = true
-            elseif bt > 8 then do_flip = false
+            -- V11.9: high-bt KEEP requires a REAL hit. Dump idx=10 (666): never-hit,
+            -- passive 58L/63R (no lean), Predicted 31° ×2 correction bt=22 then 15,
+            -- both KEEP because bt>8 short-circuited before the seed-only else.
+            -- v9.49 explore needs 2 KEEPs — they died on the second. A coin-flip
+            -- seed + fakelag is not evidence the side is right.
+            elseif bt > 8 and real_active >= 1 then do_flip = false
             elseif ack_side_bad then do_flip = true
-            elseif ack_measured > 5 and (real_active >= 1 or bt > 6) then do_flip = false
+            elseif ack_measured > 5 and real_active >= 1 then do_flip = false
             else
                 -- V9.72: blind first-contact — consult the PASSIVE side history before
                 -- exploring the other side. Real-dump: idx=6 had 550 passive obs backing
@@ -5025,6 +5033,18 @@ local function _pick_first_shot_impl(p, s, anim, eye_yaw, max_desync, preset)
                 end
                 -- V10.3: a well-measured side outranks a wide server-yaw reconstruct
                 local sy2, clamped = clamp_learned_serveryaw(s, eye_yaw, sy)
+                -- V11.9: RebuildServerYaw side with 1 real hit. Dump idx=15 HIT R +23.8
+                -- then Static-Server L -44.7 (rebuild) against the only real hit.
+                -- Boost already had this veto; the raw Static-Server return did not.
+                -- clamp_learned needs 4 reals on the shot side, so a 1-hit lock skipped it.
+                do
+                    local rside = NormalizeAngle(sy2 - eye_yaw) >= 0 and 1 or -1
+                    if resolver_side_conflicts(s, rside) then
+                        local side = s.last_hit_side ~= 0 and s.last_hit_side or -rside
+                        s.mode = "Static-Server-Dom"
+                        return eye_yaw + effective_desync(s, max_desync, side) * side
+                    end
+                end
                 s.mode = clamped and "Static-ServerClamp" or "Static-Server"
                 return sy2
             end
@@ -5409,7 +5429,15 @@ local function pick_bruteforce_angle(s, anim, eye_yaw, max_desync, p, preset)
         -- (logs: idx=3 Recall +41.9 MISS→flip L, BF:opposite +24.4 R again, +58 R again,
         -- all while the enemy sat on R). Keying off last_shot_side makes opposite a real
         -- alternation: shot R → try L → shot L → try R, so BF actually sweeps both sides.
-        kind_side = s.last_shot_side ~= 0 and -s.last_shot_side
+        -- V11.9: last_shot_side is only set from aim_fire snapshots. Air shots
+        -- often skip that, so opposite fell through to -last_hit_side AFTER a
+        -- correction-flip — dump idx=7 Air R MISS FLIP->L, BF:opposite shot R
+        -- again (the just-flipped last_hit). Prefer the resolved-vs-eye delta.
+        local shot = s.last_shot_side
+        if shot == 0 then
+            shot = resolver_shot_side_from_delta(NormalizeAngle((s.last_resolved or 0) - (s.last_eye_yaw or 0)))
+        end
+        kind_side = shot ~= 0 and -shot
                     or (s.last_hit_side ~= 0 and -s.last_hit_side or 1)
     end
     local desync = effective_desync(s, max_desync, kind_side)
@@ -7936,6 +7964,6 @@ _cs_log_color_raw("V10.9: the unbiased [KEEP] metric answered — and it says th
 _cs_log_color_raw("V11.0: the two BOOST paths never got the per-side magnitude conversion. Static-ServerBoost and Networked-Boost take their SIDE from the server-yaw reconstruct but fired the GLOBAL measured EMA as the magnitude — on a bimodal enemy that average is wrong on BOTH sides. This is the exact bug v9.22 fixed for Predicted-Alt, v9.54 for the serverfail retry and v9.92 for the Recall fast-path; these two branches were simply missed each time. The v10.9 dump makes the cost visible: Static-ServerBoost 10/13 (76.9%) against Static-Meas 50/53 (94.3%) in a lobby holding two-mode enemies like idx=8 at L=32.6 / R=47.4. Both now use effective_desync for whichever side they settled on, which falls back to the global EMA when that side has no samples, so one-sided enemies are unaffected. An audit found three more global-EMA sites — Static-Meas, Still-Meas, Networked-Meas — deliberately NOT converted: Static-Meas is the highest-volume mode in the build at 94.3%, and changing a path that works on theory alone is the same mistake as trusting the biased v10.4 metric, just smaller. They stay on the list until a dump shows them failing.")
 _cs_log_color_raw("V11.1: the persistent player model was recording passive guesses as confirmed hits. The v8.6 passive-persist wrote its observations into sl/sr/dl/dr — the same fields learning_update_hit fills from real hits — with the count set to 1, and the v9.81 boot reads sl/sr back as REAL hits on the stated assumption that only a confirmed hit can bump them. So a never-shot enemy returned claiming real hit data, and every guard built on real evidence fired on passive noise: the v9.45 seed-only keep (real_active>=1), v9.48 alt_side_pick real-dominance, the v9.78 one_sided BF ordering, the confidence real-sample cap, the v10.6 'bimodality needs real hits' rule. The v11.0 dump shows it plainly — name_48690_3 hits=1 with L=2 R=1, name_293117816_15 hits=12 with L=6 R=8; a side count above the hit count can only be passive. Passive data now lives in psl/psr/pdl/pdr, boots into the PASSIVE fields (so it stays useful without lying), and old files are migrated on load by the same arithmetic: sl+sr can never exceed hits, so the excess is passive. Two more from the same audit: the persisted EMA finally gets the v9.39 sample ramp + a v9.30-style hard reset (it blended at a flat 0.20 forever, and after a passive seed the first REAL hit moved the stored value only 20%), and e.dom gets its missing else-branch — once it went to +/-1 nothing could ever return it to neutral, and boot feeds it straight into last_hit_side. Plus: the [SESSION] raw line now adds spread-filtered shots back too, and the dump prints passive counts separately, which is the tell that was missing for eleven versions.")
 _cs_log_color_raw("V11.2: SILENT fake flick. The v9.88 detector only sees a flick that shows up in the enemy's VISIBLE eye angle — out to ~90 and back. A silent flick never does: the offset rides the hidden / defensive record (11_fakeflick.lua does exactly this — Hidden yaw ON, hidden pitch 89, hidden yaw offset -90, force_defensive every 7th command), so the model stands perfectly still while the server builds the feet yaw off an angle we never see. It was invisible to every path in the resolver, and worse, the evidence was being thrown away: passive learning discards |goal_feet - eye| above 65 degrees, which is precisely the band a hidden-yaw record produces (a legal body yaw is capped at 58, so that band is physically impossible to reach honestly). It is now counted, not discarded, and the excursion magnitude + side are learned from it — a second tell (the raw m_angEyeAngles disagreeing with the animstate eye by ~90) feeds the same counter. Both are only scored while the enemy is standing and not turning, because a fast turn makes the feet yaw lag past 65 all by itself and a spinner does it every tick. Six observations inside 3s flags them, and then: the FIRST shot goes to the measured excursion (mode Flick-Meas) instead of arriving 90 degrees off and only reaching plus/minus 90 after the BF cycle had already burned the opener, the BF cycle sweeps the measured magnitude on the measured side first, and passive learning pauses so the flick cannot poison the EMA — real-dump idx=1 had 629 passive observations seeding 52.8 degrees against that same player's honest persisted 35.5, then missed twice at 41-43. Also fixed from that dump: the blind-explore side ping-pong. idx=1 missed, flipped L to R, missed, flipped R back to L — straight back onto the side that had just whiffed, with the magnitude never once questioned. Sides now burn per engagement; once both have missed the side is no longer the open question, so it is kept and the BF cycle sweeps magnitude instead. A hit clears the burn.")
-_cs_log_color_raw("V11.8: 90° hits count as SIDE, not magnitude. The 65° EMA cap (legal desync is 58) also skipped real_*/persist/stand-move, so a BF:+90 HIT was invisible to the learner. Dump idx=12: two BF:+90 HITs at 80-85°, persist 0/1, real=0, last_hit=R from the 90° shot — next resolve trusted a ghost side. idx=11 last_hit=R with the only real hit on L. Side/hits now always count; dl/dr EMA still ignores >65 so Recall doesn't start firing 80° at a 20° body. Dump names come from resolve-time p:get_name() (entity.get(idx) showed BitchyBaboon on watro's sid).")
+_cs_log_color_raw("V11.9: never-hit + high backtrack no longer freezes a coin-flip seed. Console: missed 666 Predicted 31°/32° correction bt=22 then 15, hc 100/89 — dump idx=10 real=0, passive 58L/63R, last_hit=R from seed. `bt>8 → KEEP` fired before the seed-only else, so v9.49 explore (2 KEEPs) never ran before they died. bt>8 and meas-keep now need a real hit; 50/50 never-hit flips on the first miss. Also: BF:opposite uses last_resolved-eye when last_shot_side is 0 (idx=7 Air R miss flipped to L, opposite shot R again). Static-Server vetoes a rebuild side that conflicts with 1-hit real dominance (idx=15 HIT R +23.8 then Static-Server L -44.7).")
 _cs_log_color_raw("Logging: " .. (log_enabled:get() and ("ON" .. (log_verbose:get() and " (verbose)" or ""))  or "OFF"))
 _cs_log_color_raw("=========================================")
