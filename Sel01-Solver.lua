@@ -1,12 +1,14 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 11.13                                  ║
+-- ║  Version: 11.14                                  ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 11.13
--- @description v11.13 confidence: stddev of DESYNC not look-yaw, softer age on
+-- @version 11.14
+-- @description v11.14 per-player miss sting (100→78 on first miss, clears on
+--   hit) without flattening HUD avg. Weighted by real hits; no 50% hard cap.
+-- @description-prev v11.13 confidence: stddev of DESYNC not look-yaw, softer age on
 --   learned locks, HUD avg only shot-at players. Dump idx=2 12 R-hits at 29.5°
 --   showed conf=55 (age+look-sd) and HUD avg stuck ~50 on 53 leftover slots.
 -- @description-prev v11.12 ping on every ACK / HIT-FULL / MISS-FULL / correction-miss
@@ -165,7 +167,7 @@
 --   * v9.26 drift-bump (alpha 0.55 on 5-10° diff) still handles small shifts.
 --   * v9.29 coach variants carry.
 
-local SEL01_VERSION = "11.13"
+local SEL01_VERSION = "11.14"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -2102,16 +2104,30 @@ confidence = function(s)
             age_pen = math.min((age - 1.5) * 5, cap)
         end
     end
-    -- V8.0: miss-rate penalty — high samples + recent misses = lower trust
-    -- user feedback: confidence often high but resolver still misses → reality check
+    -- V8.0 + V11.14: miss-rate is a SLOW leak (needs 4 shots and 25%+). A lock
+    -- at 100 who you just missed stayed at 100 (1/10 = 10% < 25%). Trailing
+    -- resolver-misses from p_history (netcode/spread never land there) sting
+    -- THIS player immediately; a hit clears it. HUD avg is weighted separately
+    -- so one sting cannot flatten the lobby number.
     local miss_pen = 0
     local n_recent = #(s.p_history or {})
     if n_recent >= 4 then
         local mr = s.recent_miss_rate or 0
-        if mr >= 60 then miss_pen = 35      -- failing hard → big cap
-        elseif mr >= 40 then miss_pen = 20  -- below 60% hit → moderate
-        elseif mr >= 25 then miss_pen = 10  -- below 75% hit → small
+        if mr >= 60 then miss_pen = 35
+        elseif mr >= 40 then miss_pen = 20
+        elseif mr >= 25 then miss_pen = 10
         end
+    end
+    local sting = 0
+    if n_recent >= 1 and s.p_history[n_recent] == false then
+        local streak = 0
+        for i = n_recent, 1, -1 do
+            if s.p_history[i] == false then streak = streak + 1 else break end
+        end
+        if streak >= 3 then sting = 48
+        elseif streak == 2 then sting = 35
+        else sting = 22 end
+        miss_pen = math.floor(miss_pen * 0.4)
     end
     -- V9.9-A: DOMINANT-SIDE BOOST — when one side has >=3 more REAL hits than other,
     -- side-pick is clearly trustworthy → +15 conf bonus.
@@ -2126,11 +2142,7 @@ confidence = function(s)
         local ml, mr = s.measured_left or 0, s.measured_right or 0
         if math.abs(ml - mr) < 5 then sym_pen = 20 end
     end
-    local raw = sample_score + sd_score - age_pen - miss_pen + 10 + dom_bonus - sym_pen
-    -- additionally clamp ceiling to 65 if recent_miss_rate >= 50
-    if n_recent >= 4 and (s.recent_miss_rate or 0) >= 50 then
-        if raw > 50 then raw = 50 end
-    end
+    local raw = sample_score + sd_score - age_pen - miss_pen - sting + 10 + dom_bonus - sym_pen
     -- V9.1: caps based on REAL hits (not seeded samples)
     if real_active == 0 and raw > 50 then raw = 50 end   -- never shot at = max 50
     if real_active == 1 and raw > 70 then raw = 70 end   -- 1 hit only = max 70
@@ -7229,19 +7241,24 @@ local function esp_refresh_cache()
     for _ in pairs(PlayerState) do tracked = tracked + 1 end
     local learned = 0
     for _ in pairs(LearnedModel) do learned = learned + 1 end
-    local conf_sum, conf_cnt = 0, 0
+    local conf_sum, conf_w = 0, 0
     for _, s in pairs(PlayerState) do
         -- V11.13: leftover slots (53 tracked, most never shot) sat at conf=50
         -- and pinned HUD "Avg Confidence" under 60 even with a 12-hit lock.
+        -- V11.14: weight by real hits so a 1-miss sting on a 12-hit lock
+        -- (100→78) cannot flatten the lobby average.
         if s.mode ~= "Init"
            and ((s.real_left or 0) + (s.real_right or 0) >= 1
                 or (s.p_hits or 0) + (s.p_miss or 0) >= 1) then
-            conf_sum = conf_sum + confidence(s); conf_cnt = conf_cnt + 1
+            local w = (s.real_left or 0) + (s.real_right or 0)
+            if w < 1 then w = 1 end
+            conf_sum = conf_sum + confidence(s) * w
+            conf_w = conf_w + w
         end
     end
     hud_cache.tracked = tracked
     hud_cache.learned = learned
-    hud_cache.avg_conf = conf_cnt > 0 and math.floor(conf_sum / conf_cnt) or 0
+    hud_cache.avg_conf = conf_w > 0 and math.floor(conf_sum / conf_w) or 0
     local top_mode, top_rate, top_total = "—", 0, 0
     for m, e in pairs(mode_stats) do
         local total = e.hits + e.miss
@@ -8071,5 +8088,6 @@ _cs_log_color_raw("V11.10: Networked rebuild-side veto + Jitter-Cls needs a real
 _cs_log_color_raw("V11.11: copy-dump [NET] line — ping_ms + ACK-ring backtrack avg/max/high-bt count. High-ping sessions were being read as resolver faults; the dump now carries the tell. No aim change.")
 _cs_log_color_raw("V11.12: ping stamped on every ACK + HIT-FULL/MISS-FULL + correction-miss line (HIGH when ping>=80). [NET] also averages per-shot ping from the ACK ring. Dump is self-describing — no need to mention ping in chat. No aim change.")
 _cs_log_color_raw("V11.13: confidence was lying. sample_score caps at 60, so anything above 60 comes from desync-stability + dominance. stddev used ABSOLUTE resolved yaw (where they LOOK) — a 12-hit 29.5° lock walking around got sd~80 → sd_score=0, plus age*10 from 0.2s cap 30 while they hide, dump idx=2 conf=55 and never LOCKED. HUD Avg Confidence averaged ALL 53 leftover slots (most never-shot, capped at 50) so the number never felt above 60. Now: stddev of stored desync delta, learned locks only lose 10 to age, HUD averages shot-at players only. Also ping=0 on every v11.12 ACK: client.latency()*1000 rejected already-ms values; net_channel fallback + seconds-or-ms.")
+_cs_log_color_raw("V11.14: per-player miss sting without flattening HUD avg. A lock at 100 who you miss stayed at 100 (1/10 miss-rate never hit the 25% gate). Trailing resolver-misses now drop THIS player 22/35/48 (hit clears it; netcode/spread ignored). Hard 50% cap on 50% miss-rate removed. HUD avg weighted by real hits so one sting cannot wreck the lobby number.")
 _cs_log_color_raw("Logging: " .. (log_enabled:get() and ("ON" .. (log_verbose:get() and " (verbose)" or ""))  or "OFF"))
 _cs_log_color_raw("=========================================")
