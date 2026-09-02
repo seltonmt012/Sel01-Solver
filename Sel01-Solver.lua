@@ -1,12 +1,15 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 11.12                                  ║
+-- ║  Version: 11.13                                  ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 11.12
--- @description v11.12 ping on every ACK / HIT-FULL / MISS-FULL / correction-miss
+-- @version 11.13
+-- @description v11.13 confidence: stddev of DESYNC not look-yaw, softer age on
+--   learned locks, HUD avg only shot-at players. Dump idx=2 12 R-hits at 29.5°
+--   showed conf=55 (age+look-sd) and HUD avg stuck ~50 on 53 leftover slots.
+-- @description-prev v11.12 ping on every ACK / HIT-FULL / MISS-FULL / correction-miss
 --   line (HIGH when ping>=80). Dump is self-describing. No aim change.
 -- @description-prev v11.11 dump [NET] ping + ACK-bt so high-ping sessions are not
 --   read as resolver faults. No aim change.
@@ -162,7 +165,7 @@
 --   * v9.26 drift-bump (alpha 0.55 on 5-10° diff) still handles small shifts.
 --   * v9.29 coach variants carry.
 
-local SEL01_VERSION = "11.12"
+local SEL01_VERSION = "11.13"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -2066,32 +2069,38 @@ confidence = function(s)
     local passive = (s.passive_samples or 0) * 0.3 + seeded * 0.3
     local samples = real_active + passive
     local sample_score = math.min(samples * 8, 60)  -- max 60 from samples
-    -- stddev penalty
-    local n = #s.recent_resolved
+    -- V11.13: stddev of DESYNC (resolved-eye), not absolute resolved yaw.
+    -- Absolute yaw tracks where they LOOK. A 12-hit 29.5° lock walking around
+    -- had sd~80 → sd_score=0 → conf=55 (dump v11.12 idx=2). .d is stored at
+    -- the recent_resolved push; until the ring fills, keep the default 30.
     local sd_score = 30
-    if n >= 3 then
-        -- V9.31: circular spread vs a reference angle. A plain arithmetic mean of
-        -- wrap-around yaws explodes near the ±180 seam (+179 & -179 are 2° apart
-        -- but average to ~0 → fake ~180° stddev → confidence wrongly tanked, which
-        -- silently suppresses extrapolation / fast-fire / lock-on for an enemy
-        -- whose facing straddles the seam). Deviate from a reference via NormalizeAngle.
-        local ref = s.recent_resolved[1].a
-        local sumd = 0
-        for _, r in ipairs(s.recent_resolved) do sumd = sumd + NormalizeAngle(r.a - ref) end
-        local mean_off = sumd / n
-        local sq = 0
-        for _, r in ipairs(s.recent_resolved) do
-            local d = NormalizeAngle(r.a - ref) - mean_off
-            sq = sq + d * d
+    do
+        local n, sum, sq = 0, 0, 0
+        for i = 1, 5 do
+            local r = s.recent_resolved[i]
+            if r and r.d then n = n + 1; sum = sum + r.d end
         end
-        local sd = math.sqrt(sq / n)
-        sd_score = math.max(0, 30 - sd)
+        if n >= 3 then
+            local mean = sum / n
+            for i = 1, 5 do
+                local r = s.recent_resolved[i]
+                if r and r.d then
+                    local x = r.d - mean
+                    sq = sq + x * x
+                end
+            end
+            sd_score = math.max(0, 30 - math.sqrt(sq / n))
+        end
     end
-    -- dormancy penalty
+    -- V11.13: a learned lock hiding 3s in cover must stay locked. Old
+    -- age*10 from 0.2s, cap 30, dropped idx=2 from ~100 to 55 between peeks.
     local age_pen = 0
     if s.last_seen and tick_cache.curtime then
         local age = tick_cache.curtime - s.last_seen
-        if age > 0.2 then age_pen = math.min(age * 10, 30) end
+        if age > 1.5 then
+            local cap = real_active >= 4 and 10 or 25
+            age_pen = math.min((age - 1.5) * 5, cap)
+        end
     end
     -- V8.0: miss-rate penalty — high samples + recent misses = lower trust
     -- user feedback: confidence often high but resolver still misses → reality check
@@ -5587,6 +5596,13 @@ tick_cache.valid     = false
 tick_cache.ping_ms   = 0
 tick_cache.wc        = nil    -- V9.9-E: weapon-class cache (avoid repeated FFI in ragebot_target hot-path)
 tick_cache.lp_ducking= false  -- V9.9-C: local crouch flag
+function sel01_ping_from(v)
+    v = tonumber(v)
+    if not v or v <= 0 then return 0 end
+    if v < 1.5 then v = v * 1000 end
+    if v >= 1.5 and v < 500 then return v end
+    return 0
+end
 local function refresh_tick_cache()
     local tick = globals.tickcount or 0
     if tick == tick_cache.tick then return tick_cache.valid end
@@ -5614,13 +5630,20 @@ local function refresh_tick_cache()
             tick_cache.lp_oz = lp.m_vecOrigin.z
         end)
         tick_cache.valid = origin_ok
-        -- V9.3: get local ping (multiple NL API fallback patterns)
+        -- V9.3 + V11.13: ping in seconds OR ms. v11.12 dump had ping=0 on every
+        -- ACK — client.latency()*1000 was either already-ms (→ 80000, rejected)
+        -- or nil, and there was no net_channel fallback (working on this build).
         local ping = 0
-        pcall(function() ping = client.latency() * 1000 end)
-        if ping == 0 then pcall(function() ping = (lp.m_iPing or 0) end) end
-        if ping == 0 then pcall(function() ping = (entity.get_local_player_ping and entity.get_local_player_ping()) or 0 end) end
-        if ping > 0 and ping < 500 then tick_cache.ping_ms = ping
-        else tick_cache.ping_ms = 0 end
+        pcall(function() ping = sel01_ping_from(client.latency()) end)
+        if ping == 0 then
+            pcall(function()
+                local nc = utils.net_channel()
+                ping = sel01_ping_from(nc and nc.latency and (nc.latency[1] or nc.latency[0]))
+            end)
+        end
+        if ping == 0 then pcall(function() ping = sel01_ping_from(lp.m_iPing) end) end
+        if ping == 0 then pcall(function() ping = sel01_ping_from(entity.get_local_player_ping and entity.get_local_player_ping()) end) end
+        tick_cache.ping_ms = ping
     else
         tick_cache.valid = false
     end
@@ -6231,8 +6254,9 @@ local function resolve_player(p)
         local _ri = (s.recent_resolved_idx or 0) % 5 + 1
         s.recent_resolved_idx = _ri
         local _re = s.recent_resolved[_ri]
-        if _re then _re.a = server_yaw; _re.t = now_ct
-        else s.recent_resolved[_ri] = {a = server_yaw, t = now_ct} end
+        local _d = NormalizeAngle(server_yaw - (anim.m_flEyeYaw or 0))
+        if _re then _re.a = server_yaw; _re.t = now_ct; _re.d = _d
+        else s.recent_resolved[_ri] = {a = server_yaw, t = now_ct, d = _d} end
         anim.m_flGoalFeetYaw = NormalizeAngle(server_yaw)
         return
     end
@@ -6533,8 +6557,9 @@ local function resolve_player(p)
     local _ri = (s.recent_resolved_idx or 0) % 5 + 1
     s.recent_resolved_idx = _ri
     local _re = s.recent_resolved[_ri]
-    if _re then _re.a = angle; _re.t = now_ct
-    else s.recent_resolved[_ri] = {a = angle, t = now_ct} end
+    local _d = NormalizeAngle(angle - (eye_yaw or 0))
+    if _re then _re.a = angle; _re.t = now_ct; _re.d = _d
+    else s.recent_resolved[_ri] = {a = angle, t = now_ct, d = _d} end
 
     -- V7.1 / V11.6: PASSIVE LEARNING — unique simticks only, before the override.
     -- Must NOT return here: the resolved yaw is applied below this call.
@@ -7206,7 +7231,11 @@ local function esp_refresh_cache()
     for _ in pairs(LearnedModel) do learned = learned + 1 end
     local conf_sum, conf_cnt = 0, 0
     for _, s in pairs(PlayerState) do
-        if s.mode ~= "Init" then
+        -- V11.13: leftover slots (53 tracked, most never shot) sat at conf=50
+        -- and pinned HUD "Avg Confidence" under 60 even with a 12-hit lock.
+        if s.mode ~= "Init"
+           and ((s.real_left or 0) + (s.real_right or 0) >= 1
+                or (s.p_hits or 0) + (s.p_miss or 0) >= 1) then
             conf_sum = conf_sum + confidence(s); conf_cnt = conf_cnt + 1
         end
     end
@@ -8041,5 +8070,6 @@ _cs_log_color_raw("V11.9: never-hit + high backtrack no longer freezes a coin-fl
 _cs_log_color_raw("V11.10: Networked rebuild-side veto + Jitter-Cls needs a real hit. Dump v11.8: idx=3 HIT Networked R +13.5 then Networked L -11.7 against the only real hit — Aggressive first_shot=networked returns the raw reconstruct and never hits Static-Server-Dom / Networked-Boost (clamp_learned needs 4 reals, Boost needs +2 lead). Both Networked returns now use the same resolver_side_conflicts veto (mode Networked-Dom). idx=10 666 Jitter-Cls R with real=0: last_hit_side was booted from persist.dom/steam-mem; Jitter-Cls/Jitter-Lock now require a confirmed hit before locking.")
 _cs_log_color_raw("V11.11: copy-dump [NET] line — ping_ms + ACK-ring backtrack avg/max/high-bt count. High-ping sessions were being read as resolver faults; the dump now carries the tell. No aim change.")
 _cs_log_color_raw("V11.12: ping stamped on every ACK + HIT-FULL/MISS-FULL + correction-miss line (HIGH when ping>=80). [NET] also averages per-shot ping from the ACK ring. Dump is self-describing — no need to mention ping in chat. No aim change.")
+_cs_log_color_raw("V11.13: confidence was lying. sample_score caps at 60, so anything above 60 comes from desync-stability + dominance. stddev used ABSOLUTE resolved yaw (where they LOOK) — a 12-hit 29.5° lock walking around got sd~80 → sd_score=0, plus age*10 from 0.2s cap 30 while they hide, dump idx=2 conf=55 and never LOCKED. HUD Avg Confidence averaged ALL 53 leftover slots (most never-shot, capped at 50) so the number never felt above 60. Now: stddev of stored desync delta, learned locks only lose 10 to age, HUD averages shot-at players only. Also ping=0 on every v11.12 ACK: client.latency()*1000 rejected already-ms values; net_channel fallback + seconds-or-ms.")
 _cs_log_color_raw("Logging: " .. (log_enabled:get() and ("ON" .. (log_verbose:get() and " (verbose)" or ""))  or "OFF"))
 _cs_log_color_raw("=========================================")
