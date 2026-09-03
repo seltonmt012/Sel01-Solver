@@ -1,16 +1,16 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 11.24                                  ║
+-- ║  Version: 11.25                                  ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 11.24
--- @description v11.24 bug pass: real_* decimated once per hit (was twice), persist
---   per-side EMA no longer blends against 0 after a side-only hit, ±90 probes take
---   no part in side flips or the def-AA fingerprint. History in git.
+-- @version 11.25
+-- @description v11.25 bug pass: passive per-side seed tracks the live passive value
+--   while a side has no real hit (was frozen at first write); global passive seed
+--   takes the better-observed side, not max(L, R). History in git.
 
-local SEL01_VERSION = "11.24"
+local SEL01_VERSION = "11.25"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -5777,7 +5777,12 @@ function passive_learn_tick(p, s, anim)
         s.passive_n_left = (s.passive_n_left or 0) + 1
     end
     if s.passive_samples >= 8 and (s.desync_samples or 0) == 0 then
-        s.measured_desync = math.max(s.passive_left or 0, s.passive_right or 0)
+        -- V11.25: was max(L, R) — dump Zero: R 56.9° from 189 obs beat L 18.0° from
+        -- 1219 obs. Take the side we have actually watched; max only as a last resort.
+        local _nl, _nr = s.passive_n_left or 0, s.passive_n_right or 0
+        local _g = (_nl >= _nr) and (s.passive_left or 0) or (s.passive_right or 0)
+        if _g <= 5 then _g = math.max(s.passive_left or 0, s.passive_right or 0) end
+        s.measured_desync = _g
     end
     -- V11.6: side-seed at 12 UNIQUE simticks (was 20 choked createmoves) + 1.5× lean
     -- (was 1.3). Unique ticks are slower to accumulate, so the old 20 felt like a
@@ -5791,6 +5796,20 @@ function passive_learn_tick(p, s, anim)
             s.measured_left = pl; s.samples_left = 2
             if s.last_hit_side == 0 then s.last_hit_side = -1 end
         end
+    end
+    -- V11.25: the seed above is written ONCE (gated on samples == 0) and then FROZEN
+    -- while passive_* keeps updating. Dump Zero: seeded L 32.4 at 12 obs, passive L
+    -- drifted to 18.0 over 1219 obs, and both shots fired the frozen 32.4 because
+    -- effective_desync ranks a seeded EMA above the live passive value. While a side
+    -- has no REAL hit its EMA is nothing but that seed — keep it equal to the live
+    -- passive magnitude. Sides with a real hit (session or persisted) are untouched,
+    -- and no NEW side is seeded here (that would hand a one-sided enemy a fake
+    -- second side for the samples-keyed Air-Alt / Still-Alt switches).
+    if (s.real_left or 0) == 0 and (s.samples_left or 0) > 0 and (s.passive_left or 0) > 5 then
+        s.measured_left = s.passive_left
+    end
+    if (s.real_right or 0) == 0 and (s.samples_right or 0) > 0 and (s.passive_right or 0) > 5 then
+        s.measured_right = s.passive_right
     end
     if s.passive_samples == 16 or (s.passive_samples > 16 and s.passive_samples % 32 == 0) then
         local sid = _learning_sid(p)
@@ -8263,5 +8282,6 @@ _cs_log_color_raw("V11.21: (1) CUSTOM CROSSHAIR — new 'Crosshair' group in the
 _cs_log_color_raw("V11.22: fake-flick BF ordering arms at 3 confirmed rest/±90/rest round-trips (was 4). Dump v11.21 Burgie sat at score 3 through four ±22° misses at bt 0-10 until BF:+90 hit at bt=23. Only the BF list order and the ⚡FF tag key on the flag; first-shot Flick-Meas still needs the impossible-band tell. Session read: 70% — two per-tick randomisers (Burgie side-jitter + 90 flick, Zero magnitude 15-33°) that an averaging resolver cannot pin; the side half is what the default-off Animation-Layer read is for.")
 _cs_log_color_raw("V11.23: bug pass only (dump v11.21: 85.2%, first-shot 86%). (1) LBY-Snap used m_flLowerBodyYawTarget unchecked — fired resolved=15.3 against eye=-172.4, a 172° 'desync'; anything >65° off the eye is now treated as no snap (guess path). (2) That 'hit' gave Dance (8/8 RIGHT) a real_left=1 / persisted L=1/0.0° and made him a two-side switcher for the keep logic: no SIDE is taken from a hit delta beyond 120° (sign is arbitrary near 180; BF:+90 hits still count). (3) Fake-flick round-trip needs the return within 0.25s — a human corner-check (turn 90, turn back) scored like a 1-tick flick (6Feqzi1 ff=true/8, never flicked in six shots); with the v11.22 threshold at 3 that would have cost two ±90 probes after a miss.")
 _cs_log_color_raw("V11.24: bug pass only (dump v11.23: 75%, first-shot 75%). (1) The global AND the per-side hard-reset both decimated real_* on the same hit — one 12° magnitude move cut intection's 9-hit lock to 1 (×0.4 twice); dom / one-sided BF / jitter-veto lost standing and he was re-committed jitter. Decimated once now. (2) Persist per-side EMA: a V11.8 side-only hit (BF:+90) left dr=0 with sr=1, so the next real hit blended against 0 (Yumo R=2/19.4° after a 35.3° hit). No stored magnitude → value as-is. (3) A ±90 probe carries no side information: it no longer drives the flip/keep decision (cxr: BF:-90 miss flipped the side off err=65) and no longer fingerprints defensive AA (DEF-AA delta=90.0 off a probe's spread miss; cap 65). (4) Still-ServerBoost: the stationary path lacked the learned-magnitude boost Static-ServerBoost has — Yumo standing with 1 real L-hit @39.6 got Still-Server -9.0 (rebuild 30° short). With a real hit on the rebuild's side and a learned magnitude 5°+ larger, the learned one is fired.")
+_cs_log_color_raw("V11.25: bug pass only (dump v11.24). (1) The passive per-side seed was written once (gated on samples==0) and then frozen while passive_* kept updating — Zero: seeded L 32.4 at 12 obs, passive L drifted to 18.0 over 1219 obs, both shots fired the frozen 32.4 because effective_desync ranks a seeded EMA above the live passive value. A side with no real hit now tracks the live passive magnitude; sides with real hits untouched, no new side seeded. (2) Global passive seed took max(L, R): Zero R 56.9 from 189 obs beat L 18.0 from 1219. Now the better-observed side. Note: two different players both named '0' share one persist entry (name-hash sid) — a limitation of the name fallback, not fixable without a real Steam ID on this build.")
 _cs_log_color_raw("Logging: " .. (log_enabled:get() and ("ON" .. (log_verbose:get() and " (verbose)" or ""))  or "OFF"))
 _cs_log_color_raw("=========================================")
