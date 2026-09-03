@@ -1,15 +1,15 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 11.22                                  ║
+-- ║  Version: 11.23                                  ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 11.22
--- @description v11.22 fake-flick BF ordering arms at 3 confirmed round-trips
---   (was 4). v11.21 custom crosshair + Static-Meas per-side. History in git.
+-- @version 11.23
+-- @description v11.23 bug pass: LBY-Snap rejects >65° LBY deltas, no side from a
+--   near-180° hit, fake-flick round-trip must return within 0.25s. History in git.
 
-local SEL01_VERSION = "11.22"
+local SEL01_VERSION = "11.23"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -3945,7 +3945,11 @@ events.aim_ack:set(function(event)
         local hit_side = 0
         if src_res ~= 0 and src_eye ~= 0 then
             local d = NormalizeAngle(src_res - src_eye)
-            if math.abs(d) > 3 then
+            -- V11.23: no SIDE from a near-180° delta — the sign there is arbitrary.
+            -- Dump: LBY-Snap "hit" at -172.2 gave Dance (8/8 RIGHT) a real_left=1 and
+            -- a persisted L=1/0.0°, which made him a "two-side switcher" for the keep
+            -- logic. BF:+90 / flick hits (80-100°) still count; 120 is the cut.
+            if math.abs(d) > 3 and math.abs(d) <= 120 then
                 hit_side = d > 0 and 1 or -1
                 s.last_hit_side = hit_side
             end
@@ -5202,7 +5206,11 @@ local function _pick_first_shot_impl(p, s, anim, eye_yaw, max_desync, preset)
         --   otherwise cycle 29 -> 45 -> 58 across repeated LBY-Snap-Guess attempts so
         --   a single wrong-mag guess (e.g. user-reported amy:3 measDesync ~42 vs hardcoded 29)
         --   does not cause 3 misses in a row before BF takes over.
-        if not lby or math.abs(NormalizeAngle(lby - eye_yaw)) < 5 then
+        -- V11.23: an LBY more than 65° off the eye is not a snap, it is a stale /
+        -- unrelated netvar (dump: LBY-Snap fired resolved=15.3 vs eye=-172.4, a 172°
+        -- "desync" no legal fake can produce). Treat it like "no snap" → guess path.
+        if not lby or math.abs(NormalizeAngle(lby - eye_yaw)) < 5
+           or math.abs(NormalizeAngle(lby - eye_yaw)) > 65 then
             local side = s.last_hit_side ~= 0 and s.last_hit_side or 1
             -- V9.95: same first-contact coin-flip as the other guess paths
             if s.last_hit_side == 0 then
@@ -6500,9 +6508,16 @@ local function resolve_player(p)
                 if exc <= 22 then
                     -- resting at base: a pending excursion that RETURNED = one confirmed flick
                     if s.ff_pending then
-                        local pitch_hi = math.abs(anim.m_flPitch or 0) >= 78
-                        s.ff_score  = math.min((s.ff_score or 0) + (pitch_hi and 2 or 1), 10)
-                        s.ff_last_t = now_rt
+                        -- V11.23: a flick returns within a couple of packets; a human
+                        -- who turns 90° to check a corner and turns back takes far
+                        -- longer. Without a time bound that corner-check scored the
+                        -- same (dump: 6Feqzi1 ff=true/8, six shots, never flicked).
+                        -- 0.25s covers fake-lag packet spacing, not a human turn.
+                        if (now_rt - (s.ff_pending_t or 0)) <= 0.25 then
+                            local pitch_hi = math.abs(anim.m_flPitch or 0) >= 78
+                            s.ff_score  = math.min((s.ff_score or 0) + (pitch_hi and 2 or 1), 10)
+                            s.ff_last_t = now_rt
+                        end
                         s.ff_pending = false
                     end
                     -- slow-track baseline toward true rest + decay when idle
@@ -6512,6 +6527,7 @@ local function resolve_player(p)
                     end
                 elseif exc >= 78 and exc <= 102 then
                     -- near-±90 off rest = candidate flick tick; arm, keep base put (awaits return)
+                    if not s.ff_pending then s.ff_pending_t = now_rt end  -- V11.23: stamp the arm time
                     s.ff_pending = true
                 else
                     -- mid-range movement (real turn/peek): NOT a flick. Adopt as new heading,
@@ -8216,5 +8232,6 @@ _cs_log_color_raw("V11.19: (1) Visual Style 'Lean (labels + confidence)' — one
 _cs_log_color_raw("V11.20: two targeted fixes + one measurement, nothing else touched (dump v11.18: 79.7%, first-shot 83%). (1) extrapolate_yaw — the always-on interp-comp (lerp + ping/2) had NO gate: a standing enemy flicking his view for a tick got +12° on a proven 11° magnitude (neptune2much still=true, 5 L-hits: Static-Server-Dom-Recall fired -23.9 = 11.5 + 12.4 comp). Stationary / slow enemies and an inconsistent yaw_rate buffer now get no comp. (2) Global hard-reset two-magnitude guard: the bimodal flag needs 2+2 real hits, so Burgie (L 56 / R 24.5) thrashed the global EMA on every side change and each reset decimated that side's real count (1/3 became 1/1). When both sides hold samples that disagree by more than 10, a side-matching hit blends instead of resetting. (3) [CANCEL] dump line — ticks held per reason, hold episodes, and hit/miss of the first shot after a hold; the next dump decides whether cancel-low-confidence earns its keep.")
 _cs_log_color_raw("V11.21: (1) CUSTOM CROSSHAIR — new 'Crosshair' group in the ESP tab (switch, Show = Sniper unscoped only / Sniper only / Always, style Cross / Dot / Cross+Dot, size / gap / thickness, colour picker, outline). Drawn from the render wrapper independent of ESP master, no per-frame closures. SSG-Pro turns it on; turn the Sel01-Config crosshair off to avoid two. (2) Static-Meas fires the PER-SIDE magnitude (V9.92 fixed only the Recall copy): dump gigicornel63 L 26 / R 35.4 got R 31.2 = the average, 4° short. Dump v11.20: 79.3%, [CANCEL] 0 episodes — the 'not shooting' symptom was the v11.17 resolve_stddev bug.")
 _cs_log_color_raw("V11.22: fake-flick BF ordering arms at 3 confirmed rest/±90/rest round-trips (was 4). Dump v11.21 Burgie sat at score 3 through four ±22° misses at bt 0-10 until BF:+90 hit at bt=23. Only the BF list order and the ⚡FF tag key on the flag; first-shot Flick-Meas still needs the impossible-band tell. Session read: 70% — two per-tick randomisers (Burgie side-jitter + 90 flick, Zero magnitude 15-33°) that an averaging resolver cannot pin; the side half is what the default-off Animation-Layer read is for.")
+_cs_log_color_raw("V11.23: bug pass only (dump v11.21: 85.2%, first-shot 86%). (1) LBY-Snap used m_flLowerBodyYawTarget unchecked — fired resolved=15.3 against eye=-172.4, a 172° 'desync'; anything >65° off the eye is now treated as no snap (guess path). (2) That 'hit' gave Dance (8/8 RIGHT) a real_left=1 / persisted L=1/0.0° and made him a two-side switcher for the keep logic: no SIDE is taken from a hit delta beyond 120° (sign is arbitrary near 180; BF:+90 hits still count). (3) Fake-flick round-trip needs the return within 0.25s — a human corner-check (turn 90, turn back) scored like a 1-tick flick (6Feqzi1 ff=true/8, never flicked in six shots); with the v11.22 threshold at 3 that would have cost two ±90 probes after a miss.")
 _cs_log_color_raw("Logging: " .. (log_enabled:get() and ("ON" .. (log_verbose:get() and " (verbose)" or ""))  or "OFF"))
 _cs_log_color_raw("=========================================")
