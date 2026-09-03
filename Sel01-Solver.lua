@@ -1,15 +1,16 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 11.23                                  ║
+-- ║  Version: 11.24                                  ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 11.23
--- @description v11.23 bug pass: LBY-Snap rejects >65° LBY deltas, no side from a
---   near-180° hit, fake-flick round-trip must return within 0.25s. History in git.
+-- @version 11.24
+-- @description v11.24 bug pass: real_* decimated once per hit (was twice), persist
+--   per-side EMA no longer blends against 0 after a side-only hit, ±90 probes take
+--   no part in side flips or the def-AA fingerprint. History in git.
 
-local SEL01_VERSION = "11.23"
+local SEL01_VERSION = "11.24"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -2399,11 +2400,15 @@ local function learning_update_hit(p, side, desync_value, aa_type, mode, speed2d
     -- v9.30 equivalent: a genuine AA-preset switch replaces the stored value outright
     -- instead of crawling toward it over five sessions.
     if n_side >= 3 and prev > 5 and math.abs(desync_value - prev) > 12 then alpha = 1.0 end
+    -- V11.24: a V11.8 side-only hit (|delta|>65, BF:+90 / flick) bumps sr/sl but leaves
+    -- dr/dl at 0 — the next real magnitude then blended 0.55 × value against 0.
+    -- Dump Yumo: R=1/0.0° after a +90 hit, then R=2/19.4° after a 35.3° hit, and the
+    -- next session boots that 19.4. No stored magnitude yet → take the value as-is.
     if side > 0 then
-        e.dr = (e.sr or 0) == 0 and desync_value or (e.dr * (1 - alpha) + desync_value * alpha)
+        e.dr = ((e.sr or 0) == 0 or (e.dr or 0) <= 0) and desync_value or (e.dr * (1 - alpha) + desync_value * alpha)
         e.sr = math.min((e.sr or 0) + 1, 999)
     elseif side < 0 then
-        e.dl = (e.sl or 0) == 0 and desync_value or (e.dl * (1 - alpha) + desync_value * alpha)
+        e.dl = ((e.sl or 0) == 0 or (e.dl or 0) <= 0) and desync_value or (e.dl * (1 - alpha) + desync_value * alpha)
         e.sl = math.min((e.sl or 0) + 1, 999)
     end
     end
@@ -3525,7 +3530,9 @@ events.aim_ack:set(function(event)
             s.defensive_aa = true
             -- V9.3: fingerprint def-AA delta — magnitude of post-fire jump
             local d_mag = math.abs(NormalizeAngle((s.last_resolved or 0) - (s.last_eye_yaw or 0)))
-            if d_mag >= 10 and d_mag <= 90 then
+            -- V11.24: was <= 90, which let a BF:+90 PROBE's spread miss fingerprint
+            -- "DEF-AA delta=90.0" (dump cxr) — a probe angle is ours, not theirs.
+            if d_mag >= 10 and d_mag <= 65 then
                 local a = 0.30
                 if (s.def_samples or 0) == 0 then s.def_delta = d_mag
                 else s.def_delta = (s.def_delta or 0) * (1 - a) + d_mag * a end
@@ -3555,7 +3562,11 @@ events.aim_ack:set(function(event)
         -- when angle matches AND learned side evidence does not contradict the shot;
         -- otherwise flip/decay as a real resolver error. Correct-angle server rejects
         -- schedule one same-side BF:retry before the normal BF cycle.
-        if ack_resolverish and ack_shot_side ~= 0 then
+        -- V11.24: a ±90 PROBE (|delta| > 65) carries no information about the desync
+        -- side, so it takes no part in the flip / keep decision. Dump cxr first contact:
+        -- BF:-90 miss → "FLIP side_bad err=65.3" flipped last_hit_side off a probe.
+        -- The KEEP branch already had the bf-probe no-freeze; the FLIP path did not.
+        if ack_resolverish and ack_shot_side ~= 0 and math.abs(ack_delta) <= 65 then
           -- FIX #4: skip speculative flip/keep correction on very-low-confidence players.
           -- idx=4 (conf=5, p_hits=1/3) ran the full correction with repeated flips and
           -- wasted shots on guesses. Below conf 15 there is near-zero learned signal — let
@@ -4024,6 +4035,12 @@ events.aim_ack:set(function(event)
                 -- changes magnitude (other side empty) still hard-resets as before.
                 local two_mag = (s.samples_left or 0) >= 1 and (s.samples_right or 0) >= 1
                                 and math.abs((s.measured_left or 0) - (s.measured_right or 0)) > 10
+                -- V11.24: the global AND the per-side hard-reset both decimated real_*
+                -- on the SAME hit (on a one-sided enemy their triggers are identical), so
+                -- one 12° magnitude move cut a 9-hit lock to 1 (×0.4 twice). Dump
+                -- intection: real 9 → 1 in one hit, the 12/0 lock lost dom / one-sided /
+                -- jitter-veto standing and was re-committed jitter. Decimate ONCE.
+                local real_cut = false
                 if s.desync_samples == 0 then
                     s.measured_desync = actual
                 elseif (not s.bimodal) and (not two_mag) and s.desync_samples >= 3 and diff > 10 then
@@ -4040,6 +4057,7 @@ events.aim_ack:set(function(event)
                     elseif hit_side < 0 then
                         s.real_left = math.max(1, math.floor((s.real_left or 1) * 0.4))
                     end
+                    real_cut = true
                     cs_log_verbose("AA-switch hard-reset idx=%d global EMA %.1f → %.1f (diff=%.1f, samples↓)",
                                    Ent:get_index(), prev_emag, actual, diff)
                 else
@@ -4071,7 +4089,7 @@ events.aim_ack:set(function(event)
                         elseif s.samples_right >= 3 and diff_r > 10 then
                             s.measured_right = actual
                             s.samples_right = math.max(2, math.floor(s.samples_right * 0.4))
-                            s.real_right = math.max(1, math.floor((s.real_right or 1) * 0.4))
+                            if not real_cut then s.real_right = math.max(1, math.floor((s.real_right or 1) * 0.4)) end  -- V11.24: once per hit
                             cs_log_verbose("AA-switch hard-reset idx=%d R-side %.1f → %.1f (diff=%.1f)",
                                            Ent:get_index(), prev, actual, diff_r)
                         else
@@ -4092,7 +4110,7 @@ events.aim_ack:set(function(event)
                         elseif s.samples_left >= 3 and diff_l > 10 then
                             s.measured_left = actual
                             s.samples_left = math.max(2, math.floor(s.samples_left * 0.4))
-                            s.real_left = math.max(1, math.floor((s.real_left or 1) * 0.4))
+                            if not real_cut then s.real_left = math.max(1, math.floor((s.real_left or 1) * 0.4)) end  -- V11.24: once per hit
                             cs_log_verbose("AA-switch hard-reset idx=%d L-side %.1f → %.1f (diff=%.1f)",
                                            Ent:get_index(), prev, actual, diff_l)
                         else
@@ -5016,6 +5034,17 @@ local function _pick_first_shot_impl(p, s, anim, eye_yaw, max_desync, preset)
             local _sy_side = (sy_delta >= 0) and 1 or -1
             if math.abs(sy_delta) >= 5 and math.abs(sy_delta) <= 65
                and not (_one ~= 0 and _sy_side ~= _one) then
+                -- V11.24: the boost Static-ServerBoost has had for ages, missing here.
+                -- The rebuild gives a reliable SIDE but often an undershot magnitude;
+                -- dump Yumo (standing, 1 real L-hit @39.6): Still-Server fired -9.0,
+                -- 30° short, miss. With a real hit on the rebuild's side and a learned
+                -- magnitude 5°+ larger, shoot the learned one on the rebuild's side.
+                local _lm = sel01_side_mag(s, _sy_side)
+                local _rs = (_sy_side > 0) and (s.real_right or 0) or (s.real_left or 0)
+                if _rs >= 1 and _lm > 5 and _lm > math.abs(sy_delta) + 5 then
+                    s.mode = "Still-ServerBoost"
+                    return eye_yaw + math.min(_lm, 58) * _sy_side
+                end
                 s.mode = "Still-Server"
                 return clamp_firstcontact_serveryaw(eye_yaw, sy, s.desync_samples)  -- V9.86
             end
@@ -8233,5 +8262,6 @@ _cs_log_color_raw("V11.20: two targeted fixes + one measurement, nothing else to
 _cs_log_color_raw("V11.21: (1) CUSTOM CROSSHAIR — new 'Crosshair' group in the ESP tab (switch, Show = Sniper unscoped only / Sniper only / Always, style Cross / Dot / Cross+Dot, size / gap / thickness, colour picker, outline). Drawn from the render wrapper independent of ESP master, no per-frame closures. SSG-Pro turns it on; turn the Sel01-Config crosshair off to avoid two. (2) Static-Meas fires the PER-SIDE magnitude (V9.92 fixed only the Recall copy): dump gigicornel63 L 26 / R 35.4 got R 31.2 = the average, 4° short. Dump v11.20: 79.3%, [CANCEL] 0 episodes — the 'not shooting' symptom was the v11.17 resolve_stddev bug.")
 _cs_log_color_raw("V11.22: fake-flick BF ordering arms at 3 confirmed rest/±90/rest round-trips (was 4). Dump v11.21 Burgie sat at score 3 through four ±22° misses at bt 0-10 until BF:+90 hit at bt=23. Only the BF list order and the ⚡FF tag key on the flag; first-shot Flick-Meas still needs the impossible-band tell. Session read: 70% — two per-tick randomisers (Burgie side-jitter + 90 flick, Zero magnitude 15-33°) that an averaging resolver cannot pin; the side half is what the default-off Animation-Layer read is for.")
 _cs_log_color_raw("V11.23: bug pass only (dump v11.21: 85.2%, first-shot 86%). (1) LBY-Snap used m_flLowerBodyYawTarget unchecked — fired resolved=15.3 against eye=-172.4, a 172° 'desync'; anything >65° off the eye is now treated as no snap (guess path). (2) That 'hit' gave Dance (8/8 RIGHT) a real_left=1 / persisted L=1/0.0° and made him a two-side switcher for the keep logic: no SIDE is taken from a hit delta beyond 120° (sign is arbitrary near 180; BF:+90 hits still count). (3) Fake-flick round-trip needs the return within 0.25s — a human corner-check (turn 90, turn back) scored like a 1-tick flick (6Feqzi1 ff=true/8, never flicked in six shots); with the v11.22 threshold at 3 that would have cost two ±90 probes after a miss.")
+_cs_log_color_raw("V11.24: bug pass only (dump v11.23: 75%, first-shot 75%). (1) The global AND the per-side hard-reset both decimated real_* on the same hit — one 12° magnitude move cut intection's 9-hit lock to 1 (×0.4 twice); dom / one-sided BF / jitter-veto lost standing and he was re-committed jitter. Decimated once now. (2) Persist per-side EMA: a V11.8 side-only hit (BF:+90) left dr=0 with sr=1, so the next real hit blended against 0 (Yumo R=2/19.4° after a 35.3° hit). No stored magnitude → value as-is. (3) A ±90 probe carries no side information: it no longer drives the flip/keep decision (cxr: BF:-90 miss flipped the side off err=65) and no longer fingerprints defensive AA (DEF-AA delta=90.0 off a probe's spread miss; cap 65). (4) Still-ServerBoost: the stationary path lacked the learned-magnitude boost Static-ServerBoost has — Yumo standing with 1 real L-hit @39.6 got Still-Server -9.0 (rebuild 30° short). With a real hit on the rebuild's side and a learned magnitude 5°+ larger, the learned one is fired.")
 _cs_log_color_raw("Logging: " .. (log_enabled:get() and ("ON" .. (log_verbose:get() and " (verbose)" or ""))  or "OFF"))
 _cs_log_color_raw("=========================================")
