@@ -1,173 +1,16 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 11.18                                  ║
+-- ║  Version: 11.19                                  ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 11.18
--- @description v11.14 per-player miss sting (100→78 on first miss, clears on
---   hit) without flattening HUD avg. Weighted by real hits; no 50% hard cap.
--- @description-prev v11.13 confidence: stddev of DESYNC not look-yaw, softer age on
---   learned locks, HUD avg only shot-at players. Dump idx=2 12 R-hits at 29.5°
---   showed conf=55 (age+look-sd) and HUD avg stuck ~50 on 53 leftover slots.
--- @description-prev v11.12 ping on every ACK / HIT-FULL / MISS-FULL / correction-miss
---   line (HIGH when ping>=80). Dump is self-describing. No aim change.
--- @description-prev v11.11 dump [NET] ping + ACK-bt so high-ping sessions are not
---   read as resolver faults. No aim change.
--- @description-prev v11.10 Networked rebuild-side veto + Jitter-Cls needs a real hit.
---   Dump v11.8 idx=3 HIT Networked R +13.5 then Networked L -11.7 against the
---   only real hit (Aggressive first_shot=networked skips Static-Server-Dom).
---   idx=10 Jitter-Cls R with real=0 (last_hit from persist.dom / steam-mem).
--- @description-prev v11.9 never-hit high-bt no longer freezes a coin-flip seed. 666
---   Predicted 31° ×2 correction bt=22/15, real=0, passive 58/63, died before
---   the v9.49 explore (needs 2 KEEPs). bt>8 KEEP now requires a real hit.
--- @description-prev v11.8 90° hits count as SIDE evidence, not magnitude. BF:+90 /
---   flick land at 80-90, the 65° EMA cap dropped real_*/persist hits, so idx=12
---   had two +90 HITs and persist 0/1 with last_hit=R and real=0.
--- @description-prev v11.7 dump-driven: Still-BFGuess leaked into best_static (Recall
---   mismatch); Flick-Meas fired on the 3s flag not this-tick's wide band;
---   hard-reset left real_* high so conf never dropped; Air never got +Peek.
--- @description-prev v11.6 passive-observe nearby off-FOV + simtime-gated learning
---   + first-window peek lead. FOV cull used to skip the whole resolve, so an
---   enemy standing next to you was never passively learned and yaw_rate was
---   cold the tick they peeked in. Peek predictor needed 4 consistent samples,
---   so a 4-8 tick corner swing never got a lead.
--- @description-prev v11.4 player-model first-contact + sticky best + stand/move side:
---   Persistent learning saved every hit but ONLY booted after a dormancy gap, so the
---   first peek of a known player this session (and after reload / round-restart slot
---   reuse) was a cold Guess/Networked shot. Boot now runs on FIRST SIGHT. Typical
---   aa_type is persisted and seeded so Recall uses the right bucket instead of the
---   default "switch". best_* is a sticky vote (one stray hit no longer overwrites
---   Static-Meas). Stand vs move side is learned separately — many AA presets invert
---   when running. SteamMemory uses the same 6-pattern sid as LearnedModel.
--- @description-prev v9.79 BF real-dominance ordering broadened to switch AA:
---   * v9.78 only reordered the static/slow BF branch. This lobby's one-sided
---     locks were aa=switch (idx=8 real 10R/0L still fired BF:opposite LEFT;
---     idx=12 9R/0L fired BF:opposite LEFT) — switch fell through to the
---     opposite-first default. A >=3-vs-0 REAL split is a confirmed lock
---     regardless of AA-class, so the dominant-side magnitude sweep now applies
---     to ALL non-defensive aa_types. Genuine alternators (real hits both sides,
---     idx=6 L=2 R=1) stay opposite-first (V9.63).
--- @description-prev v9.78 BF cycle real-dominance ordering (static/slow only):
---     real_left/right firmly one-sided → sweep magnitude on proven side first.
--- @description-prev2 v9.77 Networked-Boost side-conflict guard + server-fail filter honesty:
---   * Networked-Boost (ground 4090 + air 4513) trusted RebuildServerYaw's SIDE
---     blindly while boosting the magnitude. RebuildServerYaw undershoots magnitude
---     but can also give the WRONG side; on a hard one-sided enemy it boosted onto
---     the wrong side (real-dump idx=5: streak L=20 R=0, real 5L/0R, rebuild said
---     R → boosted 29° R twice → Networked-Boost 0/2). New learned_dom_side(s) (real
---     hits / streak only, no seeded/passive) overrides the rebuild side when learned
---     dominance strongly contradicts it, and uses that side's per-side magnitude.
---   * server-fail filter (ack_serverfail_like) excused a bt=0 err=0 kept-side miss
---     as "netcode" — but bt=0 = server used the CURRENT record, no stale replay, so
---     a correct-magnitude miss there is OUR own side/switch misprediction (the v9.55
---     note already said so; the code never enforced it). The err<=5 branch now needs
---     bt>=4 (genuine backtrack); bt 0-3 correct-angle misses COUNT (real-dump idx=5
---     had ~14 bt=0/2 keeps filtered → headline 86.7% vs raw 59.1%, a 27pt lie).
--- @description-prev v9.76 AA-classify oscillation-freeze (slow-flap fix):
---   * the V9.10 anti-flap counted commits in a 10s window — a slow static<->switch<->static
---     revert spread over >10s never hit 4 entries and flapped freely (real-dump idx=3/7/11
---     at long range on yaw noise; idx=7 mode-thrashed switch->static->switch into a miss
---     right after a hit). Now an A->B->A revert (commit back to a just-left type) freezes
---     the classifier 5s regardless of timing; a real progression never reverts so genuine
---     AA changes are untouched.
--- @description-prev v9.75 AIR magnitude boost (port of ground Networked-Boost, hits 4/4=100%):
---   * resolve_player air-branch boosts an undershot RebuildServerYaw magnitude to the
---     known measured/passive air magnitude (keeps the rebuilt side) in the trust-rebuild
---     fall-through. RebuildServerYaw gives a good SIDE but undershoots magnitude in air —
---     a never-hit-but-passively-known air enemy got the raw short angle and missed
---     (real-dump idx=9: passive/measured 33.9°, rebuild +15° R, 18.9° short → miss → hit).
--- @description-prev v9.74 jitter+defAA BF fix + passive-side dump visibility + air/BF:retry guard:
---   * Issue 1 pick_bruteforce_angle skips the def_delta (BF:def+) cycle when
---     aa_type=="jitter" — jitter oscillation has no stable defensive delta, so
---     BF:def+ whiffed (v9.73 idx=3 0/1) while BF:opposite catches it. Falls through
---     to the standard BF oscillation. aim_ack logs the jitter+defAA+no-samples case.
---   * Issue 2 copy-dump [P] lines show passive_n_left/right as pL=/pR= so the
---     V9.72 passive-side-keep can be verified from a dump.
---   * Issue 3 resolve_player air-branch yields to a pending BF:retry (consumed only
---     in pick_bruteforce_angle) — v9.73 idx=14 KEEP scheduled but logged mode=Air.
---   * Issue 4 IMPROVEMENT HINTS: jitter+defAA hint + 0-real/passive-obs hint.
--- @description-prev v9.73 real-dump fixes (idx=4 switch-stuck / idx=2 BF jitter / cold Air):
---   * FIX #1 one-sided switch enemy: correct magnitude (err<2) + 2 consecutive
---     correct-angle KEEPs on same side = the switch moved → force a flip (was 6+ KEEP).
---   * FIX #2 BF:retry cap — static enemy, 2 correct-angle keeps + samples → commit
---     measured desync (Static-Meas) instead of jittering the magnitude.
---   * FIX #3 cold-air gate — no hit-EMA + no passive baseline → alternate side by
---     miss-count (BF:opposite) at a high air prior, don't fire a blind trusted Air.
---   * FIX #4 conf<15 → skip speculative correction; let BF cycle sweep sides.
---   * FIX #5 don't clobber session-learned per-side EMAs from persistent LearnedModel
---     on dormancy re-track (kept mid-session learning momentum).
---   * FIX #6 tag correct-angle server-fail keeps so Static-Meas mode-confidence isn't
---     decayed (mode_stats already gated; flag makes it explicit + ESP-visible).
--- @description-prev Correction side guard + serverfail retry:
---   * correction/prediction-error misses now check SIDE evidence, not only
---     magnitude. A BF shot on the unlearned opposite side no longer gets labeled
---     "server fail" just because abs(delta) ~= measured_desync.
---   * correct-angle server/backtrack fails schedule one same-side retry before
---     normal BF cycling, so a good +45 shot does not immediately become
---     BF:opposite on the next attempt.
---   * BF magnitude now trusts strong passive desync data (8+ observations), which
---     fixes pass-heavy players getting forced back to max_desync.
--- @description-prev Air first-contact fix (Air was the worst mode @25%):
---   * Air-Guess magnitude now biased HIGH (max(adaptive_median, 42)) — airborne
---     enemies can't move-desync so they sit near max desync; the lobby median was
---     undershooting (guessed ~18-30 on 42-58° air enemies).
---   * first-contact air SIDE now uses steam-memory dominant side instead of a blind
---     +1 coin-flip.
--- @description-prev Snapshot-match regression fix (v9.33 self-inflicted):
---   * aim_ack snapshot picker now matches event.tick (the acked shot) again, not
---     globals.tickcount (ack-time). v9.33 broke this: on rapid fire the ack for shot
---     A grabbed shot B's snapshot → wrong eye/resolved → WRONG hit_side learned →
---     corrupted per-side desync. Kept the v9.33 >64 stale-reject + push-prune.
--- @description-prev Fast-fire tightened (stop shooting too early):
---   * fast-fire used to drop hitchance to 30 on conf>=50 — firing a marginal shot
---     that, on high-desync enemies, caught a bad backtrack record → correction /
---     prediction-error rejects ("shoots too early, misses a lot"). Now it only fires
---     fast on a STABLE (stddev<12) + well-sampled resolve (conf85/s3→hc30,
---     conf70/s2→hc45), hc floors raised toward NL's manual 72 (v9.18-aligned).
--- @description-prev Air-branch hardening (air resolver focus):
---   * air corr-aware path now uses PER-SIDE measured magnitude (was global
---     measured_desync — wrong for bimodal/per-side enemies; v9.22-class fix for air).
---   * update_jitter now runs in the air-branch (used to return before it) → yaw_cache
---     / yaw_rate stay warm, so aa_type is correct on landing and air-spin is visible.
--- @description-prev Batch 3 — air recent_resolved, snapshot window, boot nil-guard, pose-read:
---   * air-branch now pushes recent_resolved so cancel-conf/confidence reflect air.
---   * snapshot matched on tickcount + rejected if >64 ticks stale (+ prune at push)
---     so a cross-engagement snapshot can't teach the wrong side.
---   * LearnedModel boot nil-coalesces fields (partial learned.lua no longer aborts).
---   * adaptive_guess ring capped at 58 so >58 reads can't bias the median high.
---   * [EXP, OFF] pose-param side read (m_flPoseParameter[11]) — A/B tiebreaker in
---     Air-Guess; mapping undocumented, validate in-game before trusting.
--- @description-prev Bimodal resolver + enriched event ticker + RebuildServerYaw nil:
---   * V9.32 bimodal: detect true switch-AA (two stable per-side magnitudes >12°
---     apart) and suppress the v9.30 GLOBAL hard-reset so it stops thrashing the
---     averaged EMA on every alternation (per-side EMAs already hit these).
---   * V9.32 event ticker HIT/MISS lines now show Δdelta / measured / conf / side
---     and bt (backtrack tick) on misses — high bt = stale-record/netcode miss.
---   * V9.32 RebuildServerYaw returns nil on failure (callers `or eye_yaw`) so a
---     failed reconstruct no longer resolves to a literal 0°.
--- @description-prev Server-side-fail flip guard + locked-target head preference:
---   * V9.31 correction-flip fix: a `correction` miss where our resolved delta
---     == measured_desync means the SIDE was right and the server rejected the
---     shot (fake-lag/backtrack). Old code flipped side anyway → oscillation +
---     fed BF:opposite the wrong side. Now flip only when angle_err > 5°; a
---     correct-angle reject KEEPS the side (generalizes the V9.24 LBY guard).
---   * V9.31 body-only fix: on LOCKED targets (8+ samples, 60+ conf, not whiffing)
---     relax NL safe-point + enable multipoint so the ragebot takes HEAD instead
---     of the safe body point. Toggle, never touches mindmg/hitbox.
--- @description-prev AA-switch detection + hard-reset on big changes:
---   * On every hit, if |actual - stored_EMA| > 10° AND we already have >=3
---     samples, treat as the enemy SWITCHING their AA preset (not drift).
---   * Replace EMA with the new actual value directly (no smoothing).
---   * Decimate sample count to 40% so confidence drops temporarily and the
---     resolver re-confirms over the next 2 hits instead of dragging on the
---     old EMA for 4-5 misses.
---   * Applied to global measured_desync AND per-side EMAs independently.
---   * v9.26 drift-bump (alpha 0.55 on 5-10° diff) still handles small shifts.
---   * v9.29 coach variants carry.
+-- @version 11.19
+-- @description v11.19 "Lean" visual style (labels + confidence only) as the
+--   SSG-Pro default; persist dom lean at 2-hit/2:1 lead; dead keep-score block
+--   removed; version history lives in git (see the V11.x load banner).
 
-local SEL01_VERSION = "11.18"
+local SEL01_VERSION = "11.19"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -625,7 +468,7 @@ local strat_learning = g_smart:combo(accent .. ui.get_icon"user"      .. accent 
 local strat_predict  = g_smart:combo(accent .. ui.get_icon"bolt"      .. accent .. "  Prediction Strategy",
                                      "Off", "Light", "Normal", "Aggressive")
 local strat_visual   = g_smart:combo(accent .. ui.get_icon"bullseye"  .. accent .. "  Visual Style",
-                                     "None", "Minimal (HUD only)", "Standard (ESP + HUD)", "Full (everything)")
+                                     "None", "Minimal (HUD only)", "Standard (ESP + HUD)", "Full (everything)", "Lean (labels + confidence)")
 local strat_hitbox   = g_smart:combo(accent .. ui.get_icon"crosshairs".. accent .. "  Hitbox Strategy",
                                      "NL Default (manual)", "Head Bias", "Head + Chest Fallback", "Head Only", "NoSpread (head always)")
 
@@ -688,10 +531,21 @@ strat_visual:set_callback(function(r)
         safe_set_local(exp_esp_overlay, true);  safe_set_local(esp_master, true)
         safe_set_local(esp_show_labels, true);  safe_set_local(esp_show_hud, true)
         safe_set_local(esp_show_confbar, false)
+    elseif v == "Lean (labels + confidence)" then
+        -- V11.19: the per-frame budget. One symbol line + the confidence bar per enemy,
+        -- nothing else: no wedge (3 world_to_screen per enemy per frame), no flash box,
+        -- no shot-dots / tags, no HUD panel, no event ticker (per-frame string.format).
+        safe_set_local(exp_esp_overlay, true);  safe_set_local(esp_master, true)
+        safe_set_local(esp_show_labels, true);  safe_set_local(esp_show_confbar, true)
+        safe_set_local(esp_show_hud, false)
+        safe_set_local(esp_wedge, false);       safe_set_local(esp_flash, false)
+        safe_set_local(esp_enh, false);         safe_set_local(esp_event_ticker, false)
     else -- Full
         safe_set_local(exp_esp_overlay, true);  safe_set_local(esp_master, true)
         safe_set_local(esp_show_labels, true);  safe_set_local(esp_show_hud, true)
         safe_set_local(esp_show_confbar, true)
+        safe_set_local(esp_wedge, true);        safe_set_local(esp_flash, true)
+        safe_set_local(esp_enh, true);          safe_set_local(esp_event_ticker, true)
     end
     cs_log("Visual Style → " .. v)
 end)
@@ -2532,8 +2386,12 @@ local function learning_update_hit(p, side, desync_value, aa_type, mode, speed2d
     -- return to neutral, even after the counts equalised. Boot feeds dom straight into
     -- last_hit_side, so a stale verdict from one session steered the first shot of every
     -- later one. Recompute it from the current counts every time, including the tie.
-    if (e.sr or 0) > (e.sl or 0) + 3 then e.dom = 1
-    elseif (e.sl or 0) > (e.sr or 0) + 3 then e.dom = -1
+    -- V11.19: was "lead > 3". Dump idx=1 kurokoai: persist L=4 / R=1 (a 4:1 lock)
+    -- sat at dom=0, so on re-engage the first shot coin-flipped and LBY-Snap-Guess
+    -- fired R; BF:opposite L then hit. A 2-hit lead that is also 2:1 is a lean.
+    local _sl, _sr = (e.sl or 0), (e.sr or 0)
+    if _sr >= _sl + 2 and _sr >= 2 * _sl then e.dom = 1
+    elseif _sl >= _sr + 2 and _sl >= 2 * _sr then e.dom = -1
     else e.dom = 0 end
     -- V11.4: typical AA-type sticky vote. Boot seeds s.aa_type from this so the
     -- known-player Recall fast-path looks up the RIGHT bucket (best_static vs
@@ -2862,7 +2720,7 @@ local function apply_preset(name)
         -- V9.4: smart strategy synced
         safe_set(strat_learning,     "Adaptive (Recommended)")
         safe_set(strat_predict,      "Aggressive")
-        safe_set(strat_visual,       "Full (everything)")
+        safe_set(strat_visual,       "Lean (labels + confidence)")  -- V11.19: per-frame budget (was Full)
         safe_set(strat_hitbox,       "NL Default (manual)")
         -- V9.96 ORDER FIX: strat_hitbox's callback sets exp_multipoint=false for
         -- "NL Default (manual)", which silently undid the exp_multipoint=true above —
@@ -2871,13 +2729,17 @@ local function apply_preset(name)
         -- whether NL fires callbacks on a programmatic :set.
         safe_set(exp_multipoint,     true)
         safe_set(exp_respect_man,    true)
+        -- V11.19: SSG-Pro is the LEAN visual set now — label + confidence bar only.
+        -- Wedge / flash / dots / HUD panel / ticker are the per-frame cost centres and
+        -- rarely change a decision mid-fight; flip them back on individually if wanted.
         safe_set(esp_master,         true)
         safe_set(esp_show_labels,    true)
         safe_set(esp_show_confbar,   true)
-        safe_set(esp_show_hud,       true)
-        safe_set(esp_wedge,          true)   -- V9.51: SSG-Pro shows the full on-model visual suite
-        safe_set(esp_flash,          true)
-        safe_set(esp_enh,            true)
+        safe_set(esp_show_hud,       false)
+        safe_set(esp_wedge,          false)
+        safe_set(esp_flash,          false)
+        safe_set(esp_enh,            false)
+        safe_set(esp_event_ticker,   false)
         safe_set(exp_lock_headpref,  true)   -- V9.96: precision preset wants heads on locked targets
         -- V9.96: on-shot flip stays ON (well-gated, common in HvH). Pose calibration is
         -- retired (dead end on this build) — the v9.95 animation-layer side read replaces
@@ -4066,14 +3928,10 @@ events.aim_ack:set(function(event)
         -- V9.95: score the animation-layer signal that was live when we fired, so a
         -- signal whose sign convention is backwards on this build corrects itself.
         if hit_side ~= 0 then pcall(anim_pol_feedback, s, hit_side) end
-        -- V10.4: settle the pending KEEP. Did the shot that finally landed use the side we
-        -- kept, or the opposite one? Bucketed by backtrack, because bt >= 4 is the case
-        -- where retry-same is believed to be genuine netcode.
-        if hit_side ~= 0 and s.pending_keep_side and s.pending_keep_side ~= 0 then
-            local b = ((s.pending_keep_bt or 0) >= 4) and sel01_keep_stats.hi or sel01_keep_stats.lo
-            if hit_side == s.pending_keep_side then b.same = b.same + 1 else b.opp = b.opp + 1 end
-            s.pending_keep_side = nil
-        end
+        -- V11.19: the V10.4 keep-scoring block that lived here was DEAD — V10.8 settles
+        -- and clears pending_keep_side at the top of the ack handler on the very next
+        -- shot, and the fields it touched (keep_stats.hi/.lo, .same/.opp) no longer
+        -- exist; had it ever run it would have thrown inside the HIT path.
         -- update measured-desync EMA (global + per-side)
         if src_res ~= 0 and src_eye ~= 0 then
             local actual = math.abs(NormalizeAngle(src_res - src_eye))
@@ -8239,5 +8097,6 @@ _cs_log_color_raw("V11.15: three real-dump fixes. (1) AIR re-fired a missed angl
 _cs_log_color_raw("V11.16: fake-flick false positives. The netvar-vs-animstate tell fires on every ordinary sharp turn (netvar lands a frame before the anim update; yaw_rate is still low that tick), only decayed while band observations existed, refreshed the band timestamp and flagged ff_silent on its own — dump: weedabuser w0/n30, woof w0/n15, zero impossible-band hits, yet every turn re-armed BF ±90 for 3s and suspended passive learning. Now: own timestamp + own decay, and no flag without >=3 impossible-band observations. Also: jitter commit vetoed by 4+ one-sided real hits (Monkeyman L1/R9 @32° stable was 'jitter', Jitter-Cls 0/2); DT-window shots tagged 'DT' in the ACK ring + hit/miss counted in the [DT] line.")
 _cs_log_color_raw("V11.17: perf + dead-code pass (full-file audit) + one fire-gate fix. FIX: resolve_stddev measured the spread of the ABSOLUTE resolved yaw (where they look) — a locked 29.5° enemy walking and aiming read sd~80, so cancel-low-confidence (sd>50 sniper / >25 rifle) refused valid shots and fast-fire never saw a stable resolve; now the desync-delta spread, same as confidence() since V11.13. PERF: cs_log_verbose/cs_log_debug no longer string.format + 12-15 find() + ring-push on every call with logging off (capture test memoised per template, toggles tick-cached); the 54 pcall(function() ctx:override_* end) closures in ragebot_target replaced by one named helper (zero alloc per tick); presets are constant tables (were 2 fresh tables + 2 menu reads per call, ~3 calls/enemy/tick); per-side / nospread / mode / baim-n / log toggles tick-cached (per-side was read up to 13x per resolve); ESP sub-toggles read once per frame instead of per enemy. DEAD: a second events.render:set near the top (replaced on load — the v9.93 version banner it called never drew; now wired into the main wrapper), write-only PlayerState fields (last_shot, last_lby, prev_origin vector, last_pred_was_hit, hostile_fire_count, last_hostile_aimed).")
 _cs_log_color_raw("V11.18: first-contact fixes (dump: first-shot 58%, BF:opposite 3/3 — the first shot picked wrong, opposite fixed it). (1) Air used the GLOBAL seed / max(passive L,R) — for a R shot the L side's number (idx=7 fired 32.8, per-side R 23.7 was right); side now decided first, then THAT side's measured/passive magnitude (sel01_side_mag) in air-boost, Air-Guess and cold-air. (2) First-contact physical cap: the predictor bounded only the lead, not lead+seed — idx=4 fired -65.7 (53 seed + 12.5 lead), past the 58° cone; with zero real hits the total is capped at 58 (mode -Cap). (3) Still-Server no longer takes the rebuild's OTHER side when one real hit exists on one side only (idx=2: 1 L-hit @18, fired R 34.6). (4) BF 'opposite' keys off the last ACKED shot side, not the last resolve (unfired air re-resolves made it flip twice). PERF: ESP per-enemy draw is a named function (was 5 closures per enemy per frame). SIZE: 84 V9/V10 changelog lines dropped from the load banner (git history keeps them).")
+_cs_log_color_raw("V11.19: (1) Visual Style 'Lean (labels + confidence)' — one symbol line + the conf bar per enemy, everything else off (wedge = 3 world_to_screen per enemy per frame, flash box, shot-dots/tags, HUD panel, event ticker = per-frame string.format). SSG-Pro preset now selects it; 'Full' re-enables all of them. (2) Persist dom lean: was a >3-hit lead, so a 4:1 lock (dump kurokoai L=4/R=1) booted with dom=0 and the first shot coin-flipped; now a 2-hit lead that is also 2:1. (3) Dead V10.4 keep-score block in the HIT path removed (V10.8 settles the keep earlier; the fields it touched no longer exist). (4) The 158-line @description-prev header history dropped — git has it. Dump v11.18: 75% overall, first-shot 58% -> 75%; the remaining first-contact misses were correct angles rejected at bt=0 on defensive-AA peekers followed by a blind flip — that is the case the (default-off) Animation-Layer side read exists for.")
 _cs_log_color_raw("Logging: " .. (log_enabled:get() and ("ON" .. (log_verbose:get() and " (verbose)" or ""))  or "OFF"))
 _cs_log_color_raw("=========================================")
