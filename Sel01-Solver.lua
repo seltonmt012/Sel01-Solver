@@ -1,11 +1,11 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 11.14                                  ║
+-- ║  Version: 11.15                                  ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 11.14
+-- @version 11.15
 -- @description v11.14 per-player miss sting (100→78 on first miss, clears on
 --   hit) without flattening HUD avg. Weighted by real hits; no 50% hard cap.
 -- @description-prev v11.13 confidence: stddev of DESYNC not look-yaw, softer age on
@@ -167,7 +167,7 @@
 --   * v9.26 drift-bump (alpha 0.55 on 5-10° diff) still handles small shifts.
 --   * v9.29 coach variants carry.
 
-local SEL01_VERSION = "11.14"
+local SEL01_VERSION = "11.15"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -1303,11 +1303,32 @@ end
 -- aim_ack regardless of verbose/debug, 24 shots, one fixed line each.
 sel01_ack_ring  = { cap = 24, head = 0, count = 0 }
 sel01_ack_stats = { hit = 0, miss = 0, keep = 0, flip = 0, spread = 0, netcode = 0, nofreeze = 0, other = 0 }
+-- V11.15: running backtrack of the shots that LANDED. The server-fail filter called
+-- any bt>=4 miss a "stale record", but the v11.14 dump's hits landed at bt 7-21
+-- (ack-bt avg 6.0) — so a bt 4-5 miss used a FRESHER record than the average hit.
+-- That is not netcode evidence; it is our own side/magnitude error wearing a netcode
+-- label (3 of 9 misses excused → HUD 80% vs raw 69%). A miss is only excused as
+-- stale when its bt clearly exceeds what hits routinely land at in THIS lobby.
+sel01_hit_bt = { ema = nil, n = 0 }
+function sel01_hit_bt_note(bt)
+    local h = sel01_hit_bt
+    bt = tonumber(bt) or 0
+    if h.ema == nil then h.ema = bt else h.ema = h.ema * 0.7 + bt * 0.3 end
+    h.n = h.n + 1
+end
+function sel01_stale_bt()
+    -- the bt a miss must EXCEED to be excused as a stale-record reject: 6 above the
+    -- hit average, never below the old fixed 8; plain 8 until 3 hits calibrate it
+    local h = sel01_hit_bt
+    if h.n < 3 or h.ema == nil then return 8 end
+    return math.max(8, math.floor(h.ema + 6 + 0.5))
+end
 function sel01_ack_reset()
     local r = sel01_ack_ring
     for i = 1, r.cap do r[i] = nil end
     r.head, r.count = 0, 0
     sel01_ack_stats = { hit = 0, miss = 0, keep = 0, flip = 0, spread = 0, netcode = 0, nofreeze = 0, other = 0 }
+    sel01_hit_bt = { ema = nil, n = 0 }
 end
 function sel01_ack_push(kind, idx, name, mode, aa, side, delta, meas, err, bt, hc, verdict, rl, rr)
     name = tostring(name or "-"):gsub("%s+", ""):sub(1, 12)
@@ -3526,9 +3547,14 @@ events.aim_ack:set(function(event)
         -- err>8 means we'd have whiffed on a FRESH record too = our overshoot, not pure
         -- netcode. Now bt>8 pardons only when err is also small (or no measurement, where
         -- err is meaningless). A high-bt + high-err miss COUNTS — keeps headline honest.
+        -- V11.15: both bt thresholds are now RELATIVE to the bt this lobby's hits land
+        -- at (sel01_stale_bt: hit-bt EMA + 6, floor 8). Fixed 4 / 8 excused misses whose
+        -- record was fresher than the average HIT — see sel01_hit_bt. The err<=5 branch
+        -- needs bt within 4 of the stale line; the no-measurement branch needs to exceed it.
+        local stale_bt = sel01_stale_bt()
         local ack_serverfail_like = ack_resolverish and ack_shot_side ~= 0 and not ack_side_bad
-                                     and ((ack_side_measured > 5 and ack_angle_err <= 5 and bt >= 4)
-                                          or (bt > 8 and (ack_side_measured <= 5 or ack_angle_err <= 8)))
+                                     and ((ack_side_measured > 5 and ack_angle_err <= 5 and bt >= math.max(4, stale_bt - 4))
+                                          or (bt > stale_bt and (ack_side_measured <= 5 or ack_angle_err <= 8)))
         -- V9.49: a CONFIRMED server-fail keep (correct angle, high bt, side kept) is not
         -- a resolver fault. Logs showed these polluting the headline hit-rate badly:
         -- idx=9 fired the SAME correct -21.8° three times into a declining stale record
@@ -3826,7 +3852,11 @@ events.aim_ack:set(function(event)
                 local keep_no_freeze, nf_why = false, nil
                 if s.aa_type == "jitter" and bt <= 8 then
                     keep_no_freeze, nf_why = true, "jitter"
-                elseif two_side_switcher and bt <= 4 then
+                -- V11.15: was bt <= 4. On a two-side enemy err~0 says NOTHING about
+                -- the side at any bt, so only a bt clearly above what hits land at earns
+                -- a retry-same. Live case weedabuser (L=2 R=1): Air L30 miss bt=12 →
+                -- retry-same scheduled on L while the enemy sat R — a wasted shot.
+                elseif two_side_switcher and bt <= stale_bt then
                     keep_no_freeze, nf_why = true, "two-side"
                 elseif ack_measured > 5 and ack_angle_err > 25 then
                     keep_no_freeze, nf_why = true, "bf-probe"
@@ -3839,7 +3869,11 @@ events.aim_ack:set(function(event)
                 else
                     resolver_note_serverfail_retry(s, ack_shot_side, (ack_side_measured > 5 and ack_side_measured) or math.abs(ack_delta))
                 end
-                server_fail_keep = ack_serverfail_like  -- V9.55: only filter GENUINE netcode (err<=5 or bt>8); a bt=0 side-miss is our fault, count it
+                -- V9.55: only filter GENUINE netcode; a bt=0 side-miss is our fault, count it.
+                -- V11.15: on a two-side enemy the err<=5 branch is meaningless (we always
+                -- shoot our own belief, so err~0 is guaranteed) — only a clearly-stale bt
+                -- excuses the miss there. Keeps the headline honest on switch enemies.
+                server_fail_keep = ack_serverfail_like and (not two_side_switcher or bt > stale_bt)
                 -- V10.4: remember this keep so the NEXT hit on this player can score it.
                 -- The open question is whether a low-bt keep is worth its shot: the v10.3
                 -- dump shows plenty of "KEEP err=0 bt<4 -> miss -> BF:opposite HIT" (the
@@ -3945,6 +3979,7 @@ events.aim_ack:set(function(event)
             if s.mode_blacklist_until then s.mode_blacklist_until[mode_clean] = 0 end
         end
         esp_push_shot(s, "hit")  -- V9.51: green flash + green dot
+        pcall(sel01_hit_bt_note, bt)  -- V11.15: calibrate the stale-record bt line off real hits
         -- HIT: prefer snapshot from aim_fire if available (accurate per-shot state)
         local src_eye, src_res = s.last_eye_yaw, s.last_resolved
         if exp_aim_fire_snap and exp_aim_fire_snap:get() and #s.shot_snapshots > 0 then
@@ -6100,9 +6135,22 @@ local function resolve_player(p)
     local bf_retry_pending = s.serverfail_retry_side
         and s.serverfail_retry_miss == s.missed
         and (s.serverfail_retry_until or 0) >= (globals.tickcount or 0)
+    -- V11.15: the air-branch has NO miss memory. It re-picks last_hit_side + the
+    -- measured magnitude every tick, and V9.64 deliberately disabled its corr-flip on
+    -- two-side enemies "so the BF cycle covers both" — but this branch `return`s before
+    -- the BF cycle can ever run, so in air a missed angle was simply re-fired. Live case
+    -- (weedabuser, L=2 R=1 @~30°, 5 head misses in a row): Air L30 miss → ground
+    -- BF:opposite R30 miss → airborne again → Air fired L30 AGAIN (shot 1 verbatim) →
+    -- BF:-58 → BF:+45 "spread" (= the enemy was R ~45 the whole time). Once a shot has
+    -- missed this engagement and we hold a measurement, fall through to the ground
+    -- path so pick_bruteforce_angle sweeps sides — airborne enemies keep their desync,
+    -- so eye_yaw + mag*side is as valid in air as on the ground (the V9.74 premise
+    -- that already routes a pending BF:retry this way). Cold air (no measurement)
+    -- keeps the air-branch: its own Air-BFGuess alternation (FIX #3) covers that.
+    local air_yield_bf = (s.missed or 0) > 0 and (s.measured_desync or 0) > 5
     -- airborne: enemies still have desync in air. Use server-yaw reconstruction
     -- (old approach assumed 0 desync → broke on nospread)
-    if tick_cache.ui_air_resolve and not anim.m_bOnGround and not bf_retry_pending then  -- V9.71: per-tick cached; V9.74: yield to pending BF:retry
+    if tick_cache.ui_air_resolve and not anim.m_bOnGround and not bf_retry_pending and not air_yield_bf then  -- V9.71: per-tick cached; V9.74: yield to pending BF:retry; V11.15: yield to BF after a miss
         s.mode = "Air"
         -- V9.34: keep yaw_cache / yaw_rate warm during air-time. The air-branch used
         -- to return BEFORE update_jitter ran, so the jitter buffer went stale (wrong
@@ -6885,7 +6933,17 @@ pcall(function()
             -- V9.4: sniper hc-floor 40 (user's NL hc=72, never drop nuclear) — auto-stop handles close anyway
             local effective_hc = priority_hc
             if wc == "sniper" and effective_hc < 40 then effective_hc = 40 end
-            pcall(function() ctx:override_hitchance(effective_hc) end)
+            -- V11.15: "Respect Manual SSG" promises to never touch hitchance, yet this
+            -- block still dropped a sniper from the user's 72 to 40 inside 700u AND pushed
+            -- multipoint to full spread ("wider for body coverage") while safe-points
+            -- stayed "Prefer". At scale 1.0 the head points sit on the hitbox edge, the
+            -- body safe point passes 40% first → body hits on shots the user wanted head
+            -- (his min-dmg 100 does not stop an AWP body or a lethal SSG body). With
+            -- respect on, NL's own hitchance decides and multipoint stays at the 0.75 hint.
+            local sniper_respect = (wc == "sniper") and exp_respect_man and exp_respect_man:get()
+            if not sniper_respect then
+                pcall(function() ctx:override_hitchance(effective_hc) end)
+            end
             -- V9.18: min_dmg overrides removed globally — NL min_dmg is the source of truth
             -- V9.4: respect safe-points "Prefer" mode when respect-manual on (sniper)
             if not (wc == "sniper" and exp_respect_man and exp_respect_man:get()) then
@@ -6894,7 +6952,7 @@ pcall(function()
             -- V6.9: SSG bonus — multipoint scale wider for body coverage (NL multi-hitbox = head/chest/stom)
             if wc == "sniper" then
                 pcall(function() ctx:override_multipoint(true) end)
-                pcall(function() ctx:override_multipoint_scale(1.0) end)
+                pcall(function() ctx:override_multipoint_scale(sniper_respect and 0.75 or 1.0) end)  -- V11.15: respect → hint only, no full spread
             else
                 -- V9.40: non-sniper close-priority — force multipoint on too. A
                 -- point-blank enemy running at you produces near-constant stale NL
@@ -7090,7 +7148,13 @@ pcall(function()
         -- force head, safepoint off — same package as counter-fire so the trade-shot
         -- fires the next frame the head is takable.
         if mode_now == "Aggressive" and s and s.missed >= 1 and target_dist < 1000 and not counter_fire_active then
-            pcall(function() ctx:override_hitchance(10) end)
+            -- V11.15: hitchance 10 on a sniper honouring "Respect Manual" is exactly the
+            -- v9.18 regression — a 10%-confidence follow-up head shot is a coin flip that
+            -- lands as a "correction" miss. Keep head-force + safe-point-off + multipoint
+            -- (they make the follow-up a HEAD shot) but leave NL's hitchance in charge.
+            if not ((wc == "sniper") and exp_respect_man and exp_respect_man:get()) then
+                pcall(function() ctx:override_hitchance(10) end)
+            end
             -- V9.18: min_dmg overrides removed globally — NL min_dmg stays in effect
             pcall(function() ctx:override_hitbox(0) end)
             pcall(function() ctx:override_safe_point(false) end)
@@ -8089,5 +8153,6 @@ _cs_log_color_raw("V11.11: copy-dump [NET] line — ping_ms + ACK-ring backtrack
 _cs_log_color_raw("V11.12: ping stamped on every ACK + HIT-FULL/MISS-FULL + correction-miss line (HIGH when ping>=80). [NET] also averages per-shot ping from the ACK ring. Dump is self-describing — no need to mention ping in chat. No aim change.")
 _cs_log_color_raw("V11.13: confidence was lying. sample_score caps at 60, so anything above 60 comes from desync-stability + dominance. stddev used ABSOLUTE resolved yaw (where they LOOK) — a 12-hit 29.5° lock walking around got sd~80 → sd_score=0, plus age*10 from 0.2s cap 30 while they hide, dump idx=2 conf=55 and never LOCKED. HUD Avg Confidence averaged ALL 53 leftover slots (most never-shot, capped at 50) so the number never felt above 60. Now: stddev of stored desync delta, learned locks only lose 10 to age, HUD averages shot-at players only. Also ping=0 on every v11.12 ACK: client.latency()*1000 rejected already-ms values; net_channel fallback + seconds-or-ms.")
 _cs_log_color_raw("V11.14: per-player miss sting without flattening HUD avg. A lock at 100 who you miss stayed at 100 (1/10 miss-rate never hit the 25% gate). Trailing resolver-misses now drop THIS player 22/35/48 (hit clears it; netcode/spread ignored). Hard 50% cap on 50% miss-rate removed. HUD avg weighted by real hits so one sting cannot wreck the lobby number.")
+_cs_log_color_raw("V11.15: three real-dump fixes. (1) AIR re-fired a missed angle: the air-branch has no miss memory and returns before BF can run — weedabuser (L2/R1 @30°) ate Air L30 / BF:opp R30 / Air L30 AGAIN / BF:-58 / BF:+45, five head misses. After a miss with a measurement the air-branch now yields to the ground BF sweep. (2) Netcode filter calibrated to THIS lobby's hit-bt (EMA+6, floor 8) instead of fixed 4/8 — hits landed at bt 7-21 so bt 4-5 misses were fresher than the average hit, not stale; two-side enemies need a clearly-stale bt (err~0 is guaranteed there). HUD said 80%, raw was 69%. (3) Respect-Manual sniper: close-priority no longer drops HC 72→40 + full-spread multipoint (body safe point won → body hits despite min-dmg 100); close-miss follow-up no longer forces HC 10.")
 _cs_log_color_raw("Logging: " .. (log_enabled:get() and ("ON" .. (log_verbose:get() and " (verbose)" or ""))  or "OFF"))
 _cs_log_color_raw("=========================================")
