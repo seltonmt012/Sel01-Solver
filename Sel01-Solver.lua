@@ -1,11 +1,11 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 11.15                                  ║
+-- ║  Version: 11.16                                  ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 11.15
+-- @version 11.16
 -- @description v11.14 per-player miss sting (100→78 on first miss, clears on
 --   hit) without flattening HUD avg. Weighted by real hits; no 50% hard cap.
 -- @description-prev v11.13 confidence: stddev of DESYNC not look-yaw, softer age on
@@ -167,7 +167,7 @@
 --   * v9.26 drift-bump (alpha 0.55 on 5-10° diff) still handles small shifts.
 --   * v9.29 coach variants carry.
 
-local SEL01_VERSION = "11.15"
+local SEL01_VERSION = "11.16"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -1330,7 +1330,7 @@ function sel01_ack_reset()
     sel01_ack_stats = { hit = 0, miss = 0, keep = 0, flip = 0, spread = 0, netcode = 0, nofreeze = 0, other = 0 }
     sel01_hit_bt = { ema = nil, n = 0 }
 end
-function sel01_ack_push(kind, idx, name, mode, aa, side, delta, meas, err, bt, hc, verdict, rl, rr)
+function sel01_ack_push(kind, idx, name, mode, aa, side, delta, meas, err, bt, hc, verdict, rl, rr, dt)
     name = tostring(name or "-"):gsub("%s+", ""):sub(1, 12)
     if name == "" then name = "-" end
     local side_s = (side or 0) > 0 and "R" or ((side or 0) < 0 and "L" or "·")
@@ -1340,11 +1340,11 @@ function sel01_ack_push(kind, idx, name, mode, aa, side, delta, meas, err, bt, h
     local ping = math.floor(tonumber(tick_cache and tick_cache.ping_ms) or 0)
     local ping_s = ping >= 80 and string.format("ping=%d HIGH", ping) or string.format("ping=%d", ping)
     local line = string.format(
-        "[ACK] %s idx=%d %s mode=%s aa=%s %s d=%+.1f meas=%.1f err=%s bt=%d hc=%d %s %s real=%d/%d",
+        "[ACK] %s idx=%d %s mode=%s aa=%s %s d=%+.1f meas=%.1f err=%s bt=%d hc=%d %s %s real=%d/%d%s",
         kind, tonumber(idx) or 0, name, tostring(mode or "?"), tostring(aa or "?"),
         side_s, tonumber(delta) or 0, tonumber(meas) or 0, err_s,
         tonumber(bt) or 0, tonumber(hc) or 0, ping_s, tostring(verdict or ""),
-        tonumber(rl) or 0, tonumber(rr) or 0)
+        tonumber(rl) or 0, tonumber(rr) or 0, dt and " DT" or "")  -- V11.16: shot fired inside a DT-peek window
     local r = sel01_ack_ring
     r.head = (r.head % r.cap) + 1
     r[r.head] = line
@@ -1384,7 +1384,9 @@ sel01_session_desyncs = { cap = 20, head = 0, count = 0, dirty = true }
 -- V10.0: simulation-time burst telemetry for the double-tap / peek detector. Counts
 -- every burst we observe regardless of whether the gate fired, so the dump can answer
 -- "does this signal even exist in my lobby" before anyone tunes a threshold.
-sel01_dt_stats = { seen = 0, max = 0, b3 = 0, b6 = 0, air = 0, duck = 0, fired = 0, reject_gap = 0, reject_ctx = 0 }
+-- V11.16: shot_hit / shot_miss = shots acked while a DT window was open on that enemy,
+-- so the dump can say whether the window's safe-point-off + full multipoint earns hits.
+sel01_dt_stats = { seen = 0, max = 0, b3 = 0, b6 = 0, air = 0, duck = 0, fired = 0, reject_gap = 0, reject_ctx = 0, shot_hit = 0, shot_miss = 0 }
 sel01_keep_stats = { stat = { lo = { hit = 0, miss = 0 }, hi = { hit = 0, miss = 0 } },
                      mov  = { lo = { hit = 0, miss = 0 }, hi = { hit = 0, miss = 0 } } }
 function session_push_desync(v)
@@ -1675,8 +1677,8 @@ local log_copy_btn = g_logging:button("📋 Copy Last Logs (for share)", functio
     -- if bursts is high but fired is 0 the threshold is simply too strict.
     do
         local d = sel01_dt_stats
-        _cs_log_raw(string.format("[DT] bursts>=2: %d (>=3: %d, >=6: %d, max %d ticks) | airborne %d, ducking %d | windows opened: %d",
-            d.seen, d.b3, d.b6, d.max, d.air, d.duck, d.fired))
+        _cs_log_raw(string.format("[DT] bursts>=2: %d (>=3: %d, >=6: %d, max %d ticks) | airborne %d, ducking %d | windows opened: %d | shots inside a window: %d hit / %d miss",
+            d.seen, d.b3, d.b6, d.max, d.air, d.duck, d.fired, d.shot_hit or 0, d.shot_miss or 0))
         _cs_log_raw(string.format("[DT] rejected: %d stale/dormant gap, %d no peek context (fake-lag noise)",
             d.reject_gap or 0, d.reject_ctx or 0))
     end
@@ -2007,7 +2009,7 @@ local log_reset_session = g_logging:button("🗑 Reset Session Stats (in-memory)
     sel01_session_serverfails = 0  -- V9.50: clear server-fail filter counter
     sel01_session_spreadfails = 0  -- V9.72: clear spread-RNG filter counter
     pcall(sel01_ack_reset)
-    sel01_dt_stats = { seen = 0, max = 0, b3 = 0, b6 = 0, air = 0, duck = 0, fired = 0, reject_gap = 0, reject_ctx = 0 }
+    sel01_dt_stats = { seen = 0, max = 0, b3 = 0, b6 = 0, air = 0, duck = 0, fired = 0, reject_gap = 0, reject_ctx = 0, shot_hit = 0, shot_miss = 0 }
 sel01_keep_stats = { stat = { lo = { hit = 0, miss = 0 }, hi = { hit = 0, miss = 0 } },
                      mov  = { lo = { hit = 0, miss = 0 }, hi = { hit = 0, miss = 0 } } }  -- V10.0
     -- mode stats
@@ -3901,6 +3903,7 @@ events.aim_ack:set(function(event)
                            Ent:get_index(), _conf_corr)
           end  -- FIX #4: closes if _conf_corr >= 15
         end
+        if s.dtpeek_active then sel01_dt_stats.shot_miss = (sel01_dt_stats.shot_miss or 0) + 1 end  -- V11.16
         cs_log_verbose("MISS [%s] target=%d count=%d mode=%s",
                        tostring(reason), Ent:get_index(), s.missed, tostring(s.mode))
         -- V9.49: a CONFIRMED server-fail keep (correct angle, server rejected, side kept)
@@ -3966,7 +3969,7 @@ events.aim_ack:set(function(event)
             elseif reason == "spread" then _v = "SPREAD" end
             pcall(sel01_ack_push, "MISS", Ent:get_index(), _nm, s.mode, s.aa_type,
                   ack_shot_side, ack_delta, ack_side_measured, ack_angle_err, bt, _hc, _v,
-                  s.real_left or 0, s.real_right or 0)
+                  s.real_left or 0, s.real_right or 0, s.dtpeek_active)
         end
     else
         -- V9.9-B: clear mode-blacklist + miss-counter on HIT (mode proven working)
@@ -3980,6 +3983,7 @@ events.aim_ack:set(function(event)
         end
         esp_push_shot(s, "hit")  -- V9.51: green flash + green dot
         pcall(sel01_hit_bt_note, bt)  -- V11.15: calibrate the stale-record bt line off real hits
+        if s.dtpeek_active then sel01_dt_stats.shot_hit = (sel01_dt_stats.shot_hit or 0) + 1 end  -- V11.16
         -- HIT: prefer snapshot from aim_fire if available (accurate per-shot state)
         local src_eye, src_res = s.last_eye_yaw, s.last_resolved
         if exp_aim_fire_snap and exp_aim_fire_snap:get() and #s.shot_snapshots > 0 then
@@ -4228,7 +4232,7 @@ events.aim_ack:set(function(event)
             pcall(sel01_ack_push, "HIT", Ent:get_index(), _nm, s.mode, s.aa_type,
                   hit_side ~= 0 and hit_side or s.last_hit_side, _dlt,
                   s.measured_desync, 0, bt, _hc, "HIT",
-                  s.real_left or 0, s.real_right or 0)
+                  s.real_left or 0, s.real_right or 0, s.dtpeek_active)
         end
         s.missed = 0
         s.expl_l, s.expl_r = false, false  -- V11.2: new engagement, un-burn both sides
@@ -6414,6 +6418,21 @@ local function resolve_player(p)
         local commit_lock_active = (s.aa_committed_at or 0) > 0 and (now_rt - s.aa_committed_at) < commit_lock
         if s.aa_classify_cd <= 0 and not commit_lock_active then
             local new_type = classify_aa(s)
+            -- V11.16: HIT-EVIDENCE VETO. classify_aa reads EYE-yaw deltas (4+ ticks of
+            -- >=10° in the buffer = "jitter"), and a moving enemy who is aiming produces
+            -- exactly that while their DESYNC stays put. Jitter-AA alternates the side
+            -- per tick; 4+ real hits all on ONE side (4:1 or better) is incompatible with
+            -- a side-jittering fake. Dump: Monkeyman real L1/R9 @32° stable — committed
+            -- jitter twice (past the 14-eval well-learned lock), Jitter-Cls 0/2 while every
+            -- switch-path shot on him hit. The measured EMA already absorbs a same-side
+            -- magnitude wobble, so keep the committed type; a jitter that is somehow
+            -- current maps to the default "switch".
+            if new_type == "jitter" then
+                local _rl, _rr = s.real_left or 0, s.real_right or 0
+                if (_rr >= 4 and _rr >= 4 * _rl) or (_rl >= 4 and _rl >= 4 * _rr) then
+                    new_type = (s.aa_type ~= "jitter") and s.aa_type or "switch"
+                end
+            end
             if new_type == s.pending_aa_type then
                 s.pending_aa_count = s.pending_aa_count + 1
                 if s.pending_aa_count >= need_count and s.aa_type ~= new_type then
@@ -6519,13 +6538,26 @@ local function resolve_player(p)
         -- band below: standing + not turning, so a genuine fast flick-turn (where the
         -- animstate legitimately lags the netvar) can't score.
         local ff_ok = s.aa_type ~= "spin" and spd < 140 and math.abs(s.yaw_rate or 0) < 90
+        -- V11.16: this tell is ALSO produced by every ordinary sharp turn — the netvar
+        -- lands one client frame before the animation update consumes it, and yaw_rate
+        -- (read off the animstate buffer) is still low on that very tick, so the guard
+        -- passes. It is corroboration, not proof. Three bugs in one: it refreshed the
+        -- impossible-band timestamp (ff_wide_t), it only DECAYED while ff_wide_n > 0 (so
+        -- with zero band observations it could only ever climb), and on its own it set
+        -- ff_silent. Dump: weedabuser w0/n30, woof w0/n15 — ordinary ~30° enemies with
+        -- ZERO impossible-band hits, yet every later turn re-armed ff_silent for 3s → BF
+        -- led with ±90 and passive learning was suspended ("FF wird falsch erkannt und
+        -- schießt dann falsch"). Own timestamp, own decay, and no flag without the band.
         if ff_ok then
             local ok_ne, ne = pcall(function() return p.m_angEyeAngles end)
             if ok_ne and ne and ne.y then
                 local d_na = math.abs(NormalizeAngle(ne.y - eye_yaw))
                 if d_na >= 60 and d_na <= 178 then
-                    s.ff_net_n  = math.min((s.ff_net_n or 0) + 1, 30)
-                    s.ff_wide_t = now_rt
+                    s.ff_net_n = math.min((s.ff_net_n or 0) + 1, 30)
+                    s.ff_net_t = now_rt
+                elseif (s.ff_net_n or 0) > 0 and now_rt - (s.ff_net_t or 0) > 2 then
+                    s.ff_net_n = s.ff_net_n - 1
+                    s.ff_net_t = now_rt
                 end
             end
         end
@@ -6577,15 +6609,16 @@ local function resolve_player(p)
                     s.ff_wide_t    = now_rt
                 elseif (s.ff_wide_n or 0) > 0 and now_rt - (s.ff_wide_t or 0) > 2 then
                     s.ff_wide_n = s.ff_wide_n - 1                  -- decay when it stops
-                    s.ff_net_n  = math.max(0, (s.ff_net_n or 0) - 1)
                     s.ff_flips  = math.max(0, (s.ff_flips or 0) - 1)
                     s.ff_wide_t = now_rt
                 end
             end
         end
-        -- 6 impossible-band observations (or netvar disagreements) inside a 3s window.
-        -- Honest play produces ZERO — the band cannot be reached legally.
-        s.ff_silent = ((s.ff_wide_n or 0) >= 6 or (s.ff_net_n or 0) >= 6)
+        -- 6 impossible-band observations inside a 3s window. Honest play produces ZERO —
+        -- the band cannot be reached legally. V11.16: the netvar tell alone no longer
+        -- flags (see above); it only lowers the bar to 3 band observations.
+        local _wn, _nn = (s.ff_wide_n or 0), (s.ff_net_n or 0)
+        s.ff_silent = (_wn >= 6 or (_wn >= 3 and _nn >= 6))
                       and (now_rt - (s.ff_wide_t or 0)) < 3
         s.ff_alt = (s.ff_flips or 0) >= 3          -- Silent mode vs Default (telemetry)
         if s.ff_silent then s.fake_flick = true end            -- feeds BF ±90 + ⚡FF tag
@@ -8154,5 +8187,6 @@ _cs_log_color_raw("V11.12: ping stamped on every ACK + HIT-FULL/MISS-FULL + corr
 _cs_log_color_raw("V11.13: confidence was lying. sample_score caps at 60, so anything above 60 comes from desync-stability + dominance. stddev used ABSOLUTE resolved yaw (where they LOOK) — a 12-hit 29.5° lock walking around got sd~80 → sd_score=0, plus age*10 from 0.2s cap 30 while they hide, dump idx=2 conf=55 and never LOCKED. HUD Avg Confidence averaged ALL 53 leftover slots (most never-shot, capped at 50) so the number never felt above 60. Now: stddev of stored desync delta, learned locks only lose 10 to age, HUD averages shot-at players only. Also ping=0 on every v11.12 ACK: client.latency()*1000 rejected already-ms values; net_channel fallback + seconds-or-ms.")
 _cs_log_color_raw("V11.14: per-player miss sting without flattening HUD avg. A lock at 100 who you miss stayed at 100 (1/10 miss-rate never hit the 25% gate). Trailing resolver-misses now drop THIS player 22/35/48 (hit clears it; netcode/spread ignored). Hard 50% cap on 50% miss-rate removed. HUD avg weighted by real hits so one sting cannot wreck the lobby number.")
 _cs_log_color_raw("V11.15: three real-dump fixes. (1) AIR re-fired a missed angle: the air-branch has no miss memory and returns before BF can run — weedabuser (L2/R1 @30°) ate Air L30 / BF:opp R30 / Air L30 AGAIN / BF:-58 / BF:+45, five head misses. After a miss with a measurement the air-branch now yields to the ground BF sweep. (2) Netcode filter calibrated to THIS lobby's hit-bt (EMA+6, floor 8) instead of fixed 4/8 — hits landed at bt 7-21 so bt 4-5 misses were fresher than the average hit, not stale; two-side enemies need a clearly-stale bt (err~0 is guaranteed there). HUD said 80%, raw was 69%. (3) Respect-Manual sniper: close-priority no longer drops HC 72→40 + full-spread multipoint (body safe point won → body hits despite min-dmg 100); close-miss follow-up no longer forces HC 10.")
+_cs_log_color_raw("V11.16: fake-flick false positives. The netvar-vs-animstate tell fires on every ordinary sharp turn (netvar lands a frame before the anim update; yaw_rate is still low that tick), only decayed while band observations existed, refreshed the band timestamp and flagged ff_silent on its own — dump: weedabuser w0/n30, woof w0/n15, zero impossible-band hits, yet every turn re-armed BF ±90 for 3s and suspended passive learning. Now: own timestamp + own decay, and no flag without >=3 impossible-band observations. Also: jitter commit vetoed by 4+ one-sided real hits (Monkeyman L1/R9 @32° stable was 'jitter', Jitter-Cls 0/2); DT-window shots tagged 'DT' in the ACK ring + hit/miss counted in the [DT] line.")
 _cs_log_color_raw("Logging: " .. (log_enabled:get() and ("ON" .. (log_verbose:get() and " (verbose)" or ""))  or "OFF"))
 _cs_log_color_raw("=========================================")
