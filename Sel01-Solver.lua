@@ -1,11 +1,11 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 11.16                                  ║
+-- ║  Version: 11.17                                  ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 11.16
+-- @version 11.17
 -- @description v11.14 per-player miss sting (100→78 on first miss, clears on
 --   hit) without flattening HUD avg. Weighted by real hits; no 50% hard cap.
 -- @description-prev v11.13 confidence: stddev of DESYNC not look-yaw, softer age on
@@ -167,7 +167,7 @@
 --   * v9.26 drift-bump (alpha 0.55 on 5-10° diff) still handles small shifts.
 --   * v9.29 coach variants carry.
 
-local SEL01_VERSION = "11.16"
+local SEL01_VERSION = "11.17"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -327,13 +327,10 @@ local loading_render_callback = function()
     end;
 end;
 
-events.render:set(function()
-    loading_render_callback();
-    sidebar();
-    -- v9.93: on-screen version banner (under the load logo, then fades). Global fn,
-    -- defined by the version-check block at the bottom — resolved at call time.
-    if sel01_vc_draw then sel01_vc_draw() end
-end)
+-- V11.17: the events.render:set that lived here was DEAD — NL keeps one render hook
+-- per script, so the main wrapper at the bottom (loading + sidebar + ESP + ticker)
+-- replaced it on load. The v9.93 version banner (sel01_vc_draw) it called therefore
+-- never drew; it is now called from the main wrapper.
 pui.sidebar("boost ~ beta",ui.get_icon"sparkles")
 local accent = "\a{Link Active}"
 
@@ -2924,22 +2921,48 @@ end
 cs_log_color = function(msg)
     if log_enabled and log_enabled:get() then _cs_log_color_raw(msg) end
 end
+-- V11.17 perf: both loggers used to string.format EVERY call and then run 12-15
+-- msg:find() scans + a ring push before checking any toggle — with logging OFF.
+-- "close-priority" / "CULL distance" / "cancel-conf TRUST" fire per enemy per tick
+-- through every fight. Now: the capture test (V8.8 "buffer key events regardless of
+-- toggle") is memoised per FORMAT template (call sites pass literals, so the memo
+-- stays tiny; the rare 0-arg call keeps the direct scan), the toggles come from
+-- tick_cache, and formatting happens only when the line is captured or printed.
+-- Same lines end up in the ring and on the console as before.
+-- (helpers are GLOBALS — main chunk is at the 200-local cap)
+sel01_vb_memo, sel01_dbg_memo = {}, {}
+function sel01_vb_capture(f)
+    return (f:find("correction%-miss") or f:find("FLIP") or f:find("aa_type commit") or
+            f:find("jump%-shot") or f:find("jump%-scout") or f:find("LearnedModel boot") or
+            f:find("cancel%-conf TRUST") or f:find("close%-priority") or f:find("HEAD") or
+            f:find("air%-block") or f:find("DEF%-AA detected") or f:find("force baim")) and true or false
+end
+function sel01_dbg_capture(f)
+    return (f:find("HIT%-FULL") or f:find("MISS%-FULL") or f:find("UNKNOWN") or
+            f:find("close%-priority") or f:find("cancel%-conf") or f:find("snapshot match") or
+            f:find("aa_type commit") or f:find("correction%-miss") or f:find("FLIP") or
+            f:find("jump%-shot") or f:find("jump%-scout") or f:find("HEAD%-STRICT") or
+            f:find("air%-block") or f:find("shot%-cooldown") or f:find("LearnedModel boot")) and true or false
+end
 local function cs_log_verbose(fmt, ...)
-    -- V8.8: build msg unconditionally for log_buffer, only print if toggle on
+    local nargs = select('#', ...)
+    local printing = tick_cache.ui_verbose
+    if printing == nil then printing = (log_enabled and log_enabled:get() and log_verbose and log_verbose:get()) or false end
+    local cap
+    if nargs > 0 and type(fmt) == "string" then
+        cap = sel01_vb_memo[fmt]
+        if cap == nil then cap = sel01_vb_capture(fmt); sel01_vb_memo[fmt] = cap end
+        if not cap and not printing then return end
+    end
     local msg
-    if select('#', ...) == 0 then msg = tostring(fmt)
+    if nargs == 0 then msg = tostring(fmt)
     else
         local ok, m = pcall(string.format, fmt, ...)
         msg = ok and m or tostring(fmt)
     end
-    -- V8.8: push key events to log_buffer regardless of verbose toggle
-    if msg:find("correction%-miss") or msg:find("FLIP") or msg:find("aa_type commit") or
-       msg:find("jump%-shot") or msg:find("jump%-scout") or msg:find("LearnedModel boot") or
-       msg:find("cancel%-conf TRUST") or msg:find("close%-priority") or msg:find("HEAD") or
-       msg:find("air%-block") or msg:find("DEF%-AA detected") or msg:find("force baim") then
-        log_buffer_push("[v] " .. msg)
-    end
-    if not (log_enabled and log_enabled:get() and log_verbose and log_verbose:get()) then return end
+    if cap == nil then cap = sel01_vb_capture(msg) end
+    if cap then log_buffer_push("[v] " .. msg) end
+    if not printing then return end
     _cs_log_raw("[v] " .. msg)
 end
 
@@ -2947,22 +2970,24 @@ end
 local function cs_log_debug(fmt, ...)
     -- V7.1: ALWAYS push HIT-FULL / MISS-FULL / UNKNOWN to log_buffer (even if debug toggle off)
     -- so Copy-Logs button has useful history regardless of debug-mode state
+    local nargs = select('#', ...)
+    local printing = tick_cache.ui_debug
+    if printing == nil then printing = (log_enabled and log_enabled:get() and log_debug and log_debug:get()) or false end
+    local cap
+    if nargs > 0 and type(fmt) == "string" then
+        cap = sel01_dbg_memo[fmt]
+        if cap == nil then cap = sel01_dbg_capture(fmt); sel01_dbg_memo[fmt] = cap end
+        if not cap and not printing then return end
+    end
     local final_msg
-    if select('#', ...) == 0 then final_msg = "[DBG] " .. tostring(fmt)
+    if nargs == 0 then final_msg = "[DBG] " .. tostring(fmt)
     else
         local ok, msg = pcall(string.format, fmt, ...)
         final_msg = "[DBG] " .. (ok and msg or tostring(fmt))
     end
-    -- V8.8: buffer expanded event types for better diagnostics
-    if final_msg:find("HIT%-FULL") or final_msg:find("MISS%-FULL") or final_msg:find("UNKNOWN") or
-       final_msg:find("close%-priority") or final_msg:find("cancel%-conf") or final_msg:find("snapshot match") or
-       final_msg:find("aa_type commit") or final_msg:find("correction%-miss") or final_msg:find("FLIP") or
-       final_msg:find("jump%-shot") or final_msg:find("jump%-scout") or final_msg:find("HEAD%-STRICT") or
-       final_msg:find("air%-block") or final_msg:find("shot%-cooldown") or final_msg:find("LearnedModel boot") then
-        log_buffer_push(final_msg)
-    end
-    -- console output only if debug toggle on
-    if not (log_enabled and log_enabled:get() and log_debug and log_debug:get()) then return end
+    if cap == nil then cap = sel01_dbg_capture(final_msg) end
+    if cap then log_buffer_push(final_msg) end
+    if not printing then return end
     _cs_log_raw(final_msg)
 end
 local function is_debug() return log_enabled and log_enabled:get() and log_debug and log_debug:get() end
@@ -3195,17 +3220,14 @@ setmetatable(PlayerState, {__index = function(t, k)
     local s = {
         missed       = 0,
         last_seen    = 0,
-        last_shot    = 0,
         lby_snap     = false,
         lby_snap_attempts = 0,  -- V9.16: magnitude cycle counter for LBY-Snap-Guess
-        last_lby     = 0,
         yaw_cache    = {},
         yaw_idx      = 0,
         jitter_ticks = 0,
         static_ticks = 0,
         jittering    = false,
         last_hit_side= 0,
-        prev_origin  = vector(0, 0, 0),
         mode         = "Init",
         -- accuracy upgrades
         measured_desync   = 0,
@@ -3304,7 +3326,6 @@ setmetatable(PlayerState, {__index = function(t, k)
         pending_aa_count  = 0,
         -- V5: adaptive predict-ticks per-player
         adaptive_predict  = nil,  -- nil = use UI default, int = tuned value
-        last_pred_was_hit = nil,
         -- V7.8: slow-walker / correction tracking
         slow_ticks        = 0,         -- consecutive ticks at low speed + low yaw_rate
         is_slow_target    = false,     -- committed slow-walker flag
@@ -4407,45 +4428,54 @@ local function can_resolve(p)
     return true
 end
 
-local function get_mode_preset()
+-- V11.17 perf: the four presets are constant tables built ONCE (global — 200-local
+-- cap). get_mode_preset used to allocate two fresh tables per call and hit the menu
+-- API twice, ~3 calls per enemy per tick. baim_after is the only live field; the
+-- toggles come from tick_cache with a direct :get() fallback before the first tick.
+SEL01_PRESET = {
     -- NoSpread: finer brute-force scan because single-shot must hit exact
-    if exp_nospread and exp_nospread:get() then
-        return {
-            baim_after   = 999,                              -- never baim on nospread
-            first_shot   = "networked",                      -- server-yaw most reliable
-            bruteforce   = {"+58", "-58", "+45", "-45", "+29", "-29", "+15", "-15", "0"},
-            close_boost  = true,
-            jitter_lock  = true,
-        }
-    end
-    local m = mode_str()
-    if m == "Aggressive" then
-        return {
-            baim_after   = force_baim_n:get(),
-            first_shot   = "predict",
-            -- measured/passive desync before blind 29° guesses; log dumps showed
-            -- pass-heavy ~45° enemies wasting shots on BF:opposite/+29/-29.
-            bruteforce   = {"opposite", "desync", "-desync", "+45", "-45", "+58", "-58", "+29", "-29", "0", "lby"},
-            close_boost  = true,
-            jitter_lock  = true,
-        }
-    elseif m == "Defensive" then
-        return {
-            baim_after   = 5,
-            first_shot   = "networked",
-            bruteforce   = {"desync", "-desync", "+29", "-29", "0"},
-            close_boost  = false,
-            jitter_lock  = false,
-        }
-    else
-        return {
-            baim_after   = force_baim_n:get(),
-            first_shot   = "adaptive",
-            bruteforce   = {"opposite", "desync", "+58", "-58", "0"},
-            close_boost  = true,
-            jitter_lock  = true,
-        }
-    end
+    nospread = {
+        baim_after   = 999,                              -- never baim on nospread
+        first_shot   = "networked",                      -- server-yaw most reliable
+        bruteforce   = {"+58", "-58", "+45", "-45", "+29", "-29", "+15", "-15", "0"},
+        close_boost  = true,
+        jitter_lock  = true,
+    },
+    aggressive = {
+        baim_after   = 0,
+        first_shot   = "predict",
+        -- measured/passive desync before blind 29° guesses; log dumps showed
+        -- pass-heavy ~45° enemies wasting shots on BF:opposite/+29/-29.
+        bruteforce   = {"opposite", "desync", "-desync", "+45", "-45", "+58", "-58", "+29", "-29", "0", "lby"},
+        close_boost  = true,
+        jitter_lock  = true,
+    },
+    defensive = {
+        baim_after   = 5,
+        first_shot   = "networked",
+        bruteforce   = {"desync", "-desync", "+29", "-29", "0"},
+        close_boost  = false,
+        jitter_lock  = false,
+    },
+    dynamic = {
+        baim_after   = 0,
+        first_shot   = "adaptive",
+        bruteforce   = {"opposite", "desync", "+58", "-58", "0"},
+        close_boost  = true,
+        jitter_lock  = true,
+    },
+}
+local function get_mode_preset()
+    local ns = tick_cache.ui_nospread
+    if ns == nil then ns = exp_nospread and exp_nospread:get() end
+    if ns then return SEL01_PRESET.nospread end
+    local m = tick_cache.ui_mode or mode_str()
+    if m == "Defensive" then return SEL01_PRESET.defensive end
+    local bn = tick_cache.ui_baim_n
+    if bn == nil then bn = force_baim_n:get() end
+    local pr = (m == "Aggressive") and SEL01_PRESET.aggressive or SEL01_PRESET.dynamic
+    pr.baim_after = bn
+    return pr
 end
 
 -- effective desync: measured EMA falls vorhanden, sonst theoretical
@@ -4456,7 +4486,9 @@ local function effective_desync(s, max_desync, side)
     -- an enemy with measured 24.2° because samples_right was 0 + desync_samples
     -- was 1 — fell through to max_desync. With this change, the 24.2° measured
     -- value is used as soon as a single hit confirms it.
-    if side and exp_perside_desync and exp_perside_desync:get() then
+    local ps = tick_cache.ui_perside  -- V11.17 perf: tick-cached (was a menu read per call, up to 13×/resolve)
+    if ps == nil then ps = exp_perside_desync and exp_perside_desync:get() end
+    if side and ps then
         if side > 0 and (s.samples_right or 0) >= 1 and (s.measured_right or 0) > 5 then
             return s.measured_right
         elseif side < 0 and (s.samples_left or 0) >= 1 and (s.measured_left or 0) > 5 then
@@ -5668,6 +5700,16 @@ local function refresh_tick_cache()
         tick_cache.ui_air_resolve  = air_resolve_tog:get()
         tick_cache.ui_aa_classify  = (exp_aa_classify and exp_aa_classify:get()) or false
         tick_cache.ui_classify_int = (exp_classify_int and exp_classify_int:get()) or 1
+        -- V11.17 perf: per-side toggle was read up to 13× per resolve via
+        -- effective_desync; preset inputs ~3× per enemy per tick; log toggles on
+        -- every cs_log_verbose / cs_log_debug call.
+        tick_cache.ui_perside      = (exp_perside_desync and exp_perside_desync:get()) or false
+        tick_cache.ui_nospread     = (exp_nospread and exp_nospread:get()) or false
+        tick_cache.ui_mode         = mode_str()
+        tick_cache.ui_baim_n       = (force_baim_n and force_baim_n:get()) or 0
+        local le = log_enabled and log_enabled:get()
+        tick_cache.ui_verbose      = (le and log_verbose and log_verbose:get()) or false
+        tick_cache.ui_debug        = (le and log_debug and log_debug:get()) or false
     end)
     local lp = entity.get_local_player()
     tick_cache.lp = lp
@@ -6699,7 +6741,6 @@ local lby_snap_handler = function(event)
     if not shooter:is_enemy() or not shooter:is_alive() then return end
     local s = get_state(shooter)
     s.lby_snap  = true
-    s.last_shot = globals.curtime
     -- V9.8: HOSTILE-FIRE DETECTION — mark when an enemy fires, for the
     -- ragebot_target counter-fire override (bypasses cancel-low-conf in their
     -- fire-window). V9.31 HARD-CONSTRAINT-5 FIX: NEVER read enemy entity props
@@ -6710,8 +6751,6 @@ local lby_snap_handler = function(event)
     -- distance is read safely), and the counter-fire consumer already re-gates by
     -- ticks_since<=64 + conf>=10, so dropping the range/aim check here is safe.
     s.last_hostile_fire  = globals.tickcount or 0
-    s.hostile_fire_count = (s.hostile_fire_count or 0) + 1
-    s.last_hostile_aimed = false
 end
 
 local lby_event_set = false
@@ -6848,6 +6887,24 @@ end
 local function resolve_stddev(s)
     local n = #s.recent_resolved
     if n < 3 then return 0 end
+    -- V11.17: spread of the resolved DESYNC DELTA (r.d), not the absolute yaw (r.a).
+    -- Absolute yaw tracks where they LOOK: a locked 29.5° enemy walking and aiming
+    -- read sd~80 here → cancel-conf (sd>50 sniper / >25 rifle) REFUSED valid shots and
+    -- fast-fire never saw a "stable" resolve. confidence() moved to r.d in V11.13 and
+    -- its comment named this function as the reason — the two fire gates just never
+    -- followed. Entries without .d fall back to the old absolute spread below.
+    do
+        local nd, sum = 0, 0
+        for i = 1, 5 do local r = s.recent_resolved[i]; if r and r.d then nd = nd + 1; sum = sum + r.d end end
+        if nd >= 3 then
+            local mean, sq = sum / nd, 0
+            for i = 1, 5 do
+                local r = s.recent_resolved[i]
+                if r and r.d then local x = r.d - mean; sq = sq + x * x end
+            end
+            return math.sqrt(sq / nd)
+        end
+    end
     -- V9.31: circular spread vs reference (wrap-safe; see confidence()). Drives
     -- cancel-conf — a fake-huge stddev here makes the ragebot REFUSE to fire.
     local ref = s.recent_resolved[1].a
@@ -6860,6 +6917,14 @@ local function resolve_stddev(s)
     end
     return math.sqrt(sq_sum / n)
 end
+
+-- V11.17 perf: ragebot_target wrapped every ctx:override_* in its own
+-- `pcall(function() ... end)` — 54 closures allocated per target per tick, each
+-- capturing ctx + a value, so LuaJIT could neither hoist nor reuse them. This named
+-- helper is called as pcall(sel01_ov, ctx, "override_hitchance", v): same safety
+-- (a missing/optional NL method still just fails inside pcall), zero allocation.
+-- `ctx:m(v)` and `ctx[m](ctx, v)` are the same call in Lua.
+function sel01_ov(ctx, m, v) ctx[m](ctx, v) end
 
 -- V3 + V9.9-E: weapon class detection — tick-cached to avoid 3-5x FFI calls per ragebot_target stack
 local function get_weapon_class()
@@ -6926,7 +6991,7 @@ pcall(function()
                 end
             end)
             if cooldown_skip then
-                pcall(function() ctx:override_hitchance(99) end)
+                pcall(sel01_ov, ctx, "override_hitchance", 99)
                 cs_log_verbose("shot-cooldown skip idx=%d (weapon reloading)", target:get_index())
                 return
             end
@@ -6975,17 +7040,17 @@ pcall(function()
             -- respect on, NL's own hitchance decides and multipoint stays at the 0.75 hint.
             local sniper_respect = (wc == "sniper") and exp_respect_man and exp_respect_man:get()
             if not sniper_respect then
-                pcall(function() ctx:override_hitchance(effective_hc) end)
+                pcall(sel01_ov, ctx, "override_hitchance", effective_hc)
             end
             -- V9.18: min_dmg overrides removed globally — NL min_dmg is the source of truth
             -- V9.4: respect safe-points "Prefer" mode when respect-manual on (sniper)
             if not (wc == "sniper" and exp_respect_man and exp_respect_man:get()) then
-                pcall(function() ctx:override_safe_point(false) end)
+                pcall(sel01_ov, ctx, "override_safe_point", false)
             end
             -- V6.9: SSG bonus — multipoint scale wider for body coverage (NL multi-hitbox = head/chest/stom)
             if wc == "sniper" then
-                pcall(function() ctx:override_multipoint(true) end)
-                pcall(function() ctx:override_multipoint_scale(sniper_respect and 0.75 or 1.0) end)  -- V11.15: respect → hint only, no full spread
+                pcall(sel01_ov, ctx, "override_multipoint", true)
+                pcall(sel01_ov, ctx, "override_multipoint_scale", sniper_respect and 0.75 or 1.0)  -- V11.15: respect → hint only, no full spread
             else
                 -- V9.40: non-sniper close-priority — force multipoint on too. A
                 -- point-blank enemy running at you produces near-constant stale NL
@@ -6994,16 +7059,16 @@ pcall(function()
                 -- correct (logs: our=meas, err=0, bt 7-15, reason=correction). Spread
                 -- aim points across the hitbox so a slightly-stale record still lands.
                 -- Widen to full spread when this target is already flagged stale-record.
-                pcall(function() ctx:override_multipoint(true) end)
+                pcall(sel01_ov, ctx, "override_multipoint", true)
                 -- V9.46: full spread when stale-record-flagged OR mid teleport-peek blink.
-                pcall(function() ctx:override_multipoint_scale((s and (s.backtrack_resistant or s.tp_peek_active or s.dtpeek_active)) and 1.0 or 0.85) end)
+                pcall(sel01_ov, ctx, "override_multipoint_scale", (s and (s.backtrack_resistant or s.tp_peek_active or s.dtpeek_active)) and 1.0 or 0.85)
             end
             cs_log_verbose("close-priority idx=%d dist=%.0f reason=%s hc=%d (eff=%d) wc=%s",
                            target:get_index(), target_dist, priority_reason, priority_hc, effective_hc, tostring(wc))
             -- continue (don't return) — head-focus + other overrides still apply
         elseif wc == "sniper" and lp_airborne and target_dist > 3500 then
             -- V8.5: only block VERY long range airborne (3500u+) — let jump-scout work elsewhere
-            pcall(function() ctx:override_hitchance(99) end)
+            pcall(sel01_ov, ctx, "override_hitchance", 99)
             cs_log_verbose("air-block idx=%d (sniper airborne, dist=%.0f >3500)", target:get_index(), target_dist)
             return
         end
@@ -7022,15 +7087,14 @@ pcall(function()
                 local wc_cf = get_weapon_class()
                 if wc_cf ~= "sniper" and intel and intel.conf >= 10 then
                     counter_fire_active = true
-                    pcall(function() ctx:override_hitchance(15) end)
+                    pcall(sel01_ov, ctx, "override_hitchance", 15)
                     -- V9.18: min_dmg overrides removed globally — NL min_dmg=100 stays in effect
-                    pcall(function() ctx:override_hitbox(0) end)
-                    pcall(function() ctx:override_safe_point(false) end)
-                    pcall(function() ctx:override_multipoint(true) end)
-                    pcall(function() ctx:override_multipoint_scale(0.85) end)
-                    cs_log_verbose("counter-fire+head idx=%d conf=%d aimed=%s (fired %d ticks ago)",
-                                   target:get_index(), intel.conf,
-                                   tostring(s.last_hostile_aimed), ticks_since)
+                    pcall(sel01_ov, ctx, "override_hitbox", 0)
+                    pcall(sel01_ov, ctx, "override_safe_point", false)
+                    pcall(sel01_ov, ctx, "override_multipoint", true)
+                    pcall(sel01_ov, ctx, "override_multipoint_scale", 0.85)
+                    cs_log_verbose("counter-fire+head idx=%d conf=%d (fired %d ticks ago)",
+                                   target:get_index(), intel.conf, ticks_since)
                 end
             end
         end
@@ -7048,8 +7112,8 @@ pcall(function()
            and intel and intel.samples >= 8 and intel.conf >= 60
            and (not s or (s.missed or 0) == 0)
            and not (wc == "sniper" and exp_respect_man and exp_respect_man:get()) then
-            pcall(function() ctx:override_safe_point(false) end)
-            pcall(function() ctx:override_multipoint(true) end)
+            pcall(sel01_ov, ctx, "override_safe_point", false)
+            pcall(sel01_ov, ctx, "override_multipoint", true)
             cs_log_verbose("lock-headpref idx=%d conf=%d samples=%d → safepoint off (take head)",
                            target:get_index(), intel.conf, intel.samples)
         end
@@ -7067,11 +7131,11 @@ pcall(function()
             dtpeek_active = true
             local wc_dt = get_weapon_class()
             local respect_sniper = (wc_dt == "sniper") and exp_respect_man and exp_respect_man:get()
-            pcall(function() ctx:override_safe_point(false) end)
-            pcall(function() ctx:override_multipoint(true) end)
-            pcall(function() ctx:override_multipoint_scale(1.0) end)
+            pcall(sel01_ov, ctx, "override_safe_point", false)
+            pcall(sel01_ov, ctx, "override_multipoint", true)
+            pcall(sel01_ov, ctx, "override_multipoint_scale", 1.0)
             if not respect_sniper then
-                pcall(function() ctx:override_hitchance(20) end)
+                pcall(sel01_ov, ctx, "override_hitchance", 20)
             end
             cs_log_verbose("DT-peek response idx=%d air_duck=%s%s → multipoint full + safepoint off%s",
                            target:get_index(), tostring(s.air_duck),
@@ -7125,7 +7189,7 @@ pcall(function()
                 end
                 if sd > sd_threshold or intel.conf < conf_threshold then
                     -- V9.15: snipers now also cancel (was: only verbose-log, no actual hc bump).
-                    pcall(function() ctx:override_hitchance(99) end)
+                    pcall(sel01_ov, ctx, "override_hitchance", 99)
                     cs_log_verbose("cancel-conf idx=%d sd=%.1f° conf=%d%% samples=%d wc=%s thresh=%d (wait)",
                                    target:get_index(), sd, intel.conf, intel.samples,
                                    tostring(wc), conf_threshold)
@@ -7141,11 +7205,11 @@ pcall(function()
         if exp_auto_weapon and exp_auto_weapon:get() then
             local wc = get_weapon_class()
             if wc == "sniper" then
-                pcall(function() ctx:override_multipoint(true) end)
-                pcall(function() ctx:override_multipoint_scale(0.75) end)
+                pcall(sel01_ov, ctx, "override_multipoint", true)
+                pcall(sel01_ov, ctx, "override_multipoint_scale", 0.75)
                 cs_log_verbose("per-weapon: sniper RESPECT (NL settings preserved, multipoint hint)")
             elseif wc == "knife" then
-                pcall(function() ctx:override_hitchance(99) end)  -- effectively disable
+                pcall(sel01_ov, ctx, "override_hitchance", 99)  -- effectively disable
                 cs_log_verbose("per-weapon: knife (resolver disabled)")
                 return
             end
@@ -7169,7 +7233,7 @@ pcall(function()
             elseif intel.conf >= 70 and intel.samples >= 2 and stable then fast_hc = 45
             end
             if fast_hc then
-                pcall(function() ctx:override_hitchance(fast_hc) end)
+                pcall(sel01_ov, ctx, "override_hitchance", fast_hc)
                 cs_log_verbose("fast-fire idx=%d conf=%d samples=%d sd=%.1f hc=%d",
                                target:get_index(), intel.conf, intel.samples, sd, fast_hc)
             end
@@ -7186,13 +7250,13 @@ pcall(function()
             -- lands as a "correction" miss. Keep head-force + safe-point-off + multipoint
             -- (they make the follow-up a HEAD shot) but leave NL's hitchance in charge.
             if not ((wc == "sniper") and exp_respect_man and exp_respect_man:get()) then
-                pcall(function() ctx:override_hitchance(10) end)
+                pcall(sel01_ov, ctx, "override_hitchance", 10)
             end
             -- V9.18: min_dmg overrides removed globally — NL min_dmg stays in effect
-            pcall(function() ctx:override_hitbox(0) end)
-            pcall(function() ctx:override_safe_point(false) end)
-            pcall(function() ctx:override_multipoint(true) end)
-            pcall(function() ctx:override_multipoint_scale(0.85) end)
+            pcall(sel01_ov, ctx, "override_hitbox", 0)
+            pcall(sel01_ov, ctx, "override_safe_point", false)
+            pcall(sel01_ov, ctx, "override_multipoint", true)
+            pcall(sel01_ov, ctx, "override_multipoint_scale", 0.85)
             cs_log_verbose("close-miss followup idx=%d dist=%.0f missed=%d",
                            target:get_index(), target_dist, s.missed)
         end
@@ -7208,25 +7272,25 @@ pcall(function()
 
         -- NOSPREAD MODE: head every shot, hitchance 1%, min-dmg 100, no multipoint, no safepoint
         if exp_nospread and exp_nospread:get() then
-            pcall(function() ctx:override_hitbox(0) end)            -- head ALWAYS
-            pcall(function() ctx:override_hitchance(1) end)         -- 1% = always fire
+            pcall(sel01_ov, ctx, "override_hitbox", 0)            -- head ALWAYS
+            pcall(sel01_ov, ctx, "override_hitchance", 1)         -- 1% = always fire
             -- V9.18: min_dmg removed — user's NL min_dmg=100 already enforces OHK
-            pcall(function() ctx:override_safe_point(false) end)
-            pcall(function() ctx:override_multipoint(false) end)
+            pcall(sel01_ov, ctx, "override_safe_point", false)
+            pcall(sel01_ov, ctx, "override_multipoint", false)
             cs_log_verbose("NOSPREAD head-shot mode=%s missed=%d", tostring(s and s.mode), s and s.missed or 0)
         -- V7.9 + V9.9-C: HEADSHOT-ONLY STRICT — head every shot.
         -- Crouched target swaps to chest (head too low/occluded when ducked), tighter hc + higher mindmg.
         elseif exp_head_strict and exp_head_strict:get() then
             if target_crouched then
-                pcall(function() ctx:override_hitbox(3) end)        -- chest (head occluded when crouched)
-                pcall(function() ctx:override_hitchance(40) end)
+                pcall(sel01_ov, ctx, "override_hitbox", 3)        -- chest (head occluded when crouched)
+                pcall(sel01_ov, ctx, "override_hitchance", 40)
             else
-                pcall(function() ctx:override_hitbox(0) end)        -- head ALWAYS
-                pcall(function() ctx:override_hitchance(45) end)
+                pcall(sel01_ov, ctx, "override_hitbox", 0)        -- head ALWAYS
+                pcall(sel01_ov, ctx, "override_hitchance", 45)
             end
             -- V9.18: min_dmg removed — NL min_dmg stays in effect
-            pcall(function() ctx:override_safe_point(false) end)
-            pcall(function() ctx:override_multipoint(false) end)
+            pcall(sel01_ov, ctx, "override_safe_point", false)
+            pcall(sel01_ov, ctx, "override_multipoint", false)
             cs_log_verbose("HEAD-STRICT %s mode=%s missed=%d",
                            target_crouched and "CHEST(crouched)" or "head",
                            tostring(s and s.mode), s and s.missed or 0)
@@ -7239,21 +7303,21 @@ pcall(function()
         -- multipoint hint when first-shot networked-mode
         elseif exp_multipoint and exp_multipoint:get() then
             if s and s.missed == 0 and (s.mode == "Networked" or s.mode == "Predicted" or s.mode == "Static") then
-                pcall(function() ctx:override_multipoint(true) end)
-                pcall(function() ctx:override_multipoint_scale(0.7) end)
-                pcall(function() ctx:set_multipoint(true) end)
+                pcall(sel01_ov, ctx, "override_multipoint", true)
+                pcall(sel01_ov, ctx, "override_multipoint_scale", 0.7)
+                pcall(sel01_ov, ctx, "set_multipoint", true)
                 cs_log_verbose("multipoint hint mode=%s", tostring(s.mode))
             end
         end
 
         if should_force_baim(target) then
             local hb_idx = baim_hb_id()
-            pcall(function() ctx:override_hitbox(hb_idx) end)
+            pcall(sel01_ov, ctx, "override_hitbox", hb_idx)
             -- V9.18: min_dmg override removed — NL min_dmg stays in effect. NOTE: if NL
             -- min_dmg is set high (e.g. 100), force-baim body hits may still be rejected
             -- by NL since body shots typically deal <100 dmg. Lower NL min_dmg manually
             -- if you want baim to actually fire after misses.
-            pcall(function() ctx:override_safe_point(false) end)
+            pcall(sel01_ov, ctx, "override_safe_point", false)
             -- V8.4: drop hitchance based on miss-count → faster body follow-up
             -- More misses = lower hc (tries body shot quicker). Scales 25 → 10.
             local baim_hc = 25
@@ -7263,10 +7327,10 @@ pcall(function()
                 elseif s.missed >= 3 then baim_hc = 20
                 end
             end
-            pcall(function() ctx:override_hitchance(baim_hc) end)
+            pcall(sel01_ov, ctx, "override_hitchance", baim_hc)
             -- V8.4: multipoint scan body for chest hits
-            pcall(function() ctx:override_multipoint(true) end)
-            pcall(function() ctx:override_multipoint_scale(1.0) end)
+            pcall(sel01_ov, ctx, "override_multipoint", true)
+            pcall(sel01_ov, ctx, "override_multipoint_scale", 1.0)
             cs_log_verbose("force baim → hitbox=%d hc=%d miss=%d",
                            hb_idx, baim_hc, s and s.missed or 0)
         end
@@ -7276,20 +7340,20 @@ pcall(function()
             local respect_sniper = (wc == "sniper") and exp_respect_man and exp_respect_man:get()
             if respect_sniper then
                 -- V9.18: SSG-Pro respect mode — preserve NL hc + multi-hitbox entirely
-                pcall(function() ctx:override_multipoint(true) end)
-                pcall(function() ctx:override_multipoint_scale(0.85) end)
+                pcall(sel01_ov, ctx, "override_multipoint", true)
+                pcall(sel01_ov, ctx, "override_multipoint_scale", 0.85)
                 cs_log_verbose("jump-scout SSG-RESPECT idx=%d dist=%.0f vz=%.0f (NL settings preserved)",
                                target:get_index(), target_dist, lp_vz)
             else
                 -- Standard jump-shot: head-only + low hc (min_dmg now respects NL)
-                pcall(function() ctx:override_hitbox(0) end)
-                pcall(function() ctx:override_multipoint(false) end)
-                pcall(function() ctx:override_safe_point(false) end)
+                pcall(sel01_ov, ctx, "override_hitbox", 0)
+                pcall(sel01_ov, ctx, "override_multipoint", false)
+                pcall(sel01_ov, ctx, "override_safe_point", false)
                 if wc == "sniper" then
-                    pcall(function() ctx:override_hitchance(35) end)
+                    pcall(sel01_ov, ctx, "override_hitchance", 35)
                     cs_log_verbose("jump-scout SNIPER idx=%d dist=%.0f hc=35", target:get_index(), target_dist)
                 else
-                    pcall(function() ctx:override_hitchance(30) end)
+                    pcall(sel01_ov, ctx, "override_hitchance", 30)
                     cs_log_verbose("jump-shot HEAD idx=%d dist=%.0f wc=%s", target:get_index(), target_dist, tostring(wc))
                 end
             end
@@ -7399,6 +7463,12 @@ local esp_paint_handler = function()
 
     -- ═══ per-enemy ESP labels ═══
     if esp_show_labels and esp_show_labels:get() then
+    -- V11.17 perf: the four sub-toggles were read INSIDE the per-enemy loop — a menu
+    -- round-trip per enemy per frame (5 enemies × 300 fps = 6000/s). Read once per frame.
+    local f_enh   = esp_enh and esp_enh:get()
+    local f_flash = esp_flash and esp_flash:get()
+    local f_wedge = esp_wedge and esp_wedge:get()
+    local f_conf  = esp_show_confbar and esp_show_confbar:get()
     pcall(function()
         entity.get_players(true, false, function(p)
             if not p:is_alive() or p:is_dormant() then return end
@@ -7418,7 +7488,7 @@ local esp_paint_handler = function()
             -- mode-string finds, string.format, color objects) throttled to 5Hz per
             -- enemy; the per-frame draw path reads the cache. Cosmetic-only fields
             -- (_espc_*) — no resolver state touched from render.
-            local enh_on = esp_enh and esp_enh:get()
+            local enh_on = f_enh
             local now_rt = globals.realtime or 0
             if (now_rt - (s._espc_t or 0)) > 0.2 or s._espc_mode ~= s.mode then
                 s._espc_t = now_rt
@@ -7474,7 +7544,7 @@ local esp_paint_handler = function()
                 local now_t = globals.curtime or 0
 
                 -- V9.51-B: HIT/MISS/SERVERFAIL flash box around the model (~0.45s fade).
-                if esp_flash and esp_flash:get() and feet_pos and s.last_shot_result
+                if f_flash and feet_pos and s.last_shot_result
                    and (now_t - (s.last_shot_result_time or 0)) < 0.45 then
                     local age   = now_t - (s.last_shot_result_time or 0)
                     local alpha = math.floor(220 * (1 - age / 0.45))
@@ -7495,7 +7565,7 @@ local esp_paint_handler = function()
                 -- V9.51-A: desync wedge — two lines from the pelvis. White = the enemy's
                 -- REAL eye_yaw, mode-color = our RESOLVED fake-yaw. The angle between them
                 -- IS the desync we're shooting; lets you eyeball side + magnitude on the body.
-                if esp_wedge and esp_wedge:get() and s.last_eye_yaw and s.last_resolved then
+                if f_wedge and s.last_eye_yaw and s.last_resolved then
                     local base, t_eye, t_res
                     pcall(function() base  = render.world_to_screen(vector(ox, oy, oz + 36)) end)
                     local function tip(yaw_deg)
@@ -7540,7 +7610,7 @@ local esp_paint_handler = function()
                     end
                 end
 
-                if esp_show_confbar and esp_show_confbar:get() then
+                if f_conf then
                     local bar_w = 40
                     local fill = math.floor(bar_w * conf / 100)
                     render.rect(vector(head_pos.x - bar_w/2, head_pos.y - 8),
@@ -7703,6 +7773,10 @@ pcall(function()
     events.render:set(function()
         pcall(loading_render_callback)
         pcall(sidebar)
+        -- V11.17: v9.93 version banner (global fn defined by the version-check block
+        -- below; resolved at call time). Its old home was a second events.render:set
+        -- near the top that this one replaced on load, so it never drew.
+        if sel01_vc_draw then pcall(sel01_vc_draw) end
         pcall(esp_paint_handler)
         pcall(render_event_ticker)
     end)
@@ -8188,5 +8262,6 @@ _cs_log_color_raw("V11.13: confidence was lying. sample_score caps at 60, so any
 _cs_log_color_raw("V11.14: per-player miss sting without flattening HUD avg. A lock at 100 who you miss stayed at 100 (1/10 miss-rate never hit the 25% gate). Trailing resolver-misses now drop THIS player 22/35/48 (hit clears it; netcode/spread ignored). Hard 50% cap on 50% miss-rate removed. HUD avg weighted by real hits so one sting cannot wreck the lobby number.")
 _cs_log_color_raw("V11.15: three real-dump fixes. (1) AIR re-fired a missed angle: the air-branch has no miss memory and returns before BF can run — weedabuser (L2/R1 @30°) ate Air L30 / BF:opp R30 / Air L30 AGAIN / BF:-58 / BF:+45, five head misses. After a miss with a measurement the air-branch now yields to the ground BF sweep. (2) Netcode filter calibrated to THIS lobby's hit-bt (EMA+6, floor 8) instead of fixed 4/8 — hits landed at bt 7-21 so bt 4-5 misses were fresher than the average hit, not stale; two-side enemies need a clearly-stale bt (err~0 is guaranteed there). HUD said 80%, raw was 69%. (3) Respect-Manual sniper: close-priority no longer drops HC 72→40 + full-spread multipoint (body safe point won → body hits despite min-dmg 100); close-miss follow-up no longer forces HC 10.")
 _cs_log_color_raw("V11.16: fake-flick false positives. The netvar-vs-animstate tell fires on every ordinary sharp turn (netvar lands a frame before the anim update; yaw_rate is still low that tick), only decayed while band observations existed, refreshed the band timestamp and flagged ff_silent on its own — dump: weedabuser w0/n30, woof w0/n15, zero impossible-band hits, yet every turn re-armed BF ±90 for 3s and suspended passive learning. Now: own timestamp + own decay, and no flag without >=3 impossible-band observations. Also: jitter commit vetoed by 4+ one-sided real hits (Monkeyman L1/R9 @32° stable was 'jitter', Jitter-Cls 0/2); DT-window shots tagged 'DT' in the ACK ring + hit/miss counted in the [DT] line.")
+_cs_log_color_raw("V11.17: perf + dead-code pass (full-file audit) + one fire-gate fix. FIX: resolve_stddev measured the spread of the ABSOLUTE resolved yaw (where they look) — a locked 29.5° enemy walking and aiming read sd~80, so cancel-low-confidence (sd>50 sniper / >25 rifle) refused valid shots and fast-fire never saw a stable resolve; now the desync-delta spread, same as confidence() since V11.13. PERF: cs_log_verbose/cs_log_debug no longer string.format + 12-15 find() + ring-push on every call with logging off (capture test memoised per template, toggles tick-cached); the 54 pcall(function() ctx:override_* end) closures in ragebot_target replaced by one named helper (zero alloc per tick); presets are constant tables (were 2 fresh tables + 2 menu reads per call, ~3 calls/enemy/tick); per-side / nospread / mode / baim-n / log toggles tick-cached (per-side was read up to 13x per resolve); ESP sub-toggles read once per frame instead of per enemy. DEAD: a second events.render:set near the top (replaced on load — the v9.93 version banner it called never drew; now wired into the main wrapper), write-only PlayerState fields (last_shot, last_lby, prev_origin vector, last_pred_was_hit, hostile_fire_count, last_hostile_aimed).")
 _cs_log_color_raw("Logging: " .. (log_enabled:get() and ("ON" .. (log_verbose:get() and " (verbose)" or ""))  or "OFF"))
 _cs_log_color_raw("=========================================")
