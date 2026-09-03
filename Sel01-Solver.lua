@@ -1,15 +1,15 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 11.21                                  ║
+-- ║  Version: 11.22                                  ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 11.21
--- @description v11.21 custom crosshair (ESP tab, sniper-unscoped default, on in
---   SSG-Pro), Static-Meas fires the per-side magnitude. Version history in git.
+-- @version 11.22
+-- @description v11.22 fake-flick BF ordering arms at 3 confirmed round-trips
+--   (was 4). v11.21 custom crosshair + Static-Meas per-side. History in git.
 
-local SEL01_VERSION = "11.21"
+local SEL01_VERSION = "11.22"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -6521,7 +6521,13 @@ local function resolve_player(p)
                         s.ff_pending = false
                     end
                 end
-                s.fake_flick = (s.ff_score or 0) >= 4
+                -- V11.22: 4 → 3 confirmed rest→±90→rest round-trips. Dump v11.21 Burgie
+                -- sat at score 3 (`ff=false/3`, wide 90°) through four ±22° misses at
+                -- bt 0-10 until BF:+90 hit at bt=23 — the flick ticks were the misses.
+                -- Only BF ordering (±90 first) and the ⚡FF tag key on this flag; the
+                -- first-shot Flick-Meas still needs the impossible-band tell, so a false
+                -- positive costs at most one BF probe after a miss.
+                s.fake_flick = (s.ff_score or 0) >= 3
             end
         end
 
@@ -8209,5 +8215,6 @@ _cs_log_color_raw("V11.18: first-contact fixes (dump: first-shot 58%, BF:opposit
 _cs_log_color_raw("V11.19: (1) Visual Style 'Lean (labels + confidence)' — one symbol line + the conf bar per enemy, everything else off (wedge = 3 world_to_screen per enemy per frame, flash box, shot-dots/tags, HUD panel, event ticker = per-frame string.format). SSG-Pro preset now selects it; 'Full' re-enables all of them. (2) Persist dom lean: was a >3-hit lead, so a 4:1 lock (dump kurokoai L=4/R=1) booted with dom=0 and the first shot coin-flipped; now a 2-hit lead that is also 2:1. (3) Dead V10.4 keep-score block in the HIT path removed (V10.8 settles the keep earlier; the fields it touched no longer exist). (4) The 158-line @description-prev header history dropped — git has it. Dump v11.18: 75% overall, first-shot 58% -> 75%; the remaining first-contact misses were correct angles rejected at bt=0 on defensive-AA peekers followed by a blind flip — that is the case the (default-off) Animation-Layer side read exists for.")
 _cs_log_color_raw("V11.20: two targeted fixes + one measurement, nothing else touched (dump v11.18: 79.7%, first-shot 83%). (1) extrapolate_yaw — the always-on interp-comp (lerp + ping/2) had NO gate: a standing enemy flicking his view for a tick got +12° on a proven 11° magnitude (neptune2much still=true, 5 L-hits: Static-Server-Dom-Recall fired -23.9 = 11.5 + 12.4 comp). Stationary / slow enemies and an inconsistent yaw_rate buffer now get no comp. (2) Global hard-reset two-magnitude guard: the bimodal flag needs 2+2 real hits, so Burgie (L 56 / R 24.5) thrashed the global EMA on every side change and each reset decimated that side's real count (1/3 became 1/1). When both sides hold samples that disagree by more than 10, a side-matching hit blends instead of resetting. (3) [CANCEL] dump line — ticks held per reason, hold episodes, and hit/miss of the first shot after a hold; the next dump decides whether cancel-low-confidence earns its keep.")
 _cs_log_color_raw("V11.21: (1) CUSTOM CROSSHAIR — new 'Crosshair' group in the ESP tab (switch, Show = Sniper unscoped only / Sniper only / Always, style Cross / Dot / Cross+Dot, size / gap / thickness, colour picker, outline). Drawn from the render wrapper independent of ESP master, no per-frame closures. SSG-Pro turns it on; turn the Sel01-Config crosshair off to avoid two. (2) Static-Meas fires the PER-SIDE magnitude (V9.92 fixed only the Recall copy): dump gigicornel63 L 26 / R 35.4 got R 31.2 = the average, 4° short. Dump v11.20: 79.3%, [CANCEL] 0 episodes — the 'not shooting' symptom was the v11.17 resolve_stddev bug.")
+_cs_log_color_raw("V11.22: fake-flick BF ordering arms at 3 confirmed rest/±90/rest round-trips (was 4). Dump v11.21 Burgie sat at score 3 through four ±22° misses at bt 0-10 until BF:+90 hit at bt=23. Only the BF list order and the ⚡FF tag key on the flag; first-shot Flick-Meas still needs the impossible-band tell. Session read: 70% — two per-tick randomisers (Burgie side-jitter + 90 flick, Zero magnitude 15-33°) that an averaging resolver cannot pin; the side half is what the default-off Animation-Layer read is for.")
 _cs_log_color_raw("Logging: " .. (log_enabled:get() and ("ON" .. (log_verbose:get() and " (verbose)" or ""))  or "OFF"))
 _cs_log_color_raw("=========================================")
