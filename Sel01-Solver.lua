@@ -1,16 +1,15 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 11.20                                  ║
+-- ║  Version: 11.21                                  ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 11.20
--- @description v11.20 interp-comp gated (no lead on standing / slow / inconsistent
---   turners), two-magnitude guard on the global hard-reset, [CANCEL] telemetry
---   for cancel-low-confidence. Version history lives in git.
+-- @version 11.21
+-- @description v11.21 custom crosshair (ESP tab, sniper-unscoped default, on in
+--   SSG-Pro), Static-Meas fires the per-side magnitude. Version history in git.
 
-local SEL01_VERSION = "11.20"
+local SEL01_VERSION = "11.21"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -439,6 +438,22 @@ local esp_hud_pos      = ui_sub(esp_show_hud, g_esp_sub):combo(accent .. ui.get_
                                       "Top-Left", "Bottom-Left", "Bottom-Right", "Top-Right")
 local esp_throttle_hz  = g_esp_sub:slider(accent .. ui.get_icon"bolt"      .. accent .. "  ESP Refresh Rate (Hz)", 5, 30, 10)
 local esp_label_color  = ui_sub(esp_show_labels, g_esp_sub):color_picker(accent .. ui.get_icon"feather" .. accent .. "  Label Default Color", color(255, 255, 255, 255))
+-- ─── V11.21: CUSTOM CROSSHAIR (globals — main chunk at the 200-local cap) ───────
+-- Snipers have no crosshair unscoped; this draws one at screen centre, independent
+-- of the ESP master switch. Drawn by sel01_crosshair_draw from the render wrapper.
+g_xhair    = ui.create(TAB_ESP, "Crosshair", 1)
+xh_enable  = g_xhair:switch(accent .. ui.get_icon"crosshairs" .. accent .. "  Custom Crosshair", false)
+xh_when    = ui_sub(xh_enable, g_xhair):combo(accent .. ui.get_icon"eye"        .. accent .. "  Show", "Sniper unscoped only", "Sniper only", "Always")
+xh_style   = ui_sub(xh_enable, g_xhair):combo(accent .. ui.get_icon"bullseye"   .. accent .. "  Style", "Cross", "Dot", "Cross + Dot")
+xh_size    = ui_sub(xh_enable, g_xhair):slider(accent .. ui.get_icon"sliders"   .. accent .. "  Size", 2, 20, 6)
+xh_gap     = ui_sub(xh_enable, g_xhair):slider(accent .. ui.get_icon"sliders"   .. accent .. "  Gap", 0, 12, 3)
+xh_thick   = ui_sub(xh_enable, g_xhair):slider(accent .. ui.get_icon"sliders"   .. accent .. "  Thickness", 1, 4, 2)
+xh_color   = ui_sub(xh_enable, g_xhair):color_picker(accent .. ui.get_icon"feather" .. accent .. "  Color", color(255, 255, 255, 255))
+xh_outline = ui_sub(xh_enable, g_xhair):switch(accent .. ui.get_icon"layer-group" .. accent .. "  Outline", true)
+ui_tip(xh_enable,  "Draws a crosshair at screen centre. Turn the Sel01-Config crosshair off if you use this one — two overlap.")
+ui_tip(xh_when,    "Sniper unscoped only = the case CSGO leaves you without any crosshair. Always = every weapon, scoped or not.")
+ui_tip(xh_style,   "Cross = four bars with a gap. Dot = a single square. Cross + Dot = both.")
+ui_tip(xh_outline, "1px dark border so the crosshair stays visible on bright walls.")
 ui_tip(esp_master,      "Master switch for every on-screen element this script draws.")
 ui_tip(esp_show_labels, "The one-line symbol tag next to each enemy: AA type, resolved side, desync degrees, how well they are learned.")
 ui_tip(esp_show_confbar,"Small bar showing how much the resolver trusts its own answer for that enemy.")
@@ -2752,6 +2767,7 @@ local function apply_preset(name)
         safe_set(esp_flash,          false)
         safe_set(esp_enh,            false)
         safe_set(esp_event_ticker,   false)
+        safe_set(xh_enable,          true)    -- V11.21: sniper crosshair (unscoped)
         safe_set(exp_lock_headpref,  true)   -- V9.96: precision preset wants heads on locked targets
         -- V9.96: on-shot flip stays ON (well-gated, common in HvH). Pose calibration is
         -- retired (dead end on this build) — the v9.95 animation-layer side read replaces
@@ -5062,7 +5078,11 @@ local function _pick_first_shot_impl(p, s, anim, eye_yaw, max_desync, preset)
             if s.desync_samples >= 2 and s.measured_desync > 5 then
                 local side = learned_pick_side(s)
                 s.mode = "Static-Meas"
-                return eye_yaw + s.measured_desync * side
+                -- V11.21: PER-SIDE magnitude (V9.92 fixed the Recall copy of this path,
+                -- the base path kept firing the GLOBAL EMA). Dump gigicornel63 L 26° /
+                -- R 35.4°: Static-Meas R fired 31.2 = the average, 4° short, head miss.
+                -- effective_desync falls back to the global when that side has no samples.
+                return eye_yaw + effective_desync(s, max_desync, side) * side
             end
             -- 2) server-yaw if it returns meaningful delta
             local sy = RebuildServerYaw(p) or eye_yaw  -- V9.32: nil=fail → eye_yaw → guess
@@ -7415,6 +7435,46 @@ local function esp_refresh_cache()
     end)
 end
 
+-- ─── V11.21: CUSTOM CROSSHAIR draw ─────────────────────────────────────────────
+-- Defined AFTER get_weapon_class (a local) so the reference binds lexically.
+-- No closures per frame: one named bar helper, five calls at most.
+XH_COL_OUT = color(0, 0, 0, 200)
+function sel01_xh_bar(x1, y1, x2, y2, col, outline)
+    if outline then render.rect(vector(x1 - 1, y1 - 1), vector(x2 + 1, y2 + 1), XH_COL_OUT, 0, true) end
+    render.rect(vector(x1, y1), vector(x2, y2), col, 0, true)
+end
+function sel01_crosshair_draw()
+    if not (xh_enable and xh_enable:get()) then return end
+    local when = tostring(xh_when:get())
+    if when ~= "Always" then
+        if get_weapon_class() ~= "sniper" then return end
+        if when == "Sniper unscoped only" then
+            local lp = tick_cache.lp or entity.get_local_player()
+            if not lp then return end
+            local scoped = false
+            pcall(function() local v = lp.m_bIsScoped; scoped = (v == true or v == 1) end)
+            if scoped then return end
+        end
+    end
+    local scr = render.screen_size()
+    local cx, cy = math.floor(scr.x / 2), math.floor(scr.y / 2)
+    local style   = tostring(xh_style:get())
+    local sz, gap = xh_size:get(), xh_gap:get()
+    local th      = xh_thick:get()
+    local col     = xh_color:get()
+    local outline = xh_outline and xh_outline:get()
+    local h = math.floor(th / 2)
+    if style ~= "Dot" then
+        sel01_xh_bar(cx - gap - sz, cy - h,        cx - gap,      cy - h + th, col, outline)  -- left
+        sel01_xh_bar(cx + gap,      cy - h,        cx + gap + sz, cy - h + th, col, outline)  -- right
+        sel01_xh_bar(cx - h,        cy - gap - sz, cx - h + th,   cy - gap,    col, outline)  -- top
+        sel01_xh_bar(cx - h,        cy + gap,      cx - h + th,   cy + gap + sz, col, outline) -- bottom
+    end
+    if style ~= "Cross" then
+        sel01_xh_bar(cx - h, cy - h, cx - h + th, cy - h + th, col, outline)  -- centre dot
+    end
+end
+
 -- V11.18 perf: the per-enemy draw body was an anonymous closure created and pcall'd
 -- per enemy per FRAME, plus a second closure (`tip`) and three more pcall closures
 -- for the wedge. One named global now, called through a single pcall — zero closure
@@ -7743,6 +7803,7 @@ pcall(function()
         -- near the top that this one replaced on load, so it never drew.
         if sel01_vc_draw then pcall(sel01_vc_draw) end
         pcall(esp_paint_handler)
+        pcall(sel01_crosshair_draw)  -- V11.21: independent of ESP master
         pcall(render_event_ticker)
     end)
     cs_log("ESP render hook installed (events.render)")
@@ -8147,5 +8208,6 @@ _cs_log_color_raw("V11.17: perf + dead-code pass (full-file audit) + one fire-ga
 _cs_log_color_raw("V11.18: first-contact fixes (dump: first-shot 58%, BF:opposite 3/3 — the first shot picked wrong, opposite fixed it). (1) Air used the GLOBAL seed / max(passive L,R) — for a R shot the L side's number (idx=7 fired 32.8, per-side R 23.7 was right); side now decided first, then THAT side's measured/passive magnitude (sel01_side_mag) in air-boost, Air-Guess and cold-air. (2) First-contact physical cap: the predictor bounded only the lead, not lead+seed — idx=4 fired -65.7 (53 seed + 12.5 lead), past the 58° cone; with zero real hits the total is capped at 58 (mode -Cap). (3) Still-Server no longer takes the rebuild's OTHER side when one real hit exists on one side only (idx=2: 1 L-hit @18, fired R 34.6). (4) BF 'opposite' keys off the last ACKED shot side, not the last resolve (unfired air re-resolves made it flip twice). PERF: ESP per-enemy draw is a named function (was 5 closures per enemy per frame). SIZE: 84 V9/V10 changelog lines dropped from the load banner (git history keeps them).")
 _cs_log_color_raw("V11.19: (1) Visual Style 'Lean (labels + confidence)' — one symbol line + the conf bar per enemy, everything else off (wedge = 3 world_to_screen per enemy per frame, flash box, shot-dots/tags, HUD panel, event ticker = per-frame string.format). SSG-Pro preset now selects it; 'Full' re-enables all of them. (2) Persist dom lean: was a >3-hit lead, so a 4:1 lock (dump kurokoai L=4/R=1) booted with dom=0 and the first shot coin-flipped; now a 2-hit lead that is also 2:1. (3) Dead V10.4 keep-score block in the HIT path removed (V10.8 settles the keep earlier; the fields it touched no longer exist). (4) The 158-line @description-prev header history dropped — git has it. Dump v11.18: 75% overall, first-shot 58% -> 75%; the remaining first-contact misses were correct angles rejected at bt=0 on defensive-AA peekers followed by a blind flip — that is the case the (default-off) Animation-Layer side read exists for.")
 _cs_log_color_raw("V11.20: two targeted fixes + one measurement, nothing else touched (dump v11.18: 79.7%, first-shot 83%). (1) extrapolate_yaw — the always-on interp-comp (lerp + ping/2) had NO gate: a standing enemy flicking his view for a tick got +12° on a proven 11° magnitude (neptune2much still=true, 5 L-hits: Static-Server-Dom-Recall fired -23.9 = 11.5 + 12.4 comp). Stationary / slow enemies and an inconsistent yaw_rate buffer now get no comp. (2) Global hard-reset two-magnitude guard: the bimodal flag needs 2+2 real hits, so Burgie (L 56 / R 24.5) thrashed the global EMA on every side change and each reset decimated that side's real count (1/3 became 1/1). When both sides hold samples that disagree by more than 10, a side-matching hit blends instead of resetting. (3) [CANCEL] dump line — ticks held per reason, hold episodes, and hit/miss of the first shot after a hold; the next dump decides whether cancel-low-confidence earns its keep.")
+_cs_log_color_raw("V11.21: (1) CUSTOM CROSSHAIR — new 'Crosshair' group in the ESP tab (switch, Show = Sniper unscoped only / Sniper only / Always, style Cross / Dot / Cross+Dot, size / gap / thickness, colour picker, outline). Drawn from the render wrapper independent of ESP master, no per-frame closures. SSG-Pro turns it on; turn the Sel01-Config crosshair off to avoid two. (2) Static-Meas fires the PER-SIDE magnitude (V9.92 fixed only the Recall copy): dump gigicornel63 L 26 / R 35.4 got R 31.2 = the average, 4° short. Dump v11.20: 79.3%, [CANCEL] 0 episodes — the 'not shooting' symptom was the v11.17 resolve_stddev bug.")
 _cs_log_color_raw("Logging: " .. (log_enabled:get() and ("ON" .. (log_verbose:get() and " (verbose)" or ""))  or "OFF"))
 _cs_log_color_raw("=========================================")
