@@ -1,7 +1,7 @@
 # Sel01 scripts — latest published versions.
 # Every script fetches this file once at load and compares it to its own constant.
 # Format: key=version   (bump the line in the SAME commit as the version constant)
-solver=11.19
+solver=11.20
 config=3.32
 walkbot=2.2
 plantbot=1.10

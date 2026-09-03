@@ -1,16 +1,16 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 11.19                                  ║
+-- ║  Version: 11.20                                  ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 11.19
--- @description v11.19 "Lean" visual style (labels + confidence only) as the
---   SSG-Pro default; persist dom lean at 2-hit/2:1 lead; dead keep-score block
---   removed; version history lives in git (see the V11.x load banner).
+-- @version 11.20
+-- @description v11.20 interp-comp gated (no lead on standing / slow / inconsistent
+--   turners), two-magnitude guard on the global hard-reset, [CANCEL] telemetry
+--   for cancel-low-confidence. Version history lives in git.
 
-local SEL01_VERSION = "11.19"
+local SEL01_VERSION = "11.20"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -1240,6 +1240,10 @@ sel01_session_desyncs = { cap = 20, head = 0, count = 0, dirty = true }
 sel01_dt_stats = { seen = 0, max = 0, b3 = 0, b6 = 0, air = 0, duck = 0, fired = 0, reject_gap = 0, reject_ctx = 0, shot_hit = 0, shot_miss = 0 }
 sel01_keep_stats = { stat = { lo = { hit = 0, miss = 0 }, hi = { hit = 0, miss = 0 } },
                      mov  = { lo = { hit = 0, miss = 0 }, hi = { hit = 0, miss = 0 } } }
+-- V11.20: cancel-low-confidence telemetry. Ticks held per reason, hold episodes, and
+-- what the first shot AFTER a hold did — the number that says whether the gate earns
+-- its keep or only delays shots ("ich schieße nicht, obwohl er treffbar wäre").
+sel01_cancel_stats = { sd = 0, conf = 0, blind = 0, mismatch = 0, episodes = 0, hold_ticks = 0, then_hit = 0, then_miss = 0 }
 function session_push_desync(v)
     if not v or v < 5 or v > 58 then return end  -- V9.33: cap at 58 (max desync) so >58 reads can't bias the median high
     local r = sel01_session_desyncs
@@ -1565,6 +1569,13 @@ local log_copy_btn = g_logging:button("📋 Copy Last Logs (for share)", functio
         local k = sel01_keep_stats
         _cs_log_raw(string.format("[KEEP] next shot after a keep — STATIC bt<4 %s, bt>=4 %s | MOVING(switch/jitter) bt<4 %s, bt>=4 %s",
             _kb(k.stat.lo), _kb(k.stat.hi), _kb(k.mov.lo), _kb(k.mov.hi)))
+        -- V11.20: cancel-low-confidence — did holding fire earn anything?
+        local c = sel01_cancel_stats
+        local held_n = c.then_hit + c.then_miss
+        _cs_log_raw(string.format("[CANCEL] held fire %d episodes / %d ticks (%.1fs) — reasons: spread %d, low-conf %d, blind %d, known-mismatch %d | first shot after a hold: %d hit / %d miss%s",
+            c.episodes, c.hold_ticks, c.hold_ticks / 64,
+            c.sd, c.conf, c.blind, c.mismatch, c.then_hit, c.then_miss,
+            held_n > 0 and string.format(" (%.0f%%)", c.then_hit / held_n * 100) or ""))
     end
     -- V11.5: session ACK tally — KEEP/FLIP/NETCODE/SPREAD without hand-counting the log
     do
@@ -1878,6 +1889,7 @@ local log_reset_session = g_logging:button("🗑 Reset Session Stats (in-memory)
     sel01_session_serverfails = 0  -- V9.50: clear server-fail filter counter
     sel01_session_spreadfails = 0  -- V9.72: clear spread-RNG filter counter
     pcall(sel01_ack_reset)
+    sel01_cancel_stats = { sd = 0, conf = 0, blind = 0, mismatch = 0, episodes = 0, hold_ticks = 0, then_hit = 0, then_miss = 0 }  -- V11.20
     sel01_dt_stats = { seen = 0, max = 0, b3 = 0, b6 = 0, air = 0, duck = 0, fired = 0, reject_gap = 0, reject_ctx = 0, shot_hit = 0, shot_miss = 0 }
 sel01_keep_stats = { stat = { lo = { hit = 0, miss = 0 }, hi = { hit = 0, miss = 0 } },
                      mov  = { lo = { hit = 0, miss = 0 }, hi = { hit = 0, miss = 0 } } }  -- V10.0
@@ -3806,6 +3818,7 @@ events.aim_ack:set(function(event)
           end  -- FIX #4: closes if _conf_corr >= 15
         end
         if s.dtpeek_active then sel01_dt_stats.shot_miss = (sel01_dt_stats.shot_miss or 0) + 1 end  -- V11.16
+        if s.cc_held_pending then sel01_cancel_stats.then_miss = sel01_cancel_stats.then_miss + 1; s.cc_held_pending = nil end  -- V11.20
         cs_log_verbose("MISS [%s] target=%d count=%d mode=%s",
                        tostring(reason), Ent:get_index(), s.missed, tostring(s.mode))
         -- V9.49: a CONFIRMED server-fail keep (correct angle, server rejected, side kept)
@@ -3885,6 +3898,7 @@ events.aim_ack:set(function(event)
         end
         esp_push_shot(s, "hit")  -- V9.51: green flash + green dot
         pcall(sel01_hit_bt_note, bt)  -- V11.15: calibrate the stale-record bt line off real hits
+        if s.cc_held_pending then sel01_cancel_stats.then_hit = sel01_cancel_stats.then_hit + 1; s.cc_held_pending = nil end  -- V11.20
         if s.dtpeek_active then sel01_dt_stats.shot_hit = (sel01_dt_stats.shot_hit or 0) + 1 end  -- V11.16
         -- HIT: prefer snapshot from aim_fire if available (accurate per-shot state)
         local src_eye, src_res = s.last_eye_yaw, s.last_resolved
@@ -3979,9 +3993,20 @@ events.aim_ack:set(function(event)
                 if _sc <= 1 then alpha = 0.55
                 elseif _sc <= 3 then alpha = 0.42 end
                 if _sc > 0 and diff > 5 then alpha = math.max(alpha, 0.55) end
+                -- V11.20: TWO-MAGNITUDE guard. The bimodal flag needs 2+2 real hits
+                -- (V10.6), so an enemy with hits on both sides at DIFFERENT magnitudes
+                -- but fewer hits thrashed the global reset on every side change — and
+                -- since V11.7 each reset also decimates that side's real_* count.
+                -- Dump Burgie (L 56° / R 24.5°): real went 1/3 → 1/1 on one R hit, the
+                -- global EMA swung 24.8 → 56.2 → 24.5. When both sides already hold
+                -- samples that disagree by >10°, a hit matching ITS side is not a preset
+                -- switch: blend the global, keep the real counts. A one-sided enemy who
+                -- changes magnitude (other side empty) still hard-resets as before.
+                local two_mag = (s.samples_left or 0) >= 1 and (s.samples_right or 0) >= 1
+                                and math.abs((s.measured_left or 0) - (s.measured_right or 0)) > 10
                 if s.desync_samples == 0 then
                     s.measured_desync = actual
-                elseif (not s.bimodal) and s.desync_samples >= 3 and diff > 10 then
+                elseif (not s.bimodal) and (not two_mag) and s.desync_samples >= 3 and diff > 10 then
                     -- V9.30 SWITCH-RESET: take the new value as-is, decay samples
                     -- V9.32: suppressed when bimodal — a stable two-mode enemy must
                     -- NOT hard-reset the global on every alternation (that thrashes).
@@ -4542,6 +4567,14 @@ end
 
 -- yaw-extrapolation für hohen ping/lerp
 local function extrapolate_yaw(s, current_yaw)
+    -- V11.20: this always-on interp-comp (lerp + ping/2 ≈ 35 ms) had NO gate while the
+    -- main predictor has six. A STANDING enemy who flicks his view for a tick carries a
+    -- yaw_rate of a few hundred °/s → +12° on top of a proven 11° magnitude. Dump
+    -- neptune2much (still=true, 5 L-hits @ ~11°): Static-Server-Dom-Recall fired
+    -- -23.9 = 11.5 learned + 12.4 comp → miss. Stationary / slow enemies and an
+    -- inconsistent yaw_rate buffer get no comp; a sustained turn still does.
+    if s.is_stationary or s.is_slow_target then return current_yaw end
+    if s.yaw_rate_buf and #s.yaw_rate_buf >= 4 and not s.yaw_rate_consistent then return current_yaw end
     local lerp_ms = 16
     pcall(function() lerp_ms = (entity.get_lerp_time and entity.get_lerp_time() * 1000) or 16 end)
     -- V9.3: add ping/2 (one-way latency) — high ping needs more extrapolation
@@ -7103,6 +7136,19 @@ pcall(function()
                 if sd > sd_threshold or intel.conf < conf_threshold then
                     -- V9.15: snipers now also cancel (was: only verbose-log, no actual hc bump).
                     pcall(sel01_ov, ctx, "override_hitchance", 99)
+                    -- V11.20: telemetry — WHY we held, how long, and whether the first shot
+                    -- after the hold lands (scored in aim_ack). "Held then hit" dominating
+                    -- means the gate was only delaying a good shot.
+                    do
+                        local cs = sel01_cancel_stats
+                        if sd > sd_threshold then cs.sd = cs.sd + 1
+                        elseif intel.samples == 0 then cs.blind = cs.blind + 1
+                        elseif intel.known and not intel.mode_match then cs.mismatch = cs.mismatch + 1
+                        else cs.conf = cs.conf + 1 end
+                        cs.hold_ticks = cs.hold_ticks + 1
+                        if not s.cc_holding then cs.episodes = cs.episodes + 1; s.cc_holding = true end
+                        s.cc_held_pending = true
+                    end
                     cs_log_verbose("cancel-conf idx=%d sd=%.1f° conf=%d%% samples=%d wc=%s thresh=%d (wait)",
                                    target:get_index(), sd, intel.conf, intel.samples,
                                    tostring(wc), conf_threshold)
@@ -7110,6 +7156,8 @@ pcall(function()
                 end
             end
         end
+
+        if s then s.cc_holding = false end  -- V11.20: not held this tick (cancel branch returns above)
 
         -- V3 #10 + V4 + V9.18: AUTO PER-WEAPON — only multipoint hint + knife disable.
         -- All hitchance/min_damage/hitbox overrides removed: user's NL settings (hc=72,
@@ -8098,5 +8146,6 @@ _cs_log_color_raw("V11.16: fake-flick false positives. The netvar-vs-animstate t
 _cs_log_color_raw("V11.17: perf + dead-code pass (full-file audit) + one fire-gate fix. FIX: resolve_stddev measured the spread of the ABSOLUTE resolved yaw (where they look) — a locked 29.5° enemy walking and aiming read sd~80, so cancel-low-confidence (sd>50 sniper / >25 rifle) refused valid shots and fast-fire never saw a stable resolve; now the desync-delta spread, same as confidence() since V11.13. PERF: cs_log_verbose/cs_log_debug no longer string.format + 12-15 find() + ring-push on every call with logging off (capture test memoised per template, toggles tick-cached); the 54 pcall(function() ctx:override_* end) closures in ragebot_target replaced by one named helper (zero alloc per tick); presets are constant tables (were 2 fresh tables + 2 menu reads per call, ~3 calls/enemy/tick); per-side / nospread / mode / baim-n / log toggles tick-cached (per-side was read up to 13x per resolve); ESP sub-toggles read once per frame instead of per enemy. DEAD: a second events.render:set near the top (replaced on load — the v9.93 version banner it called never drew; now wired into the main wrapper), write-only PlayerState fields (last_shot, last_lby, prev_origin vector, last_pred_was_hit, hostile_fire_count, last_hostile_aimed).")
 _cs_log_color_raw("V11.18: first-contact fixes (dump: first-shot 58%, BF:opposite 3/3 — the first shot picked wrong, opposite fixed it). (1) Air used the GLOBAL seed / max(passive L,R) — for a R shot the L side's number (idx=7 fired 32.8, per-side R 23.7 was right); side now decided first, then THAT side's measured/passive magnitude (sel01_side_mag) in air-boost, Air-Guess and cold-air. (2) First-contact physical cap: the predictor bounded only the lead, not lead+seed — idx=4 fired -65.7 (53 seed + 12.5 lead), past the 58° cone; with zero real hits the total is capped at 58 (mode -Cap). (3) Still-Server no longer takes the rebuild's OTHER side when one real hit exists on one side only (idx=2: 1 L-hit @18, fired R 34.6). (4) BF 'opposite' keys off the last ACKED shot side, not the last resolve (unfired air re-resolves made it flip twice). PERF: ESP per-enemy draw is a named function (was 5 closures per enemy per frame). SIZE: 84 V9/V10 changelog lines dropped from the load banner (git history keeps them).")
 _cs_log_color_raw("V11.19: (1) Visual Style 'Lean (labels + confidence)' — one symbol line + the conf bar per enemy, everything else off (wedge = 3 world_to_screen per enemy per frame, flash box, shot-dots/tags, HUD panel, event ticker = per-frame string.format). SSG-Pro preset now selects it; 'Full' re-enables all of them. (2) Persist dom lean: was a >3-hit lead, so a 4:1 lock (dump kurokoai L=4/R=1) booted with dom=0 and the first shot coin-flipped; now a 2-hit lead that is also 2:1. (3) Dead V10.4 keep-score block in the HIT path removed (V10.8 settles the keep earlier; the fields it touched no longer exist). (4) The 158-line @description-prev header history dropped — git has it. Dump v11.18: 75% overall, first-shot 58% -> 75%; the remaining first-contact misses were correct angles rejected at bt=0 on defensive-AA peekers followed by a blind flip — that is the case the (default-off) Animation-Layer side read exists for.")
+_cs_log_color_raw("V11.20: two targeted fixes + one measurement, nothing else touched (dump v11.18: 79.7%, first-shot 83%). (1) extrapolate_yaw — the always-on interp-comp (lerp + ping/2) had NO gate: a standing enemy flicking his view for a tick got +12° on a proven 11° magnitude (neptune2much still=true, 5 L-hits: Static-Server-Dom-Recall fired -23.9 = 11.5 + 12.4 comp). Stationary / slow enemies and an inconsistent yaw_rate buffer now get no comp. (2) Global hard-reset two-magnitude guard: the bimodal flag needs 2+2 real hits, so Burgie (L 56 / R 24.5) thrashed the global EMA on every side change and each reset decimated that side's real count (1/3 became 1/1). When both sides hold samples that disagree by more than 10, a side-matching hit blends instead of resetting. (3) [CANCEL] dump line — ticks held per reason, hold episodes, and hit/miss of the first shot after a hold; the next dump decides whether cancel-low-confidence earns its keep.")
 _cs_log_color_raw("Logging: " .. (log_enabled:get() and ("ON" .. (log_verbose:get() and " (verbose)" or ""))  or "OFF"))
 _cs_log_color_raw("=========================================")
