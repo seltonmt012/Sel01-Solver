@@ -1,16 +1,16 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 11.25                                  ║
+-- ║  Version: 11.26                                  ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 11.25
--- @description v11.25 bug pass: passive per-side seed tracks the live passive value
---   while a side has no real hit (was frozen at first write); global passive seed
---   takes the better-observed side, not max(L, R). History in git.
+-- @version 11.26
+-- @description v11.26 bug pass: lead no longer counted as desync (ack err + hit
+--   learning use the eye the resolve was built on), idle decay only for seed-only
+--   enemies, pending keep score survives dormancy. History in git.
 
-local SEL01_VERSION = "11.25"
+local SEL01_VERSION = "11.26"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -3288,7 +3288,10 @@ local function reset_state(s)
     -- real hits, but never cleared a stale one. Both halves are needed.
     s.bimodal            = false
     s.serverfail_streak  = 0
-    s.pending_keep_side  = nil
+    -- V11.26: pending_keep_side is NOT cleared here any more. The [KEEP] STATIC
+    -- bucket read "-" for sessions: static enemies are exactly the ones you
+    -- re-engage after a dormancy gap, and the reset threw the pending score away
+    -- before the next shot could settle it. It is settled on the next shot, whenever.
     resolver_clear_serverfail_retry(s)
 end
 
@@ -4940,6 +4943,13 @@ local function _pick_first_shot_impl(p, s, anim, eye_yaw, max_desync, preset)
             end
         end
     end
+    -- V11.26: remember the eye we are about to resolve AGAINST (interp-comp / lead
+    -- applied). resolve_player stores it as last_eye_yaw, so a lead no longer shows up
+    -- as "magnitude error" in the ack (dump kurokoai: Networked-Meas R 40.0 vs 26.4
+    -- measured = 26.4 + 13.6 lead at yaw_rate -209) and is no longer LEARNED into the
+    -- desync EMA on a hit. The first-contact cap in resolve_player keeps using the
+    -- raw eye on purpose (that is a physical cone, lead included).
+    s._eye_used = eye_yaw
 
     -- V9.67: DIRECT-SIDE SOURCES (pose read / on-shot flip / switch-period). When one of
     -- these opt-in levers produces a confident side, resolve straight at the per-side
@@ -5843,7 +5853,13 @@ local function resolve_player(p)
     local now = tick_cache.curtime
 
     -- V9.2: decay measured_desync when player idle 60s+ (handles AA-config switch mid-match)
-    if s.last_seen > 0 and s.measured_desync > 0 then
+    -- V11.26: decay only what is a SEED. A magnitude measured from real hits does not
+    -- rot with time — dump brandogdsa: one real L-hit at 37.5, six minutes away, the
+    -- live EMA had decayed to 26.3 (persist still 37.5), Static-ServerBoost-Recall
+    -- fired 26.3 at bt=0 and missed. A genuine preset switch is caught by the V9.30
+    -- hard-reset on the next hit; the seed-only case keeps the old behaviour.
+    if s.last_seen > 0 and s.measured_desync > 0
+       and (s.real_left or 0) + (s.real_right or 0) == 0 then
         local idle = now - s.last_seen
         if idle > 60 then
             -- gentle decay 5% per 60s idle, keeps high samples relevant longer
@@ -6689,6 +6705,7 @@ local function resolve_player(p)
     end
 
     if s.missed == 0 then
+        s._eye_used = nil  -- V11.26: set by _pick_first_shot_impl once a lead is applied
         angle = pick_first_shot_angle(p, s, anim, eye_yaw, max_desync, preset)
         -- V11.18: FIRST-CONTACT PHYSICAL CAP. The predictor's sanity check bounds only
         -- the LEAD (<30° vs raw eye), not lead + magnitude — and on a never-hit enemy
@@ -6715,7 +6732,10 @@ local function resolve_player(p)
     end
 
     -- store for measured-desync learning in aim_ack
-    s.last_eye_yaw  = eye_yaw
+    -- V11.26: the eye the first-shot resolve was built on (lead included) — see
+    -- _eye_used. BF resolves use the raw eye. Everything downstream (snapshot, hit
+    -- learning, ack err, BF "opposite" sign) now sees the pure desync delta.
+    s.last_eye_yaw  = (s.missed == 0 and s._eye_used) or eye_yaw
     -- V10.9: normalize before STORING. The applied yaw was already normalized, but the
     -- stored copy was not, so snapshots and logs carried values like 232.4 / -212.2.
     -- Every consumer computes its delta through NormalizeAngle, so this changes no maths
@@ -8283,5 +8303,6 @@ _cs_log_color_raw("V11.22: fake-flick BF ordering arms at 3 confirmed rest/±90/
 _cs_log_color_raw("V11.23: bug pass only (dump v11.21: 85.2%, first-shot 86%). (1) LBY-Snap used m_flLowerBodyYawTarget unchecked — fired resolved=15.3 against eye=-172.4, a 172° 'desync'; anything >65° off the eye is now treated as no snap (guess path). (2) That 'hit' gave Dance (8/8 RIGHT) a real_left=1 / persisted L=1/0.0° and made him a two-side switcher for the keep logic: no SIDE is taken from a hit delta beyond 120° (sign is arbitrary near 180; BF:+90 hits still count). (3) Fake-flick round-trip needs the return within 0.25s — a human corner-check (turn 90, turn back) scored like a 1-tick flick (6Feqzi1 ff=true/8, never flicked in six shots); with the v11.22 threshold at 3 that would have cost two ±90 probes after a miss.")
 _cs_log_color_raw("V11.24: bug pass only (dump v11.23: 75%, first-shot 75%). (1) The global AND the per-side hard-reset both decimated real_* on the same hit — one 12° magnitude move cut intection's 9-hit lock to 1 (×0.4 twice); dom / one-sided BF / jitter-veto lost standing and he was re-committed jitter. Decimated once now. (2) Persist per-side EMA: a V11.8 side-only hit (BF:+90) left dr=0 with sr=1, so the next real hit blended against 0 (Yumo R=2/19.4° after a 35.3° hit). No stored magnitude → value as-is. (3) A ±90 probe carries no side information: it no longer drives the flip/keep decision (cxr: BF:-90 miss flipped the side off err=65) and no longer fingerprints defensive AA (DEF-AA delta=90.0 off a probe's spread miss; cap 65). (4) Still-ServerBoost: the stationary path lacked the learned-magnitude boost Static-ServerBoost has — Yumo standing with 1 real L-hit @39.6 got Still-Server -9.0 (rebuild 30° short). With a real hit on the rebuild's side and a learned magnitude 5°+ larger, the learned one is fired.")
 _cs_log_color_raw("V11.25: bug pass only (dump v11.24). (1) The passive per-side seed was written once (gated on samples==0) and then frozen while passive_* kept updating — Zero: seeded L 32.4 at 12 obs, passive L drifted to 18.0 over 1219 obs, both shots fired the frozen 32.4 because effective_desync ranks a seeded EMA above the live passive value. A side with no real hit now tracks the live passive magnitude; sides with real hits untouched, no new side seeded. (2) Global passive seed took max(L, R): Zero R 56.9 from 189 obs beat L 18.0 from 1219. Now the better-observed side. Note: two different players both named '0' share one persist entry (name-hash sid) — a limitation of the name fallback, not fixable without a real Steam ID on this build.")
+_cs_log_color_raw("V11.26: bug pass only (dump v11.25: 74%, first-shot 76%). (1) last_eye_yaw stored the RAW eye while the first-shot resolve was built on the interp-comp / lead eye, so every lead showed up as magnitude error in the ack (kurokoai Networked-Meas R 40.0 vs 26.4 measured = 26.4 + 13.6 lead at -209°/s, then NOFREEZE) and was LEARNED as desync on a hit. The eye the resolve used is stored now; the first-contact 58° cap keeps the raw eye on purpose. (2) V9.2 idle decay shrank REAL measurements: brandogdsa 1 real L-hit 37.5, six minutes away, live EMA 26.3 (persist 37.5), Static-ServerBoost-Recall fired 26.3 at bt=0, miss. Decay now only for seed-only enemies. (3) [KEEP] STATIC always read '-': reset_state cleared pending_keep_side on dormancy, i.e. for exactly the static enemies you re-engage after a gap. Kept until the next shot settles it.")
 _cs_log_color_raw("Logging: " .. (log_enabled:get() and ("ON" .. (log_verbose:get() and " (verbose)" or ""))  or "OFF"))
 _cs_log_color_raw("=========================================")
