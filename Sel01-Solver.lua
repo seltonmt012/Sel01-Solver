@@ -1,16 +1,16 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 11.26                                  ║
+-- ║  Version: 11.27                                  ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 11.26
--- @description v11.26 bug pass: lead no longer counted as desync (ack err + hit
---   learning use the eye the resolve was built on), idle decay only for seed-only
---   enemies, pending keep score survives dormancy. History in git.
+-- @version 11.27
+-- @description v11.27 bug pass: first-shot + BF caches re-anchor their cached delta
+--   on the current eye (absolute angle drifted off a turning head for up to 20°);
+--   [HITBOX] tally + hitgroup on every ACK line. History in git.
 
-local SEL01_VERSION = "11.26"
+local SEL01_VERSION = "11.27"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -1197,7 +1197,7 @@ function sel01_ack_reset()
     sel01_ack_stats = { hit = 0, miss = 0, keep = 0, flip = 0, spread = 0, netcode = 0, nofreeze = 0, other = 0 }
     sel01_hit_bt = { ema = nil, n = 0 }
 end
-function sel01_ack_push(kind, idx, name, mode, aa, side, delta, meas, err, bt, hc, verdict, rl, rr, dt)
+function sel01_ack_push(kind, idx, name, mode, aa, side, delta, meas, err, bt, hc, verdict, rl, rr, dt, hb)
     name = tostring(name or "-"):gsub("%s+", ""):sub(1, 12)
     if name == "" then name = "-" end
     local side_s = (side or 0) > 0 and "R" or ((side or 0) < 0 and "L" or "·")
@@ -1207,11 +1207,12 @@ function sel01_ack_push(kind, idx, name, mode, aa, side, delta, meas, err, bt, h
     local ping = math.floor(tonumber(tick_cache and tick_cache.ping_ms) or 0)
     local ping_s = ping >= 80 and string.format("ping=%d HIGH", ping) or string.format("ping=%d", ping)
     local line = string.format(
-        "[ACK] %s idx=%d %s mode=%s aa=%s %s d=%+.1f meas=%.1f err=%s bt=%d hc=%d %s %s real=%d/%d%s",
+        "[ACK] %s idx=%d %s mode=%s aa=%s %s d=%+.1f meas=%.1f err=%s bt=%d hc=%d %s %s real=%d/%d%s%s",
         kind, tonumber(idx) or 0, name, tostring(mode or "?"), tostring(aa or "?"),
         side_s, tonumber(delta) or 0, tonumber(meas) or 0, err_s,
         tonumber(bt) or 0, tonumber(hc) or 0, ping_s, tostring(verdict or ""),
-        tonumber(rl) or 0, tonumber(rr) or 0, dt and " DT" or "")  -- V11.16: shot fired inside a DT-peek window
+        tonumber(rl) or 0, tonumber(rr) or 0, dt and " DT" or "",  -- V11.16: shot fired inside a DT-peek window
+        hb and (" hb=" .. tostring(hb)) or "")  -- V11.27: hitgroup hit (HIT) / aimed (MISS)
     local r = sel01_ack_ring
     r.head = (r.head % r.cap) + 1
     r[r.head] = line
@@ -1260,6 +1261,8 @@ sel01_keep_stats = { stat = { lo = { hit = 0, miss = 0 }, hi = { hit = 0, miss =
 -- what the first shot AFTER a hold did — the number that says whether the gate earns
 -- its keep or only delays shots ("ich schieße nicht, obwohl er treffbar wäre").
 sel01_cancel_stats = { sd = 0, conf = 0, blind = 0, mismatch = 0, episodes = 0, hold_ticks = 0, then_hit = 0, then_miss = 0 }
+-- V11.27: where the hits land (from player_hurt-reliable event.hitgroup on the ack)
+sel01_hg_stats = { head = 0, chest = 0, stomach = 0, arms = 0, legs = 0, other = 0 }
 function session_push_desync(v)
     if not v or v < 5 or v > 58 then return end  -- V9.33: cap at 58 (max desync) so >58 reads can't bias the median high
     local r = sel01_session_desyncs
@@ -1600,6 +1603,12 @@ local log_copy_btn = g_logging:button("📋 Copy Last Logs (for share)", functio
         _cs_log_raw(string.format("[ACK] %d hit / %d miss (%d shots) | KEEP %d  FLIP %d  NETCODE %d  SPREAD %d  NOFREEZE %d  other %d",
             a.hit or 0, a.miss or 0, tot, a.keep or 0, a.flip or 0, a.netcode or 0,
             a.spread or 0, a.nofreeze or 0, a.other or 0))
+        -- V11.27: hitgroup tally
+        local g = sel01_hg_stats
+        local gt = (g.head or 0) + (g.chest or 0) + (g.stomach or 0) + (g.arms or 0) + (g.legs or 0) + (g.other or 0)
+        _cs_log_raw(string.format("[HITBOX] hits by group — head %d (%.0f%%), chest %d, stomach %d, arms %d, legs %d, other %d",
+            g.head or 0, gt > 0 and (g.head or 0) / gt * 100 or 0,
+            g.chest or 0, g.stomach or 0, g.arms or 0, g.legs or 0, g.other or 0))
     end
     -- V9.95: animation-layer signal scoreboard. Compare the *-AnimGuess rows in MODE
     -- HIT-RATES below against plain *-Guess to judge whether the layers actually help.
@@ -1906,6 +1915,7 @@ local log_reset_session = g_logging:button("🗑 Reset Session Stats (in-memory)
     sel01_session_spreadfails = 0  -- V9.72: clear spread-RNG filter counter
     pcall(sel01_ack_reset)
     sel01_cancel_stats = { sd = 0, conf = 0, blind = 0, mismatch = 0, episodes = 0, hold_ticks = 0, then_hit = 0, then_miss = 0 }  -- V11.20
+    sel01_hg_stats = { head = 0, chest = 0, stomach = 0, arms = 0, legs = 0, other = 0 }  -- V11.27
     sel01_dt_stats = { seen = 0, max = 0, b3 = 0, b6 = 0, air = 0, duck = 0, fired = 0, reject_gap = 0, reject_ctx = 0, shot_hit = 0, shot_miss = 0 }
 sel01_keep_stats = { stat = { lo = { hit = 0, miss = 0 }, hi = { hit = 0, miss = 0 } },
                      mov  = { lo = { hit = 0, miss = 0 }, hi = { hit = 0, miss = 0 } } }  -- V10.0
@@ -3914,7 +3924,7 @@ events.aim_ack:set(function(event)
             elseif reason == "spread" then _v = "SPREAD" end
             pcall(sel01_ack_push, "MISS", Ent:get_index(), _nm, s.mode, s.aa_type,
                   ack_shot_side, ack_delta, ack_side_measured, ack_angle_err, bt, _hc, _v,
-                  s.real_left or 0, s.real_right or 0, s.dtpeek_active)
+                  s.real_left or 0, s.real_right or 0, s.dtpeek_active, _hb)
         end
     else
         -- V9.9-B: clear mode-blacklist + miss-counter on HIT (mode proven working)
@@ -4190,13 +4200,23 @@ events.aim_ack:set(function(event)
             pcall(function() _dmg = event.damage or 0 end)
             pcall(function() _hc = event.hitchance or 0 end)
             pcall(function() _hb = EV_HB[event.hitgroup or -1] end)
+            -- V11.27: session hitgroup tally — answers "why not the head" from the dump
+            do
+                local g = sel01_hg_stats
+                local k = (_hb == "head" or _hb == "neck") and "head"
+                       or (_hb == "chest") and "chest"
+                       or (_hb == "stomach" or _hb == "body") and "stomach"
+                       or (_hb == "l.arm" or _hb == "r.arm") and "arms"
+                       or (_hb == "l.leg" or _hb == "r.leg") and "legs" or "other"
+                g[k] = (g[k] or 0) + 1
+            end
             pcall(cs_event_hit, Ent:get_index(), _nm, _hb, _dmg, bt, _hc,
                   s.mode, s.measured_desync, s.last_hit_side)
             local _dlt = NormalizeAngle((src_res or 0) - (src_eye or 0))
             pcall(sel01_ack_push, "HIT", Ent:get_index(), _nm, s.mode, s.aa_type,
                   hit_side ~= 0 and hit_side or s.last_hit_side, _dlt,
                   s.measured_desync, 0, bt, _hc, "HIT",
-                  s.real_left or 0, s.real_right or 0, s.dtpeek_active)
+                  s.real_left or 0, s.real_right or 0, s.dtpeek_active, _hb)
         end
         s.missed = 0
         s.expl_l, s.expl_r = false, false  -- V11.2: new engagement, un-burn both sides
@@ -5425,13 +5445,23 @@ local function pick_first_shot_angle(p, s, anim, eye_yaw, max_desync, preset)
        and s.fs_cached_angle ~= nil
        and math.abs(NormalizeAngle(s.fs_cached_angle - s.fs_cached_eye)) >= 5 then
         s.mode = s.fs_cached_mode
-        return s.fs_cached_angle
+        -- V11.27: re-apply the cached DELTA to the CURRENT eye. The cache returned the
+        -- absolute angle it computed up to 150 ms ago while the eye kept moving (the
+        -- invalidation only trips at 20°): on a turning enemy the resolve drifted off
+        -- the head by the eye movement since caching. Dump APILAS: Static-Meas fired
+        -- -63.2 on a 58.5° lock — 58.5 plus 4.7° of eye drift inside the cache window.
+        -- The stability the cache exists for (same side, same magnitude, no branch
+        -- flip) is untouched; only the anchor follows the eye. Lead is re-applied the
+        -- same way so last_eye_yaw / the ack still see the pure desync (V11.26).
+        s._eye_used = NormalizeAngle(eye_yaw + (s.fs_cached_lead or 0))
+        return NormalizeAngle(eye_yaw + NormalizeAngle(s.fs_cached_angle - s.fs_cached_eye))
     end
     local angle = _pick_first_shot_impl(p, s, anim, eye_yaw, max_desync, preset)
     s.fs_cached_time  = now_ct
     s.fs_cached_eye   = eye_yaw
     s.fs_cached_angle = angle
     s.fs_cached_mode  = s.mode
+    s.fs_cached_lead  = s._eye_used and NormalizeAngle(s._eye_used - eye_yaw) or 0  -- V11.27
     return angle
 end
 
@@ -5441,7 +5471,11 @@ local function pick_bruteforce_angle(s, anim, eye_yaw, max_desync, p, preset)
     if s.bf_cached_missed == s.missed and s.bf_cached_angle ~= nil
        and s.bf_cached_eye and math.abs(NormalizeAngle(eye_yaw - s.bf_cached_eye)) < 20 then
         s.mode = s.bf_cached_mode
-        return s.bf_cached_angle
+        -- V11.27: same fix as the first-shot cache — this one lives for as long as the
+        -- miss count stands still, i.e. potentially seconds, during which the enemy's
+        -- eye can wander up to 19° before the invalidation trips. Re-anchor the cached
+        -- delta on the current eye; the probe itself (side, magnitude) is unchanged.
+        return NormalizeAngle(eye_yaw + NormalizeAngle(s.bf_cached_angle - s.bf_cached_eye))
     end
 
     -- V9.38: if the previous ack looked like a correct-angle server/backtrack
@@ -8304,5 +8338,6 @@ _cs_log_color_raw("V11.23: bug pass only (dump v11.21: 85.2%, first-shot 86%). (
 _cs_log_color_raw("V11.24: bug pass only (dump v11.23: 75%, first-shot 75%). (1) The global AND the per-side hard-reset both decimated real_* on the same hit — one 12° magnitude move cut intection's 9-hit lock to 1 (×0.4 twice); dom / one-sided BF / jitter-veto lost standing and he was re-committed jitter. Decimated once now. (2) Persist per-side EMA: a V11.8 side-only hit (BF:+90) left dr=0 with sr=1, so the next real hit blended against 0 (Yumo R=2/19.4° after a 35.3° hit). No stored magnitude → value as-is. (3) A ±90 probe carries no side information: it no longer drives the flip/keep decision (cxr: BF:-90 miss flipped the side off err=65) and no longer fingerprints defensive AA (DEF-AA delta=90.0 off a probe's spread miss; cap 65). (4) Still-ServerBoost: the stationary path lacked the learned-magnitude boost Static-ServerBoost has — Yumo standing with 1 real L-hit @39.6 got Still-Server -9.0 (rebuild 30° short). With a real hit on the rebuild's side and a learned magnitude 5°+ larger, the learned one is fired.")
 _cs_log_color_raw("V11.25: bug pass only (dump v11.24). (1) The passive per-side seed was written once (gated on samples==0) and then frozen while passive_* kept updating — Zero: seeded L 32.4 at 12 obs, passive L drifted to 18.0 over 1219 obs, both shots fired the frozen 32.4 because effective_desync ranks a seeded EMA above the live passive value. A side with no real hit now tracks the live passive magnitude; sides with real hits untouched, no new side seeded. (2) Global passive seed took max(L, R): Zero R 56.9 from 189 obs beat L 18.0 from 1219. Now the better-observed side. Note: two different players both named '0' share one persist entry (name-hash sid) — a limitation of the name fallback, not fixable without a real Steam ID on this build.")
 _cs_log_color_raw("V11.26: bug pass only (dump v11.25: 74%, first-shot 76%). (1) last_eye_yaw stored the RAW eye while the first-shot resolve was built on the interp-comp / lead eye, so every lead showed up as magnitude error in the ack (kurokoai Networked-Meas R 40.0 vs 26.4 measured = 26.4 + 13.6 lead at -209°/s, then NOFREEZE) and was LEARNED as desync on a hit. The eye the resolve used is stored now; the first-contact 58° cap keeps the raw eye on purpose. (2) V9.2 idle decay shrank REAL measurements: brandogdsa 1 real L-hit 37.5, six minutes away, live EMA 26.3 (persist 37.5), Static-ServerBoost-Recall fired 26.3 at bt=0, miss. Decay now only for seed-only enemies. (3) [KEEP] STATIC always read '-': reset_state cleared pending_keep_side on dormancy, i.e. for exactly the static enemies you re-engage after a gap. Kept until the next shot settles it.")
+_cs_log_color_raw("V11.27: bug pass (dump v11.26: 85.4%, first-shot 89%). (1) Both resolve caches returned an ABSOLUTE angle: the first-shot cache for 150 ms, the BF cache for as long as the miss count stood still — while the enemy's eye kept moving, with invalidation only at 20° drift. On a turning enemy the resolve drifted off the head by the eye movement since caching (APILAS: Static-Meas fired -63.2 on a 58.5° lock). Both now re-anchor the cached DELTA on the current eye; side / magnitude / mode are unchanged, only the anchor follows. (2) [HITBOX] dump line (head / chest / stomach / arms / legs) and the hitgroup on every ACK entry (hit group on a HIT, aimed group on a MISS) — the data to answer 'why not the head'.")
 _cs_log_color_raw("Logging: " .. (log_enabled:get() and ("ON" .. (log_verbose:get() and " (verbose)" or ""))  or "OFF"))
 _cs_log_color_raw("=========================================")
