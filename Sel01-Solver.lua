@@ -1,19 +1,21 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 11.30                                  ║
+-- ║  Version: 11.31                                  ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 11.30
--- @description v11.30: choke average ignores bursts above 14 ticks (fl_max keeps them).
+-- @version 11.31
+-- @description v11.31: dump-readiness % (Logging label + HUD line, 20 shots = 100%),
+--   SSG-Pro: HUD panel ON / custom crosshair OFF, alt_side_pick honours 2+ real hits
+--   on one side over a seeded tie. v11.30: choke average ignores bursts above 14 ticks.
 --   v11.29: fake-lag-aware tracking — update_jitter samples once per SERVER
 --   tick (yaw_rate in sim time, no duplicate frames in the jitter ring) and keeps a
 --   per-player choke profile (fl_avg/fl_max, fl_heavy) used proactively for lead -1 +
 --   full multipoint; [FL] hit-rate by target choke; animation-layer read scored in
 --   shadow ([ANIM] line) while the toggle stays off. v11.28 SSG body-hit fix. History in git.
 
-local SEL01_VERSION = "11.30"
+local SEL01_VERSION = "11.31"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -1363,6 +1365,13 @@ function alt_side_pick(s)
         if (s.last_hit_side or 0) < 0 then return  1 end
         return 0
     end
+    -- V11.31: ONE side has 2+ real hits, the other none → that is real dominance and
+    -- it must beat a seeded tie. Dump SherlokRST: real L0/R2 (both hits RIGHT), seeded
+    -- samp L2/R2 → tie → blind alternation off last_hit_side → Predicted-Alt shot LEFT,
+    -- missed, FLIP back to right. Two real same-side hits with zero on the other side
+    -- are exactly the "streak dom" case the seeded branch below exists for.
+    if rl >= 2 and rr == 0 then return -1 end
+    if rr >= 2 and rl == 0 then return  1 end
     if sl >= sr + 2 then return -1 end
     if sr >= sl + 2 then return  1 end
     if (s.last_hit_side or 0) > 0 then return -1 end
@@ -1451,6 +1460,30 @@ function learning_sticky_set(e, key, nkey, value)
         else
             e[nkey] = n - 1
         end
+    end
+end
+
+-- V11.31: DUMP READINESS — how much a copy right now is worth. Session shots drive
+-- it (10 shots = 50%, 20+ = 100%); updated via :name() from createmove once a second
+-- and mirrored on the HUD panel. GLOBAL (main chunk at the 200-local cap).
+sel01_dump_lbl = g_logging:label("📋 Dump readiness: 0% — 0 shots (20 = full)")
+sel01_dump_lbl_txt = ""
+function sel01_dump_readiness()
+    local shots = (session_stats.total_hits or 0) + (session_stats.total_miss or 0)
+    local pct = math.min(100, math.floor(shots / 20 * 100 + 0.5))
+    local txt
+    if pct >= 100 then
+        txt = string.format("📋 Dump readiness: 100%% — %d shots, copy now ✓", shots)
+    else
+        txt = string.format("📋 Dump readiness: %d%% — %d shots (20 = full)", pct, shots)
+    end
+    return pct, shots, txt
+end
+function sel01_dump_lbl_update()
+    local _, _, txt = sel01_dump_readiness()
+    if txt ~= sel01_dump_lbl_txt then
+        sel01_dump_lbl_txt = txt
+        pcall(function() sel01_dump_lbl:name(txt) end)
     end
 end
 
@@ -2822,12 +2855,12 @@ local function apply_preset(name)
         safe_set(esp_master,         true)
         safe_set(esp_show_labels,    true)
         safe_set(esp_show_confbar,   true)
-        safe_set(esp_show_hud,       false)
+        safe_set(esp_show_hud,       true)    -- V11.31: HUD panel back ON (confidence + dump readiness live there)
         safe_set(esp_wedge,          false)
         safe_set(esp_flash,          false)
         safe_set(esp_enh,            false)
         safe_set(esp_event_ticker,   false)
-        safe_set(xh_enable,          true)    -- V11.21: sniper crosshair (unscoped)
+        safe_set(xh_enable,          false)   -- V11.31: custom crosshair OFF in SSG-Pro (user request)
         safe_set(exp_lock_headpref,  true)   -- V9.96: precision preset wants heads on locked targets
         -- V9.96: on-shot flip stays ON (well-gated, common in HvH). Pose calibration is
         -- retired (dead end on this build) — the v9.95 animation-layer side read replaces
@@ -7009,7 +7042,16 @@ pcall(function() events.ragebot_fire:set(aim_fire_handler) end)
 local _last_auto_save = 0
 local AUTO_SAVE_INTERVAL = 10
 
+sel01_dump_lbl_t = 0
 events.createmove:set(function(cmd)
+    -- V11.31: dump-readiness label, 1 Hz, before the enable gate (stats exist either way)
+    do
+        local rt = globals.realtime or 0
+        if rt - sel01_dump_lbl_t >= 1.0 then
+            sel01_dump_lbl_t = rt
+            pcall(sel01_dump_lbl_update)
+        end
+    end
     if not resolver.enable:get() then return end
     entity.get_players(true, false, function(p)
         pcall(resolve_player, p)
@@ -7666,9 +7708,16 @@ local function esp_refresh_cache()
     hud_cache.txt_toprate = string.format("  Hit-rate: %.0f%% (%d shots)", top_rate, top_total)
     local ar, ag, ab = color_by_confidence(hud_cache.avg_conf)
     hud_cache.conf_col = color(ar, ag, ab, 255)
+    -- V11.31: dump readiness line (same number as the Logging-tab label)
+    pcall(function()
+        local pct, shots = sel01_dump_readiness()
+        hud_cache.txt_dump = string.format("Dump: %d%% (%d shots%s)", pct, shots, pct >= 100 and " — copy now" or " / 20")
+        local dr, dg, db = color_by_confidence(pct)
+        hud_cache.dump_col = color(dr, dg, db, 255)
+    end)
     pcall(function()
         local screen = render.screen_size()
-        local panel_w, panel_h = 320, 150
+        local panel_w, panel_h = 320, 166
         local pos = esp_hud_pos and tostring(esp_hud_pos:get()) or "Bottom-Left"
         local x0, y0
         if     pos == "Bottom-Right" then x0 = screen.x - panel_w - 20; y0 = screen.y - panel_h - 20
@@ -7908,7 +7957,7 @@ local esp_paint_handler = function()
         -- V9.71 perf: panel position + screen_size + static line text now cached in
         -- esp_refresh_cache (10Hz) — draw path only positions and blits.
         local x0, y0 = hud_cache.x0 or 20, hud_cache.y0 or 80
-        local panel_w, panel_h = 320, 150
+        local panel_w, panel_h = 320, 166   -- V11.31: +1 line (dump readiness)
         local line_h = 14
 
         -- background panel + border (drawn every frame)
@@ -7987,6 +8036,8 @@ local esp_paint_handler = function()
                 string.format("Trend: %s (recent %.0f%% vs early %.0f%%)",
                     trend_str, session_stats.recent_rate, session_stats.early_rate))
         end
+        -- V11.31: dump readiness (red → yellow → green, same as the Logging-tab label)
+        render.text(3, vector(x0, y0 + line_h * 9 + 4), hud_cache.dump_col or ESP_COL_TXT2, nil, hud_cache.txt_dump or "")
         -- V9.50: server-fail filter readout. Shows how many correct-angle misses the
         -- server rejected (stale backtrack) were excluded from the hit-rate above, so the
         -- headline % is trustworthy and the netcode load on this server is visible.
