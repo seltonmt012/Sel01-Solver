@@ -1,12 +1,24 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Config — Neverlose CSGO HvH config        ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 4.0                                    ║
+-- ║  Version: 4.1                                    ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Config
 -- @author seltonmt01
--- @version 4.0
--- @description v4.0 FULL ANTI-AIM REWORK (per-state engine + defensive + copy-logs):
+-- @version 4.1
+-- @description v4.1 AI PEEK REWRITE + first-dump fixes:
+--   * AI Peek now holds an anchor and only steps out when utils.trace_bullet from a
+--     candidate peek position (perpendicular to the threat, wall-traced, eye height)
+--     would deal NL Min. Damage - 5 to an enemy hitbox (aiPeek_61044 algorithm).
+--     Quick-stop on the point, retreat on events.aim_fire, exposure timeout, DT
+--     teleport back, "hittable from cover → don't move" (angelwings). The v3.28
+--     version waited for aim_fire (= already exposed) and ran TOWARD the enemy.
+--   * Crouching / Crouch-Move get their own state rows in the defaults + presets
+--     (first dump: 6/11 hits taken in Crouch-Move on the Global rows).
+--   * Copy dump: [NL] line shows EFFECTIVE (override) values, menu values separately,
+--     [AIPEEK] line, timeline no longer floods stand↔move flicker, new hints
+--     (hits during active defensive, hits on Global rows, one-tap lobby).
+-- @description-prev v4.0 FULL ANTI-AIM REWORK (per-state engine + defensive + copy-logs):
 --   * The v3 "presets" only wrote Body Yaw limits / inverter noise; Pitch, Yaw Base,
 --     Yaw Modifier and Jitter combos in the menu were decorative and the yaw-base
 --     rotation wrote invalid option strings (Base takes "At Target"/"Local View").
@@ -91,7 +103,7 @@
 --     variance for full per-side chaos.
 --   * MAG-JIT indicator added to bottom HvH strip; dumped in v3.8 stats.
 
-local SEL01_CFG_VERSION = "4.0"
+local SEL01_CFG_VERSION = "4.1"
 
 -- DEBUG: print to CSGO console at major load checkpoints. Plain print() bypasses
 -- NL chat (which may not flush before crash) and writes directly to CSGO console.
@@ -230,8 +242,15 @@ AA.STATE_DEFAULTS = {
     slow    = { use_global = false, yaw_mode = "Center Jitter", yaw_l = -6, yaw_r = 6, yaw_jit = 12, yaw_rand = 8,
                 body_mode = "Jitter (side switch)", body_mag = "Random Min-Max", body_l = 60, body_r = 60, body_min = 45,
                 sw_mode = "Random delay", sw_delay = 2, sw_lo = 1, sw_hi = 2, freestand = false, defensive = "On threat", fakelag = 0 },
-    duck    = { use_global = true },
-    duckmv  = { use_global = true },
+    -- v4.1: crouch states get their own rows. First real dump: 6/11 hits taken were in
+    -- Crouch-Move on the Global rows — crouch-walking is a slow-walk in disguise, so it
+    -- gets the slow-walk recipe (fast random switch, high min magnitude, no freestand).
+    duck    = { use_global = false, yaw_mode = "Center Jitter", yaw_l = -4, yaw_r = 4, yaw_jit = 16, yaw_rand = 6,
+                body_mode = "Jitter (side switch)", body_mag = "Random Min-Max", body_l = 60, body_r = 60, body_min = 45,
+                sw_mode = "Random delay", sw_delay = 2, sw_lo = 1, sw_hi = 2, freestand = false, defensive = "On threat", fakelag = 0 },
+    duckmv  = { use_global = false, yaw_mode = "Center Jitter", yaw_l = -6, yaw_r = 6, yaw_jit = 14, yaw_rand = 8,
+                body_mode = "Jitter (side switch)", body_mag = "Random Min-Max", body_l = 60, body_r = 60, body_min = 45,
+                sw_mode = "Random delay", sw_delay = 2, sw_lo = 1, sw_hi = 2, freestand = false, defensive = "On threat", fakelag = 0 },
     air     = { use_global = false, yaw_mode = "Random", yaw_l = 0, yaw_r = 0, yaw_jit = 26, yaw_rand = 6,
                 body_mode = "Jitter (side switch)", body_mag = "Random Min-Max", body_l = 60, body_r = 60, body_min = 30,
                 sw_mode = "Every send", sw_delay = 1, sw_lo = 1, sw_hi = 2, freestand = false, defensive = "Always", fakelag = 0 },
@@ -390,18 +409,40 @@ g_move:label(accent .. "  Slow-walk / Fake-duck: NL Anti Aim/Misc tab")
 -- deliberately BREAK the v9.18 never-override rule (user-requested full-send) and
 -- are restored the tick the peek ends / feature disables. Default OFF.
 g_move:label(" ")
-g_move:label(accent .. ui.get_icon"crosshairs" .. accent .. "  AI Peek (auto peek-shoot-retreat)")
-local mv_aipeek        = g_move:switch("Enable AI Peek", false)
-local mv_aipeek_mode   = g_move:combo("AI Peek Trigger", {"Hold Hotkey", "Always On"}, 1)
-local mv_aipeek_key    = g_move:hotkey("AI Peek Key (hold)")
-local mv_aipeek_range  = g_move:slider("Max Range (u)", 200, 4000, 2500)
-local mv_aipeek_hold   = g_move:slider("Peek Hold (ms)", 100, 600, 280)
-local mv_aipeek_retr   = g_move:slider("Retreat (ms)", 100, 1000, 280)
-local mv_aipeek_rate   = g_move:slider("Rate Limit (ms)", 0, 3000, 200)
-local mv_aipeek_hc     = g_move:slider("Peek Hit Chance (0=keep NL)", 0, 100, 35)
-local mv_aipeek_unsafe = g_move:switch("Unsafety (drop Safe Points during peek)", false)
-local mv_aipeek_wpn    = g_move:combo("Weapon Filter", {"All", "Snipers only", "Pistols only", "Deagle only"}, 1)
-local mv_aipeek_dev    = g_move:switch("Dev Mode (console debug)", false)
+g_move:label(accent .. ui.get_icon"crosshairs" .. accent .. "  AI Peek (hold cover → step out when a shot exists → back)")
+-- v4.1 AI Peek rewrite (aiPeek_61044 algorithm): you stand at a spot; the script anchors
+-- there and HOLDS. Every tick it builds candidate positions left/right of the anchor
+-- (perpendicular to the threat, traced against walls) and runs utils.trace_bullet from
+-- each candidate EYE position to the enemy hitboxes. Only when a candidate yields at
+-- least NL Min. Damage does it strafe to that point (P-controlled, stops on the point),
+-- lets the ragebot fire, then returns to the anchor (DT teleport back when charged).
+-- Elements live in one table (main-chunk local budget).
+local AIP = {}
+AIP.enable   = g_move:switch("Enable AI Peek", false)
+AIP.mode     = g_move:combo("Trigger", { "Hold Hotkey", "Always On" }, 1)
+AIP.key      = g_move:hotkey("AI Peek Key (hold)")
+AIP.dist     = g_move:slider("Peek distance (u)", 10, 120, 40)
+AIP.delay    = g_move:slider("Confirm ticks before peeking", 0, 5, 1)
+AIP.expose   = g_move:slider("Max exposure without a shot (ms)", 150, 1500, 450)
+AIP.cooldown = g_move:slider("Cooldown after retreat (ms)", 0, 2000, 250)
+AIP.retreat  = g_move:combo("Retreat", { "After the shot", "When no shot exists" }, 1)
+AIP.dt_wait  = g_move:switch("Wait for DT charge (when DT is on)", false)
+AIP.dt_tele  = g_move:switch("DT teleport back on retreat", true)
+AIP.keys     = g_move:switch("Pause while you move manually", true)
+AIP.hitboxes = g_move:combo("Check hitboxes", { "Head + Body", "Head only", "Body only" }, 1)
+AIP.hc       = g_move:slider("Peek Hit Chance (0 = keep NL)", 0, 100, 0)
+AIP.unsafe   = g_move:switch("Drop Safe Points during the peek", false)
+AIP.wpn      = g_move:combo("Weapon Filter", { "All", "Snipers only", "Pistols only", "Deagle only" }, 1)
+AIP.vis      = g_move:switch("Draw peek point + target hitbox", true)
+AIP.dev      = g_move:switch("Dev Mode (console debug)", false)
+pcall(function()
+    AIP.enable:tooltip("Stand still behind cover with the key held (or Always On). The bot only moves when a traced bullet from a peek position would deal NL Min. Damage (-5) to an enemy.")
+    AIP.dist:tooltip("How far left/right of the anchor the peek positions are searched. Walls cut it short automatically.")
+    AIP.delay:tooltip("Consecutive ticks a shot must exist before committing. 0 = instant, 1-2 filters flickering sightlines.")
+    AIP.expose:tooltip("Safety: standing on the peek point this long without the ragebot firing → retreat anyway.")
+    AIP.retreat:tooltip("After the shot = go back the moment events.aim_fire says the ragebot committed (default). When no shot exists = stay out while a shot is still possible.")
+    AIP.hc:tooltip("0 keeps your NL Hit Chance (recommended - the bot stops on the point, NL auto-stop handles the rest). A value here overrides HC only while peeking.")
+end)
 
 -- ══════════════════════════════════════════════════════════════════════════
 -- VISUALS UI
@@ -744,6 +785,12 @@ local AA_PRESETS = {
             slow    = { use_global = false, yaw_mode = "Center Jitter", yaw_l = -8, yaw_r = 8, yaw_jit = 14, yaw_rand = 10,
                         body_mode = "Jitter (side switch)", body_mag = "Random Min-Max", body_min = 45,
                         sw_mode = "Random delay", sw_lo = 1, sw_hi = 2, freestand = false, defensive = "Always" },
+            duck    = { use_global = false, yaw_mode = "Center Jitter", yaw_l = -4, yaw_r = 4, yaw_jit = 18, yaw_rand = 8,
+                        body_mode = "Jitter (side switch)", body_mag = "Random Min-Max", body_min = 45,
+                        sw_mode = "Random delay", sw_lo = 1, sw_hi = 2, freestand = false, defensive = "Always" },
+            duckmv  = { use_global = false, yaw_mode = "Center Jitter", yaw_l = -8, yaw_r = 8, yaw_jit = 14, yaw_rand = 10,
+                        body_mode = "Jitter (side switch)", body_mag = "Random Min-Max", body_min = 45,
+                        sw_mode = "Every send", freestand = false, defensive = "Always" },
             air     = { use_global = false, yaw_mode = "Random", yaw_jit = 34, yaw_rand = 8,
                         body_mode = "Jitter (side switch)", body_mag = "Random Min-Max", body_min = 25,
                         sw_mode = "Every send", freestand = false, defensive = "Always" },
@@ -772,6 +819,12 @@ local AA_PRESETS = {
                         body_mode = "Jitter (side switch)", body_mag = "Random Min-Max", body_min = 45,
                         sw_mode = "Fixed delay", sw_delay = 2, freestand = true, defensive = "On threat" },
             slow    = { use_global = false, yaw_mode = "Center Jitter", yaw_l = -4, yaw_r = 4, yaw_jit = 8, yaw_rand = 6,
+                        body_mode = "Jitter (side switch)", body_mag = "Random Min-Max", body_min = 50,
+                        sw_mode = "Random delay", sw_lo = 1, sw_hi = 2, freestand = true, defensive = "On threat" },
+            duck    = { use_global = false, yaw_mode = "Center Jitter", yaw_l = -3, yaw_r = 3, yaw_jit = 10, yaw_rand = 4,
+                        body_mode = "Jitter (side switch)", body_mag = "Random Min-Max", body_min = 50,
+                        sw_mode = "Random delay", sw_lo = 1, sw_hi = 3, freestand = true, defensive = "On threat" },
+            duckmv  = { use_global = false, yaw_mode = "Center Jitter", yaw_l = -4, yaw_r = 4, yaw_jit = 8, yaw_rand = 6,
                         body_mode = "Jitter (side switch)", body_mag = "Random Min-Max", body_min = 50,
                         sw_mode = "Random delay", sw_lo = 1, sw_hi = 2, freestand = true, defensive = "On threat" },
             air     = { use_global = false, yaw_mode = "Random", yaw_jit = 20, yaw_rand = 4,
@@ -977,7 +1030,11 @@ local function aa_engine_tick(cmd)
     -- ── 1. state ──
     local key, airborne, ducked, vel, slow = aa_get_state(lp, cmd)
     if key ~= aa_eng.state then
-        aa_tl_push("STATE", tostring(aa_eng.state) .. " → " .. key .. string.format(" (vel %.0f)", vel))
+        -- v4.1: the timeline only logs a transition once the previous state lasted 0.3s
+        -- (stand↔move flicker at start/stop flooded the first real dump)
+        if now - aa_eng.state_since >= 0.3 then
+            aa_tl_push("STATE", tostring(aa_eng.state) .. " → " .. key .. string.format(" (vel %.0f)", vel))
+        end
         aa_eng.state, aa_eng.state_since = key, now
     end
     local S = AA.st[key]
@@ -1429,79 +1486,62 @@ end
 -- combo = yaw-offset math; Fake-lag variance combo).
 
 -- ══════════════════════════════════════════════════════════════════════════
--- AI PEEK (V3.28) — auto peek → shoot → retreat state machine. Original code.
+-- AI PEEK (v4.1) — hold cover → trace-bullet search for a peek point → step out →
+-- ragebot fires → back to the anchor. Algorithm follows aiPeek_61044 `ai_peek_func`
+-- (candidate points perpendicular to the threat, utils.trace_bullet from the candidate
+-- EYE position to enemy hitboxes, NL Min. Damage - 5 threshold, confirm ticks, 25-tick
+-- side lock, P-controlled go_to, DT teleport back). The v3.28/3.29 version waited for
+-- aim_fire (= enemy already visible = we were already exposed) and then ran TOWARD the
+-- enemy on a timer — the opposite of a peek.
 -- ══════════════════════════════════════════════════════════════════════════
 local ai_peek = {
-    phase     = "idle",   -- idle | peek | retreat
-    until_t   = 0,
-    last_peek = 0,
-    anchor_x  = 0, anchor_y = 0,
-    tx = 0, ty = 0,
-    hc_active = false,
-    sp_active = false,
-    dev_t     = 0,
-    -- V3.29 "hittable" gate: set by the events.aim_fire handler. The NL ragebot
-    -- only fires aim_fire when it has a target whose ESTIMATED damage clears the
-    -- ragebot's Hit Chance + we additionally compare event.damage against the
-    -- user's NL Min. Damage. While that signal is fresh the enemy is provably
-    -- hittable-for-min-dmg → only then do we peek. No fresh signal → bot holds.
-    shootable_until = 0,
-    aim_x = 0, aim_y = 0,  -- world aim point from event.aim (safe vector, no entity read)
+    anchor = nil,          -- vector: where you stood when the trigger began (cover)
+    phase = "off",         -- off | hold | peek | retreat
+    side = nil,            -- 0 = left of the threat direction, 1 = right (locked)
+    ent = nil,             -- locked enemy entity
+    lock_tick = 0,         -- last tick a shot existed (unlock after 25)
+    confirm = 0,           -- consecutive ticks with a shot point
+    shoot = nil,           -- { pos, hb, side, ent, dmg }
+    points = {},           -- candidate positions (for the drawing)
+    peek_t0 = 0,           -- when we reached / started moving to the point
+    retreat_until = 0, cooldown_until = 0,
+    shot_tick = -1,        -- events.aim_fire tick (ragebot committed)
+    tele_done = false,
+    hc_active = false, sp_active = false,
+    dev_t = 0, def_until = {},   -- per-enemy defensive window (sim time went backwards)
+    peeks = 0, shots = 0, timeouts = 0,
 }
-local AI_PEEK_SHOOTABLE_FRESH = 0.35   -- seconds an aim_fire keeps the peek "armed"
-
-local function ai_peek_origin(ent)
-    local o = nil
-    pcall(function() o = ent.m_vecOrigin end)
-    return o
-end
 
 -- weapon filter: combo :get() returns the option STRING (NL convention)
-local function ai_peek_weapon_ok()
+local function ai_peek_weapon_ok(lp)
     local sel = "All"
-    pcall(function() sel = mv_aipeek_wpn:get() end)
-    if sel == "All" then return true end
-    local name = ""
+    pcall(function() sel = AIP.wpn:get() end)
+    local name, wtype, can_fire, clip = "", -1, true, 1
     pcall(function()
-        local lp = entity.get_local_player()
-        local w  = lp and lp:get_weapon()
-        if w then name = tostring(w:get_name() or ""):lower() end
+        local w = lp:get_player_weapon()
+        if not w then return end
+        name = tostring((w.get_name and w:get_name()) or w:get_classname() or ""):lower()
+        local inf = w:get_weapon_info()
+        if inf then wtype = tonumber(inf.weapon_type) or -1 end
+        can_fire = (w.m_flNextPrimaryAttack or 0) <= (globals.curtime or 0)
+        clip = w.m_iClip1
+        if clip == nil then clip = 1 end
     end)
-    if name == "" then return true end   -- unknown weapon → don't block the peek
+    -- weapon_type: 0 knife, 7 c4, 9 grenade, 11 healthshot-ish → never peek with those
+    if wtype == 0 or wtype == 7 or wtype == 9 or wtype == 11 then return false, "no gun" end
+    if clip == 0 then return false, "empty clip" end
+    if not can_fire then return false, "weapon busy" end
+    if sel == "All" or name == "" then return true end
     if sel == "Snipers only" then
-        return (name:find("ssg") or name:find("awp") or name:find("scar") or name:find("g3sg")) and true or false
+        return (name:find("ssg") or name:find("awp") or name:find("scar") or name:find("g3sg")) and true or false, "filtered"
     elseif sel == "Pistols only" then
         return (name:find("glock") or name:find("hkp2000") or name:find("usp") or name:find("p250")
             or name:find("fiveseven") or name:find("tec9") or name:find("cz75") or name:find("elite")
-            or name:find("deagle") or name:find("revolver")) and true or false
+            or name:find("deagle") or name:find("revolver")) and true or false, "filtered"
     elseif sel == "Deagle only" then
-        return (name:find("deagle") or name:find("revolver")) and true or false
+        return (name:find("deagle") or name:find("revolver")) and true or false, "filtered"
     end
     return true
-end
-
--- nearest alive non-dormant enemy (WalkBot get_enemies pattern). Returns x,y,z,dist
-local function ai_peek_nearest(lp, lo)
-    local best, bx, by, bz, bd = nil, 0, 0, 0, math.huge
-    local players = nil
-    pcall(function() players = entity.get_players(true) end)
-    if not players then return nil end
-    for _, e in ipairs(players) do
-        local alive = false
-        pcall(function() alive = e:is_alive() end)
-        local dorm = false
-        pcall(function() dorm = e:is_dormant() end)
-        if alive and not dorm and e ~= lp then
-            local o = ai_peek_origin(e)
-            if o then
-                local dx, dy, dz = o.x - lo.x, o.y - lo.y, o.z - lo.z
-                local d = math.sqrt(dx * dx + dy * dy + dz * dz)
-                if d < bd then bd = d; best = e; bx = o.x; by = o.y; bz = o.z end
-            end
-        end
-    end
-    if best then return bx, by, bz, bd end
-    return nil
 end
 
 -- raise ragebot HC + optionally drop Safe Points for the peek window only.
@@ -1509,14 +1549,14 @@ end
 local function ai_peek_set_overrides(on)
     if on then
         local hc = 0
-        pcall(function() hc = mv_aipeek_hc:get() end)
-        if hc and hc > 0 and nl_refs.rage_hc then
+        pcall(function() hc = AIP.hc:get() end)
+        if hc and hc > 0 and nl_refs.rage_hc and not ai_peek.hc_active then
             nl_override(nl_refs.rage_hc, hc)
             ai_peek.hc_active = true
         end
         local unsafe = false
-        pcall(function() unsafe = mv_aipeek_unsafe:get() end)
-        if unsafe and nl_refs.rage_safepoint then
+        pcall(function() unsafe = AIP.unsafe:get() end)
+        if unsafe and nl_refs.rage_safepoint and not ai_peek.sp_active then
             -- Safe Points is a COMBO on this build — string :override only (bool
             -- segfaults). "Off" is best-effort; pcall'd so a bad label no-ops.
             pcall(function() nl_refs.rage_safepoint:override("Off") end)
@@ -1534,95 +1574,299 @@ local function ai_peek_set_overrides(on)
     end
 end
 
-local function ai_peek_dev(msg)
-    if not (mv_aipeek_dev and mv_aipeek_dev:get()) then return end
+local function ai_peek_dev(msg, force)
+    if not (AIP.dev and AIP.dev:get()) then return end
     local now = globals.realtime or 0
-    if now - (ai_peek.dev_t or 0) < 0.5 then return end
+    if not force and now - (ai_peek.dev_t or 0) < 0.5 then return end
     ai_peek.dev_t = now
     cs_log("[AI-Peek] " .. tostring(msg))
 end
 
+local function ai_peek_reset(reason)
+    if ai_peek.phase ~= "off" then aa_tl_push("AIPEEK", "off (" .. tostring(reason) .. ")") end
+    ai_peek_set_overrides(false)
+    ai_peek.anchor, ai_peek.side, ai_peek.ent, ai_peek.shoot = nil, nil, nil, nil
+    ai_peek.points, ai_peek.confirm, ai_peek.phase = {}, 0, "off"
+end
+
+-- P-controlled move toward a world point (WalkBot-style world-space move_yaw; the
+-- ragebot keeps aiming freely). Stops dead on the point so NL auto-stop is happy.
+local function ai_peek_go_to(cmd, lp, lo, pos)
+    local dx, dy = pos.x - lo.x, pos.y - lo.y
+    local d = math.sqrt(dx * dx + dy * dy)
+    pcall(function() cmd.in_duck = false; cmd.in_jump = false; cmd.in_speed = false end)
+    if d < 5 then
+        -- angelwings / gazolina quick-stop: thrust AGAINST the current velocity so we
+        -- stand dead on the point within a tick (NL auto-stop then has nothing to do)
+        pcall(function()
+            local v = lp.m_vecVelocity
+            local sp = math.sqrt((v.x or 0) ^ 2 + (v.y or 0) ^ 2)
+            if sp > 5 then
+                cmd.move_yaw = math.deg(math.atan2(v.y, v.x))
+                cmd.forwardmove = -math.min(450, sp)
+            else
+                cmd.forwardmove = 0
+            end
+            cmd.sidemove = 0
+        end)
+        return d
+    end
+    pcall(function()
+        cmd.move_yaw = math.deg(math.atan2(dy, dx))
+        cmd.forwardmove = (d < 20) and math.max(120, d * 22) or 450
+        cmd.sidemove = 0
+    end)
+    return d
+end
+
+local AIP_BRUSH_MASK = 0x400B   -- MASK_SOLID_BRUSHONLY: world geometry only (WalkBot pattern)
+
 local function ai_peek_tick(cmd)
-    -- master/feature/cmd gate → restore any live overrides + reset
-    if not (cmd and enable_master:get() and mv_aipeek and mv_aipeek:get()) then
-        if ai_peek.phase ~= "idle" or ai_peek.hc_active or ai_peek.sp_active then
-            ai_peek_set_overrides(false)
-            ai_peek.phase = "idle"
-        end
+    -- master / feature gate → restore overrides + reset
+    if not (cmd and enable_master:get() and AIP.enable and AIP.enable:get()) then
+        if ai_peek.phase ~= "off" then ai_peek_reset("disabled") end
         return
     end
     local lp = entity.get_local_player()
-    if not lp then return end
     local alive = false
-    pcall(function() alive = lp:is_alive() end)
+    if lp then pcall(function() alive = lp:is_alive() end) end
     if not alive then
-        if ai_peek.phase ~= "idle" or ai_peek.hc_active or ai_peek.sp_active then
-            ai_peek_set_overrides(false); ai_peek.phase = "idle"
-        end
+        if ai_peek.phase ~= "off" then ai_peek_reset("dead") end
         return
     end
+    local now  = globals.realtime or 0
+    local tick = globals.tickcount or 0
 
-    local lo = ai_peek_origin(lp)
-    if not lo then return end
-    local now = globals.realtime or 0
-
-    -- trigger gate (hold-hotkey vs always-on)
+    -- trigger (hold-hotkey vs always-on)
     local triggered = true
-    local mode = "Hold Hotkey"
-    pcall(function() mode = mv_aipeek_mode:get() end)
-    if mode == "Hold Hotkey" then
-        triggered = (mv_aipeek_key and mv_aipeek_key:get()) and true or false
-    end
-
-    if ai_peek.phase == "idle" then
-        if not triggered then return end
-        if now - (ai_peek.last_peek or 0) < ((mv_aipeek_rate:get() or 0) / 1000) then return end
-        if not ai_peek_weapon_ok() then ai_peek_dev("weapon filtered"); return end
-        -- V3.29 HITTABLE GATE: only peek while a fresh aim_fire (damage >= NL min
-        -- dmg) has armed us. No shootable enemy → no aim_fire → bot stays put
-        -- instead of walking constantly.
-        if now >= (ai_peek.shootable_until or 0) then ai_peek_dev("not hittable (no min-dmg shot)"); return end
-        -- direction: prefer the armed aim point; fall back to nearest enemy.
-        local tx, ty = ai_peek.aim_x, ai_peek.aim_y
-        local td
-        local nx, ny, nz, nd = ai_peek_nearest(lp, lo)
-        if nx then td = nd; if not (tx ~= 0 or ty ~= 0) then tx, ty = nx, ny end end
-        if (tx == 0 and ty == 0) and not nx then ai_peek_dev("no target"); return end
-        if td and td > (mv_aipeek_range:get() or 2500) then
-            ai_peek_dev("too far " .. math.floor(td)); return
-        end
-        ai_peek.anchor_x, ai_peek.anchor_y = lo.x, lo.y
-        ai_peek.tx, ai_peek.ty = tx, ty
-        ai_peek.phase   = "peek"
-        ai_peek.until_t = now + ((mv_aipeek_hold:get() or 280) / 1000)
-        ai_peek_set_overrides(true)
-        ai_peek_dev("PEEK armed dist=" .. (td and math.floor(td) or "?"))
+    pcall(function() if AIP.mode:get() == "Hold Hotkey" then triggered = AIP.key:get() and true or false end end)
+    if not triggered then
+        if ai_peek.phase ~= "off" then ai_peek_reset("key released") end
         return
     end
 
-    if ai_peek.phase == "peek" then
-        -- strafe toward target to gain the sightline (world-space move_yaw,
-        -- independent of view → ragebot keeps aiming freely)
-        local ang = math.deg(math.atan2(ai_peek.ty - lo.y, ai_peek.tx - lo.x))
-        pcall(function() cmd.move_yaw = ang; cmd.forwardmove = 450 end)
-        if now >= ai_peek.until_t then
-            ai_peek.phase   = "retreat"
-            ai_peek.until_t = now + ((mv_aipeek_retr:get() or 280) / 1000)
-            ai_peek_set_overrides(false)   -- restore NL config the moment we pull back
-            ai_peek_dev("RETREAT")
-        end
+    local lo, flags, vel = nil, 0, 0
+    pcall(function()
+        lo = lp:get_origin()
+        flags = lp.m_fFlags or 0
+        local v = lp.m_vecVelocity
+        vel = math.sqrt((v.x or 0) ^ 2 + (v.y or 0) ^ 2)
+    end)
+    if not lo then return end
+    local on_ground = bit.band(flags, 1) ~= 0
+
+    -- manual movement pauses the bot and re-anchors where you stop
+    local user_moving = false
+    pcall(function() user_moving = (cmd.forwardmove ~= 0 or cmd.sidemove ~= 0) end)
+    if AIP.keys:get() and user_moving then
+        if ai_peek.anchor then ai_peek_reset("manual movement") end
         return
     end
 
+    -- anchor = where you stand when the trigger begins (needs ground + standing still)
+    if not ai_peek.anchor then
+        if not on_ground or vel > 15 then return end
+        ai_peek.anchor = vector(lo.x, lo.y, lo.z)
+        ai_peek.phase = "hold"
+        ai_peek.peek_t0, ai_peek.tele_done = 0, false
+        aa_tl_push("AIPEEK", string.format("anchored at %.0f %.0f %.0f", lo.x, lo.y, lo.z))
+        ai_peek_dev("anchored", true)
+    end
+    local anchor = ai_peek.anchor
+    local d_anchor = math.sqrt((lo.x - anchor.x) ^ 2 + (lo.y - anchor.y) ^ 2)
+
+    -- retreat / cooldown phases: drive back, no searching
+    local function go_home(why)
+        if ai_peek.phase == "peek" then
+            ai_peek.phase = "retreat"
+            ai_peek.retreat_until = now + 0.6
+            ai_peek_set_overrides(false)
+            aa_tl_push("AIPEEK", "retreat: " .. tostring(why))
+            ai_peek_dev("RETREAT " .. tostring(why), true)
+            -- DT teleport back (aiPeek pattern): one shot per retreat, only when charged
+            if AIP.dt_tele:get() and not ai_peek.tele_done then
+                local ch = 0
+                pcall(function() ch = rage.exploit:get() or 0 end)
+                if ch >= 1 then pcall(function() rage.exploit:force_teleport() end); ai_peek.tele_done = true end
+            end
+        end
+        if d_anchor > 3 then ai_peek_go_to(cmd, lp, lo, anchor) else pcall(function() cmd.forwardmove = 0; cmd.sidemove = 0 end) end
+    end
+    if not on_ground then go_home("airborne"); return end
     if ai_peek.phase == "retreat" then
-        local ang = math.deg(math.atan2(ai_peek.anchor_y - lo.y, ai_peek.anchor_x - lo.x))
-        pcall(function() cmd.move_yaw = ang; cmd.forwardmove = 450 end)
-        if now >= ai_peek.until_t then
-            ai_peek.phase     = "idle"
-            ai_peek.last_peek = now
-            ai_peek_dev("idle")
+        go_home("continuing")
+        if d_anchor <= 3 or now >= ai_peek.retreat_until then
+            ai_peek.phase = "hold"
+            ai_peek.cooldown_until = now + (AIP.cooldown:get() / 1000)
+            ai_peek.side, ai_peek.ent, ai_peek.confirm, ai_peek.shoot = nil, nil, 0, nil
         end
         return
+    end
+    if now < ai_peek.cooldown_until then go_home("cooldown"); return end
+
+    -- the ragebot committed a shot (events.aim_fire) → retreat immediately
+    if AIP.retreat:get() == "After the shot" and ai_peek.phase == "peek" and ai_peek.shot_tick >= ai_peek.peek_tick then
+        ai_peek.shots = ai_peek.shots + 1
+        go_home("shot fired")
+        return
+    end
+
+    -- gates that mean "hold / go back": no threat, wrong weapon, weapon busy, DT charging
+    local threat = nil
+    pcall(function() threat = entity.get_threat() end)
+    if not threat then ai_peek.points = {}; ai_peek.shoot = nil; go_home("no threat"); return end
+    local wok, wwhy = ai_peek_weapon_ok(lp)
+    if not wok then ai_peek.shoot = nil; go_home(wwhy or "weapon"); ai_peek_dev("hold: " .. tostring(wwhy)); return end
+    if AIP.dt_wait:get() then
+        local dt_on, ch = false, 1
+        pcall(function() dt_on = (nl_refs.rage_dt and nl_refs.rage_dt:get()) and true or false end)
+        if dt_on then pcall(function() ch = rage.exploit:get() or 0 end) end
+        if dt_on and ch < 1 then ai_peek.shoot = nil; go_home("DT charging"); ai_peek_dev("hold: DT charging"); return end
+    end
+
+    -- ── candidate peek positions (eye height), perpendicular to the threat ──
+    local to = nil
+    pcall(function() to = threat:get_origin() end)
+    if not to then go_home("no threat origin"); return end
+    local yaw_to = math.deg(math.atan2(to.y - anchor.y, to.x - anchor.x))
+    local eye_off = 64
+    pcall(function() eye_off = lp:get_eye_position().z - lo.z end)
+    local dist = AIP.dist:get()
+    local points = {}
+    local function side_dir(side)
+        local a = math.rad(yaw_to + ((side == 0) and -90 or 90))
+        return math.cos(a), math.sin(a)
+    end
+    local function traced_point(fx, fy, fz, tx, ty, tz)
+        local ex, ey, ez, frac = tx, ty, tz, 1
+        pcall(function()
+            local tr = utils.trace_line(vector(fx, fy, fz), vector(tx, ty, tz), lp, AIP_BRUSH_MASK)
+            if tr and tr.end_pos then ex, ey, ez, frac = tr.end_pos.x, tr.end_pos.y, tr.end_pos.z, tr.fraction or 1 end
+        end)
+        return ex, ey, ez, frac
+    end
+    local az = anchor.z + eye_off
+    if ai_peek.side ~= nil then
+        -- locked side: 7 steps along it so we peek only as far as needed
+        local cx, cy = side_dir(ai_peek.side)
+        local px, py = anchor.x, anchor.y
+        for i = 1, 7 do
+            local nx, ny, nz, frac = traced_point(px, py, az, px + cx * dist / 7, py + cy * dist / 7, az)
+            points[#points + 1] = { x = nx, y = ny, z = nz, side = ai_peek.side }
+            px, py = nx, ny
+            if frac < 1 then break end
+        end
+    else
+        for side = 0, 1 do
+            local cx, cy = side_dir(side)
+            local nx, ny, nz = traced_point(anchor.x, anchor.y, az, anchor.x + cx * dist, anchor.y + cy * dist, az)
+            points[#points + 1] = { x = nx, y = ny, z = nz, side = side }
+        end
+    end
+    ai_peek.points = points
+
+    -- ── trace bullets: candidate eye → enemy hitboxes, need NL Min. Damage - 5 ──
+    local mindmg = 5
+    pcall(function() mindmg = math.max((tonumber(nl_refs.rage_mindmg and nl_refs.rage_mindmg:get()) or 10) - 5, 5) end)
+    local hbsel = "Head + Body"
+    pcall(function() hbsel = AIP.hitboxes:get() end)
+    local shoot = nil
+    local enemies = nil
+    pcall(function() enemies = entity.get_players(true) end)
+    local list = {}
+    if ai_peek.ent then list[1] = ai_peek.ent elseif enemies then list = enemies end
+    -- angelwings check: a shot that already exists from the ANCHOR eye needs no peek —
+    -- the ragebot fires from cover; the anchor itself is candidate #0 while we hold
+    if ai_peek.phase ~= "peek" and d_anchor <= 5 then
+        table.insert(points, 1, { x = anchor.x, y = anchor.y, z = az, side = -1 })
+    end
+    for _, e in ipairs(list) do
+        if shoot then break end
+        local ok_e, e_alive, e_dorm = pcall(function() return e:is_alive(), e:is_dormant() end)
+        if ok_e and e_alive and not e_dorm then
+            -- enemy defensive (sim time went backwards) → body only for 12 ticks, ground only
+            local idx = 0
+            pcall(function() idx = e:get_index() end)
+            pcall(function()
+                local st = e:get_simulation_time()
+                if st and st.current and st.old and (st.current - st.old) <= -0.01 then
+                    ai_peek.def_until[idx] = tick + 12
+                end
+            end)
+            local defensive = (ai_peek.def_until[idx] or 0) > tick
+            local hbs = {}
+            pcall(function()
+                if hbsel ~= "Body only" and not defensive then
+                    local h = e:get_hitbox_position(0)
+                    if h then hbs[#hbs + 1] = vector(h.x, h.y, h.z + 2) end
+                end
+                if hbsel ~= "Head only" then
+                    local c = e:get_hitbox_position(5); if c then hbs[#hbs + 1] = c end
+                    local p = e:get_hitbox_position(2); if p then hbs[#hbs + 1] = p end
+                end
+            end)
+            local hp = 100
+            pcall(function() hp = e.m_iHealth or 100 end)
+            local need = math.min(mindmg, hp)
+            for _, pt in ipairs(points) do
+                if shoot then break end
+                local from = vector(pt.x, pt.y, pt.z)
+                for _, hb in ipairs(hbs) do
+                    local dmg, hit_e = 0, nil
+                    pcall(function()
+                        local d, tr = utils.trace_bullet(lp, from, hb, lp)
+                        dmg = tonumber(d) or 0
+                        hit_e = tr and tr.entity or nil
+                    end)
+                    if hit_e == e and dmg >= need then
+                        shoot = { pos = pt, hb = hb, side = pt.side, ent = e, dmg = dmg, idx = idx }
+                        break
+                    end
+                end
+            end
+        end
+    end
+
+    -- ── confirm + side lock ──
+    if shoot and shoot.side == -1 then
+        -- hittable from cover already: stay, let the ragebot work, keep the lock fresh
+        ai_peek.lock_tick = tick
+        ai_peek.shoot = shoot
+        ai_peek_dev("hittable from cover, holding")
+        go_home("hittable from cover")
+        return
+    end
+    if shoot then
+        ai_peek.confirm = ai_peek.confirm + 1
+        ai_peek.lock_tick = tick
+        if ai_peek.confirm < AIP.delay:get() then shoot = nil
+        elseif ai_peek.side == nil then
+            ai_peek.side, ai_peek.ent = shoot.side, shoot.ent
+            aa_tl_push("AIPEEK", string.format("shot found: side %s dmg %d (need %d) → peek", shoot.side == 0 and "L" or "R", shoot.dmg, mindmg))
+        end
+    else
+        ai_peek.confirm = 0
+        if tick - ai_peek.lock_tick > 25 or not ai_peek.ent then ai_peek.side, ai_peek.ent = nil, nil end
+    end
+    ai_peek.shoot = shoot
+
+    -- ── move ──
+    if shoot then
+        if ai_peek.phase ~= "peek" then
+            ai_peek.phase = "peek"
+            ai_peek.peek_t0, ai_peek.peek_tick, ai_peek.tele_done = now, tick, false
+            ai_peek.peeks = ai_peek.peeks + 1
+            ai_peek_set_overrides(true)
+            ai_peek_dev(string.format("PEEK side=%s dmg=%d", shoot.side == 0 and "L" or "R", shoot.dmg), true)
+        end
+        ai_peek_go_to(cmd, lp, lo, shoot.pos)
+        -- safety: exposed without a shot for too long → back
+        if now - ai_peek.peek_t0 > (AIP.expose:get() / 1000) then
+            ai_peek.timeouts = ai_peek.timeouts + 1
+            go_home("exposure timeout")
+        end
+    else
+        go_home("no shot")
     end
 end
 
@@ -1683,28 +1927,19 @@ local update_clantag = function() end
 -- registrations DISABLED. on_local_fire kept as a stub for any future re-enable.
 local function on_local_fire(event) end
 
--- V3.29: aim_fire RE-ENABLED for the AI Peek "hittable" gate ONLY. aim_ack +
--- player_hurt came back safely after the v1.13 bisect; this handler is stricter
--- still — it reads ONLY numeric fields (event.damage / event.hitchance) and the
--- event.aim VECTOR. It NEVER touches event.target's entity properties (the
--- transition-state crash source). NL fires aim_fire when the ragebot commits a
--- shot; we mark the enemy "hittable" only when the estimated damage clears the
--- user's NL Min. Damage, arming the peek for AI_PEEK_SHOOTABLE_FRESH seconds.
+-- aim_fire (re-enabled in v3.29 after the v1.13 bisect): v4.1 uses it ONLY as the
+-- "ragebot committed a shot" signal for the AI Peek retreat. Reads numeric fields
+-- only, never event.target's entity properties (transition-state crash source).
 pcall(function()
     if events.aim_fire then
         events.aim_fire:set(function(event)
             pcall(function()
                 if not event then return end
-                if not (mv_aipeek and mv_aipeek:get()) then return end
-                local dmg = tonumber(event.damage) or 0
-                local mindmg = 1
-                pcall(function() mindmg = tonumber(nl_refs.rage_mindmg and nl_refs.rage_mindmg:get()) or 1 end)
-                if dmg < mindmg then return end          -- NOT hittable for the configured min dmg
-                local now = globals.realtime or 0
-                ai_peek.shootable_until = now + AI_PEEK_SHOOTABLE_FRESH
-                local a = event.aim
-                if a then
-                    pcall(function() ai_peek.aim_x, ai_peek.aim_y = a.x, a.y end)
+                -- v4.1: the ragebot committed a shot → AI Peek retreats on the next tick.
+                -- Reads NOTHING from event.target (transition-state crash source).
+                ai_peek.shot_tick = globals.tickcount or 0
+                if ai_peek.phase == "peek" then
+                    aa_tl_push("AIPEEK", string.format("ragebot fired (dmg %d hc %d)", tonumber(event.damage) or 0, tonumber(event.hitchance) or 0))
                 end
             end)
         end)
@@ -2427,12 +2662,31 @@ pcall(function()
             end
         end
 
+        -- ── v4.1: AI PEEK drawing (peek point + target hitbox + candidates) ──
+        if AIP.vis:get() and ai_peek.phase ~= "off" then
+            pcall(function()
+                if ai_peek.anchor then render.circle_3d(ai_peek.anchor, color(120, 200, 255, 200), 6, 0, 1) end
+                for _, pt in ipairs(ai_peek.points or {}) do
+                    render.circle_3d(vector(pt.x, pt.y, pt.z - 60), color(255, 255, 255, 90), 3, 0, 1)
+                end
+                local s = ai_peek.shoot
+                if s and s.pos and s.hb then
+                    render.circle_3d(vector(s.pos.x, s.pos.y, s.pos.z - 60), color(80, 255, 120, 230), 5, 0, 1)
+                    render.circle_3d(s.hb, color(255, 80, 80, 230), 3, 0, 1)
+                    render.line_3d(vector(s.pos.x, s.pos.y, s.pos.z), s.hb, color(80, 255, 120, 120))
+                end
+            end)
+        end
+
         -- ── KEYBINDS PANEL (right-middle, active hotkeys list) ──
         if vis_keybinds:get() then
             local active = {}
             -- V2.7: show Peek Boost active state
             if _peek_boost_active then
                 table.insert(active, "Peek Boost: ACTIVE")
+            end
+            if ai_peek.phase ~= "off" then
+                table.insert(active, "AI Peek: " .. string.upper(ai_peek.phase) .. (ai_peek.shoot and " (shot)" or ""))
             end
             -- NL manual binds + double-tap if enabled show as fallback
             if #active > 0 then
@@ -2665,6 +2919,16 @@ local function _nl_get(ref, fallback)
     if ok then return v end
     return fallback
 end
+-- v4.1: EFFECTIVE value — the live :override when one is set, else the menu value.
+-- The first real dump printed menu values (mod=3-Way, opts=Jitter) while the engine was
+-- overriding them, which read like the engine was not writing at all.
+local function _nl_eff(ref, fallback)
+    if not ref then return fallback end
+    local ov = nil
+    pcall(function() if ref.get_override then ov = ref:get_override() end end)
+    if ov ~= nil then return ov end
+    return _nl_get(ref, fallback)
+end
 local function _b(v) return v and "ON" or "OFF" end
 -- multi-select :get() returns a table (array of labels OR {label=true}); join it
 local function _fmt_val(v)
@@ -2720,6 +2984,7 @@ local function aa_hints()
     local n = #hits_taken_log
     if n == 0 then H[#H + 1] = "no hits taken this session — nothing to tune yet"; return H end
     local by_state, by_side, head, nodt, uncharged, nothreat, pulsing, late_sw, react_hits, air = {}, { L = 0, R = 0 }, 0, 0, 0, 0, 0, 0, 0, 0
+    local def_active_hits, ug_hits, deaths = 0, 0, 0
     for _, e in ipairs(hits_taken_log) do
         local s = e.snapshot or {}
         by_state[s.state or "?"] = (by_state[s.state or "?"] or 0) + 1
@@ -2728,9 +2993,13 @@ local function aa_hints()
         if s.dt == false then nodt = nodt + 1 elseif (s.charge or 0) < 1 then uncharged = uncharged + 1 end
         if s.threat == false then nothreat = nothreat + 1 end
         if s.def_pulse then pulsing = pulsing + 1 end
+        if s.def_pulse or (s.def_ticks or 0) > 0 or s.dtlag then def_active_hits = def_active_hits + 1 end
         if (s.since_switch or 0) > 0.25 then late_sw = late_sw + 1 end
         if s.react then react_hits = react_hits + 1 end
-        if s.airborne then air = air + 1 end
+        -- v4.1: air by ENGINE state (the raw flag reads airborne on a death snapshot)
+        if s.state == "air" or s.state == "airduck" then air = air + 1 end
+        if s.uses_global then ug_hits = ug_hits + 1 end
+        if (e.hp_left or 1) <= 0 then deaths = deaths + 1 end
     end
     local top_state, top_n = "?", 0
     for k, v in pairs(by_state) do if v > top_n then top_state, top_n = k, v end end
@@ -2759,6 +3028,9 @@ local function aa_hints()
     if uncharged > 0 then H[#H + 1] = string.format("%d hits while DT was NOT charged → you were hit right after shooting; enable 'DT Lag Options = Always On' or peek less after a shot", uncharged) end
     if n >= 3 and pulsing == 0 and nodt + uncharged < n then H[#H + 1] = "defensive never pulsed at a hit → check per-state 'Defensive AA' (Off?) or use 'Always' on the states you die in" end
     if nothreat >= 2 then H[#H + 1] = string.format("%d hits from a non-threat (no hittable enemy known) → dormant / unexpected angle; not an AA problem", nothreat) end
+    if def_active_hits >= 2 then H[#H + 1] = string.format("%d hits landed WHILE defensive was active (pulse / shifted ticks / DT lag) → their resolver ignores defensive records; defensive alone will not save you, vary yaw + magnitude harder", def_active_hits) end
+    if n >= 4 and ug_hits / n >= 0.5 then H[#H + 1] = string.format("%d/%d hits in states that use the GLOBAL rows → give those states their own settings (Use Global OFF)", ug_hits, n) end
+    if deaths >= 3 and deaths / n >= 0.6 then H[#H + 1] = string.format("%d/%d hits were one-taps (hp 0) → sniper lobby: body-yaw magnitude matters less than SIDE + timing; prefer Every send / Random 1-2 and defensive Always", deaths, n) end
     if n >= 3 and late_sw / n >= 0.6 then H[#H + 1] = string.format("%d/%d hits landed >0.25s after the last side switch → switch delay too long for this lobby", late_sw, n) end
     if react_hits >= 2 then H[#H + 1] = string.format("%d hits INSIDE a hit-reaction burst → they re-hit you after the flip; try a longer burst or Random side during the burst", react_hits) end
     if air >= 2 then H[#H + 1] = string.format("%d hits airborne → Air-lag (Aggressive preset) or stop jumping into their angle", air) end
@@ -3039,15 +3311,25 @@ local function config_copy_logs()
         _fmt_val(_nl_get(nl_refs.rage_dtlag, "?")), _fmt_val(_nl_get(nl_refs.rage_hs_opts, "?")),
         _fmt_val(_nl_get(nl_refs.rage_safepoint, "?")), _fmt_val(_nl_get(nl_refs.rage_bodyaim, "?")),
         _fmt_val(_nl_get(nl_refs.rage_hitsafety, "?"))))
-    add(string.format("[NL] AA enabled=%s pitch=%s yaw=%s base=%s offset=%s mod=%s(%s) bodyyaw=%s inv=%s L/R=%s/%s opts=%s free=%s hidden=%s | fakelag on=%s limit=%s var=%s | fake latency=%s | slowwalk=%s fakeduck=%s",
-        _b(_nl_get(nl_refs.aa_enabled, false)), _fmt_val(_nl_get(nl_refs.aa_pitch, "?")), _fmt_val(_nl_get(nl_refs.aa_yaw, "?")),
-        _fmt_val(_nl_get(nl_refs.aa_yaw_base, "?")), tostring(_nl_get(nl_refs.aa_yaw_offset, "?")),
-        _fmt_val(_nl_get(nl_refs.aa_yawmod, "?")), tostring(_nl_get(nl_refs.aa_yawmod_offset, "?")),
-        _b(_nl_get(nl_refs.aa_bodyyaw, false)), _b(_nl_get(nl_refs.aa_bodyyaw_inv, false)),
-        tostring(_nl_get(nl_refs.aa_bodyyaw_l, "?")), tostring(_nl_get(nl_refs.aa_bodyyaw_r, "?")),
-        _fmt_val(_nl_get(nl_refs.aa_bodyyaw_opts, "?")), _b(_nl_get(nl_refs.aa_freestand, false)), _b(_nl_get(nl_refs.aa_yaw_hidden, false)),
-        _b(_nl_get(nl_refs.fl_switch, false)), tostring(_nl_get(nl_refs.fl_limit, "?")), tostring(_nl_get(nl_refs.fl_variability, "?")),
+    add(string.format("[NL] AA (effective = override else menu) enabled=%s pitch=%s yaw=%s base=%s offset=%s mod=%s(%s) bodyyaw=%s inv=%s L/R=%s/%s opts=%s free=%s hidden=%s | fakelag on=%s limit=%s var=%s | fake latency=%s | slowwalk=%s fakeduck=%s",
+        _b(_nl_eff(nl_refs.aa_enabled, false)), _fmt_val(_nl_eff(nl_refs.aa_pitch, "?")), _fmt_val(_nl_eff(nl_refs.aa_yaw, "?")),
+        _fmt_val(_nl_eff(nl_refs.aa_yaw_base, "?")), tostring(_nl_eff(nl_refs.aa_yaw_offset, "?")),
+        _fmt_val(_nl_eff(nl_refs.aa_yawmod, "?")), tostring(_nl_eff(nl_refs.aa_yawmod_offset, "?")),
+        _b(_nl_eff(nl_refs.aa_bodyyaw, false)), _b(_nl_eff(nl_refs.aa_bodyyaw_inv, false)),
+        tostring(_nl_eff(nl_refs.aa_bodyyaw_l, "?")), tostring(_nl_eff(nl_refs.aa_bodyyaw_r, "?")),
+        _fmt_val(_nl_eff(nl_refs.aa_bodyyaw_opts, "?")), _b(_nl_eff(nl_refs.aa_freestand, false)), _b(_nl_eff(nl_refs.aa_yaw_hidden, false)),
+        _b(_nl_get(nl_refs.fl_switch, false)), tostring(_nl_eff(nl_refs.fl_limit, "?")), tostring(_nl_get(nl_refs.fl_variability, "?")),
         tostring(_nl_get(nl_refs.misc_fakelat, "?")), _b(_nl_get(nl_refs.aa_slowwalk, false)), _b(_nl_get(nl_refs.aa_fakeduck, false))))
+    add(string.format("[NL] AA menu values: pitch=%s yaw=%s base=%s mod=%s(%s) L/R=%s/%s opts=%s free=%s  (what NL falls back to when the engine is off)",
+        _fmt_val(_nl_get(nl_refs.aa_pitch, "?")), _fmt_val(_nl_get(nl_refs.aa_yaw, "?")), _fmt_val(_nl_get(nl_refs.aa_yaw_base, "?")),
+        _fmt_val(_nl_get(nl_refs.aa_yawmod, "?")), tostring(_nl_get(nl_refs.aa_yawmod_offset, "?")),
+        tostring(_nl_get(nl_refs.aa_bodyyaw_l, "?")), tostring(_nl_get(nl_refs.aa_bodyyaw_r, "?")),
+        _fmt_val(_nl_get(nl_refs.aa_bodyyaw_opts, "?")), _b(_nl_get(nl_refs.aa_freestand, false))))
+    add(string.format("[AIPEEK] enabled=%s phase=%s anchor=%s side=%s peeks=%d shots=%d exposure-timeouts=%d dist=%d delay=%d expose=%dms retreat=%s dt_wait=%s tele=%s hc=%d",
+        _b(AIP.enable:get()), tostring(ai_peek.phase), ai_peek.anchor and "set" or "none",
+        ai_peek.side == nil and "-" or (ai_peek.side == 0 and "L" or "R"), ai_peek.peeks or 0, ai_peek.shots or 0,
+        ai_peek.timeouts or 0, AIP.dist:get(), AIP.delay:get(), AIP.expose:get(), tostring(AIP.retreat:get()),
+        _b(AIP.dt_wait:get()), _b(AIP.dt_tele:get()), AIP.hc:get()))
     -- attackers, most hits first
     local names = {}
     for name in pairs(attackers) do names[#names + 1] = name end
