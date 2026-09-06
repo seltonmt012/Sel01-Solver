@@ -1,16 +1,17 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 11.27                                  ║
+-- ║  Version: 11.28                                  ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 11.27
--- @description v11.27 bug pass: first-shot + BF caches re-anchor their cached delta
---   on the current eye (absolute angle drifted off a turning head for up to 20°);
---   [HITBOX] tally + hitgroup on every ACK line. History in git.
+-- @version 11.28
+-- @description v11.28: SSG body-hit fix — the DT-peek response no longer forces
+--   full-spread multipoint + safepoint-off on a sniper with "Respect Manual" on
+--   (head points on the hitbox edge failed NL's hitchance, NL took the body point).
+--   Respect paths are now a uniform 0.75 multipoint hint. History in git.
 
-local SEL01_VERSION = "11.27"
+local SEL01_VERSION = "11.28"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -7221,16 +7222,25 @@ pcall(function()
             dtpeek_active = true
             local wc_dt = get_weapon_class()
             local respect_sniper = (wc_dt == "sniper") and exp_respect_man and exp_respect_man:get()
-            pcall(sel01_ov, ctx, "override_safe_point", false)
+            -- V11.28: same body-hit trap v11.15 closed in close-priority. At multipoint
+            -- scale 1.0 the head points sit on the hitbox edge and fail the user's 72%
+            -- hitchance, so NL takes the chest/stomach point instead (dump: 11 of 24
+            -- shots inside a DT window, 10 of them body; 268 windows in one session).
+            -- With "Respect Manual SSG" on, this block is now a 0.75 multipoint hint only
+            -- and leaves safe-points + hitchance to NL's own Selection.
             pcall(sel01_ov, ctx, "override_multipoint", true)
-            pcall(sel01_ov, ctx, "override_multipoint_scale", 1.0)
-            if not respect_sniper then
+            if respect_sniper then
+                pcall(sel01_ov, ctx, "override_multipoint_scale", 0.75)
+            else
+                pcall(sel01_ov, ctx, "override_safe_point", false)
+                pcall(sel01_ov, ctx, "override_multipoint_scale", 1.0)
                 pcall(sel01_ov, ctx, "override_hitchance", 20)
             end
-            cs_log_verbose("DT-peek response idx=%d air_duck=%s%s → multipoint full + safepoint off%s",
+            cs_log_verbose("DT-peek response idx=%d air_duck=%s%s → %s",
                            target:get_index(), tostring(s.air_duck),
                            (s.dtpeek_n and (" n=" .. s.dtpeek_n) or ""),
-                           respect_sniper and " (sniper: hitchance untouched)" or " + hc floor 20")
+                           respect_sniper and "multipoint hint 0.75 only (sniper respect: NL hitchance/safepoint untouched)"
+                                          or "multipoint full + safepoint off + hc floor 20")
         end
 
         -- V3+V5+V6: CANCEL LOW-CONFIDENCE — intel-aware (known mode-match = trust)
@@ -7445,8 +7455,9 @@ pcall(function()
             local respect_sniper = (wc == "sniper") and exp_respect_man and exp_respect_man:get()
             if respect_sniper then
                 -- V9.18: SSG-Pro respect mode — preserve NL hc + multi-hitbox entirely
+                -- V11.28: 0.85 → 0.75, same hint level as every other respect path
                 pcall(sel01_ov, ctx, "override_multipoint", true)
-                pcall(sel01_ov, ctx, "override_multipoint_scale", 0.85)
+                pcall(sel01_ov, ctx, "override_multipoint_scale", 0.75)
                 cs_log_verbose("jump-scout SSG-RESPECT idx=%d dist=%.0f vz=%.0f (NL settings preserved)",
                                target:get_index(), target_dist, lp_vz)
             else
