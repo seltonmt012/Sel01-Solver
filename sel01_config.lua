@@ -1,12 +1,32 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Config — Neverlose CSGO HvH config        ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 3.29                                   ║
+-- ║  Version: 4.0                                    ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Config
 -- @author seltonmt01
--- @version 3.32
--- @description AI Peek hittable-gate (only peek when min-dmg shot exists):
+-- @version 4.0
+-- @description v4.0 FULL ANTI-AIM REWORK (per-state engine + defensive + copy-logs):
+--   * The v3 "presets" only wrote Body Yaw limits / inverter noise; Pitch, Yaw Base,
+--     Yaw Modifier and Jitter combos in the menu were decorative and the yaw-base
+--     rotation wrote invalid option strings (Base takes "At Target"/"Local View").
+--     Everything the enemy saw came from the user's NL config.
+--   * New per-state builder (Global / Standing / Moving / Slow-Walk / Crouching /
+--     Crouch-Move / Air / Air-Crouch): yaw offset L/R, jitter mode (Static / Center /
+--     Offset / Random / 3-Way / 5-Way / Spin), randomization, body-yaw mode + fixed /
+--     random / bimodal magnitude, side-switch timing in UN-CHOKED sends, freestanding,
+--     defensive mode and fake-lag limit per state. Manual L/R/F hotkeys.
+--   * Defensive AA on this build: cmd.force_defensive pulses while NL Double Tap is
+--     charged (rage.exploit:get() == 1), "On threat" / "Always" / hotkey, optional
+--     record-cleaning yaw after a discharge, DT Lag Options auto "Always On", air-lag.
+--   * Anti-bruteforce: events.bullet_impact near-miss (point-to-shot-line distance)
+--     per shooter → side flip + random fake limit + random switch delay for N seconds.
+--     Hit taken → side flip + defensive burst + freestanding off.
+--   * 📋 Copy Last Logs (Info tab): hits-taken with FULL engine snapshot (state, side,
+--     written yaw / limits, defensive, DT charge, choke, threat, distance, weapon),
+--     attacker table, near-miss + reaction + state timeline, NL live values and
+--     auto-hints. FFI clipboard + nl/Sel01-Config/last_logs.txt fallback.
+-- @description-prev AI Peek hittable-gate (only peek when min-dmg shot exists):
 --   * v3.28 peeked at any in-range enemy → walked constantly. v3.29 arms the
 --     peek ONLY while a fresh events.aim_fire (estimated damage >= the user's NL
 --     Min. Damage) says the enemy is provably hittable. No shootable enemy → no
@@ -71,7 +91,7 @@
 --     variance for full per-side chaos.
 --   * MAG-JIT indicator added to bottom HvH strip; dumped in v3.8 stats.
 
-local SEL01_CFG_VERSION = "3.32"
+local SEL01_CFG_VERSION = "4.0"
 
 -- DEBUG: print to CSGO console at major load checkpoints. Plain print() bypasses
 -- NL chat (which may not flush before crash) and writes directly to CSGO console.
@@ -112,6 +132,10 @@ local g_main    = ui.create(T_MAIN, "Presets",         1)
 local g_qol     = ui.create(T_MAIN, "Quality of Life", 2)
 local g_info    = ui.create(T_MAIN, "Info",            2)
 local g_aa      = ui.create(T_AA,   "Anti-Aim",        1)
+local g_aa_st   = ui.create(T_AA,   "State Builder",   1)
+local g_aa_def  = ui.create(T_AA,   "Defensive & Exploit", 2)
+local g_aa_rx   = ui.create(T_AA,   "Anti-Bruteforce & Reactions", 2)
+local g_aa_hs   = ui.create(T_AA,   "Anti-Headshot extras", 2)
 local g_visual  = ui.create(T_VIS,  "Visuals",         1)
 local g_move    = ui.create(T_VIS,  "Movement",        2)
 
@@ -138,107 +162,212 @@ local enable_master = g_main:switch(accent .. ui.get_icon"power" .. accent .. " 
 -- ══════════════════════════════════════════════════════════════════════════
 -- ANTI-AIM UI
 -- ══════════════════════════════════════════════════════════════════════════
-g_aa:label(accent .. ui.get_icon"target" .. accent .. "  Anti-Aim Override (uses events.antiaim hook + NL UI fallback)")
-local aa_enable      = g_aa:switch("Enable AA Override", false)
-local aa_pitch       = g_aa:combo("Pitch", {"Off", "Down", "Up", "Jitter Down/Up", "Custom"}, 2)
-local aa_pitch_cust  = g_aa:slider("Pitch Custom (deg)", -89, 89, -89)
-local aa_yaw_base    = g_aa:combo("Yaw Base", {"Forward", "Backward", "Left", "Right", "AtTarget"}, 2)
-local aa_yaw_add     = g_aa:slider("Yaw Add (deg)", -180, 180, 0)
-local aa_yaw_mod     = g_aa:combo("Yaw Modifier", {"None", "Center", "Offset", "Random", "Jitter"}, 5)
-local aa_yaw_mod_mag = g_aa:slider("Jitter Magnitude (deg)", 5, 60, 30)
-local aa_yaw_mod_int = g_aa:slider("Jitter Interval (ticks)", 1, 16, 2)
-local aa_desync      = g_aa:slider("Desync Range (deg)", 0, 60, 58)
-local aa_desync_side = g_aa:combo("Desync Side", {"Auto (alternate)", "Left", "Right", "Random"}, 1)
-local aa_freestanding= g_aa:switch("Freestanding (auto-best-side)", true)
--- V3.14: NL freestanding is DETERMINISTIC — it always picks the same "safe" side, so
--- a resolver models it and headshots the predictably-exposed side (user report). When
--- this is on, freestand is auto-DISABLED during the chaos states (defensive after a
--- hit / slow-walk) so the RANDOM body-yaw inverter controls the side → the head peeks
--- an unpredictable side under fire. Freestand still protects you the rest of the time.
-local aa_smart_free  = g_aa:switch("  └ Smart freestand (random side when beamed)", true)
-local aa_at_targets  = g_aa:switch("Yaw points at targets (At-Target mode)", false)
-g_aa:label(" ")
-g_aa:label(accent .. ui.get_icon"bolt" .. accent .. "  HvH extras")
--- D: Force on-shot AA — different values during/after ragebot fire
-local aa_onshot      = g_aa:switch("Force on-shot AA (more defensive after fire)", true)
-local aa_onshot_dur  = g_aa:slider("On-shot duration (ms)", 100, 1500, 600)
--- F: Air desync override (V2.3 air-AA improvements for jumping aggressive play)
-local aa_air_set      = g_aa:switch("Air desync override (airborne = different AA)", true)
-local aa_air_mag      = g_aa:slider("Air desync magnitude (deg)", 10, 58, 35)
-local aa_air_flip     = g_aa:switch("  └ Air rapid inverter flip (LBY break)", true)
-local aa_air_boost    = g_aa:switch("  └ Air max jitter boost (yaw mod offset = 58)", true)
-local aa_air_fakeduck = g_aa:switch("  └ Air force fake-duck (LBY break alt)", false)
--- V3.2 F-MOVE: Move desync override (running on ground)
-local aa_move_set     = g_aa:switch("Move desync override (running ground)", false)
-local aa_move_mag     = g_aa:slider("Move desync magnitude (deg)", 10, 58, 45)
-local aa_move_thresh  = g_aa:slider("Move velocity threshold (u/s)", 50, 250, 100)
-local aa_move_flip    = g_aa:switch("  └ Move rapid inverter flip", false)
-local aa_move_boost   = g_aa:switch("  └ Move max jitter boost", false)
--- G: Anti-bruteforce jitter variance
-local aa_anti_bf     = g_aa:switch("Anti-bruteforce jitter (random mag variance)", true)
-local aa_anti_bf_var = g_aa:slider("Anti-BF variance (deg)", 5, 25, 15)
--- H: Fake-duck assist (V1.9: default OFF — hooks events.weapon_fire which fires for
--- audio/init events on spawn, suspected contributor to v1.8 spawn-crash)
-local aa_fd_assist   = g_aa:switch("Fake-duck assist (auto on hostile-fire)", false)
-local aa_fd_duration = g_aa:slider("Fake-duck duration (ms)", 200, 2000, 800)
-g_aa:label(" ")
-g_aa:label(accent .. "  Anti-headshot extras (default OFF — test first)")
--- V3.0 anti-HS: pitch jitter (head Y bobs)
-local aa_pitch_jitter   = g_aa:switch("Pitch jitter (head Y bob Down/Up)", false)
--- V3.0 anti-HS: auto-fakeduck while moving (ducked head = different Y)
-local aa_move_fakeduck  = g_aa:switch("Auto fake-duck while moving (ground only)", false)
-local aa_move_fd_thresh = g_aa:slider("Move-FD velocity threshold (u/s)", 50, 250, 100)
-g_aa:label(" ")
-g_aa:label(accent .. ui.get_icon"shield" .. accent .. "  Anti-resolver (v3.6 / 3.7)")
--- V3.6: defensive AA when WE take damage. player_hurt (bullet hits only,
--- nade/world skipped) → max desync + random side flip for N seconds. V3.7:
--- force-fake-duck removed (was crouching mid-movement). Mobility kept.
-local aa_def_on_dmg   = g_aa:switch("Defensive AA on hit-taken (bullet only)", true)
-local aa_def_duration = g_aa:slider("  └ Defensive duration (ms)", 500, 4000, 2000)
--- V3.6: slow-walk = easy target. NL Slow Walk hotkey held → max desync 58 +
--- random side + 2× anti-BF variance so resolver can't pattern-lock us.
-local aa_slow_boost   = g_aa:switch("Slow-walk AA boost (max desync + chaos)", true)
--- V3.6: periodic NL Fake Lag Limit variance (±2 ticks every 1–3s) to break
--- choke prediction. Off by default — may conflict with NL Double Tap.
-local aa_fl_var       = g_aa:switch("Fake-lag variance (±2 ticks every 1–3s)", false)
--- V3.7: periodically rotate NL Yaw Base (Forward/Backward/Left/Right) every
--- 4-8s random. Breaks resolvers that learned our eye_yaw → fake_yaw mapping.
-local aa_yaw_rotate   = g_aa:switch("Yaw base rotation (anti eye-yaw track)", false)
--- V3.7: force NL body-yaw inverter flip after N consecutive same-side shots.
--- Resolvers like ours track streak{L=9 R=0} → predict L; flipping breaks it.
-local aa_side_streak  = g_aa:switch("Side-streak limit (auto flip after N shots)", true)
-local aa_side_streak_n= g_aa:slider("  └ Flip after consecutive same-side shots", 2, 6, 3)
--- V3.9: per-tick magnitude variance. Randomize desync magnitude between
--- min/max every periodic-sync tick instead of a fixed value. Resolvers that
--- use EMA on measured_desync (including ours v9.x) settle to the AVERAGE of
--- the randomized magnitudes — so if user picks 35-58 their EMA → 46° but
--- the actual fake yaw cycles {35,42,51,58,38...} → always 5-12° off.
-local aa_mag_jitter   = g_aa:switch("Magnitude jitter (per-tick variance, anti-EMA)", false)
-local aa_mag_jit_min  = g_aa:slider("  └ Min magnitude (deg)", 10, 58, 35)
-local aa_mag_jit_max  = g_aa:slider("  └ Max magnitude (deg)", 10, 58, 58)
--- V3.10: BIMODAL magnitude — alternate between TWO fixed clusters (e.g. 25° / 55°)
--- every 2-5s instead of uniform random. Uniform jitter's mean == its center, which
--- an EMA / median resolver locks onto EXACTLY; bimodal puts the long-run mean in the
--- EMPTY gap between the clusters, so the resolver's tracked value matches NO actual
--- shot. Strongest anti-EMA option. Mutually exclusive with magnitude jitter above.
-local aa_bimodal      = g_aa:switch("Bimodal magnitude (two clusters, anti-EMA)", false)
-local aa_bimodal_lo   = g_aa:slider("  └ Cluster A (deg)", 10, 58, 25)
-local aa_bimodal_hi   = g_aa:slider("  └ Cluster B (deg)", 10, 58, 55)
-local aa_bimodal_state = { mode = 1, next_switch = 0 }
--- V3.11: CORRELATED (anti-median) jitter. The anti-BF block draws TWO INDEPENDENT
--- zero-mean uniform offsets per side — but the median/EMA of symmetric independent
--- noise about `lim` IS `lim`, so a median tracker (incl ours) smooths it away.
--- Correlated patterns defeat that: a sawtooth ramp has same-sign successive deltas
--- (EMA chases but never centers); anti-phase pushes L and R in opposite directions
--- from one shared phase (whichever side the resolver locks, the other is max wrong).
-local aa_corr_jitter    = g_aa:switch("Correlated jitter (anti-median)", false)
-local aa_corr_antiphase = g_aa:switch("  └ Anti-phase L/R (off = sawtooth ramp)", false)
-local aa_corr_amp       = g_aa:slider("  └ Amplitude (deg)", 5, 38, 20)
-local aa_corr_phase     = 0
--- V3.13: alternation state for the slow-walk / defensive / air ANTI-EMA two-cluster
--- magnitude (replaces fixed-center-+-symmetric-noise, which EMA resolvers average out).
-local slow_aa_state     = { mode = 1, next = 0 }
-local _smart_free_off   = false  -- V3.14: dirty flag for smart-freestand override
+-- v4.0: every AA element lives in ONE table (`AA`) — the main chunk sits near the
+-- Lua 5.1 200-local ceiling, and the per-state builder alone is ~140 elements.
+-- All NL writes go through :override on NL's own Anti Aim elements (never cmd
+-- angle fields — v1.6 crash). Option strings verified from nyanza / angelnbone /
+-- bloodwings / gingersense on THIS build:
+--   Pitch        : "Disabled" | "Down" | "Fake Up" | "Fake Down"
+--   Yaw          : "Disabled" | "Backward" | "Static"
+--   Yaw Base     : "Local View" | "At Target"     (direction = Yaw Offset math)
+--   Yaw Modifier : "Disabled" | "Offset" | "Center" | "Random" | "Spin" | "3-Way" | "5-Way"
+--   Body Yaw Options (multi): "Avoid Overlap" | "Jitter" | "Randomize Jitter" | "Anti Bruteforce"
+--   Leg Movement : "Walking" | "Sliding"
+--   DT Lag Options: "On Peek" | "Always On"
+local AA = {}
+local AA_STATES = {
+    { key = "global",  name = "Global",      tag = "GL"  },
+    { key = "stand",   name = "Standing",    tag = "ST"  },
+    { key = "move",    name = "Moving",      tag = "MV"  },
+    { key = "slow",    name = "Slow-Walk",   tag = "SW"  },
+    { key = "duck",    name = "Crouching",   tag = "CR"  },
+    { key = "duckmv",  name = "Crouch-Move", tag = "CM"  },
+    { key = "air",     name = "Air",         tag = "AIR" },
+    { key = "airduck", name = "Air-Crouch",  tag = "AC"  },
+}
+AA.YAW_MODES  = { "Static", "Center Jitter", "Offset Jitter", "Random", "3-Way", "5-Way", "Spin" }
+AA.BODY_MODES = { "Jitter (side switch)", "Random side", "Tick-Switch", "Static side", "Off (no desync)" }
+AA.MAG_MODES  = { "Fixed L/R", "Random Min-Max", "Bimodal A/B" }
+AA.SW_MODES   = { "Every send", "Fixed delay", "Random delay" }
+AA.DEF_MODES  = { "Off", "On threat", "Always", "Hotkey only" }
+
+g_aa:label(accent .. ui.get_icon"target" .. accent .. "  Sel01 AA engine (v4.0 per-state)")
+AA.enable    = g_aa:switch("Enable AA engine", true)
+AA.pitch     = g_aa:combo("Pitch", { "Down", "Fake Up", "Fake Down", "Disabled" }, 1)
+AA.base      = g_aa:combo("Yaw Base", { "At Target", "Local View" }, 1)
+AA.dir       = g_aa:combo("Direction", { "Backward", "Left", "Right", "Forward" }, 1)
+AA.avoid_bs  = g_aa:switch("Avoid Backstab", true)
+AA.legs      = g_aa:combo("Leg Movement", { "Keep NL", "Sliding", "Walking" }, 1)
+AA.key_l     = g_aa:hotkey("Manual Left")
+AA.key_r     = g_aa:hotkey("Manual Right")
+AA.key_f     = g_aa:hotkey("Manual Forward")
+AA.man_static= g_aa:switch("  └ Manual = static (no jitter / desync)", false)
+AA.idle_spin = g_aa:switch("Idle spin (warmup / round end, no threat)", false)
+pcall(function()
+    AA.enable:tooltip("Master for the per-state engine. OFF = all NL Anti Aim overrides cleared, your NL config is back in control.")
+    AA.dir:tooltip("Applied as Yaw Offset math on top of the state offset: Backward 0 / Left +90 / Right -90 / Forward 180.")
+    AA.man_static:tooltip("While a manual key is held: yaw modifier off and body yaw fixed 60/60 on the manual side.")
+    AA.idle_spin:tooltip("Spinbot only when it cannot hurt you: warmup, or after round end with no threat.")
+end)
+
+-- ── per-state builder ─────────────────────────────────────────────────────
+g_aa_st:label(accent .. ui.get_icon"sliders" .. accent .. "  Per-state settings (pick a state, edit its rows)")
+do
+    local names = {}
+    for i, st in ipairs(AA_STATES) do names[i] = st.name end
+    AA.state_sel = g_aa_st:combo("Edit state", names, 1)
+end
+AA.st = {}
+-- defaults = the "Dynamic" preset (a fresh install is playable without clicking)
+AA.STATE_DEFAULTS = {
+    global  = { use_global = false, yaw_mode = "Center Jitter", yaw_l = -4, yaw_r = 4, yaw_jit = 24, yaw_rand = 4,
+                body_mode = "Jitter (side switch)", body_mag = "Random Min-Max", body_l = 60, body_r = 60, body_min = 42,
+                sw_mode = "Random delay", sw_delay = 2, sw_lo = 1, sw_hi = 3, freestand = true, defensive = "On threat", fakelag = 0 },
+    stand   = { use_global = true },
+    move    = { use_global = false, yaw_mode = "Center Jitter", yaw_l = 0, yaw_r = 0, yaw_jit = 18, yaw_rand = 6,
+                body_mode = "Jitter (side switch)", body_mag = "Random Min-Max", body_l = 60, body_r = 60, body_min = 35,
+                sw_mode = "Fixed delay", sw_delay = 2, sw_lo = 1, sw_hi = 3, freestand = false, defensive = "On threat", fakelag = 0 },
+    slow    = { use_global = false, yaw_mode = "Center Jitter", yaw_l = -6, yaw_r = 6, yaw_jit = 12, yaw_rand = 8,
+                body_mode = "Jitter (side switch)", body_mag = "Random Min-Max", body_l = 60, body_r = 60, body_min = 45,
+                sw_mode = "Random delay", sw_delay = 2, sw_lo = 1, sw_hi = 2, freestand = false, defensive = "On threat", fakelag = 0 },
+    duck    = { use_global = true },
+    duckmv  = { use_global = true },
+    air     = { use_global = false, yaw_mode = "Random", yaw_l = 0, yaw_r = 0, yaw_jit = 26, yaw_rand = 6,
+                body_mode = "Jitter (side switch)", body_mag = "Random Min-Max", body_l = 60, body_r = 60, body_min = 30,
+                sw_mode = "Every send", sw_delay = 1, sw_lo = 1, sw_hi = 2, freestand = false, defensive = "Always", fakelag = 0 },
+    airduck = { use_global = false, yaw_mode = "Static", yaw_l = 0, yaw_r = 0, yaw_jit = 0, yaw_rand = 4,
+                body_mode = "Random side", body_mag = "Random Min-Max", body_l = 60, body_r = 60, body_min = 30,
+                sw_mode = "Every send", sw_delay = 1, sw_lo = 1, sw_hi = 2, freestand = false, defensive = "Always", fakelag = 0 },
+}
+for _, st in ipairs(AA_STATES) do
+    local d = AA.STATE_DEFAULTS[st.key]
+    local g = AA.STATE_DEFAULTS.global
+    local function dv(k) if d[k] ~= nil then return d[k] end return g[k] end
+    local function idx(list, v) for i, s in ipairs(list) do if s == v then return i end end return 1 end
+    local p = "[" .. st.tag .. "] "
+    local S = {}
+    if st.key ~= "global" then S.use_global = g_aa_st:switch(p .. "Use Global settings", dv("use_global")) end
+    S.yaw_mode  = g_aa_st:combo(p .. "Yaw mode", AA.YAW_MODES, idx(AA.YAW_MODES, dv("yaw_mode")))
+    S.yaw_l     = g_aa_st:slider(p .. "Yaw offset L", -180, 180, dv("yaw_l"))
+    S.yaw_r     = g_aa_st:slider(p .. "Yaw offset R", -180, 180, dv("yaw_r"))
+    S.yaw_jit   = g_aa_st:slider(p .. "Jitter amount / spin speed", 0, 180, dv("yaw_jit"))
+    S.yaw_rand  = g_aa_st:slider(p .. "Randomization", 0, 30, dv("yaw_rand"))
+    S.body_mode = g_aa_st:combo(p .. "Body yaw", AA.BODY_MODES, idx(AA.BODY_MODES, dv("body_mode")))
+    S.body_mag  = g_aa_st:combo(p .. "Body magnitude", AA.MAG_MODES, idx(AA.MAG_MODES, dv("body_mag")))
+    S.body_l    = g_aa_st:slider(p .. "Left limit / Max", 0, 60, dv("body_l"))
+    S.body_r    = g_aa_st:slider(p .. "Right limit / Max", 0, 60, dv("body_r"))
+    S.body_min  = g_aa_st:slider(p .. "Min magnitude (Random / Bimodal A)", 0, 60, dv("body_min"))
+    S.sw_mode   = g_aa_st:combo(p .. "Side switch", AA.SW_MODES, idx(AA.SW_MODES, dv("sw_mode")))
+    S.sw_delay  = g_aa_st:slider(p .. "Switch delay (sends)", 1, 16, dv("sw_delay"))
+    S.sw_lo     = g_aa_st:slider(p .. "Random delay min (sends)", 1, 16, dv("sw_lo"))
+    S.sw_hi     = g_aa_st:slider(p .. "Random delay max (sends)", 1, 16, dv("sw_hi"))
+    S.freestand = g_aa_st:switch(p .. "Freestanding", dv("freestand"))
+    S.defensive = g_aa_st:combo(p .. "Defensive AA", AA.DEF_MODES, idx(AA.DEF_MODES, dv("defensive")))
+    S.fakelag   = g_aa_st:slider(p .. "Fake lag limit (0 = keep NL)", 0, 14, dv("fakelag"))
+    pcall(function()
+        S.yaw_mode:tooltip("Static: offset only. Center: +/- half amount around the offset, flips with the side. Offset: amount on one side only. Random: uniform in +/- amount. 3-Way / 5-Way / Spin: NL's own modifier with amount as offset / speed.")
+        S.body_mag:tooltip("Fixed = Left/Right sliders. Random = new value between Min and Max on every side switch (kills EMA resolvers). Bimodal = alternates Min and Max every 2-5s.")
+        S.sw_mode:tooltip("Counted in UN-CHOKED sends (packets the enemy actually receives), not ticks.")
+        S.defensive:tooltip("Needs NL Double Tap ON + charged. On threat = only while someone can hit you. Hotkey only = the Force defensive key.")
+    end)
+    AA.st[st.key] = S
+end
+-- show only the selected state's rows; a state on "Use Global" collapses to that one switch
+local function aa_state_vis()
+    local sel = "Global"
+    pcall(function() sel = AA.state_sel:get() end)
+    for _, st in ipairs(AA_STATES) do
+        local S = AA.st[st.key]
+        local show = (st.name == sel)
+        local ug = false
+        if S.use_global then pcall(function() ug = S.use_global:get() end) end
+        for k, el in pairs(S) do
+            local vis = show and (k == "use_global" or not ug)
+            pcall(function() el:visibility(vis) end)
+        end
+    end
+end
+pcall(function() AA.state_sel:set_callback(function() aa_state_vis() end) end)
+for _, st in ipairs(AA_STATES) do
+    local S = AA.st[st.key]
+    if S.use_global then pcall(function() S.use_global:set_callback(function() aa_state_vis() end) end) end
+end
+aa_state_vis()
+
+-- ── defensive / exploit ───────────────────────────────────────────────────
+g_aa_def:label(accent .. ui.get_icon"bolt" .. accent .. "  Defensive AA (needs NL Double Tap ON + charged)")
+AA.def_enable = g_aa_def:switch("Defensive AA master", true)
+AA.def_int    = g_aa_def:slider("Pulse every N commands", 1, 8, 3)
+AA.def_rand   = g_aa_def:switch("  └ Randomize N (N-1 .. N+1)", true)
+AA.def_key    = g_aa_def:hotkey("Force defensive (hold)")
+AA.def_clean  = g_aa_def:combo("After discharge: clean records", { "Off", "Random +/-12", "Random + flick 60-72" }, 2)
+AA.def_lag    = g_aa_def:switch("DT Lag Options = Always On while weapon ready", false)
+AA.airlag     = g_aa_def:switch("Air-lag (force defensive + teleport airborne)", false)
+AA.fl_mode    = g_aa_def:combo("Fake-lag variance", { "Off", "+/-2 around NL value", "Fluctuate 1 / 14" }, 2)
+g_aa_def:label(" ")
+g_aa_def:label(accent .. "  Hidden angles on defensive ticks (silent flick)")
+AA.dh_enable  = g_aa_def:switch("Defensive hidden angles", false)
+AA.dh_pitch   = g_aa_def:combo("  └ Hidden pitch", { "Down 89", "Up -89", "Cycle", "Random" }, 1)
+AA.dh_yaw     = g_aa_def:combo("  └ Hidden yaw", { "Sideways +/-90", "Spin", "Random", "Custom" }, 1)
+AA.dh_yaw_val = g_aa_def:slider("  └ Custom yaw / spin speed", -180, 180, 90)
+AA.dh_cond    = g_aa_def:combo("  └ When", { "Hittable threat", "Always" }, 1)
+pcall(function()
+    AA.def_enable:tooltip("cmd.force_defensive pulses on command_number % N while rage.exploit charge == 1. Revolver skipped. Nothing is written when DT is off.")
+    AA.def_clean:tooltip("gingersense 'clean records': for 11-17 ticks after a detected discharge (tickbase drop) with a threat, add a random yaw so the records the enemy backtracks are garbage.")
+    AA.def_lag:tooltip("Overrides NL Double Tap > Lag Options to Always On while your weapon can fire (never while Peek Assist is held). This is the mainstream NL defensive mode.")
+    AA.airlag:tooltip("gingersense air-lag: force_defensive every tick + force_charge + teleport every 6 ticks while airborne. Aggressive only.")
+    AA.dh_enable:tooltip("Writes rage.antiaim:override_hidden_pitch / yaw_offset (Yaw > Hidden). Only defensive records carry it; your visible model does not flick. Turn 11_fakeflick / 12_silentflick OFF - they write the same thing.")
+end)
+
+-- ── anti-bruteforce / reactions ───────────────────────────────────────────
+g_aa_rx:label(accent .. ui.get_icon"shield" .. accent .. "  Anti-bruteforce (bullet impacts near you)")
+AA.ab_enable  = g_aa_rx:switch("Anti-bruteforce", true)
+AA.ab_radius  = g_aa_rx:slider("Near-miss radius (u)", 20, 150, 60)
+AA.ab_dur     = g_aa_rx:slider("Reaction duration (s)", 1, 10, 5)
+AA.ab_flip    = g_aa_rx:switch("  └ Flip side", true)
+AA.ab_limit   = g_aa_rx:switch("  └ Random fake limit (10-60)", true)
+AA.ab_delay   = g_aa_rx:switch("  └ Random switch delay (-2..+4)", false)
+AA.ab_yaw     = g_aa_rx:switch("  └ Staged yaw offset (+2 per shot, alternating)", true)
+g_aa_rx:label(" ")
+AA.hit_react  = g_aa_rx:switch("On hit taken: flip side + defensive burst", true)
+AA.hit_dur    = g_aa_rx:slider("  └ Burst duration (ms)", 300, 3000, 1500)
+AA.hit_nofree = g_aa_rx:switch("  └ Freestanding OFF during burst", true)
+AA.head_prot  = g_aa_rx:switch("Head-safe pulses (threat can shoot, you can too)", false)
+pcall(function()
+    AA.ab_enable:tooltip("events.bullet_impact: distance from your eye to the shot line (shooter eye -> impact). Per shooter, one reaction per 0.25s.")
+    AA.ab_yaw:tooltip("gazolina 'Meta' mode: every close shot bumps a per-shooter stage; yaw offset += stage*2 on the current side for the duration.")
+    AA.head_prot:tooltip("gingersense head protection: when the hittable threat's weapon is ready, hold a near-zero yaw with max desync for 1-2 ticks, re-arm after 7-15 ticks. Test before relying on it.")
+end)
+
+-- ── anti-headshot extras ──────────────────────────────────────────────────
+g_aa_hs:label(accent .. "  Anti-headshot extras (default OFF - test first)")
+AA.pitch_jitter = g_aa_hs:switch("Pitch jitter (Down / Fake Up per send)", false)
+AA.move_fd      = g_aa_hs:switch("Auto fake-duck while moving (ground only)", false)
+AA.move_fd_thr  = g_aa_hs:slider("  └ Velocity threshold (u/s)", 50, 250, 100)
+
+-- runtime state of the engine (one table, no per-field locals)
+local aa_eng = {
+    active = false, side = 0, sw_ctr = 0, sends = 0, false_ticks = 0,
+    body_l = 60, body_r = 60, body_roll_side = -1, bimodal_mode = 1, bimodal_next = 0,
+    max_tickbase = 0, defensive = 0, def_state = false, def_after = 0, def_pulse = false,
+    def_pulses = 0, last_def_t = 0, charge = 0, dt_on = false, hs_on = false,
+    state = "?", state_since = 0, last_switch_t = 0, switches = 0,
+    ab = {}, ab_tick = 0, ab_last = 0, ab_stage = 0, ab_hits = 0,
+    react_until = 0, react_from = "", force_side = nil,
+    hp = { hold = 0, delay = 8, yaw = 0, active = false },
+    manual = "", threat = nil, threat_name = "", threat_dist = 0, threat_x = 0, threat_y = 0, threat_z = 0,
+    yaw_w = 0, l_w = 0, r_w = 0, mod_w = "Disabled", modamt_w = 0, free_w = false, body_w = true,
+    fl_base = nil, fl_active = false, dtlag_active = false, hidden_active = false,
+    airlag_ctr = 0, pitch_flip = false, fd_active = false, fd_cnt = 0,
+    stats = { near_miss = 0, flips = 0, def_ticks = 0, react = 0, hp_pulses = 0 },
+}
+-- timeline ring (what happened lately) — feeds Copy Last Logs + the hits-taken dump
+local aa_tl = {}
+local AA_TL_MAX = 160
+local function aa_tl_push(kind, text)
+    aa_tl[#aa_tl + 1] = { t = globals.realtime or 0, kind = kind, text = tostring(text) }
+    if #aa_tl > AA_TL_MAX then table.remove(aa_tl, 1) end
+end
 
 -- ══════════════════════════════════════════════════════════════════════════
 -- MOVEMENT UI
@@ -367,6 +496,9 @@ local qol_clantag_st = g_qol:combo("Clantag style", {"Wave", "Spin", "Pulse", "L
 -- ══════════════════════════════════════════════════════════════════════════
 -- INFO UI
 -- ══════════════════════════════════════════════════════════════════════════
+-- v4.0: 📋 Copy Last Logs — the Solver-style one-click share dump (hits taken with the
+-- full engine snapshot, attacker table, timeline, NL live values, hints) → clipboard.
+local btn_copy   = g_info:button("📋 Copy Last Logs (hits taken + AA timeline)", function() end)
 local btn_status = g_info:button("Print Status", function() end)
 local btn_reset  = g_info:button("Reset Settings", function() end)
 local btn_stats  = g_info:button("Dump Debug Stats", function() end) -- V2.6
@@ -433,6 +565,14 @@ pcall(function()
     nl_refs.aa_avoidbackstab = nl_find_safe("Aimbot", "Anti Aim", "Angles", "Yaw", "Avoid Backstab")
     nl_refs.aa_yawmod        = nl_find_safe("Aimbot", "Anti Aim", "Angles", "Yaw Modifier")
     nl_refs.aa_yawmod_offset = nl_find_safe("Aimbot", "Anti Aim", "Angles", "Yaw Modifier", "Offset")
+    -- v4.0: Yaw combo ("Disabled"/"Backward"/"Static") + Body Yaw > Freestanding combo
+    -- ("Off"/"Peek Fake"/"Peek Real") + DT lag options + extended angles master
+    nl_refs.aa_bodyyaw_fs    = nl_find_safe("Aimbot", "Anti Aim", "Angles", "Body Yaw", "Freestanding")
+    nl_refs.aa_extended      = nl_find_safe("Aimbot", "Anti Aim", "Angles", "Extended Angles")
+    nl_refs.rage_dtlag       = nl_find_safe("Aimbot", "Ragebot", "Main", "Double Tap", "Lag Options")
+    nl_refs.rage_dt_fl       = nl_find_safe("Aimbot", "Ragebot", "Main", "Double Tap", "Fake Lag Limit")
+    nl_refs.rage_hs          = nl_find_safe("Aimbot", "Ragebot", "Main", "Hide Shots")
+    nl_refs.rage_hs_opts     = nl_find_safe("Aimbot", "Ragebot", "Main", "Hide Shots", "Options")
     -- Body Yaw (desync)
     nl_refs.aa_bodyyaw       = nl_find_safe("Aimbot", "Anti Aim", "Angles", "Body Yaw")
     nl_refs.aa_bodyyaw_inv   = nl_find_safe("Aimbot", "Anti Aim", "Angles", "Body Yaw", "Inverter")
@@ -462,6 +602,7 @@ pcall(function()
     -- pattern), never :override. Reading a hotkey state is safe; writing crashes.
     nl_refs.rage_peek_assist = nl_find_safe("Aimbot", "Ragebot", "Main", "Peek Assist")
     nl_refs.rage_hc          = nl_find_safe("Aimbot", "Ragebot", "Selection", "Hit Chance")
+    nl_refs.misc_fakelat     = nl_find_safe("Miscellaneous", "Main", "Other", "Fake Latency")
     -- V3.15: rage_mindmg re-added READ-ONLY for the dump display. The V3.5 removal was
     -- to stop WRITING NL min-damage (never-override rule) — reading via :get() is safe.
     -- Verified path "Min. Damage" (was the wrong key before → dump showed MinDmg=?).
@@ -507,231 +648,187 @@ local function _safe_step(label, fn)
     end
 end
 _troll_mode = false  -- V3.16: global flag for the 🤡 TROLL indicator (set true only by troll)
-local function _do_apply_preset(name)
-    cs_log("[apply] start " .. tostring(name))
-    _troll_mode = false  -- reset on every preset; troll re-sets it true below
-    if name == "aggressive" then
-        safe_set(aa_enable, true)
-        safe_set(aa_freestanding, true)
-        safe_set(aa_at_targets, false)
-        safe_set(aa_desync, 58)
-        safe_set(aa_yaw_add, 0)
-        safe_set(aa_yaw_mod_mag, 45)
-        safe_set(aa_yaw_mod_int, 2)
-        safe_set(aa_onshot, true)
-        safe_set(aa_air_set, true)
-        safe_set(aa_air_mag, 35)
-        safe_set(aa_air_flip, true)
-        safe_set(aa_air_boost, true)
-        safe_set(aa_air_fakeduck, false)
-        -- V3.2 + V3.3: Move-AA + Pitch-jitter enabled. move_fakeduck stays default
-        -- OFF (v3.2 had it ON which left NL fake-duck stuck after the user stopped
-        -- running — sticky-fakeduck bug). User can opt-in via the toggle.
-        safe_set(aa_move_set, true)
-        safe_set(aa_move_mag, 45)
-        safe_set(aa_move_thresh, 100)
-        safe_set(aa_move_flip, true)
-        safe_set(aa_move_boost, true)
-        safe_set(aa_pitch_jitter, true)
-        safe_set(aa_move_fakeduck, false)
-        safe_set(aa_move_fd_thresh, 100)
-        safe_set(aa_anti_bf, true)
-        safe_set(aa_anti_bf_var, 15)
-        safe_set(aa_fd_assist, true)
-        -- V3.16: enable Magnitude jitter in Aggressive. The debug dumps showed enemies
-        -- repeatedly headshotting at a STABLE desync (58/45/35) — that is exactly what an
-        -- EMA resolver (incl. Sel01-Solver itself) locks onto. Per-tick magnitude jitter
-        -- leaves the real fake-yaw 5-15° off the learned average every shot. Only affects
-        -- the OUTGOING anti-aim (how enemies see you) — zero cost to your own hit-rate.
-        safe_set(aa_mag_jitter, true)
-        safe_set(aa_mag_jit_min, 38)
-        safe_set(aa_mag_jit_max, 58)
-        safe_set(aa_fl_var, true)        -- fake-lag variance — breaks backtrack resolvers too
-        safe_set(vis_watermark, true)
-        safe_set(vis_indicators, true)
-        safe_set(vis_velwarn, true)
-        safe_set(vis_aaarrows, true)
-        safe_set(vis_hitmarker, true)
-        safe_set(vis_hitlog, true)
-        safe_set(vis_keybinds, true)
-        safe_set(vis_dmgind, true)
-        safe_set(vis_specoverlay, true)
-        safe_set(qol_clantag, true)
-        -- v3.19/3.20 visuals — ALL ON in Aggressive so the user can test without toggling
+
+-- v4.0: presets are DATA. A state cfg lists every per-state element by key; missing keys
+-- fall back to the Dynamic defaults so every preset writes every field (deterministic —
+-- no leftovers from whatever preset ran last, the v9.96 lesson).
+local function aa_apply_state(key, cfg)
+    local S = AA.st[key]
+    if not S then return end
+    local base = AA.STATE_DEFAULTS[key] or {}
+    local glob = AA.STATE_DEFAULTS.global
+    for field, el in pairs(S) do
+        local v = cfg[field]
+        if v == nil then v = base[field] end
+        if v == nil then v = glob[field] end
+        if v ~= nil then safe_set(el, v) end
+    end
+end
+-- G = global-ish switches shared by all presets; states = per-state cfg tables
+local function aa_apply_bundle(b)
+    for key, cfg in pairs(b.states) do aa_apply_state(key, cfg) end
+    -- states a preset does not mention fall back to the element defaults (Dynamic)
+    for _, key in ipairs({ "stand", "move", "slow", "duck", "duckmv", "air", "airduck" }) do
+        if not b.states[key] then aa_apply_state(key, {}) end
+    end
+    if not b.states.global then aa_apply_state("global", {}) end
+    local g = b.g or {}
+    safe_set(AA.enable,      true)
+    safe_set(AA.pitch,       g.pitch      or "Down")
+    safe_set(AA.base,        g.base       or "At Target")
+    safe_set(AA.dir,         g.dir        or "Backward")
+    safe_set(AA.avoid_bs,    g.avoid_bs   ~= false)
+    safe_set(AA.legs,        g.legs       or "Sliding")
+    safe_set(AA.man_static,  g.man_static == true)
+    safe_set(AA.idle_spin,   g.idle_spin  == true)
+    safe_set(AA.def_enable,  g.def_enable ~= false)
+    safe_set(AA.def_int,     g.def_int    or 3)
+    safe_set(AA.def_rand,    g.def_rand   ~= false)
+    safe_set(AA.def_clean,   g.def_clean  or "Random +/-12")
+    safe_set(AA.def_lag,     g.def_lag    == true)
+    safe_set(AA.airlag,      g.airlag     == true)
+    safe_set(AA.fl_mode,     g.fl_mode    or "+/-2 around NL value")
+    safe_set(AA.dh_enable,   g.dh_enable  == true)
+    safe_set(AA.dh_pitch,    g.dh_pitch   or "Down 89")
+    safe_set(AA.dh_yaw,      g.dh_yaw     or "Sideways +/-90")
+    safe_set(AA.dh_cond,     g.dh_cond    or "Hittable threat")
+    safe_set(AA.ab_enable,   g.ab_enable  ~= false)
+    safe_set(AA.ab_radius,   g.ab_radius  or 60)
+    safe_set(AA.ab_dur,      g.ab_dur     or 5)
+    safe_set(AA.ab_flip,     g.ab_flip    ~= false)
+    safe_set(AA.ab_limit,    g.ab_limit   ~= false)
+    safe_set(AA.ab_delay,    g.ab_delay   == true)
+    safe_set(AA.ab_yaw,      g.ab_yaw     ~= false)
+    safe_set(AA.hit_react,   g.hit_react  ~= false)
+    safe_set(AA.hit_dur,     g.hit_dur    or 1500)
+    safe_set(AA.hit_nofree,  g.hit_nofree ~= false)
+    safe_set(AA.head_prot,   g.head_prot  == true)
+    safe_set(AA.pitch_jitter,g.pitch_jitter == true)
+    safe_set(AA.move_fd,     g.move_fd    == true)
+    safe_set(AA.move_fd_thr, g.move_fd_thr or 100)
+end
+local function vis_apply_all(on_extras)
+    safe_set(vis_watermark, true)
+    safe_set(vis_indicators, true)
+    safe_set(vis_velwarn, true)
+    safe_set(vis_aaarrows, true)
+    safe_set(vis_hitmarker, true)
+    safe_set(vis_hitlog, true)
+    safe_set(vis_keybinds, true)
+    safe_set(vis_dmgind, true)
+    safe_set(vis_specoverlay, true)
+    if on_extras then
         safe_set(vis_desyncpct, true)
         safe_set(vis_skeet, true)
         safe_set(vis_netgraph, true)
         safe_set(vis_scopefade, true)
         safe_set(vis_sleeves, true)
-        safe_set(vis_menublur, false)   -- v3.23: menu blur OFF by default (user request)
+        safe_set(vis_menublur, false)
         safe_set(vis_custscope, true)
         safe_set(vis_scope_rot, true)
         safe_set(vis_menuborder, true)
-        _safe_step("nl aa_enabled",     function() nl_override(nl_refs.aa_enabled, true) end)
-        _safe_step("nl aa_freestand",   function() nl_override(nl_refs.aa_freestand, true) end)
-        _safe_step("nl aa_avoidbk",     function() nl_override(nl_refs.aa_avoidbackstab, true) end)
-        _safe_step("nl fl_switch",      function() nl_override(nl_refs.fl_switch, true) end)
-        -- V3.16: force NL Yaw Base = Backward. The user noticed the fake facing the enemy
-        -- in aggressive — that is Yaw Base "Forward" (fake points toward the look/aim
-        -- direction). "Backward" makes the fake point AWAY while the real angle still
-        -- snaps to the enemy when the ragebot fires. Combo :override takes the option
-        -- STRING (bool segfaults).
-        _safe_step("nl yaw_base_back",  function() nl_override(nl_refs.aa_yaw_base, "Backward") end)
-        cs_log_color("AGGRESSIVE preset applied")
-    elseif name == "dynamic" then
-        safe_set(aa_enable, true)
-        safe_set(aa_freestanding, true)
-        safe_set(aa_at_targets, true)
-        safe_set(aa_desync, 45)
-        safe_set(aa_yaw_mod_mag, 28)
-        safe_set(aa_yaw_mod_int, 3)
-        safe_set(aa_onshot, true)
-        safe_set(aa_air_set, true)
-        safe_set(aa_air_flip, true)
-        safe_set(aa_air_boost, false)    -- dynamic = balanced, no max boost
-        safe_set(aa_anti_bf, true)
-        safe_set(aa_fd_assist, true)
-        safe_set(vis_watermark, true)
-        safe_set(vis_indicators, true)
-        safe_set(vis_velwarn, true)
-        safe_set(vis_aaarrows, true)
-        safe_set(vis_hitmarker, true)
-        safe_set(vis_hitlog, true)
-        safe_set(vis_keybinds, true)
-        safe_set(vis_dmgind, true)
-        safe_set(vis_specoverlay, true)
-        safe_set(qol_clantag, true)
-        nl_override(nl_refs.aa_enabled, true)
-        nl_override(nl_refs.aa_freestand, true)
-        nl_override(nl_refs.fl_switch, true)
-        cs_log_color("DYNAMIC preset applied")
-    elseif name == "defensive" then
-        safe_set(aa_enable, true)
-        safe_set(aa_freestanding, true)
-        safe_set(aa_at_targets, false)
-        safe_set(aa_desync, 35)
-        safe_set(aa_yaw_mod_mag, 15)
-        safe_set(aa_yaw_mod_int, 4)
-        safe_set(aa_onshot, true)
-        safe_set(aa_air_set, true)
-        safe_set(aa_air_flip, false)     -- defensive = no rapid flip
-        safe_set(aa_air_boost, false)
-        safe_set(aa_anti_bf, false)  -- defensive = predictable static
-        safe_set(aa_fd_assist, true)
-        safe_set(vis_watermark, true)
-        safe_set(vis_indicators, true)
-        safe_set(vis_velwarn, true)
-        safe_set(vis_aaarrows, true)
-        safe_set(vis_hitmarker, true)
-        safe_set(vis_hitlog, true)        -- V2.9: always ON for kill/miss/hit log
-        safe_set(vis_keybinds, true)
-        safe_set(vis_dmgind, false)
-        safe_set(vis_specoverlay, true)
-        safe_set(qol_clantag, false)
-        nl_override(nl_refs.aa_enabled, true)
-        nl_override(nl_refs.aa_freestand, true)
-        nl_override(nl_refs.fl_switch, true)
-        cs_log_color("DEFENSIVE preset applied")
-    elseif name == "spin" then
-        -- Full spinbot — fast yaw rotation, high-freq jitter, NO freestanding (we WANT spin)
-        safe_set(aa_enable, true)
-        safe_set(aa_freestanding, false)
-        safe_set(aa_at_targets, false)
-        safe_set(aa_desync, 58)
-        safe_set(aa_yaw_add, 0)
-        safe_set(aa_yaw_mod_mag, 58)
-        safe_set(aa_yaw_mod_int, 1)  -- every tick flip
-        safe_set(aa_onshot, false)   -- spin = always spin, no defensive interrupt
-        safe_set(aa_air_set, true)
-        safe_set(aa_air_mag, 58)
-        safe_set(aa_air_flip, true)      -- spin = full chaos in air
-        safe_set(aa_air_boost, true)
-        safe_set(aa_air_fakeduck, true)  -- spin allows fake-duck LBY break
-        safe_set(aa_anti_bf, true)
-        safe_set(aa_anti_bf_var, 25)
-        safe_set(aa_fd_assist, true)
-        safe_set(vis_watermark, true)
-        safe_set(vis_indicators, true)
-        safe_set(vis_velwarn, true)
-        safe_set(vis_aaarrows, true)
-        safe_set(vis_hitmarker, true)
-        safe_set(vis_hitlog, true)
-        safe_set(vis_keybinds, true)
-        safe_set(vis_dmgind, true)
-        safe_set(vis_specoverlay, true)
-        safe_set(qol_clantag, true)
-        nl_override(nl_refs.aa_enabled, true)
-        nl_override(nl_refs.aa_freestand, false)
-        nl_override(nl_refs.aa_avoidbackstab, false)
-        nl_override(nl_refs.fl_switch, true)
-        cs_log_color("SPIN preset applied (full spinbot — no freestanding, max jitter)")
-    elseif name == "troll" then
-        -- V3.16: TROLL / BAIT — NOT competitive. Built for running or slow-walking
-        -- straight INTO enemies to see who can actually resolve you (everyone else
-        -- whiffs). Stacks EVERY anti-resolver layer at once: per-tick magnitude jitter
-        -- (kills EMA resolvers — including the kind Sel01-Solver itself is), fake-lag
-        -- variance (breaks backtrack), yaw-base rotation (anti eye-yaw fingerprint),
-        -- fast side-streak flipping (never a predictable side), defensive-on-hit +
-        -- slow-walk chaos. Freestanding OFF on purpose — it picks a DETERMINISTIC side
-        -- (resolvable); pure jitter is less trackable for a bait.
-        safe_set(aa_enable, true)
-        safe_set(aa_freestanding, false)
-        safe_set(aa_at_targets, false)
-        safe_set(aa_desync, 58)            -- max angle
-        safe_set(aa_yaw_add, 0)
-        safe_set(aa_yaw_mod_mag, 58)
-        safe_set(aa_yaw_mod_int, 1)        -- flip every tick
-        safe_set(aa_onshot, true)
-        safe_set(aa_air_set, true)
-        safe_set(aa_air_mag, 58)
-        safe_set(aa_air_flip, true)
-        safe_set(aa_air_boost, true)
-        safe_set(aa_air_fakeduck, true)
-        safe_set(aa_move_set, true)        -- keep desync while running in
-        safe_set(aa_move_mag, 58)
-        safe_set(aa_move_thresh, 100)
-        safe_set(aa_move_flip, true)
-        safe_set(aa_move_boost, true)
-        safe_set(aa_pitch_jitter, true)    -- anti-headshot vertical
-        -- V3.16-troll-v2: duck-bob while running in. The sticky-fakeduck bug was fixed
-        -- in v3.3 (falling-edge clear), so this is safe now. thresh 50 = bob only while
-        -- MOVING (running/slow-walking in) and STAND the instant you stop to shoot, so
-        -- it stays functional — your ragebot still commits cleanly when stationary.
-        safe_set(aa_move_fakeduck, true)
-        safe_set(aa_move_fd_thresh, 50)
-        safe_set(aa_anti_bf, true)
-        safe_set(aa_anti_bf_var, 25)       -- max bruteforce variance
-        safe_set(aa_fd_assist, true)
-        -- ── the whole anti-resolver bundle ON (this is the point of the preset) ──
-        safe_set(aa_mag_jitter, true)      -- THE EMA-resolver killer
-        safe_set(aa_mag_jit_min, 20)       -- v2: wider (20-58) so the jitter spans low
-        safe_set(aa_mag_jit_max, 58)       --     AND high magnitudes — even harder to lock
-        safe_set(aa_fl_var, true)          -- breaks backtrack records
-        safe_set(aa_yaw_rotate, true)      -- rotates yaw base, anti eye-yaw fingerprint
-        safe_set(aa_side_streak, true)
-        safe_set(aa_side_streak_n, 2)      -- flip after 2 same-side shots = never predictable
-        safe_set(aa_def_on_dmg, true)
-        safe_set(aa_def_duration, 3000)    -- long chaos window when hit
-        safe_set(aa_slow_boost, true)      -- max chaos while slow-walking in
-        safe_set(vis_watermark, true)
-        safe_set(vis_indicators, true)
-        safe_set(vis_velwarn, true)
-        safe_set(vis_aaarrows, true)
-        safe_set(vis_hitmarker, true)
-        safe_set(vis_hitlog, true)
-        safe_set(vis_keybinds, true)
-        safe_set(vis_dmgind, true)
-        safe_set(vis_specoverlay, true)
-        safe_set(qol_clantag, true)
-        safe_set(qol_clantag_st, "Spin")   -- v2: spinning troll clantag
-        nl_override(nl_refs.aa_enabled, true)
-        nl_override(nl_refs.aa_freestand, false)
-        nl_override(nl_refs.aa_avoidbackstab, false)
-        nl_override(nl_refs.fl_switch, true)
-        -- yaw-rotation is ON in troll → NL Yaw Base cycles on its own; no static set.
-        _troll_mode = true   -- v2: drives the 🤡 TROLL indicator in render
-        cs_log_color("TROLL/BAIT preset applied — max anti-resolver chaos. Run/slow-walk in + watch who whiffs.")
     end
+end
+
+local AA_PRESETS = {
+    -- full send: wide center jitter, defensive always, air-lag, hidden defensive angles,
+    -- fluctuating fake lag, every reaction on. Freestanding only while standing.
+    aggressive = {
+        states = {
+            global  = { yaw_mode = "Center Jitter", yaw_l = -6, yaw_r = 6, yaw_jit = 30, yaw_rand = 6,
+                        body_mode = "Jitter (side switch)", body_mag = "Random Min-Max", body_min = 38,
+                        sw_mode = "Random delay", sw_lo = 1, sw_hi = 3, freestand = true, defensive = "Always" },
+            move    = { use_global = false, yaw_mode = "Center Jitter", yaw_l = 0, yaw_r = 0, yaw_jit = 22, yaw_rand = 8,
+                        body_mode = "Jitter (side switch)", body_mag = "Random Min-Max", body_min = 30,
+                        sw_mode = "Fixed delay", sw_delay = 2, freestand = false, defensive = "Always" },
+            slow    = { use_global = false, yaw_mode = "Center Jitter", yaw_l = -8, yaw_r = 8, yaw_jit = 14, yaw_rand = 10,
+                        body_mode = "Jitter (side switch)", body_mag = "Random Min-Max", body_min = 45,
+                        sw_mode = "Random delay", sw_lo = 1, sw_hi = 2, freestand = false, defensive = "Always" },
+            air     = { use_global = false, yaw_mode = "Random", yaw_jit = 34, yaw_rand = 8,
+                        body_mode = "Jitter (side switch)", body_mag = "Random Min-Max", body_min = 25,
+                        sw_mode = "Every send", freestand = false, defensive = "Always" },
+            airduck = { use_global = false, yaw_mode = "Static", yaw_jit = 0, yaw_rand = 4,
+                        body_mode = "Random side", body_mag = "Random Min-Max", body_min = 30,
+                        sw_mode = "Every send", freestand = false, defensive = "Always" },
+        },
+        g = { def_int = 2, def_clean = "Random + flick 60-72", def_lag = true, airlag = true,
+              fl_mode = "Fluctuate 1 / 14", dh_enable = true, dh_pitch = "Cycle", dh_yaw = "Sideways +/-90",
+              ab_delay = true, hit_dur = 2000, pitch_jitter = true, idle_spin = true },
+        vis_extras = true, clantag = true, log = "AGGRESSIVE preset applied (per-state engine, defensive always, hidden flick)",
+    },
+    -- balanced = the element defaults
+    dynamic = {
+        states = {},
+        g = {},
+        vis_extras = false, clantag = true, log = "DYNAMIC preset applied (balanced defaults)",
+    },
+    -- safe: small jitter, freestanding everywhere on the ground, fixed 60/60, head-safe pulses
+    defensive = {
+        states = {
+            global  = { yaw_mode = "Center Jitter", yaw_l = -3, yaw_r = 3, yaw_jit = 14, yaw_rand = 3,
+                        body_mode = "Jitter (side switch)", body_mag = "Fixed L/R", body_l = 60, body_r = 60,
+                        sw_mode = "Random delay", sw_lo = 2, sw_hi = 4, freestand = true, defensive = "On threat" },
+            move    = { use_global = false, yaw_mode = "Center Jitter", yaw_l = 0, yaw_r = 0, yaw_jit = 10, yaw_rand = 4,
+                        body_mode = "Jitter (side switch)", body_mag = "Random Min-Max", body_min = 45,
+                        sw_mode = "Fixed delay", sw_delay = 2, freestand = true, defensive = "On threat" },
+            slow    = { use_global = false, yaw_mode = "Center Jitter", yaw_l = -4, yaw_r = 4, yaw_jit = 8, yaw_rand = 6,
+                        body_mode = "Jitter (side switch)", body_mag = "Random Min-Max", body_min = 50,
+                        sw_mode = "Random delay", sw_lo = 1, sw_hi = 2, freestand = true, defensive = "On threat" },
+            air     = { use_global = false, yaw_mode = "Random", yaw_jit = 20, yaw_rand = 4,
+                        body_mode = "Jitter (side switch)", body_mag = "Random Min-Max", body_min = 30,
+                        sw_mode = "Every send", freestand = false, defensive = "On threat" },
+        },
+        g = { fl_mode = "Off", ab_limit = false, ab_yaw = false, head_prot = true, hit_dur = 1500 },
+        vis_extras = false, clantag = false, log = "DEFENSIVE preset applied (small jitter, freestanding, head-safe pulses)",
+    },
+    -- spinbot: NL Spin modifier, random magnitude, every-send switch, no freestanding
+    spin = {
+        states = {
+            global  = { yaw_mode = "Spin", yaw_jit = 40, yaw_rand = 0,
+                        body_mode = "Jitter (side switch)", body_mag = "Random Min-Max", body_min = 30,
+                        sw_mode = "Every send", freestand = false, defensive = "Always" },
+            air     = { use_global = false, yaw_mode = "Spin", yaw_jit = 60, yaw_rand = 0,
+                        body_mode = "Random side", body_mag = "Random Min-Max", body_min = 30,
+                        sw_mode = "Every send", freestand = false, defensive = "Always" },
+            stand = { use_global = true }, move = { use_global = true }, slow = { use_global = true },
+            duck  = { use_global = true }, duckmv = { use_global = true }, airduck = { use_global = true },
+        },
+        g = { avoid_bs = false, fl_mode = "Fluctuate 1 / 14", ab_enable = false, hit_react = false, idle_spin = true },
+        vis_extras = false, clantag = true, log = "SPIN preset applied (NL Spin modifier, no freestanding)",
+    },
+    -- bait: everything random, run in and watch who resolves it. Not competitive.
+    troll = {
+        states = {
+            global  = { yaw_mode = "Random", yaw_jit = 90, yaw_rand = 30,
+                        body_mode = "Random side", body_mag = "Random Min-Max", body_min = 10,
+                        sw_mode = "Every send", freestand = false, defensive = "Always" },
+            stand = { use_global = true }, move = { use_global = true }, slow = { use_global = true },
+            duck  = { use_global = true }, duckmv = { use_global = true }, air = { use_global = true },
+            airduck = { use_global = true },
+        },
+        g = { avoid_bs = false, def_int = 2, def_clean = "Random + flick 60-72", airlag = true,
+              fl_mode = "Fluctuate 1 / 14", dh_enable = true, dh_pitch = "Random", dh_yaw = "Spin",
+              dh_cond = "Always", ab_delay = true, pitch_jitter = true, move_fd = true, move_fd_thr = 50, idle_spin = true },
+        vis_extras = false, clantag = true, clantag_style = "Spin", troll = true,
+        log = "TROLL/BAIT preset applied - max chaos. Run / slow-walk in + watch who whiffs.",
+    },
+}
+
+local function _do_apply_preset(name)
+    cs_log("[apply] start " .. tostring(name))
+    _troll_mode = false  -- reset on every preset; troll re-sets it true below
+    local P = AA_PRESETS[name]
+    if not P then cs_log("[apply] unknown preset " .. tostring(name)); return end
+    _safe_step("aa bundle", function() aa_apply_bundle(P) end)
+    _safe_step("visuals",   function() vis_apply_all(P.vis_extras) end)
+    safe_set(qol_clantag, P.clantag == true)
+    if P.clantag_style then safe_set(qol_clantag_st, P.clantag_style) end
+    _troll_mode = P.troll == true
+    -- the engine writes every NL Anti Aim element itself from the next tick on;
+    -- only Fake Lag master is forced here (the engine never toggles it)
+    _safe_step("nl fl_switch", function() nl_override(nl_refs.fl_switch, true) end)
+    aa_tl_push("PRESET", tostring(name))
+    cs_log_color(P.log or (tostring(name) .. " preset applied"))
 end
 
 -- Public entry — just queue the work, do not touch UI state from this function.
@@ -742,278 +839,549 @@ end
 apply_preset_fwd = apply_preset  -- resolve forward-decl
 
 -- ══════════════════════════════════════════════════════════════════════════
--- ANTI-AIM EVENT HOOK
--- NL exposes events.antiaim (signature varies). Best-effort write to cmd
--- (pitch, yaw_base, yaw_add, yaw_modifier, jitter, desync). All pcall.
+-- AA ENGINE (v4.0) — ONE createmove pass, every tick:
+--   state → threat/defensive tracking → side switch (un-choked sends) → yaw →
+--   body yaw → head-safe / manual / idle → NL :override writes → force_defensive →
+--   DT lag / hidden angles → fake lag → anti-HS extras.
+-- Never writes cmd angle fields (v1.6 CTD) — only NL's own Anti Aim elements via
+-- :override, plus the documented cmd.force_defensive bool and rage.antiaim /
+-- rage.exploit calls that nyanza / angelnbone / gingersense use on this build.
 -- ══════════════════════════════════════════════════════════════════════════
--- V1.8: aa_handler with cmd.* field writes was deleted because no other NL script
--- (JAG0YAW oracle, bloodwings, nyanza, bettervisal, gingersense) uses that pattern.
--- They all drive anti-aim through ui.find:override() on NL's own AA elements. Writing
--- to undefined fields on the events.antiaim cmd userdata likely caused the CTD the
--- user hit a few seconds after team-select. This version routes everything through
--- aa_periodic_sync (called from createmove_unified) which only uses :override on
--- NL refs — same well-tested path the other scripts use.
+local aa_yaw_jitter_counter = 0   -- drives the crosshair arrow animation
+local aa_jitter_dir         = 1   -- -1 = left, +1 = right (engine side)
 
-local aa_yaw_jitter_counter = 0
--- Kept alias for indicator's rotating-line animation (still uses yaw rhythm)
-local aa_jitter_counter     = 0
-local aa_jitter_dir         = 1
--- V1.6 HvH state — runtime flags shared with indicators + AA decisions
-local aa_state = {
-    on_shot_until    = 0,
-    fakeduck_until   = 0,
-    last_fire_time   = 0,
-    -- V3.6
-    defensive_until  = 0,       -- realtime cutoff for defensive AA mode
-    fl_next_change   = 0,       -- next realtime at which to re-randomize fake-lag
-    fl_active        = false,   -- dirty-track for clearing override
-    fl_base          = nil,     -- captured user fake-lag value before first override
-    -- V3.7
-    yaw_next_change  = 0,       -- next realtime to re-roll yaw base
-    yaw_active       = false,   -- dirty-track yaw-base override
-    side_streak_dir  = 0,       -- our last-shot side: +1 right, -1 left, 0 unknown
-    side_streak_n    = 0,       -- count of consecutive same-side shots
-    side_force_inv   = nil,     -- when set, force aa_bodyyaw_inv to this bool next sync
-}
-
--- V2.3: air-AA improvements for jumping aggressive play. New air-extras (rapid
--- inverter flip, max-jitter boost, force fake-duck). Transition handling clears
--- overrides on land so ground AA returns to user's preset state.
-local aa_periodic_last_tick = 0
-local _was_airborne   = false
-local _move_fd_active = false  -- V3.3 dirty-track for fake-duck override
-local _def_inv_active = false  -- V3.6 dirty-track for bodyyaw_inv override (defensive/slow random side)
-
-local function aa_periodic_sync()
-    if not (enable_master:get() and aa_enable:get()) then return end
-    local lp = entity.get_local_player()
-    if not lp then return end
-    local alive = false
-    pcall(function() alive = lp:is_alive() end)
-    if not alive then return end
-
-    local tick = globals.tickcount or 0
-    -- jitter rhythm counter (runs every tick, cheap, drives indicator animation)
-    aa_yaw_jitter_counter = aa_yaw_jitter_counter + 1
-    aa_jitter_counter     = aa_yaw_jitter_counter
-    local jint = math.max(1, aa_yaw_mod_int:get())
-    if aa_yaw_jitter_counter % jint == 0 then aa_jitter_dir = -aa_jitter_dir end
-    if tick - aa_periodic_last_tick < 4 then return end
-    aa_periodic_last_tick = tick
-    aa_corr_phase = aa_corr_phase + 1  -- V3.11: advance once per EXECUTED sync (post-throttle)
-
-    -- airborne detection (FL_ONGROUND bit 0)
-    local f = 0
-    pcall(function() f = lp.m_fFlags or 0 end)
-    local airborne = (bit.band(f, 1) == 0)
-
-    -- transition handling: just landed -> clear air-extra overrides so ground AA
-    -- returns to user's preset / manual values
-    if _was_airborne and not airborne then
-        nl_clear(nl_refs.aa_bodyyaw_inv)
-        nl_clear(nl_refs.aa_yawmod_offset)
-        nl_clear(nl_refs.aa_fakeduck)
+-- type-guarded override (realsilentff pattern): combo=string, switch=bool,
+-- slider=number, multi-select=table. A wrong type on an NL element is how v2.2
+-- segfaulted; this refuses instead of crashing.
+local function aa_ov(ref, v)
+    if not ref then return false end
+    if v == nil then return pcall(function() ref:override() end) end
+    local cur
+    if not pcall(function() cur = ref:get() end) then return false end
+    if type(cur) ~= type(v) then return false end
+    return pcall(function() ref:override(v) end)
+end
+-- combo override with label aliases (option labels vary slightly per NL build)
+local function aa_ov_str(ref, ...)
+    if not ref then return false end
+    local cur
+    if not pcall(function() cur = ref:get() end) then return false end
+    if type(cur) ~= "string" then return false end
+    for i = 1, select("#", ...) do
+        local s = select(i, ...)
+        if s and pcall(function() ref:override(s) end) then return true end
     end
-    _was_airborne = airborne
+    return false
+end
 
-    -- V3.0: clear pitch override if pitch_jitter is OFF (so user's manual NL pitch
-    -- combo value comes back). Cheap: NL handles no-op clears.
-    if not aa_pitch_jitter:get() then
-        pcall(function() if nl_refs.aa_pitch then nl_refs.aa_pitch:override() end end)
-    end
+local AA_REF_KEYS = { "aa_enabled", "aa_pitch", "aa_yaw", "aa_yaw_base", "aa_yaw_offset",
+    "aa_avoidbackstab", "aa_yawmod", "aa_yawmod_offset", "aa_bodyyaw", "aa_bodyyaw_inv",
+    "aa_bodyyaw_l", "aa_bodyyaw_r", "aa_bodyyaw_opts", "aa_freestand", "aa_leg_movement",
+    "aa_yaw_hidden", "fl_limit", "rage_dtlag", "aa_fakeduck" }
+local function aa_clear_overrides()
+    for _, k in ipairs(AA_REF_KEYS) do nl_clear(nl_refs[k]) end
+    pcall(function() rage.antiaim:override_hidden_yaw_offset(0) end)
+    pcall(function() rage.antiaim:override_hidden_pitch(0) end)
+    aa_eng.fl_active, aa_eng.dtlag_active, aa_eng.hidden_active, aa_eng.fd_active = false, false, false, false
+    aa_eng.fl_base = nil
+end
 
-    local now = globals.realtime or 0
-    local on_shot_active = aa_onshot:get() and now < aa_state.on_shot_until
-    local anti_bf_active = aa_anti_bf:get()
-    local air_set_active = aa_air_set:get() and airborne
-    -- V3.2: Move override active when running on ground over threshold velocity
-    local move_set_active = false
-    local _vel_cache = 0
-    if aa_move_set:get() and not airborne then
+-- state: air via anim-state on_ground (no landing flicker), duck via m_flDuckAmount
+-- or the NL Fake Duck key, slow-walk via the NL Slow Walk key, run via 2D speed.
+local function aa_get_state(lp, cmd)
+    local flags, vel, duck_amt = 0, 0, 0
+    pcall(function()
+        flags = lp.m_fFlags or 0
+        local v = lp.m_vecVelocity
+        vel = math.sqrt((v.x or 0) ^ 2 + (v.y or 0) ^ 2)
+        duck_amt = lp.m_flDuckAmount or 0
+    end)
+    local airborne = (bit.band(flags, 1) == 0)
+    pcall(function()
+        local as = lp:get_anim_state()
+        if as and as.on_ground ~= nil then
+            airborne = not (as.on_ground and not as.landed_on_ground_this_frame)
+        end
+    end)
+    pcall(function() if cmd and cmd.in_jump and not airborne and bit.band(flags, 1) == 0 then airborne = true end end)
+    local ducked = duck_amt > 0.4 or bit.band(flags, 4) == 4
+    pcall(function() if nl_refs.aa_fakeduck and nl_refs.aa_fakeduck:get() then ducked = true end end)
+    local slow = false
+    pcall(function() slow = (nl_refs.aa_slowwalk and nl_refs.aa_slowwalk:get()) and true or false end)
+    local key
+    if airborne then key = ducked and "airduck" or "air"
+    elseif vel > 3.63 then key = ducked and "duckmv" or (slow and "slow" or "move")
+    else key = ducked and "duck" or "stand" end
+    return key, airborne, ducked, vel, slow
+end
+
+-- hittable threat + cached name / origin / distance (read in createmove context, the
+-- safe place; player_hurt only reuses the cache — never reads the attacker entity)
+local function aa_update_threat(lp)
+    local th = nil
+    pcall(function() th = entity.get_threat(true) end)
+    aa_eng.threat = th
+    if th then
         pcall(function()
-            local v = lp.m_vecVelocity
-            _vel_cache = math.sqrt((v.x or 0)^2 + (v.y or 0)^2)
+            aa_eng.threat_name = tostring(th:get_name() or "?")
+            local o, lo = th:get_origin(), lp:get_origin()
+            aa_eng.threat_x, aa_eng.threat_y, aa_eng.threat_z = o.x, o.y, o.z
+            aa_eng.threat_dist = math.sqrt((o.x - lo.x) ^ 2 + (o.y - lo.y) ^ 2 + (o.z - lo.z) ^ 2)
         end)
-        if _vel_cache > (aa_move_thresh:get() or 100) then move_set_active = true end
+    else
+        aa_eng.threat_dist = 0
     end
+    return th
+end
 
-    -- V3.6: defensive window after we took damage — max desync + random side + fake-duck
-    local defensive_active = aa_def_on_dmg:get() and now < (aa_state.defensive_until or 0)
-    -- V3.6: slow-walk boost — when NL Slow Walk hotkey held, force max desync + chaos
-    local slow_active = false
-    if aa_slow_boost:get() and nl_refs.aa_slowwalk then
-        local ok, v = pcall(function() return nl_refs.aa_slowwalk:get() end)
-        if ok and v then slow_active = true end
-    end
+-- defensive discharge detection: m_nTickBase runs BACKWARDS on a defensive tick
+-- (angelnbone / gingersense). aa_eng.defensive = how many ticks the shift is.
+local function aa_track_defensive(lp)
+    local tb = 0
+    pcall(function() tb = lp.m_nTickBase or 0 end)
+    if math.abs(tb - aa_eng.max_tickbase) > 64 then aa_eng.max_tickbase = 0 end
+    local n = 0
+    if tb > aa_eng.max_tickbase then aa_eng.max_tickbase = tb
+    elseif tb < aa_eng.max_tickbase then n = math.min(14, math.max(0, aa_eng.max_tickbase - tb - 1)) end
+    aa_eng.defensive = n
+    if n > 0 then aa_eng.stats.def_ticks = aa_eng.stats.def_ticks + 1 end
+end
 
-    if not (air_set_active or on_shot_active or anti_bf_active or move_set_active
-            or defensive_active or slow_active) then return end
+local AA_DIR_ADD = { Backward = 0, Left = 90, Right = -90, Forward = 180 }
+local AA_MAN_YAW = { L = -90, R = 90, F = 180 }
 
-    -- V3.2: desync magnitude priority: defensive > air > slow > move > on-shot reduction > base
-    local lim = aa_desync:get()
-    if move_set_active then lim = aa_move_mag:get() end
-    if air_set_active  then lim = aa_air_mag:get() end
-    if on_shot_active  then lim = math.max(15, math.floor(lim * 0.5)) end
-    -- V3.6: slow + defensive both push to max (base); V3.13 two-cluster overrides below
-    if slow_active      then lim = 58 end
-    if defensive_active then lim = 58 end
-
-    -- V3.13: ANTI-EMA two-cluster for the chaos states (slow-walk / defensive / air).
-    -- These used to sit at a FIXED center (58 for slow/def, the slider for air) and
-    -- lean on symmetric anti-BF noise — but an EMA/median resolver averages symmetric
-    -- noise straight back to that center and beams you (hits-taken log: every hit at
-    -- desync=58, resolved clean). Alternate TWO clusters (~base and ~base-22) every
-    -- 0.4-1.1s so the resolver's tracked mean lands in the EMPTY gap and matches
-    -- neither. anti-BF still adds per-side spread on top. Skipped if the user
-    -- explicitly enabled Magnitude jitter / Bimodal (those take precedence below).
-    if (slow_active or defensive_active or air_set_active)
-       and not aa_mag_jitter:get() and not aa_bimodal:get() then
-        if now >= slow_aa_state.next then
-            slow_aa_state.mode = 3 - slow_aa_state.mode
-            slow_aa_state.next = now + 0.4 + math.random() * 0.7
+local function aa_engine_tick(cmd)
+    local on = enable_master:get() and AA.enable:get()
+    local lp = on and entity.get_local_player() or nil
+    local alive = false
+    if lp then pcall(function() alive = lp:is_alive() end) end
+    if not (on and lp and alive and globals.is_in_game) then
+        if aa_eng.active then
+            aa_clear_overrides()
+            aa_eng.active = false
+            aa_tl_push("ENGINE", on and "dead / not in game → overrides cleared" or "disabled → overrides cleared")
         end
-        local hi = math.min(58, lim)            -- high cluster = the base magnitude
-        local lo = math.max(18, lim - 22)       -- low cluster ~22° below
-        lim = (slow_aa_state.mode == 1 and lo or hi) + (math.random() * 4 - 2)
+        aa_eng.def_after = 0
+        return
     end
+    if not aa_eng.active then aa_eng.active = true; aa_tl_push("ENGINE", "active") end
 
-    -- V3.9: per-tick magnitude jitter. When enabled, base magnitude is picked
-    -- randomly inside [min,max] every periodic-sync tick. EMA-based resolvers
-    -- (incl ours v9.x) lock onto the average; randomized mag keeps the actual
-    -- value 5-15° off that average each shot. Off by default — combine with
-    -- anti-BF below for full per-side chaos.
-    if aa_mag_jitter:get() then
-        local mj_lo = aa_mag_jit_min:get()
-        local mj_hi = aa_mag_jit_max:get()
-        if mj_lo > mj_hi then mj_lo, mj_hi = mj_hi, mj_lo end
-        lim = mj_lo + math.random() * (mj_hi - mj_lo)
-    elseif aa_bimodal:get() then
-        -- V3.10: flip cluster every 2-5s; small ±3° wobble so each cluster isn't a
-        -- dead-constant the resolver could lock per-side. Long-run mean sits in the
-        -- gap between A and B → resolver EMA/median matches no actual shot.
-        local now2 = globals.realtime or 0
-        if now2 >= aa_bimodal_state.next_switch then
-            aa_bimodal_state.mode = 3 - aa_bimodal_state.mode  -- 1 <-> 2
-            aa_bimodal_state.next_switch = now2 + 2.0 + math.random() * 3.0
-        end
-        local base = (aa_bimodal_state.mode == 1) and aa_bimodal_lo:get() or aa_bimodal_hi:get()
-        lim = base + (math.random() * 2 - 1) * 3
+    local now  = globals.realtime or 0
+    local tick = globals.tickcount or 0
+    local choked, cn = 0, tick
+    pcall(function() choked = cmd.choked_commands or globals.choked_commands or 0 end)
+    pcall(function() cn = cmd.command_number or tick end)
+    local unchoked = (choked == 0)
+    aa_yaw_jitter_counter = aa_yaw_jitter_counter + 1
+
+    -- ── 1. state ──
+    local key, airborne, ducked, vel, slow = aa_get_state(lp, cmd)
+    if key ~= aa_eng.state then
+        aa_tl_push("STATE", tostring(aa_eng.state) .. " → " .. key .. string.format(" (vel %.0f)", vel))
+        aa_eng.state, aa_eng.state_since = key, now
     end
+    local S = AA.st[key]
+    if S.use_global and S.use_global:get() then S = AA.st.global end
 
-    local l_lim, r_lim = lim, lim
-    if aa_corr_jitter:get() then
-        -- V3.11: correlated pattern REPLACES the independent symmetric draw (stacking
-        -- a second random layer would just re-introduce the averaging it defeats).
-        local amp = aa_corr_amp:get()
-        if aa_corr_antiphase:get() then
-            local sn = math.sin(aa_corr_phase * 0.6)
-            l_lim = lim + amp * sn
-            r_lim = lim - amp * sn
+    -- ── 2. threat / defensive tracking / exploit ──
+    local threat = aa_update_threat(lp)
+    aa_track_defensive(lp)
+    pcall(function() rage.exploit:allow_defensive(true) end)
+    pcall(function() aa_eng.charge = rage.exploit:get() or 0 end)
+    pcall(function() aa_eng.dt_on = (nl_refs.rage_dt and nl_refs.rage_dt:get()) and true or false end)
+    pcall(function() aa_eng.hs_on = (nl_refs.rage_hs and nl_refs.rage_hs:get()) and true or false end)
+    local revolver = false
+    pcall(function()
+        local w = lp:get_player_weapon()
+        local inf = w and w:get_weapon_info()
+        revolver = (inf and inf.is_revolver) and true or false
+    end)
+
+    -- ── 3. reactions (anti-bruteforce entry + hit burst) ──
+    if aa_eng.force_side ~= nil and unchoked then
+        aa_eng.side = aa_eng.force_side
+        aa_eng.force_side = nil
+        aa_eng.sw_ctr, aa_eng.sw_need = 0, nil
+        aa_eng.body_roll_side = -1
+        aa_eng.stats.flips = aa_eng.stats.flips + 1
+    end
+    local react = now < aa_eng.react_until
+    local ab = nil
+    for name, e in pairs(aa_eng.ab) do
+        if e.until_t > now then
+            if not ab then ab = e end
         else
-            local span = math.max(1, amp)
-            local ramp = (aa_corr_phase * 8) % span   -- same-sign walk; EMA never centers
-            l_lim = lim + ramp
-            r_lim = lim + ramp
-        end
-    elseif anti_bf_active or slow_active or defensive_active then
-        local var = aa_anti_bf_var:get()
-        -- 1.5x variance airborne for more chaos; 2x for slow / defensive
-        if air_set_active                       then var = math.min(58, var * 1.5) end
-        if slow_active or defensive_active      then var = math.min(58, var * 2.0) end
-        l_lim = lim + (math.random() * 2 - 1) * var
-        r_lim = lim + (math.random() * 2 - 1) * var
-    end
-    if l_lim < 0 then l_lim = 0 elseif l_lim > 58 then l_lim = 58 end
-    if r_lim < 0 then r_lim = 0 elseif r_lim > 58 then r_lim = 58 end
-    nl_override(nl_refs.aa_bodyyaw_l, math.floor(l_lim))
-    nl_override(nl_refs.aa_bodyyaw_r, math.floor(r_lim))
-
-    -- V3.6: defensive/slow → random body-yaw inverter every periodic tick. Dirty-tracked
-    -- so falling edge clears the override and ground AA returns to user's preset.
-    local def_or_slow = defensive_active or slow_active
-    if def_or_slow then
-        nl_override(nl_refs.aa_bodyyaw_inv, (math.random() < 0.5))
-        _def_inv_active = true
-    elseif aa_state.side_force_inv ~= nil then
-        -- V3.7: streak-limit forced flip — apply once then clear
-        nl_override(nl_refs.aa_bodyyaw_inv, aa_state.side_force_inv)
-        aa_state.side_force_inv = nil
-        _def_inv_active = true   -- mark so next non-forced tick clears
-    elseif _def_inv_active then
-        pcall(function() if nl_refs.aa_bodyyaw_inv then nl_refs.aa_bodyyaw_inv:override() end end)
-        _def_inv_active = false
-    end
-
-    -- V3.14: SMART FREESTAND — during the chaos states (defensive / slow) deterministic
-    -- freestanding re-locks a predictable side (the one getting your head shot) and
-    -- fights the random inverter above. Disable it there so the random inverter rules;
-    -- restore the user's freestand setting on the falling edge (override revert).
-    if aa_smart_free:get() and aa_freestanding:get() and def_or_slow then
-        nl_override(nl_refs.aa_freestand, false)
-        _smart_free_off = true
-    elseif _smart_free_off then
-        nl_clear(nl_refs.aa_freestand)
-        _smart_free_off = false
-    end
-
-    -- V2.3 AIR EXTRAS — only when airborne
-    if air_set_active then
-        if aa_air_flip:get() then
-            nl_override(nl_refs.aa_bodyyaw_inv, (aa_yaw_jitter_counter % 2 == 0))
-        end
-        if aa_air_boost:get() then
-            nl_override(nl_refs.aa_yawmod_offset, 58)
-        end
-        if aa_air_fakeduck:get() then
-            nl_override(nl_refs.aa_fakeduck, true)
+            aa_eng.ab[name] = nil
         end
     end
 
-    -- V3.2 MOVE EXTRAS — only when running on ground above threshold
-    if move_set_active then
-        if aa_move_flip:get() then
-            nl_override(nl_refs.aa_bodyyaw_inv, (aa_yaw_jitter_counter % 2 == 0))
+    -- ── 4. idle spin (warmup / round end, no threat) ──
+    local idle = false
+    if AA.idle_spin:get() then
+        local warm = false
+        pcall(function() local gr = entity.get_game_rules(); warm = (gr and gr.m_bWarmupPeriod) and true or false end)
+        if warm or (aa_eng.round_ended and not threat) then idle = true end
+    end
+
+    -- ── 5. side switching — counted in UN-CHOKED sends ──
+    if unchoked then
+        aa_eng.sends = aa_eng.sends + 1
+        aa_eng.false_ticks = aa_eng.false_ticks + 1
+        local mode = S.sw_mode:get()
+        local need
+        if mode == "Every send" then need = 1
+        elseif mode == "Fixed delay" then need = S.sw_delay:get()
+        else
+            if not aa_eng.sw_need then
+                local lo, hi = S.sw_lo:get(), S.sw_hi:get()
+                if lo > hi then lo, hi = hi, lo end
+                aa_eng.sw_need = math.random(lo, hi)
+            end
+            need = aa_eng.sw_need
         end
-        if aa_move_boost:get() then
-            nl_override(nl_refs.aa_yawmod_offset, 58)
+        if ab and ab.delay and AA.ab_delay:get() then need = math.max(1, need + ab.delay) end
+        aa_eng.sw_ctr = aa_eng.sw_ctr + 1
+        if aa_eng.sw_ctr >= need then
+            aa_eng.sw_ctr, aa_eng.sw_need = 0, nil
+            aa_eng.side = 1 - aa_eng.side
+            aa_eng.switches = aa_eng.switches + 1
+            aa_eng.last_switch_t = now
+            aa_eng.body_roll_side = -1          -- new random magnitude on every switch
+        end
+    end
+    local side = aa_eng.side   -- 0 = left (inverter ON), 1 = right
+
+    -- ── 6. yaw ──
+    local dir_add = AA_DIR_ADD[AA.dir:get()] or 0
+    local yaw = (side == 0) and S.yaw_l:get() or S.yaw_r:get()
+    local rnd = S.yaw_rand:get()
+    if rnd > 0 then yaw = yaw + math.random(0, rnd) end
+    local jit = math.floor(S.yaw_jit:get())
+    local ymode = S.yaw_mode:get()
+    local mod_str, mod_amt = "Disabled", 0
+    if ymode == "Center Jitter" then yaw = yaw + ((side == 1) and jit / 2 or -jit / 2)
+    elseif ymode == "Offset Jitter" then yaw = yaw + ((side == 1) and jit or 0)
+    elseif ymode == "Random" then if jit > 0 then yaw = yaw + math.random(-jit, jit) end
+    elseif ymode == "3-Way" then mod_str, mod_amt = "3-Way", jit
+    elseif ymode == "5-Way" then mod_str, mod_amt = "5-Way", jit
+    elseif ymode == "Spin" then mod_str, mod_amt = "Spin", jit end
+    if ab and ab.yaw and AA.ab_yaw:get() then yaw = yaw + ab.yaw end
+    -- gingersense "clean records": after a discharge with a threat, garbage yaw for 11-17 ticks
+    if aa_eng.defensive > 0 then aa_eng.def_state = true end
+    if aa_eng.def_state and aa_eng.defensive < 1 and threat then
+        local span = tick % 7 + 11
+        aa_eng.def_after = tick + span
+        aa_eng.def_state = false
+        if now - (aa_eng.def_log_t or 0) > 1.0 then
+            aa_eng.def_log_t = now
+            aa_tl_push("DEF", string.format("discharge seen (threat %s) → clean records %d ticks", aa_eng.threat_name, span))
+        end
+    end
+    local clean = AA.def_clean:get()
+    if aa_eng.def_after >= tick and clean ~= "Off" and not idle then
+        local adj = math.random(-9, 12)
+        if clean == "Random + flick 60-72" and (tick % math.random(15, 16) == 1) then adj = math.random(60, 72) end
+        yaw = yaw + adj
+    end
+    yaw = yaw + dir_add
+
+    -- ── 7. body yaw ──
+    local bmode = S.body_mode:get()
+    local body_on = (bmode ~= "Off (no desync)")
+    local inv = (side == 0)
+    if bmode == "Random side" then
+        if unchoked and aa_eng.sends % math.random(3, 7) == 0 then aa_eng.rand_inv = not aa_eng.rand_inv end
+        inv = aa_eng.rand_inv and true or false
+    elseif bmode == "Tick-Switch" then
+        body_on = (aa_eng.false_ticks % math.max(2, S.sw_delay:get() + 2) ~= 1)
+    elseif bmode == "Static side" then
+        inv = true
+    end
+    local mag_mode = S.body_mag:get()
+    local L, R = S.body_l:get(), S.body_r:get()
+    if mag_mode == "Random Min-Max" then
+        if aa_eng.body_roll_side ~= side or aa_eng.body_roll_state ~= key then
+            local mn = S.body_min:get()
+            aa_eng.body_l = math.random(math.min(mn, L), L)
+            aa_eng.body_r = math.random(math.min(mn, R), R)
+            aa_eng.body_roll_side, aa_eng.body_roll_state = side, key
+        end
+        L, R = aa_eng.body_l, aa_eng.body_r
+    elseif mag_mode == "Bimodal A/B" then
+        if now >= aa_eng.bimodal_next then
+            aa_eng.bimodal_mode = 3 - aa_eng.bimodal_mode
+            aa_eng.bimodal_next = now + 2.0 + math.random() * 3.0
+        end
+        local mn, wob = S.body_min:get(), math.random(-3, 3)
+        if aa_eng.bimodal_mode == 1 then L, R = mn + wob, mn + wob else L, R = L + wob, R + wob end
+    end
+    if ab and ab.limit and AA.ab_limit:get() then L, R = ab.limit, ab.limit end
+    local free = S.freestand:get() and true or false
+    if react and AA.hit_nofree:get() then free = false end
+
+    -- ── 8. head-safe pulses (gingersense head protection) ──
+    aa_eng.hp.active = false
+    if AA.head_prot:get() and choked < 3 and threat and not idle then
+        local t_ready, we_ready = false, false
+        pcall(function()
+            local ct = globals.curtime or 0
+            local tw = threat:get_player_weapon()
+            t_ready = (tw and ((tw.m_flNextPrimaryAttack or 0) <= ct + 0.2)) and true or false
+            we_ready = (lp.m_flNextAttack or 0) <= ct
+        end)
+        if aa_eng.hp.delay <= 0 and t_ready and we_ready then
+            aa_eng.hp.active = true
+            if aa_eng.hp.hold > 0 then
+                yaw = aa_eng.hp.yaw
+                aa_eng.hp.hold = aa_eng.hp.hold - 1
+            else
+                yaw = ((vel > 5) and math.random(-4, 6) or (3 + tick % 3)) + dir_add
+                aa_eng.hp.yaw, aa_eng.hp.hold = yaw, 1 + tick % 2
+                aa_eng.hp.delay = 6 + math.random(1, 9)
+                aa_eng.stats.hp_pulses = aa_eng.stats.hp_pulses + 1
+            end
+            L, R, inv = 60, 60, true
+            body_on = (tick % 2 == 0)
+            mod_str, mod_amt = "Disabled", 0
+        else
+            aa_eng.hp.delay = aa_eng.hp.delay - 1
         end
     end
 
-    -- V3.0 ANTI-HEADSHOT EXTRAS — head Y-axis randomization vs enemy resolver
-    if aa_pitch_jitter:get() then
-        nl_override(nl_refs.aa_pitch, "Jitter Down/Up")
+    -- ── 9. manual keys (replace the yaw, nyanza) + idle spin ──
+    local base_str = AA.base:get()
+    local man = ""
+    pcall(function()
+        if AA.key_l:get() then man = "L" elseif AA.key_r:get() then man = "R" elseif AA.key_f:get() then man = "F" end
+    end)
+    if man ~= aa_eng.manual then
+        aa_tl_push("MANUAL", man == "" and "released" or ("held " .. man))
+        aa_eng.manual = man
     end
-    -- V3.0/V3.3: auto fake-duck while moving on ground. Dirty-track via
-    -- _move_fd_active so we ONLY override on rising edge and CLEAR on falling
-    -- edge. Without the clear, NL kept the fake-duck override true forever
-    -- after the user stopped moving (v3.2 sticky-fakeduck bug).
-    local want_move_fd = false
-    if aa_move_fakeduck:get() and not airborne then
-        local vel = _vel_cache  -- already computed above for move_set_active
-        if vel == 0 then
-            pcall(function()
-                local v = lp.m_vecVelocity
-                vel = math.sqrt((v.x or 0)^2 + (v.y or 0)^2)
-            end)
+    if man ~= "" then
+        yaw = AA_MAN_YAW[man]
+        base_str, free = "Local View", false
+        if AA.man_static:get() then
+            mod_str, mod_amt = "Disabled", 0
+            L, R, body_on = 60, 60, true
+            inv = (man ~= "R")
         end
-        if vel > (aa_move_fd_thresh:get() or 100) then want_move_fd = true end
     end
-    -- Combine with air-fakeduck. V3.7: defensive no longer force-fake-ducks (was
-    -- crouching during movement, hindering escape). Defensive now = max desync +
-    -- random side flip only; user keeps full mobility.
-    local want_fd = want_move_fd
-        or (air_set_active and aa_air_fakeduck:get())
-    if want_fd and not _move_fd_active then
-        nl_override(nl_refs.aa_fakeduck, true)
-        _move_fd_active = true
-    elseif (not want_fd) and _move_fd_active then
-        pcall(function() if nl_refs.aa_fakeduck then nl_refs.aa_fakeduck:override() end end)
-        _move_fd_active = false
+    if idle then
+        local sp = math.max(2, math.floor(S.yaw_jit:get() / 10))
+        yaw = (tick * sp) % 360 - 180
+        mod_str, mod_amt, body_on, free = "Disabled", 0, false, false
+        L, R = 0, 0
+    end
+    yaw = ((yaw + 180) % 360) - 180
+    L = math.floor(math.max(0, math.min(60, L)) + 0.5)
+    R = math.floor(math.max(0, math.min(60, R)) + 0.5)
+
+    -- ── 10. NL writes ──
+    aa_ov(nl_refs.aa_enabled, true)
+    local pitch_str = AA.pitch:get()
+    if idle then pitch_str = "Disabled"
+    elseif AA.pitch_jitter:get() then pitch_str = (math.floor(aa_eng.sends / 2) % 2 == 0) and "Down" or "Fake Up" end
+    aa_ov_str(nl_refs.aa_pitch, pitch_str, "Down")
+    aa_ov_str(nl_refs.aa_yaw, "Backward")
+    aa_ov_str(nl_refs.aa_yaw_base, base_str, "At Target")
+    aa_ov(nl_refs.aa_yaw_offset, math.floor(yaw + 0.5))
+    aa_ov_str(nl_refs.aa_yawmod, mod_str, "Disabled")
+    aa_ov(nl_refs.aa_yawmod_offset, math.floor(mod_amt))
+    aa_ov(nl_refs.aa_bodyyaw, body_on)
+    -- our side switching replaces NL's own jitter options; the element takes a table on
+    -- most builds and a string on some (nyanza writes "") — try both
+    if not aa_ov(nl_refs.aa_bodyyaw_opts, {}) then aa_ov_str(nl_refs.aa_bodyyaw_opts, "") end
+    if not aa_ov(nl_refs.aa_bodyyaw_inv, inv) then pcall(function() rage.antiaim:inverter(inv) end) end
+    aa_ov(nl_refs.aa_bodyyaw_l, L)
+    aa_ov(nl_refs.aa_bodyyaw_r, R)
+    aa_ov(nl_refs.aa_freestand, free)
+    aa_ov(nl_refs.aa_avoidbackstab, AA.avoid_bs:get() and true or false)
+    local legs = AA.legs:get()
+    if legs == "Keep NL" then nl_clear(nl_refs.aa_leg_movement) else aa_ov_str(nl_refs.aa_leg_movement, legs) end
+    aa_eng.yaw_w, aa_eng.l_w, aa_eng.r_w = yaw, L, R
+    aa_eng.mod_w, aa_eng.modamt_w, aa_eng.free_w, aa_eng.body_w = mod_str, mod_amt, free, body_on
+    aa_jitter_dir = inv and -1 or 1
+
+    -- ── 11. defensive pulse (cmd.force_defensive, needs DT on + charged) ──
+    local dmode = S.defensive:get()
+    local want_def = false
+    local key_def = false
+    pcall(function() key_def = AA.def_key:get() and true or false end)
+    local def_ok = AA.def_enable:get() and aa_eng.dt_on and aa_eng.charge >= 1 and not revolver and not idle
+    if def_ok then
+        local cond = (dmode == "Always") or (dmode == "On threat" and threat ~= nil) or key_def or react
+        if cond then
+            local n = AA.def_int:get()
+            if AA.def_rand:get() then n = n + math.random(-1, 1) end
+            n = math.max(1, n)
+            if react then n = math.min(n, 2) end
+            want_def = (cn % n == 0)
+        end
+    end
+    if AA.airlag:get() and airborne and aa_eng.dt_on and not revolver and not idle then
+        want_def = true
+        aa_eng.airlag_ctr = aa_eng.airlag_ctr + 1
+        pcall(function() rage.exploit:force_charge() end)
+        if aa_eng.airlag_ctr % 6 == 0 then pcall(function() rage.exploit:force_teleport() end) end
+    end
+    -- only ever ASSERT true (never write false) so a second script pulsing defensive is not fought
+    if want_def then pcall(function() cmd.force_defensive = true end) end
+    if want_def and not aa_eng.def_pulse then
+        aa_eng.def_pulses = aa_eng.def_pulses + 1
+        aa_eng.last_def_t = now
+    end
+    aa_eng.def_pulse = want_def
+
+    -- DT Lag Options = Always On while the weapon can fire (gingersense "Always"),
+    -- never while Peek Assist is held. Cleared the moment the condition drops.
+    local want_dtlag = false
+    if AA.def_lag:get() and aa_eng.dt_on and not idle then
+        pcall(function()
+            local w = lp:get_player_weapon()
+            local np = (w and w.m_flNextPrimaryAttack) or 0
+            local ready = math.max(np, lp.m_flNextAttack or 0) - (globals.tickinterval or 0.015625) - (globals.curtime or 0) < 0
+            local peek = (nl_refs.rage_peek_assist and nl_refs.rage_peek_assist:get()) and true or false
+            want_dtlag = ready and not peek
+        end)
+    end
+    if want_dtlag then
+        aa_ov_str(nl_refs.rage_dtlag, "Always On", "Always on")
+        aa_eng.dtlag_active = true
+    elseif aa_eng.dtlag_active then
+        nl_clear(nl_refs.rage_dtlag)
+        aa_eng.dtlag_active = false
+    end
+
+    -- ── 12. hidden angles on defensive records (silent flick) ──
+    local hid_on = false
+    if AA.dh_enable:get() and aa_eng.dt_on and aa_eng.charge >= 1 and not revolver and not idle then
+        hid_on = (AA.dh_cond:get() == "Always") or (threat ~= nil)
+    end
+    if hid_on then
+        local pm, hp = AA.dh_pitch:get(), 89
+        if pm == "Up -89" then hp = -89
+        elseif pm == "Cycle" then hp = ({ -89, -45, 0, 45, 89 })[cn % 5 + 1]
+        elseif pm == "Random" then hp = math.random(-89, 89) end
+        local ym, hy = AA.dh_yaw:get(), 90
+        if ym == "Sideways +/-90" then hy = (cn % 4 >= 2) and 90 or -90
+        elseif ym == "Spin" then hy = (now * math.max(1, math.abs(AA.dh_yaw_val:get())) / 30 * 360) % 360 - 180
+        elseif ym == "Random" then hy = math.random(-180, 180)
+        else hy = AA.dh_yaw_val:get() end
+        aa_ov(nl_refs.aa_yaw_hidden, true)
+        pcall(function() rage.antiaim:override_hidden_pitch(hp) end)
+        pcall(function() rage.antiaim:override_hidden_yaw_offset(hy) end)
+        aa_eng.hidden_active = true
+    elseif aa_eng.hidden_active then
+        nl_clear(nl_refs.aa_yaw_hidden)
+        pcall(function() rage.antiaim:override_hidden_pitch(0) end)
+        pcall(function() rage.antiaim:override_hidden_yaw_offset(0) end)
+        aa_eng.hidden_active = false
+    end
+
+    -- ── 13. fake lag limit ──
+    local flm, st_fl = AA.fl_mode:get(), S.fakelag:get()
+    if st_fl > 0 then
+        aa_ov(nl_refs.fl_limit, st_fl)
+        aa_eng.fl_active = true
+    elseif flm == "Fluctuate 1 / 14" then
+        local fd = false
+        pcall(function() fd = (nl_refs.aa_fakeduck and nl_refs.aa_fakeduck:get()) and true or false end)
+        if not fd then
+            local v = 5 + tick % 11
+            aa_ov(nl_refs.fl_limit, (tick % v == 0) and 1 or 14)
+            aa_eng.fl_active = true
+        elseif aa_eng.fl_active then
+            nl_clear(nl_refs.fl_limit)
+            aa_eng.fl_active = false
+        end
+    elseif flm == "+/-2 around NL value" then
+        if now >= (aa_eng.fl_next or 0) then
+            aa_eng.fl_next = now + 1.0 + math.random() * 2.0
+            if not aa_eng.fl_base then
+                local v0 = 5
+                pcall(function() v0 = nl_refs.fl_limit:get() or 5 end)
+                aa_eng.fl_base = v0
+            end
+            aa_ov(nl_refs.fl_limit, math.max(1, math.min(14, aa_eng.fl_base + math.random(-2, 2))))
+            aa_eng.fl_active = true
+        end
+    elseif aa_eng.fl_active then
+        nl_clear(nl_refs.fl_limit)
+        aa_eng.fl_active, aa_eng.fl_base = false, nil
+    end
+
+    -- ── 14. auto fake-duck while moving (dirty-tracked, v3.3 falling-edge clear) ──
+    local want_fd = AA.move_fd:get() and not airborne and vel > AA.move_fd_thr:get()
+    if want_fd and not aa_eng.fd_active then
+        aa_ov(nl_refs.aa_fakeduck, true)
+        aa_eng.fd_active = true
+    elseif (not want_fd) and aa_eng.fd_active then
+        nl_clear(nl_refs.aa_fakeduck)
+        aa_eng.fd_active = false
     end
 end
 
--- V1.8: events.antiaim hook DELETED (writing to cmd userdata fields caused CTD).
--- AA now flows entirely through aa_periodic_sync -> nl_override on NL UI refs.
+-- full engine snapshot — attached to every hit taken, printed by Copy Last Logs
+local function aa_snapshot()
+    local now = globals.realtime or 0
+    local lp = entity.get_local_player()
+    local vel, airborne, ducked, hp, wname, fl = 0, false, false, 0, "?", "?"
+    if lp then
+        pcall(function()
+            local v = lp.m_vecVelocity
+            vel = math.sqrt((v.x or 0) ^ 2 + (v.y or 0) ^ 2)
+            airborne = bit.band(lp.m_fFlags or 0, 1) == 0
+            ducked = (lp.m_flDuckAmount or 0) > 0.4
+            hp = lp.m_iHealth or 0
+            local w = lp:get_player_weapon()
+            if w then wname = tostring((w.get_name and w:get_name()) or w:get_classname() or "?") end
+        end)
+    end
+    pcall(function() fl = tostring(nl_refs.fl_limit and nl_refs.fl_limit:get() or "?") end)
+    local S = AA.st[aa_eng.state] or AA.st.global
+    local ug = false
+    if S.use_global then pcall(function() ug = S.use_global:get() end) end
+    if ug then S = AA.st.global end
+    local abn = 0
+    for _, e in pairs(aa_eng.ab) do if e.until_t > now then abn = abn + 1 end end
+    return {
+        engine = aa_eng.active, state = aa_eng.state, state_age = now - aa_eng.state_since, uses_global = ug,
+        side = (aa_eng.side == 0) and "L" or "R", since_switch = now - aa_eng.last_switch_t,
+        yaw = aa_eng.yaw_w, l = aa_eng.l_w, r = aa_eng.r_w, mod = aa_eng.mod_w, modamt = aa_eng.modamt_w,
+        body = aa_eng.body_w, free = aa_eng.free_w,
+        yaw_mode = S.yaw_mode:get(), body_mode = S.body_mode:get(), mag_mode = S.body_mag:get(),
+        sw_mode = S.sw_mode:get(), def_mode = S.defensive:get(),
+        def_pulse = aa_eng.def_pulse, def_ticks = aa_eng.defensive, since_def = now - aa_eng.last_def_t,
+        charge = aa_eng.charge, dt = aa_eng.dt_on, hs = aa_eng.hs_on, dtlag = aa_eng.dtlag_active,
+        hidden = aa_eng.hidden_active, choked = globals.choked_commands or 0, fl = fl, fl_ov = aa_eng.fl_active,
+        threat = aa_eng.threat ~= nil, threat_name = aa_eng.threat_name, threat_dist = aa_eng.threat_dist,
+        react = now < aa_eng.react_until, ab = abn, hp_pulse = aa_eng.hp.active, manual = aa_eng.manual,
+        vel = math.floor(vel), airborne = airborne, ducked = ducked, hp = hp, weapon = wname,
+        pitch = AA.pitch:get(), dir = AA.dir:get(),
+    }
+end
+-- 2-line human format shared by the copy dump + Dump Debug Stats
+local function aa_fmt_snapshot(s, ind)
+    ind = ind or "    "
+    if not s or not s.state then return { ind .. "(no engine snapshot)" } end
+    local function b(v) return v and "ON" or "off" end
+    return {
+        string.format("%sstate=%s%s (%.1fs)  side=%s (%.2fs since switch)  yaw=%d  L/R=%d/%d  mod=%s(%d)  body=%s  free=%s  pitch=%s dir=%s",
+            ind, tostring(s.state), s.uses_global and "→global" or "", s.state_age or 0, tostring(s.side), s.since_switch or 0,
+            math.floor(s.yaw or 0), s.l or 0, s.r or 0, tostring(s.mod), s.modamt or 0, b(s.body), b(s.free),
+            tostring(s.pitch), tostring(s.dir)),
+        string.format("%smodes: yaw=%s body=%s mag=%s switch=%s def=%s  | DT=%s charge=%.0f%% pulse=%s defticks=%d (%.1fs ago) dtlag=%s hidden=%s HS=%s",
+            ind, tostring(s.yaw_mode), tostring(s.body_mode), tostring(s.mag_mode), tostring(s.sw_mode), tostring(s.def_mode),
+            b(s.dt), (s.charge or 0) * 100, b(s.def_pulse), s.def_ticks or 0, s.since_def or 0, b(s.dtlag), b(s.hidden), b(s.hs)),
+        string.format("%schoke=%d fakelag=%s%s  vel=%d air=%s duck=%s hp=%d wpn=%s  threat=%s%s%s  react=%s ab=%d headsafe=%s manual=%s",
+            ind, s.choked or 0, tostring(s.fl), s.fl_ov and "(ov)" or "", s.vel or 0, b(s.airborne), b(s.ducked), s.hp or 0,
+            tostring(s.weapon), b(s.threat), s.threat and (" " .. tostring(s.threat_name)) or "",
+            s.threat and string.format(" %.0fu", s.threat_dist or 0) or "",
+            b(s.react), s.ab or 0, b(s.hp_pulse), s.manual ~= "" and s.manual or "-"),
+    }
+end
+
 local _hooks_status = {}
 local function register_first(handler, ...)
     for _, name in ipairs({...}) do
@@ -1056,57 +1424,9 @@ local function createmove_handler(cmd)
     end)
 end
 
--- V3.7: yaw base rotation. Periodic NL Yaw Base override cycling
--- Forward/Backward/Left/Right every 4–8s random. Breaks resolvers that
--- learned our eye_yaw → fake_yaw mapping. :override on a combo with a
--- matching option STRING is the safe pattern (combo :override(bool) segfaults).
-local YAW_BASE_OPTS = { "Forward", "Backward", "Left", "Right" }
-local function yaw_rotation_tick()
-    if not (enable_master:get() and aa_enable:get()
-            and aa_yaw_rotate and aa_yaw_rotate:get()) then
-        if aa_state.yaw_active then
-            pcall(function() if nl_refs.aa_yaw_base then nl_refs.aa_yaw_base:override() end end)
-            aa_state.yaw_active = false
-        end
-        return
-    end
-    if not nl_refs.aa_yaw_base then return end
-    local now = globals.realtime or 0
-    if now < (aa_state.yaw_next_change or 0) then return end
-    aa_state.yaw_next_change = now + 4.0 + math.random() * 4.0   -- 4–8s
-    local pick = YAW_BASE_OPTS[math.random(1, #YAW_BASE_OPTS)]
-    nl_override(nl_refs.aa_yaw_base, pick)
-    aa_state.yaw_active = true
-end
-
--- V3.6: fake-lag variance. Re-randomize NL Fake Lag Limit every 1–3s within
--- ±2 ticks of user's set value. Read user's current value once on activation
--- (via :get()), then alternate around it. Dirty-tracked so toggle-off clears.
-local function fake_lag_variance_tick()
-    if not (enable_master:get() and aa_fl_var and aa_fl_var:get()) then
-        if aa_state.fl_active then
-            pcall(function() if nl_refs.fl_limit then nl_refs.fl_limit:override() end end)
-            aa_state.fl_active = false
-            aa_state.fl_base   = nil       -- forget so next on-cycle re-captures
-        end
-        return
-    end
-    if not nl_refs.fl_limit then return end
-    local now = globals.realtime or 0
-    if now < (aa_state.fl_next_change or 0) then return end
-    aa_state.fl_next_change = now + 1.0 + math.random() * 2.0   -- 1–3s
-    -- Capture user's base value ONCE before we start overriding. Reading
-    -- :get() while we have an active :override would drift.
-    if not aa_state.fl_base then
-        local v0 = 5
-        pcall(function() v0 = nl_refs.fl_limit:get() or 5 end)
-        aa_state.fl_base = v0
-    end
-    local delta = math.random(-2, 2)
-    local v = math.max(1, math.min(16, (aa_state.fl_base or 5) + delta))
-    nl_override(nl_refs.fl_limit, v)
-    aa_state.fl_active = true
-end
+-- v4.0: yaw_rotation_tick (wrote invalid "Forward/Left/Right" strings to Yaw Base — a
+-- silent no-op) and fake_lag_variance_tick are folded into aa_engine_tick (Direction
+-- combo = yaw-offset math; Fake-lag variance combo).
 
 -- ══════════════════════════════════════════════════════════════════════════
 -- AI PEEK (V3.28) — auto peek → shoot → retreat state machine. Original code.
@@ -1320,12 +1640,16 @@ local function createmove_unified(cmd)
     createmove_handler(cmd)
     -- V3.28: AI Peek state machine (cheap, internally gated; default OFF)
     pcall(ai_peek_tick, cmd)
-    -- V2.0: AA periodic sync restored (still throttled + alive-checked + lazy).
-    aa_periodic_sync()
-    -- V3.6: fake-lag variance loop (cheap, internally throttled)
-    fake_lag_variance_tick()
-    -- V3.7: yaw-base rotation (cheap, internally throttled)
-    yaw_rotation_tick()
+    -- v4.0: the per-state AA engine (every tick; side timing counted in un-choked sends)
+    local ok, err = pcall(aa_engine_tick, cmd)
+    if not ok then
+        local now = globals.realtime or 0
+        if now - (aa_eng.err_t or 0) > 5 then
+            aa_eng.err_t = now
+            cs_log("[AA-ENGINE ERROR] " .. tostring(err))
+            aa_tl_push("ERROR", tostring(err))
+        end
+    end
     -- V2.2: visual NL :overrides REMOVED. Scope Overlay is a combo element
     -- (confirmed via JAG0YAW :set("Remove All")). Hit Marker Sound + Force
     -- Thirdperson are also likely combos. :override(bool) on a combo userdata
@@ -1394,7 +1718,7 @@ end)
 -- V2.8: hits-taken log — when WE get shot, snapshot AA state + context so we can
 -- analyze "why did this hit me". Ring buffer of last 10 incidents.
 local hits_taken_log = {}
-local HITS_TAKEN_MAX = 10
+local HITS_TAKEN_MAX = 25   -- v4.0: 10 → 25 so the copy dump covers a whole bad round
 
 -- V3.0: two distinct mappings.
 --   HB_INDEX = aim_ack's event.hitbox (bone-index, 0 = head, 3 = chest, etc.)
@@ -1412,36 +1736,9 @@ local function _hb_name(hb)
     return HB_GROUP_NAMES[hb] or HB_INDEX_NAMES[hb] or tostring(hb or "?")
 end
 
--- V2.8: capture our AA state at the moment we get hit
-local function _snapshot_aa_state()
-    local lp = entity.get_local_player()
-    local airborne = false
-    local velocity = 0
-    if lp then
-        pcall(function()
-            local f = lp.m_fFlags or 0
-            airborne = bit.band(f, 1) == 0
-            local v = lp.m_vecVelocity
-            velocity = math.sqrt((v.x or 0)^2 + (v.y or 0)^2)
-        end)
-    end
-    return {
-        aa_enable     = aa_enable:get(),
-        desync        = aa_desync:get(),
-        air_set       = aa_air_set:get(),
-        air_mag       = aa_air_mag:get(),
-        anti_bf       = aa_anti_bf:get(),
-        on_shot       = aa_onshot:get() and (globals.realtime or 0) < (aa_state.on_shot_until or 0),
-        fd_assist     = aa_fd_assist:get(),
-        freestanding  = aa_freestanding:get(),
-        airborne      = airborne,
-        velocity      = math.floor(velocity),
-        peek_boost    = _peek_boost_active,
-        jitter_dir    = aa_jitter_dir,
-        body_yaw_l    = aa_periodic_last_lim_l or nil,  -- if we track this
-        body_yaw_r    = aa_periodic_last_lim_r or nil,
-    }
-end
+-- v4.0: the hit-taken snapshot is aa_snapshot() (engine block above). Per-attacker
+-- table so the dump can say WHO resolves you and in which state.
+local attackers = {}   -- [name] = { hits, dmg, head, states = {[state]=n}, last = t, wpn = {} }
 
 -- V2.6: debug stats accumulator. Same idea as resolver's session_stats — track
 -- shot counts + hit/miss + hitbox breakdown + total damage so the user can dump
@@ -1482,6 +1779,10 @@ local function _stats_clear()
     stats.dmg_taken      = 0
     stats.kills          = 0
     hits_taken_log       = {}  -- clear hits-taken log too
+    attackers            = {}
+    aa_tl                = {}
+    aa_eng.stats = { near_miss = 0, flips = 0, def_ticks = 0, react = 0, hp_pulses = 0 }
+    aa_eng.def_pulses, aa_eng.switches = 0, 0
 end
 
 -- V2.9: aim_ack hit-detection FIXED. Resolver pattern: nil reason = HIT (was MISS
@@ -1507,6 +1808,7 @@ pcall(function()
             local hb_name     = HB_NAMES_C[event.hitbox] or tostring(event.hitbox or "?")
             if is_hit then
                 stats.shots_hit = stats.shots_hit + 1
+                aa_tl_push("HIT", string.format("%s +%d", target_name, event.damage or 0))
                 -- V3.0: hitbox bucketing moved to player_hurt (event.hitgroup is
                 -- reliable; event.hitbox in aim_ack returns nil in this NL build).
                 if vis_hitmarker:get() then hitmark_time = globals.realtime or 0 end
@@ -1524,6 +1826,7 @@ pcall(function()
                 end
             else
                 stats.shots_missed = stats.shots_missed + 1
+                aa_tl_push("MISS", string.format("%s (%s)", target_name, tostring(reason or "?")))
                 if vis_hitlog:get() then
                     table.insert(hit_log, {
                         time      = globals.realtime or 0,
@@ -1536,28 +1839,9 @@ pcall(function()
                     while #hit_log > HIT_LOG_MAX do table.remove(hit_log, 1) end
                 end
             end
-            -- V3.7: side-streak tracker. After every shot, read NL body-yaw inverter
-            -- state and count consecutive same-side. When the streak crosses the
-            -- user-set threshold, queue a forced inverter flip for the next periodic
-            -- sync. Breaks resolvers that track streak{L=N R=0} → predict L pattern.
-            if aa_side_streak and aa_side_streak:get() and nl_refs.aa_bodyyaw_inv then
-                local cur
-                pcall(function() cur = nl_refs.aa_bodyyaw_inv:get() end)
-                if cur ~= nil then
-                    local dir = cur and 1 or -1
-                    if dir == aa_state.side_streak_dir then
-                        aa_state.side_streak_n = aa_state.side_streak_n + 1
-                    else
-                        aa_state.side_streak_n = 1
-                        aa_state.side_streak_dir = dir
-                    end
-                    if aa_state.side_streak_n >= (aa_side_streak_n:get() or 3) then
-                        aa_state.side_force_inv  = not cur
-                        aa_state.side_streak_n   = 0
-                        aa_state.side_streak_dir = 0
-                    end
-                end
-            end
+            -- v4.0: the v3.7 side-streak limiter is gone — the engine owns the side now
+            -- and switches it in un-choked sends (per-state timing), so an enemy never
+            -- sees N same-side packets unless the state's delay says so.
         end)
     end)
 end)
@@ -1580,6 +1864,7 @@ pcall(function()
             -- toggle + the 8-entry ring). The dump used to recount from hit_log, which
             -- rotates → showed kills=0 despite 21 one-taps + a 297 headshot.
             stats.kills = (stats.kills or 0) + 1
+            aa_tl_push("KILL", tostring(victim_name))
             if vis_hitlog:get() then
                 table.insert(hit_log, {
                     time = globals.realtime or 0,
@@ -1615,21 +1900,44 @@ pcall(function()
                 local atk_name = "?"
                 pcall(function() if attacker.get_name then atk_name = attacker:get_name() end end)
                 local hb_in = event.hitgroup or -1
+                local wpn_in = "?"
+                pcall(function() wpn_in = tostring(event.weapon or "?") end)
+                local now = globals.realtime or 0
+                -- v4.0: full engine snapshot (state / side / written angles / defensive /
+                -- threat cache) — the attacker entity itself is NEVER read here (transition
+                -- state crash); distance comes from the createmove threat cache when the
+                -- attacker IS the cached threat.
+                local snap = aa_snapshot()
+                snap.atk_is_threat = (aa_eng.threat ~= nil and attacker == aa_eng.threat)
                 table.insert(hits_taken_log, {
-                    time     = globals.realtime or 0,
+                    time     = now,
                     atk_name = atk_name,
                     dmg      = dmg_in,
                     hp_left  = event.health or 0,
                     hitbox   = _hb_name(hb_in),
                     hb_id    = hb_in,
-                    snapshot = _snapshot_aa_state(),
+                    weapon   = wpn_in,
+                    snapshot = snap,
                 })
                 while #hits_taken_log > HITS_TAKEN_MAX do table.remove(hits_taken_log, 1) end
-                -- V3.6 + V3.7: trigger defensive AA window — ONLY on bullet hits
-                -- (hitgroup 1-7). Skip hitgroup 0 = nade / world / fall damage; user
-                -- reported defensive fake-duck mid-movement during nade hits = annoying.
-                if aa_def_on_dmg and aa_def_on_dmg:get() and hb_in >= 1 and hb_in <= 7 then
-                    aa_state.defensive_until = (globals.realtime or 0) + (aa_def_duration:get() / 1000.0)
+                local A = attackers[atk_name] or { hits = 0, dmg = 0, head = 0, states = {}, wpn = {}, last = 0 }
+                A.hits, A.dmg, A.last = A.hits + 1, A.dmg + dmg_in, now
+                if hb_in == 1 then A.head = A.head + 1 end
+                A.states[snap.state or "?"] = (A.states[snap.state or "?"] or 0) + 1
+                A.wpn[wpn_in] = (A.wpn[wpn_in] or 0) + 1
+                attackers[atk_name] = A
+                aa_tl_push("HIT-TAKEN", string.format("%s → %s for %d (%s) hp=%d | %s side=%s yaw=%d L/R=%d/%d def=%s%s",
+                    atk_name, _hb_name(hb_in), dmg_in, wpn_in, event.health or 0,
+                    tostring(snap.state), tostring(snap.side), math.floor(snap.yaw or 0), snap.l or 0, snap.r or 0,
+                    snap.def_pulse and "PULSE" or (snap.dt and "armed" or "noDT"),
+                    snap.atk_is_threat and string.format(" dist=%.0f", snap.threat_dist or 0) or ""))
+                -- v4.0 hit reaction: bullet hits only (hitgroup 1-7; 0 = nade / world / fall)
+                if AA.hit_react:get() and hb_in >= 1 and hb_in <= 7 then
+                    aa_eng.react_until = now + (AA.hit_dur:get() / 1000.0)
+                    aa_eng.react_from = atk_name
+                    aa_eng.force_side = 1 - aa_eng.side
+                    aa_eng.stats.react = aa_eng.stats.react + 1
+                    aa_tl_push("REACT", string.format("hit by %s → flip side + defensive burst %dms", atk_name, AA.hit_dur:get()))
                 end
                 return  -- don't run damage-given accumulator for received hits
             end
@@ -1662,6 +1970,66 @@ pcall(function()
         end)
     end)
 end)
+
+-- v4.0 ANTI-BRUTEFORCE — events.bullet_impact (gazolina / gingersense pattern). A shot
+-- whose line (shooter eye → impact) passes within the radius of our eye counts as a
+-- near-miss: per-shooter reaction for N seconds (side flip / random fake limit / random
+-- switch delay / staged yaw). One reaction per tick, 0.25s per shooter.
+local function _seg_dist(px, py, pz, ax, ay, az, bx, by, bz)
+    local dx, dy, dz = bx - ax, by - ay, bz - az
+    local len2 = dx * dx + dy * dy + dz * dz
+    local t = 0
+    if len2 > 0 then
+        t = ((px - ax) * dx + (py - ay) * dy + (pz - az) * dz) / len2
+        if t < 0 then t = 0 elseif t > 1 then t = 1 end
+    end
+    local cx, cy, cz = ax + dx * t, ay + dy * t, az + dz * t
+    return math.sqrt((px - cx) ^ 2 + (py - cy) ^ 2 + (pz - cz) ^ 2)
+end
+pcall(function()
+    events.bullet_impact:set(function(event)
+        pcall(function()
+            if not (enable_master:get() and AA.enable:get() and AA.ab_enable:get()) then return end
+            if not event or not event.userid then return end
+            local tick = globals.tickcount or 0
+            if aa_eng.ab_tick == tick then return end
+            local lp = entity.get_local_player()
+            if not lp or not lp:is_alive() then return end
+            local sh = entity.get(event.userid, true)
+            if not sh or sh == lp then return end
+            if not sh:is_alive() or sh:is_dormant() or not sh:is_enemy() then return end
+            local now = globals.realtime or 0
+            local name = "?"
+            pcall(function() name = tostring(sh:get_name() or "?") end)
+            local prev = aa_eng.ab[name]
+            if prev and now - (prev.at or 0) < 0.25 then return end
+            local me, from = lp:get_eye_position(), sh:get_eye_position()
+            if not (me and from) then return end
+            local d = _seg_dist(me.x, me.y, me.z, from.x, from.y, from.z, event.x, event.y, event.z)
+            if d > AA.ab_radius:get() then return end
+            aa_eng.ab_tick = tick
+            aa_eng.ab_stage = (aa_eng.ab_stage + 1) % 15
+            aa_eng.stats.near_miss = aa_eng.stats.near_miss + 1
+            local e = {
+                at = now, until_t = now + AA.ab_dur:get(),
+                yaw   = aa_eng.ab_stage * 2 * ((aa_eng.side == 0) and 1 or -1),
+                limit = math.random(10, 60),
+                delay = math.random(-2, 4),
+            }
+            aa_eng.ab[name] = e
+            if AA.ab_flip:get() then aa_eng.force_side = 1 - aa_eng.side end
+            aa_tl_push("NEAR-MISS", string.format("%s shot %.0fu from head → %s%s%s%s", name, d,
+                AA.ab_flip:get() and "flip " or "",
+                AA.ab_limit:get() and string.format("limit=%d ", e.limit) or "",
+                AA.ab_yaw:get() and string.format("yaw%+d ", e.yaw) or "",
+                AA.ab_delay:get() and string.format("delay%+d", e.delay) or ""))
+        end)
+    end)
+    _hooks_status.bullet_impact = "bullet_impact"
+end)
+-- round markers for the idle-spin gate + the timeline
+pcall(function() events.round_start:set(function() aa_eng.round_ended = false; aa_eng.ab = {}; aa_tl_push("ROUND", "start") end) end)
+pcall(function() events.round_end:set(function() aa_eng.round_ended = true; aa_tl_push("ROUND", "end") end) end)
 
 -- Performance HUD state
 local perf = { fps = 0, ping = 0, choke = 0, var = 0, last_update = 0 }
@@ -1801,7 +2169,7 @@ pcall(function()
             local lp = entity.get_local_player()
             if lp and lp:is_alive() then
                 local side
-                if aa_enable:get() then
+                if AA.enable:get() then
                     side = aa_jitter_dir or 1
                 else
                     side = 1
@@ -1817,8 +2185,8 @@ pcall(function()
                 local txt  = (side < 0) and "<" or ">"
                 local ox   = (side < 0) and -22 or 14
                 pcall(function() render.text(4, vector(cx + ox, cy - 6), mcol, nil, txt) end)
-                -- rotating accent line — small dash that spins with jitter_counter (animation)
-                local ang = (aa_jitter_counter * 0.35) + now * 1.8
+                -- rotating accent line — small dash that spins with the send counter (animation)
+                local ang = (aa_yaw_jitter_counter * 0.35) + now * 1.8
                 local r1, r2 = 18, 28
                 local x1 = cx + math.cos(ang) * r1
                 local y1 = cy + math.sin(ang) * r1
@@ -1911,23 +2279,31 @@ pcall(function()
             pcall(function()
                 local lp = entity.get_local_player()
                 if not (lp and lp:is_alive()) then return end
-                local aa_on = aa_enable:get()
-                local f, sp = 0, 0
-                pcall(function()
-                    f = lp.m_fFlags or 0
-                    local v = lp.m_vecVelocity; sp = math.sqrt((v.x or 0)^2 + (v.y or 0)^2)
-                end)
-                local mstate = (bit.band(f, 1) == 0) and "AIR"
-                            or (bit.band(f, 2) ~= 0) and "CROUCH"
-                            or (sp > 5) and "MOVING" or "STANDING"
+                local aa_on = AA.enable:get() and aa_eng.active
+                -- v4.0: movement line = the engine's own state (what the AA is built for)
+                local AA_STATE_LABEL = { stand = "STANDING", move = "MOVING", slow = "SLOW-WALK", duck = "CROUCH",
+                                         duckmv = "CROUCH-MOVE", air = "AIR", airduck = "AIR-CROUCH" }
+                local mstate = AA_STATE_LABEL[aa_eng.state]
+                if not (aa_on and mstate) then
+                    local f, sp = 0, 0
+                    pcall(function()
+                        f = lp.m_fFlags or 0
+                        local v = lp.m_vecVelocity; sp = math.sqrt((v.x or 0)^2 + (v.y or 0)^2)
+                    end)
+                    mstate = (bit.band(f, 1) == 0) and "AIR"
+                          or (bit.band(f, 2) ~= 0) and "CROUCH"
+                          or (sp > 5) and "MOVING" or "STANDING"
+                end
                 -- short curated list of active key states (dynamic / important only)
                 local subs = {}
-                if aa_on and aa_def_on_dmg:get() and now < (aa_state.defensive_until or 0) then subs[#subs+1] = "DEFENSIVE" end
-                if aa_on and aa_onshot:get() and now < (aa_state.on_shot_until or 0) then subs[#subs+1] = "ON-SHOT" end
-                pcall(function() if nl_refs.rage_dt and nl_refs.rage_dt:get() then subs[#subs+1] = "DOUBLE TAP" end end)
+                if aa_on and now < aa_eng.react_until then subs[#subs+1] = "REACTING" end
+                if aa_on and aa_eng.def_pulse then subs[#subs+1] = "DEFENSIVE" end
+                if aa_on and aa_eng.hidden_active then subs[#subs+1] = "HIDDEN" end
+                if aa_on and aa_eng.hp.active then subs[#subs+1] = "HEAD-SAFE" end
+                if aa_on and next(aa_eng.ab) ~= nil then subs[#subs+1] = "ANTI-BF" end
+                pcall(function() if nl_refs.rage_dt and nl_refs.rage_dt:get() then subs[#subs+1] = (aa_eng.charge or 0) >= 1 and "DOUBLE TAP" or string.format("DT %d%%", math.floor((aa_eng.charge or 0) * 100)) end end)
                 pcall(function() if nl_refs.aa_fakeduck and nl_refs.aa_fakeduck:get() then subs[#subs+1] = "FAKE DUCK" end end)
-                local mside = aa_desync_side:get()
-                if mside == "Left" then subs[#subs+1] = "MANUAL L" elseif mside == "Right" then subs[#subs+1] = "MANUAL R" end
+                if aa_on and aa_eng.manual ~= "" then subs[#subs+1] = "MANUAL " .. aa_eng.manual end
                 -- desync value (smoothed)
                 local dline
                 if vis_desyncpct:get() and rage and rage.antiaim and rage.antiaim.get_rotation then
@@ -2257,9 +2633,14 @@ local KILL_LINES = {
 local function dump_status()
     cs_log_color("══ Sel01-Config v" .. SEL01_CFG_VERSION .. " STATUS ══")
     cs_log(string.format("Master enabled: %s", tostring(enable_master:get())))
-    cs_log(string.format("AA override: %s | pitch=%s yaw_base=%s desync=%d",
-        tostring(aa_enable:get()), tostring(aa_pitch:get()),
-        tostring(aa_yaw_base:get()), aa_desync:get()))
+    cs_log(string.format("AA engine: %s active=%s | pitch=%s base=%s dir=%s | state=%s side=%s yaw=%d L/R=%d/%d",
+        tostring(AA.enable:get()), tostring(aa_eng.active), tostring(AA.pitch:get()),
+        tostring(AA.base:get()), tostring(AA.dir:get()), tostring(aa_eng.state),
+        aa_eng.side == 0 and "L" or "R", math.floor(aa_eng.yaw_w or 0), aa_eng.l_w or 0, aa_eng.r_w or 0))
+    cs_log(string.format("Defensive: master=%s DT=%s charge=%.0f%% pulses=%d defticks=%d | hidden=%s dtlag=%s | hooks bullet_impact=%s",
+        tostring(AA.def_enable:get()), tostring(aa_eng.dt_on), (aa_eng.charge or 0) * 100,
+        aa_eng.def_pulses or 0, aa_eng.stats.def_ticks or 0, tostring(aa_eng.hidden_active),
+        tostring(aa_eng.dtlag_active), tostring(_hooks_status.bullet_impact or "MISSING")))
     cs_log(string.format("Visuals: watermark=%s indic=%s velwarn=%s arrows=%s hitmark=%s hitlog=%s keybinds=%s dmgind=%s spec=%s",
         tostring(vis_watermark:get()),  tostring(vis_indicators:get()),
         tostring(vis_velwarn:get()),    tostring(vis_aaarrows:get()),
@@ -2285,6 +2666,116 @@ local function _nl_get(ref, fallback)
     return fallback
 end
 local function _b(v) return v and "ON" or "OFF" end
+-- multi-select :get() returns a table (array of labels OR {label=true}); join it
+local function _fmt_val(v)
+    if type(v) ~= "table" then return tostring(v) end
+    local parts = {}
+    for k, val in pairs(v) do
+        if type(k) == "number" then parts[#parts + 1] = tostring(val)
+        elseif val == true then parts[#parts + 1] = tostring(k)
+        elseif type(val) == "string" then parts[#parts + 1] = val end
+    end
+    return #parts > 0 and table.concat(parts, "+") or "(none)"
+end
+
+-- v4.0: engine config as text — shared by Dump Debug Stats + Copy Last Logs
+local function aa_state_line(key)
+    local S = AA.st[key]
+    if not S then return "  " .. key .. " (missing)" end
+    local ug = false
+    if S.use_global then pcall(function() ug = S.use_global:get() end) end
+    if ug then return string.format("  %-8s → Global", key) end
+    return string.format("  %-8s yaw=%s L%d/R%d jit=%d rnd=%d | body=%s mag=%s L%d/R%d min%d | switch=%s d=%d r=%d-%d | free=%s def=%s fl=%d",
+        key, tostring(S.yaw_mode:get()), S.yaw_l:get(), S.yaw_r:get(), S.yaw_jit:get(), S.yaw_rand:get(),
+        tostring(S.body_mode:get()), tostring(S.body_mag:get()), S.body_l:get(), S.body_r:get(), S.body_min:get(),
+        tostring(S.sw_mode:get()), S.sw_delay:get(), S.sw_lo:get(), S.sw_hi:get(),
+        _b(S.freestand:get()), tostring(S.defensive:get()), S.fakelag:get())
+end
+local function aa_engine_config_lines()
+    local L = {}
+    L[#L + 1] = string.format("  engine=%s active=%s pitch=%s base=%s dir=%s avoid_bs=%s legs=%s idle_spin=%s manual_static=%s",
+        _b(AA.enable:get()), _b(aa_eng.active), tostring(AA.pitch:get()), tostring(AA.base:get()), tostring(AA.dir:get()),
+        _b(AA.avoid_bs:get()), tostring(AA.legs:get()), _b(AA.idle_spin:get()), _b(AA.man_static:get()))
+    L[#L + 1] = string.format("  defensive: master=%s N=%d rand=%s clean=%s dtlag=%s airlag=%s fakelag=%s | hidden=%s pitch=%s yaw=%s(%d) when=%s",
+        _b(AA.def_enable:get()), AA.def_int:get(), _b(AA.def_rand:get()), tostring(AA.def_clean:get()),
+        _b(AA.def_lag:get()), _b(AA.airlag:get()), tostring(AA.fl_mode:get()),
+        _b(AA.dh_enable:get()), tostring(AA.dh_pitch:get()), tostring(AA.dh_yaw:get()), AA.dh_yaw_val:get(), tostring(AA.dh_cond:get()))
+    L[#L + 1] = string.format("  anti-BF=%s r=%du dur=%ds flip=%s limit=%s delay=%s yaw=%s | hit-react=%s %dms nofree=%s | head-safe=%s | pitch-jit=%s move-fd=%s@%d",
+        _b(AA.ab_enable:get()), AA.ab_radius:get(), AA.ab_dur:get(), _b(AA.ab_flip:get()), _b(AA.ab_limit:get()),
+        _b(AA.ab_delay:get()), _b(AA.ab_yaw:get()), _b(AA.hit_react:get()), AA.hit_dur:get(), _b(AA.hit_nofree:get()),
+        _b(AA.head_prot:get()), _b(AA.pitch_jitter:get()), _b(AA.move_fd:get()), AA.move_fd_thr:get())
+    L[#L + 1] = string.format("  live: state=%s side=%s yaw=%d L/R=%d/%d mod=%s(%d) body=%s free=%s | DT=%s HS=%s charge=%.0f%% pulses=%d defticks=%d switches=%d sends=%d | near-miss=%d flips=%d reacts=%d headsafe=%d",
+        tostring(aa_eng.state), aa_eng.side == 0 and "L" or "R", math.floor(aa_eng.yaw_w or 0), aa_eng.l_w or 0, aa_eng.r_w or 0,
+        tostring(aa_eng.mod_w), aa_eng.modamt_w or 0, _b(aa_eng.body_w), _b(aa_eng.free_w),
+        _b(aa_eng.dt_on), _b(aa_eng.hs_on), (aa_eng.charge or 0) * 100, aa_eng.def_pulses or 0, aa_eng.stats.def_ticks or 0,
+        aa_eng.switches or 0, aa_eng.sends or 0, aa_eng.stats.near_miss or 0, aa_eng.stats.flips or 0,
+        aa_eng.stats.react or 0, aa_eng.stats.hp_pulses or 0)
+    for _, st in ipairs(AA_STATES) do L[#L + 1] = aa_state_line(st.key) end
+    return L
+end
+
+-- v4.0: data-driven hints from the hits-taken snapshots (what to change, and why)
+local function aa_hints()
+    local H = {}
+    local n = #hits_taken_log
+    if n == 0 then H[#H + 1] = "no hits taken this session — nothing to tune yet"; return H end
+    local by_state, by_side, head, nodt, uncharged, nothreat, pulsing, late_sw, react_hits, air = {}, { L = 0, R = 0 }, 0, 0, 0, 0, 0, 0, 0, 0
+    for _, e in ipairs(hits_taken_log) do
+        local s = e.snapshot or {}
+        by_state[s.state or "?"] = (by_state[s.state or "?"] or 0) + 1
+        if s.side then by_side[s.side] = (by_side[s.side] or 0) + 1 end
+        if e.hb_id == 1 then head = head + 1 end
+        if s.dt == false then nodt = nodt + 1 elseif (s.charge or 0) < 1 then uncharged = uncharged + 1 end
+        if s.threat == false then nothreat = nothreat + 1 end
+        if s.def_pulse then pulsing = pulsing + 1 end
+        if (s.since_switch or 0) > 0.25 then late_sw = late_sw + 1 end
+        if s.react then react_hits = react_hits + 1 end
+        if s.airborne then air = air + 1 end
+    end
+    local top_state, top_n = "?", 0
+    for k, v in pairs(by_state) do if v > top_n then top_state, top_n = k, v end end
+    if n >= 3 and top_n / n >= 0.5 then
+        local tip = ({
+            slow   = "Slow-Walk: set defensive=Always, Min magnitude 45+, Random delay 1-2 sends, Freestanding OFF (deterministic side is resolvable)",
+            stand  = "Standing: raise Center jitter (24-30) + Random Min-Max magnitude; if head hits, try Head-safe pulses",
+            move   = "Moving: Fixed delay 2 → Random 1-3 sends, Min magnitude 30+, Freestanding OFF",
+            air    = "Air: defensive=Always + Air-lag (Aggressive) and Random yaw 26-34",
+            duck   = "Crouching: usually the body is safe — check if these were head hits and lower yaw offsets",
+            airduck= "Air-Crouch: Static yaw + Random side is expected to take hits; jump less into open angles",
+            duckmv = "Crouch-Move: use its own settings (Use Global OFF) with Random Min-Max magnitude",
+        })[top_state] or "check that state's settings"
+        H[#H + 1] = string.format("%d/%d hits while %s → %s", top_n, n, tostring(top_state), tip)
+    end
+    if n >= 3 and head / n >= 0.5 then
+        H[#H + 1] = string.format("%d/%d hits were HEAD → the resolver has your side/yaw: lower yaw offsets, enable Head-safe pulses or Pitch jitter, raise switch randomness", head, n)
+    end
+    if n >= 4 then
+        local dom = math.max(by_side.L or 0, by_side.R or 0)
+        if dom / n >= 0.8 then
+            H[#H + 1] = string.format("%d/%d hits on side %s → they resolve one side; switch faster (Every send / Random 1-2) or use Random side body mode", dom, n, (by_side.L or 0) >= (by_side.R or 0) and "L" or "R")
+        end
+    end
+    if nodt > 0 then H[#H + 1] = string.format("%d hits with Double Tap OFF → defensive AA cannot run without DT; enable NL Double Tap", nodt) end
+    if uncharged > 0 then H[#H + 1] = string.format("%d hits while DT was NOT charged → you were hit right after shooting; enable 'DT Lag Options = Always On' or peek less after a shot", uncharged) end
+    if n >= 3 and pulsing == 0 and nodt + uncharged < n then H[#H + 1] = "defensive never pulsed at a hit → check per-state 'Defensive AA' (Off?) or use 'Always' on the states you die in" end
+    if nothreat >= 2 then H[#H + 1] = string.format("%d hits from a non-threat (no hittable enemy known) → dormant / unexpected angle; not an AA problem", nothreat) end
+    if n >= 3 and late_sw / n >= 0.6 then H[#H + 1] = string.format("%d/%d hits landed >0.25s after the last side switch → switch delay too long for this lobby", late_sw, n) end
+    if react_hits >= 2 then H[#H + 1] = string.format("%d hits INSIDE a hit-reaction burst → they re-hit you after the flip; try a longer burst or Random side during the burst", react_hits) end
+    if air >= 2 then H[#H + 1] = string.format("%d hits airborne → Air-lag (Aggressive preset) or stop jumping into their angle", air) end
+    -- who resolves you
+    local worst, wn = nil, 0
+    for name, A in pairs(attackers) do if A.hits > wn then worst, wn = name, A.hits end end
+    if worst and wn >= 3 then
+        local A = attackers[worst]
+        H[#H + 1] = string.format("%s hit you %d× (%d head, %d dmg) → this one resolves you; they may run a learning resolver, vary states against them", worst, wn, A.head, A.dmg)
+    end
+    local nm = aa_eng.stats.near_miss or 0
+    if nm + n > 0 then
+        H[#H + 1] = string.format("enemy accuracy on you: %d hits vs %d near-misses (%.0f%% miss) — near-misses trigger anti-bruteforce", n, nm, nm / (nm + n) * 100)
+    end
+    if #H == 0 then H[#H + 1] = "no dominant pattern in the hits taken — keep the current preset" end
+    return H
+end
 
 local function dump_stats()
     local now      = globals.realtime or 0
@@ -2303,8 +2794,8 @@ local function dump_stats()
 
     -- ── SESSION ──
     cs_log_color("── SESSION ──")
-    cs_log(string.format("  Time: %.1f min  |  Master=%s  AA-override=%s",
-        elapsed / 60, _b(enable_master:get()), _b(aa_enable:get())))
+    cs_log(string.format("  Time: %.1f min  |  Master=%s  AA-engine=%s (active=%s)",
+        elapsed / 60, _b(enable_master:get()), _b(AA.enable:get()), _b(aa_eng.active)))
 
     -- ── DEALT ──
     cs_log_color("── DEALT ──")
@@ -2345,56 +2836,15 @@ local function dump_stats()
     if #hits_taken_log > 0 then
         for i = #hits_taken_log, 1, -1 do
             local e = hits_taken_log[i]
-            local s = e.snapshot or {}
-            cs_log(string.format("  [%.1fs ago] %s hit %s for %d (hp_left=%d)",
-                now - e.time, e.atk_name or "?", e.hitbox or "?", e.dmg or 0, e.hp_left or 0))
-            cs_log(string.format("    AA=%s desync=%d air-override=%s(mag=%d) anti-BF=%s onshot=%s fd-assist=%s freestand=%s",
-                _b(s.aa_enable),
-                s.desync or 0, _b(s.air_set), s.air_mag or 0,
-                _b(s.anti_bf), _b(s.on_shot), _b(s.fd_assist),
-                _b(s.freestanding)))
-            cs_log(string.format("    airborne=%s velocity=%d peek-boost=%s",
-                _b(s.airborne), s.velocity or 0, _b(s.peek_boost)))
+            cs_log(string.format("  [%.1fs ago] %s hit %s for %d (%s, hp_left=%d)",
+                now - e.time, e.atk_name or "?", e.hitbox or "?", e.dmg or 0, tostring(e.weapon or "?"), e.hp_left or 0))
+            for _, line in ipairs(aa_fmt_snapshot(e.snapshot, "    ")) do cs_log(line) end
         end
     end
 
-    -- ── CURRENT AA CONFIG (Sel01-Config sliders + switches) ──
-    cs_log_color("── AA CONFIG (Sel01-Config) ──")
-    cs_log(string.format("  pitch=%s  yaw_base=%s  yaw_mod=%s int=%d mag=%d",
-        tostring(aa_pitch:get()), tostring(aa_yaw_base:get()),
-        tostring(aa_yaw_mod:get()), aa_yaw_mod_int:get(), aa_yaw_mod_mag:get()))
-    cs_log(string.format("  desync=%d side=%s  freestand=%s  at-targets=%s",
-        aa_desync:get(), tostring(aa_desync_side:get()),
-        _b(aa_freestanding:get()), _b(aa_at_targets:get())))
-    cs_log(string.format("  on-shot=%s dur=%dms  air-override=%s mag=%d  anti-BF=%s var=%d",
-        _b(aa_onshot:get()),   aa_onshot_dur:get(),
-        _b(aa_air_set:get()),  aa_air_mag:get(),
-        _b(aa_anti_bf:get()),  aa_anti_bf_var:get()))
-    cs_log(string.format("  air-extras: flip=%s boost=%s fakeduck=%s",
-        _b(aa_air_flip:get()), _b(aa_air_boost:get()), _b(aa_air_fakeduck:get())))
-    cs_log(string.format("  move-override=%s mag=%d thresh=%d  flip=%s boost=%s",
-        _b(aa_move_set:get()), aa_move_mag:get(), aa_move_thresh:get(),
-        _b(aa_move_flip:get()), _b(aa_move_boost:get())))
-    cs_log(string.format("  fd-assist=%s dur=%dms  pitch-jitter=%s  move-fakeduck=%s thresh=%d",
-        _b(aa_fd_assist:get()), aa_fd_duration:get(),
-        _b(aa_pitch_jitter:get()),
-        _b(aa_move_fakeduck:get()), aa_move_fd_thresh:get()))
-
-    -- ── ANTI-RESOLVER (v3.6/3.7) ──
-    cs_log_color("── ANTI-RESOLVER (v3.6/3.7) ──")
-    cs_log(string.format("  DEF-on-dmg=%s dur=%dms  active=%s (until %.1fs)",
-        _b(aa_def_on_dmg:get()), aa_def_duration:get(),
-        _b(now < (aa_state.defensive_until or 0)),
-        math.max(0, (aa_state.defensive_until or 0) - now)))
-    cs_log(string.format("  Slow-walk-boost=%s  FL-variance=%s active=%s base=%s",
-        _b(aa_slow_boost:get()), _b(aa_fl_var:get()),
-        _b(aa_state.fl_active), tostring(aa_state.fl_base)))
-    cs_log(string.format("  Yaw-rotation=%s active=%s  Side-streak limit=%s thresh=%d (cur streak=%d dir=%d)",
-        _b(aa_yaw_rotate:get()), _b(aa_state.yaw_active),
-        _b(aa_side_streak:get()), aa_side_streak_n:get(),
-        aa_state.side_streak_n or 0, aa_state.side_streak_dir or 0))
-    cs_log(string.format("  Mag-jitter=%s  range=%d-%d°",
-        _b(aa_mag_jitter:get()), aa_mag_jit_min:get(), aa_mag_jit_max:get()))
+    -- ── AA ENGINE (v4.0) ──
+    cs_log_color("── AA ENGINE (v4.0) ──")
+    for _, line in ipairs(aa_engine_config_lines()) do cs_log(line) end
 
     -- ── NL RAGEBOT LIVE (read user's NL config) ──
     -- V3.15: format multi-select combos (HitboxSafety etc) — :get() returns a TABLE
@@ -2489,13 +2939,14 @@ local function print_recommendations()
             cs_log(string.format("[DEFENSE] %d/%d recent hits were HEAD — enable Pitch jitter + Auto fake-duck (Anti-HS Bundle button)",
                 head_hits, total))
         end
-        if not aa_pitch_jitter:get() then
+        if not AA.pitch_jitter:get() then
             cs_log("[DEFENSE] Pitch jitter OFF — head Y stays constant. Click Anti-HS Bundle to enable.")
         end
-        if not aa_move_fakeduck:get() then
+        if not AA.move_fd:get() then
             cs_log("[DEFENSE] Auto fake-duck OFF — running head exposed. Click Anti-HS Bundle to enable.")
         end
     end
+    for _, h in ipairs(aa_hints()) do cs_log("[AA] " .. h) end
 
     -- K/D-ish guidance
     if taken >= 5 and kd < 1 then
@@ -2508,12 +2959,149 @@ local function print_recommendations()
 end
 pcall(function() btn_recom:set_callback(function() print_recommendations() end) end)
 
+-- ══════════════════════════════════════════════════════════════════════════
+-- v4.0: 📋 COPY LAST LOGS — Solver-style share dump. Clipboard via user32 FFI (same
+-- code as Sel01-Solver v8.7/v9.85: NL's ffi state is shared across scripts, so the
+-- SetClipboardData proto may already be resident as (UINT, unsigned int) — try the
+-- pointer form, then the numeric cast). File fallback nl/Sel01-Config/last_logs.txt.
+-- ══════════════════════════════════════════════════════════════════════════
+local set_clipboard
+do
+    local cdef_ok = pcall(ffi.cdef, [[
+        typedef void* HANDLE;
+        typedef void* HWND;
+        typedef unsigned int UINT;
+        typedef unsigned long DWORD;
+        typedef int BOOL;
+        typedef unsigned long SIZE_T;
+        HANDLE GlobalAlloc(UINT uFlags, SIZE_T dwBytes);
+        void* GlobalLock(HANDLE hMem);
+        BOOL GlobalUnlock(HANDLE hMem);
+        BOOL OpenClipboard(HWND hWndNewOwner);
+        BOOL CloseClipboard();
+        BOOL EmptyClipboard();
+        HANDLE SetClipboardData(UINT uFormat, HANDLE hMem);
+        int MultiByteToWideChar(UINT CodePage, DWORD dwFlags, const char* lpMultiByteStr, int cbMultiByte, void* lpWideCharStr, int cchWideChar);
+    ]])
+    local ok_k, k32 = pcall(ffi.load, "kernel32")
+    local ok_u, u32 = pcall(ffi.load, "user32")
+    if ok_k and ok_u then
+        set_clipboard = function(text)
+            local ok, err = pcall(function()
+                text = tostring(text or "")
+                local n = k32.MultiByteToWideChar(65001, 0, text, #text, nil, 0)
+                if n <= 0 then error("size=0") end
+                local h = k32.GlobalAlloc(0x0002, (n + 1) * 2)
+                if h == nil then error("GlobalAlloc") end
+                local ptr = k32.GlobalLock(h)
+                k32.MultiByteToWideChar(65001, 0, text, #text, ptr, n)
+                ffi.cast("unsigned short*", ptr)[n] = 0
+                k32.GlobalUnlock(h)
+                if u32.OpenClipboard(nil) == 0 then error("OpenClipboard") end
+                u32.EmptyClipboard()
+                local set_ok = pcall(function() u32.SetClipboardData(13, h) end)
+                if not set_ok then
+                    set_ok = pcall(function() u32.SetClipboardData(13, ffi.cast("uintptr_t", h)) end)
+                end
+                u32.CloseClipboard()
+                if not set_ok then error("SetClipboardData (all casts failed)") end
+            end)
+            return ok, err
+        end
+    else
+        set_clipboard = function() return false, "ffi unavailable" end
+    end
+    if not cdef_ok then cs_log("clipboard cdef already resident (shared ffi state) — using existing protos") end
+end
+
+local function config_copy_logs()
+    local L = {}
+    local function add(s) L[#L + 1] = tostring(s) end
+    local now = globals.realtime or 0
+    local map = "?"
+    pcall(function() map = common.get_map_data().shortname or "?" end)
+    add("════ Sel01-Config v" .. SEL01_CFG_VERSION .. " — COPY-FRIENDLY DUMP (hits taken + AA timeline) ════")
+    add(string.format("[TIME] session %.1f min | map %s | ping %d ms | fps %d", (now - (stats.session_start or now)) / 60, map, perf.ping or 0, perf.fps or 0))
+    local fired, hits = stats.shots_fired, stats.shots_hit
+    add(string.format("[SESSION] dealt: %d shots %d hit %d miss = %.1f%% | head=%d chest=%d stomach=%d leg=%d | dmg=%d biggest=%d 1taps=%d kills=%d",
+        fired, hits, stats.shots_missed, fired > 0 and hits / fired * 100 or 0,
+        stats.hits_head, stats.hits_chest, stats.hits_stomach, stats.hits_leg,
+        stats.total_dmg, stats.biggest_hit, stats.one_taps, stats.kills or 0))
+    add(string.format("[SESSION] taken: %d hits %d dmg (avg %.1f) | near-misses %d | side flips (reactions) %d | defensive pulses %d, defensive ticks seen %d | switches %d in %d sends",
+        stats.hits_taken, stats.dmg_taken, stats.hits_taken > 0 and stats.dmg_taken / stats.hits_taken or 0,
+        aa_eng.stats.near_miss or 0, aa_eng.stats.flips or 0, aa_eng.def_pulses or 0, aa_eng.stats.def_ticks or 0,
+        aa_eng.switches or 0, aa_eng.sends or 0))
+    add("[AA] engine config + live:")
+    for _, l in ipairs(aa_engine_config_lines()) do add("[AA]" .. l) end
+    add(string.format("[NL] HC=%s MinDmg=%s DT=%s HS=%s DTlag=%s HSopts=%s SafePoints=%s BodyAim=%s HitboxSafety=%s",
+        _fmt_val(_nl_get(nl_refs.rage_hc, "?")), _fmt_val(_nl_get(nl_refs.rage_mindmg, "?")),
+        _b(_nl_get(nl_refs.rage_dt, false)), _b(_nl_get(nl_refs.rage_hs, false)),
+        _fmt_val(_nl_get(nl_refs.rage_dtlag, "?")), _fmt_val(_nl_get(nl_refs.rage_hs_opts, "?")),
+        _fmt_val(_nl_get(nl_refs.rage_safepoint, "?")), _fmt_val(_nl_get(nl_refs.rage_bodyaim, "?")),
+        _fmt_val(_nl_get(nl_refs.rage_hitsafety, "?"))))
+    add(string.format("[NL] AA enabled=%s pitch=%s yaw=%s base=%s offset=%s mod=%s(%s) bodyyaw=%s inv=%s L/R=%s/%s opts=%s free=%s hidden=%s | fakelag on=%s limit=%s var=%s | fake latency=%s | slowwalk=%s fakeduck=%s",
+        _b(_nl_get(nl_refs.aa_enabled, false)), _fmt_val(_nl_get(nl_refs.aa_pitch, "?")), _fmt_val(_nl_get(nl_refs.aa_yaw, "?")),
+        _fmt_val(_nl_get(nl_refs.aa_yaw_base, "?")), tostring(_nl_get(nl_refs.aa_yaw_offset, "?")),
+        _fmt_val(_nl_get(nl_refs.aa_yawmod, "?")), tostring(_nl_get(nl_refs.aa_yawmod_offset, "?")),
+        _b(_nl_get(nl_refs.aa_bodyyaw, false)), _b(_nl_get(nl_refs.aa_bodyyaw_inv, false)),
+        tostring(_nl_get(nl_refs.aa_bodyyaw_l, "?")), tostring(_nl_get(nl_refs.aa_bodyyaw_r, "?")),
+        _fmt_val(_nl_get(nl_refs.aa_bodyyaw_opts, "?")), _b(_nl_get(nl_refs.aa_freestand, false)), _b(_nl_get(nl_refs.aa_yaw_hidden, false)),
+        _b(_nl_get(nl_refs.fl_switch, false)), tostring(_nl_get(nl_refs.fl_limit, "?")), tostring(_nl_get(nl_refs.fl_variability, "?")),
+        tostring(_nl_get(nl_refs.misc_fakelat, "?")), _b(_nl_get(nl_refs.aa_slowwalk, false)), _b(_nl_get(nl_refs.aa_fakeduck, false))))
+    -- attackers, most hits first
+    local names = {}
+    for name in pairs(attackers) do names[#names + 1] = name end
+    table.sort(names, function(a, b) return attackers[a].hits > attackers[b].hits end)
+    add(string.format("[ATTACKERS] %d players hit you", #names))
+    for _, name in ipairs(names) do
+        local A = attackers[name]
+        local st, wp = {}, {}
+        for k, v in pairs(A.states) do st[#st + 1] = k .. "×" .. v end
+        for k, v in pairs(A.wpn) do wp[#wp + 1] = k .. "×" .. v end
+        table.sort(st); table.sort(wp)
+        add(string.format("  %-22s hits=%d head=%d dmg=%d last %.0fs ago | states: %s | weapons: %s",
+            name, A.hits, A.head, A.dmg, now - (A.last or now), table.concat(st, " "), table.concat(wp, " ")))
+    end
+    add(string.format("[HITS TAKEN] last %d (newest first) — snapshot = engine state at the moment of the hit", #hits_taken_log))
+    for i = #hits_taken_log, 1, -1 do
+        local e = hits_taken_log[i]
+        local s = e.snapshot or {}
+        add(string.format("  [%.1fs ago] %s → %s for %d (%s) hp_left=%d%s",
+            now - e.time, e.atk_name or "?", e.hitbox or "?", e.dmg or 0, tostring(e.weapon or "?"), e.hp_left or 0,
+            s.atk_is_threat and " [was the tracked threat]" or ""))
+        for _, line in ipairs(aa_fmt_snapshot(s, "      ")) do add(line) end
+    end
+    add(string.format("[TIMELINE] last %d events (newest first)", math.min(#aa_tl, 100)))
+    local lo = math.max(1, #aa_tl - 99)
+    for i = #aa_tl, lo, -1 do
+        local ev = aa_tl[i]
+        add(string.format("  [%7.1fs] %-10s %s", now - ev.t, ev.kind, ev.text))
+    end
+    add("[HINTS]")
+    for _, h in ipairs(aa_hints()) do add("  • " .. h) end
+    add("════ END DUMP ════")
+
+    local full = table.concat(L, "\n")
+    for _, l in ipairs(L) do cs_log(l) end
+    pcall(function()
+        files.create_folder("nl/Sel01-Config/")
+        files.write("nl/Sel01-Config/last_logs.txt", full)
+    end)
+    local clip_ok, clip_err = set_clipboard(full)
+    if clip_ok then
+        cs_log_color(string.format("✓ Copied to CLIPBOARD (%d bytes, %d lines) — Ctrl+V anywhere. Also saved → nl/Sel01-Config/last_logs.txt", #full, #L))
+    else
+        cs_log_color("⚠ Clipboard FFI failed (" .. tostring(clip_err) .. ") — file fallback: nl/Sel01-Config/last_logs.txt")
+    end
+end
+pcall(function() btn_copy:set_callback(function() pcall(config_copy_logs) end) end)
+
 -- V3.1: Anti-HS Bundle = enable pitch_jitter + move_fakeduck + reasonable threshold
 pcall(function() btn_antihs:set_callback(function()
-    local on = not (aa_pitch_jitter:get() and aa_move_fakeduck:get())
-    safe_set(aa_pitch_jitter,  on)
-    safe_set(aa_move_fakeduck, on)
-    safe_set(aa_move_fd_thresh, 100)
+    local on = not (AA.pitch_jitter:get() and AA.move_fd:get())
+    safe_set(AA.pitch_jitter, on)
+    safe_set(AA.move_fd,      on)
+    safe_set(AA.move_fd_thr,  100)
     cs_log_color("Anti-HS Bundle " .. (on and "ENABLED" or "DISABLED")
         .. " (pitch jitter + move-fakeduck @100u/s)")
 end) end)
@@ -2524,6 +3112,9 @@ end) end)
 -- Clear all NL :override() writes so user's manual UI returns to its real state.
 local function clear_all_nl_overrides()
     for _, ref in pairs(nl_refs) do nl_clear(ref) end
+    pcall(function() rage.antiaim:override_hidden_yaw_offset(0) end)
+    pcall(function() rage.antiaim:override_hidden_pitch(0) end)
+    aa_eng.active = false
 end
 
 pcall(function()
@@ -2663,9 +3254,10 @@ do
 end
 
 cs_log_color("══════════════════════════════════════════")
-cs_log_color("Sel01-Config v" .. SEL01_CFG_VERSION .. " loaded (CSGO HvH — +Magnitude jitter per-tick variance, anti EMA-resolvers)")
-cs_log(string.format("  hooks  createmove=%s  aim_fire=%s",
+cs_log_color("Sel01-Config v" .. SEL01_CFG_VERSION .. " loaded (v4.0 per-state AA engine + defensive + anti-bruteforce + Copy Last Logs)")
+cs_log(string.format("  hooks  createmove=%s  aim_fire=%s  bullet_impact=%s",
     tostring(_hooks_status.createmove or "MISSING"),
-    tostring(_hooks_status.aim_fire or "MISSING")))
-cs_log_color("  AA via NL :override path (no cmd writes). Pick preset → Main.")
+    tostring(_hooks_status.aim_fire or "MISSING"),
+    tostring(_hooks_status.bullet_impact or "MISSING")))
+cs_log_color("  AA via NL :override path (no cmd angle writes). Pick preset → Main. Copy Last Logs → Info.")
 cs_log_color("══════════════════════════════════════════")

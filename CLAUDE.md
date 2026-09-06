@@ -9,7 +9,7 @@ Four Neverlose **CSGO** (legacy build, NOT CS2) Lua scripts for HvH / rage play.
 | Script | Role | Working copy | NL load path |
 |---|---|---|---|
 | **Sel01-Solver** (`Sel01-Solver.lua`, ~6870 lines, v10.3) | Resolver: per-player AA learning, JSON export, HUD/ESP overlay + top-right event ticker, FFI clipboard copy-logs, Sel01-Roast chat-spam, AA Advisor (in-menu panel + Coach-chat to CSGO say) | `C:\Users\Seltonmt\Desktop\sazz\aron\ownlua\Sel01-Solver.lua` | `E:\SteamLibrary\steamapps\common\Counter-Strike Global Offensive\nl\scripts\Sel01-Solver_59853.lua` |
-| **Sel01-Config** (`sel01_config.lua`, ~2530 lines, v3.32) | Companion: AA presets (Aggressive/Dynamic/Defensive/Spin), anti-resolver bundle (defensive on hit-taken, slow-walk boost, fake-lag variance, yaw base rotation, side-streak limit, magnitude jitter), anti-HS extras (pitch jitter, move-fakeduck), peek-boost hotkey, comprehensive Dump Debug Stats, hits-taken log with AA-state snapshots, kill/miss/hit event log top-left, watermark + indicators + rotating AA arrow | `C:\Users\Seltonmt\Desktop\sazz\aron\ownlua\sel01_config.lua` | `E:\SteamLibrary\steamapps\common\Counter-Strike Global Offensive\nl\scripts\sel01_config_59908.lua` |
+| **Sel01-Config** (`sel01_config.lua`, ~3260 lines, v4.0) | Companion: **v4.0 per-state AA engine** (Global / Standing / Moving / Slow-Walk / Crouching / Crouch-Move / Air / Air-Crouch — yaw offset L/R, jitter mode, body-yaw mode + magnitude, side-switch timing in un-choked sends, freestanding, defensive, fake lag), 5 data-driven presets, defensive AA (`cmd.force_defensive` + DT lag + hidden angles), anti-bruteforce on `bullet_impact`, hit-taken reaction, manual L/R/F keys, anti-HS extras, peek-boost hotkey + AI Peek, **📋 Copy Last Logs** (hits taken with full engine snapshot + attacker table + timeline + hints → clipboard), Dump Debug Stats, kill/miss/hit event log, watermark + indicators + AA arrow | `C:\Users\Seltonmt\Desktop\sazz\aron\ownlua\sel01_config.lua` | `E:\SteamLibrary\steamapps\common\Counter-Strike Global Offensive\nl\scripts\sel01_config_59908.lua` |
 | **Sel01-WalkBot** (`Sel01-WalkBot.lua`, ~1420 lines, v2.2) | Standalone walk-bot — MOVEMENT only, aiming stays with the ragebot. CSGO nav-mesh A* routing (greedy trace-based fallback), distance-tiered engage (approach / hold-corner shoulder-peek / slow-walk peek / crouch-when-exposed), roam (nav route / HUNT last-seen enemy / leave-spawn / wander), auto-learn routes + bad-spots (persisted), no-jump by default, auto-primary-weapon | `C:\Users\Seltonmt\Desktop\sazz\aron\ownlua\Sel01-WalkBot.lua` | `E:\SteamLibrary\steamapps\common\Counter-Strike Global Offensive\nl\scripts\Sel01-WalkBot_60027.lua` |
 | **Sel01-PlantBot** (`Sel01-PlantBot.lua`, ~1300 lines, v1.10) | Standalone plant-bot. Mark an A spot + a safe spot per map, then GOTO_A → PLANT → RETREAT → DONE every round. Shares the WalkBot nav-mesh parser + A*; auto-joins T (only while dead). Diagnostic log ring + Dump button | `C:\Users\Seltonmt\Desktop\sazz\aron\ownlua\Sel01-PlantBot.lua` | `...\nl\scripts\Sel01-PlantBot_35563.lua` **and** `...\nl\scripts\plant_18.lua` (BOTH) |
 
@@ -351,58 +351,45 @@ git push origin master
 
 If hook failure on commit: investigate root cause, fix, create NEW commit (don't amend — pre-commit hooks fail means commit didn't happen, amend would modify previous one).
 
-## Sel01-Config layout (`sel01_config.lua`, v3.32, ~2530 lines)
+## Sel01-Config layout (`sel01_config.lua`, v4.0, ~3260 lines)
 
-| Section | Purpose |
+Line numbers drift — `Grep` for the function. Shape of the file:
+
+| Region | Purpose |
 |---|---|
-| 1–30 | Version constant `SEL01_CFG_VERSION`, `pui` + `ffi` requires, optional `neverlose/gradient`, `cs_log` / `cs_log_color`, `accent`, `TAB = "Sel01-Config"` |
-| 30–60 | UI groups (6 tabs: Main / Anti-Aim / Movement / Visuals / Quality of Life / Info), preset buttons forward-decl `apply_preset_fwd` |
-| 60–120 | Anti-Aim UI: enable, pitch combo, yaw base, yaw add, yaw modifier, desync slider + side, freestanding, at-targets, plus HvH extras (on-shot, air-desync, anti-BF variance, fake-duck assist) |
-| 120–155 | Movement (auto-peek + quick-stop hotkeys, strafe nudge, no-fall, fast-ladder), Visuals switches, QoL toggles, Info buttons |
-| 155–230 | `nl_find_safe` (pui.find → ui.find fallback), `nl_override` + `nl_clear`, **verified NL ui.find ref dict** (all paths from JAG0YAW/bettervisal/bloodwings analysis) inside outer pcall |
-| 230–390 | `_do_apply_preset` (4 presets: Aggressive / Dynamic / Defensive / Spin) — all writes go through `safe_set` or `nl_override`. Public `apply_preset` only queues `pending_preset = name` so the menu callback returns instantly |
-| 390–460 | `aa_state` table (on_shot_until, fakeduck_until, last_fire_time), `aa_periodic_sync` — drives `nl_refs.aa_bodyyaw_l/r/freestand` every tick. No cmd-writes (v1.8 fix) |
-| 460–550 | `createmove_handler` (auto-peek, quick-stop, strafe nudge, no-fall, fast-ladder), `createmove_unified` (drains pending_preset, runs movement, runs aa_periodic_sync, syncs NL visuals overrides + fake-duck) |
-| 550–700 | Event hooks: `on_local_fire` → aim_fire / ragebot_fire (sets on_shot timer), `events.weapon_fire` (hostile-fire detection → fake-duck assist), `events.aim_ack` (hit-marker + skeet hit-log push), `events.player_hurt` (damage popups with hitgroup) |
-| 700–1100 | `events.render` — single handler. Order: hit-marker → rotating AA indicator → damage popups → animated-gradient watermark (sine-wave RGB) → bottom HvH indicators (DT / HS / ON-SHOT pulse / FD-ASSIST pulse / AA / MANUAL L/R / AIR / ANTI-BF / FREE / SW / FD) → velocity warning → skeet hit-log → keybinds panel → clantag updater → spectator overlay |
-| 1100–1220 | QoL: animated clantag (3 styles), kill-say themes, auto-accept, Status/Reset Info buttons, `clear_all_nl_overrides`, master-disable + shutdown handlers, load banner with hook-status report |
+| Header | `SEL01_CFG_VERSION`, `pui` + `ffi`, `cs_log` / `cs_log_color`, `accent`, `TAB` |
+| UI groups | 3 horizontal tabs (`Main` / `Anti-Aim` / `Visuals`). Anti-Aim tab = `g_aa` (base), `g_aa_st` (State Builder), `g_aa_def` (Defensive & Exploit), `g_aa_rx` (Anti-Bruteforce & Reactions), `g_aa_hs` (Anti-Headshot extras) |
+| **AA UI (v4.0)** | EVERY AA element lives in the `AA` table (main chunk was at 194 locals — the per-state builder alone is ~140 elements). `AA_STATES` (8 states, `key`/`name`/`tag`), `AA.STATE_DEFAULTS` (= Dynamic preset), `AA.st[key]` = per-state element set (`use_global`, `yaw_mode`, `yaw_l/r`, `yaw_jit`, `yaw_rand`, `body_mode`, `body_mag`, `body_l/r`, `body_min`, `sw_mode`, `sw_delay`, `sw_lo/hi`, `freestand`, `defensive`, `fakelag`). Labels are prefixed `[TAG]` so NL keys them apart; `aa_state_vis()` shows only the selected state via `:visibility` (a state on Use Global collapses to that one switch). `aa_eng` = runtime state table, `aa_tl` / `aa_tl_push` = 160-entry timeline ring |
+| Movement / Visuals / QoL / Info UI | unchanged from v3 (Peek Boost hotkey, AI Peek, visual switches, clantag, Info buttons incl. **📋 Copy Last Logs**) |
+| `nl_refs` | verified ui.find dict (+ v4.0: `aa_bodyyaw_fs`, `aa_extended`, `rage_dtlag`, `rage_dt_fl`, `rage_hs`, `rage_hs_opts`, `misc_fakelat`) |
+| Presets | `AA_PRESETS` = DATA (`states` per key + `g` globals + vis flags). `aa_apply_state(key, cfg)` writes every element (cfg → state default → global default), `aa_apply_bundle` applies all 8 states + every global switch, `_do_apply_preset` = bundle + visuals + clantag. Still queued via `pending_preset` and drained from createmove |
+| **AA engine** | `aa_ov` (type-guarded `:override`: combo=string, switch=bool, slider=number, multi-select=table — refuses instead of segfaulting) + `aa_ov_str` (label aliases), `aa_clear_overrides`, `aa_get_state`, `aa_update_threat`, `aa_track_defensive` (m_nTickBase regression), `aa_engine_tick(cmd)` (14 numbered steps, see flow), `aa_snapshot()` + `aa_fmt_snapshot()` |
+| createmove | `createmove_unified` → drain preset → `createmove_handler` (Peek Boost) → `ai_peek_tick` → `pcall(aa_engine_tick)` (errors logged once per 5s + pushed to the timeline) |
+| Event hooks | `aim_fire` (AI Peek gate), `aim_ack` (hit/miss log + timeline), `player_death` (kills), `player_hurt` (hits taken: `aa_snapshot()` + `attackers[]` table + hit reaction; dealt damage stats), **`bullet_impact`** (anti-bruteforce near-miss), `round_start` / `round_end` (idle-spin gate) |
+| `events.render` | single handler: hit-marker → AA arrow (engine side) → damage popups → watermark → troll banner → minimal centered indicator (engine state name + REACTING / DEFENSIVE / HIDDEN / HEAD-SAFE / ANTI-BF / DT charge / FAKE DUCK / MANUAL) → velocity → event log → keybinds → spectators → netgraph → custom scope |
+| Dump / Copy | `_nl_get`, `_b`, `_fmt_val`, `aa_state_line` / `aa_engine_config_lines()` (shared by Dump + Copy), `aa_hints()` (data-driven from the hits-taken snapshots), `dump_stats`, `print_recommendations`, `set_clipboard` (user32 FFI, Solver v9.85 dual-cast) + `config_copy_logs()` → console + `nl/Sel01-Config/last_logs.txt` + clipboard |
+| Shutdown / banner | `clear_all_nl_overrides` (also zeroes hidden angles), master-disable callback, version check, load banner with hook status |
 
-### Sel01-Config flow (one tick)
+### Sel01-Config AA engine flow (one createmove tick, v4.0)
 
-`events.createmove` → `createmove_unified(cmd)` → drain `pending_preset` (if any) via `pcall(_do_apply_preset, name)` → `createmove_handler(cmd)` (movement helpers, pcall'd) → `aa_periodic_sync()` (compute Body Yaw L/R from base desync + air override + on-shot reduction + anti-BF variance; clamp [0,58]; nl_override on body-yaw + freestand refs) → if master enabled, sync NL visuals overrides (hit-marker sound, thirdperson, scope overlay) + fake-duck during `fakeduck_until` window.
+`aa_engine_tick(cmd)`: gate (master + `AA.enable` + alive + in game; falling edge clears every override once) → **1 state** (`aa_get_state`: air via `get_anim_state().on_ground and not landed_on_ground_this_frame`, duck via `m_flDuckAmount > 0.4` / FL_DUCKING / NL Fake Duck key, slow via NL Slow Walk key, run via 2D speed > 3.63; `S = AA.st[state]` or Global when Use Global) → **2 threat cache + defensive tracking + exploit** (`entity.get_threat(true)`, name/origin/dist cached for the hit snapshot; `rage.exploit:allow_defensive(true)`, charge, DT/HS state, revolver check) → **3 reactions** (`force_side` from anti-BF / hit applied on the next un-choked send; expired `aa_eng.ab[name]` entries dropped) → **4 idle spin** (warmup or round end without threat) → **5 side switch counted in UN-CHOKED sends** (Every send / Fixed delay / Random delay lo..hi, + anti-BF delay; a switch re-rolls the random magnitude) → **6 yaw** (per-side offset + randomization + Center/Offset/Random math or NL 3-Way/5-Way/Spin modifier + anti-BF staged yaw + gingersense "clean records" after a detected discharge + Direction add) → **7 body yaw** (mode → inverter/body switch, magnitude Fixed / Random Min-Max per switch / Bimodal 2-5s, anti-BF random limit, freestanding off during a hit burst) → **8 head-safe pulses** (opt-in) → **9 manual keys** (replace yaw ±90/180, Local View, freestand off) + idle spin → **10 NL writes** (`aa_ov`/`aa_ov_str` on Enabled / Pitch / Yaw "Backward" / Base / Offset / Modifier + Offset / Body Yaw / Options `{}` (or `""`) / Inverter (fallback `rage.antiaim:inverter`) / Left + Right Limit / Freestanding / Avoid Backstab / Leg Movement) → **11 defensive pulse** (`cmd.force_defensive = true` on `command_number % N`, only ASSERTED never written false, when DT on + charge == 1 + not revolver + per-state mode / hotkey / hit burst; air-lag = every tick + `force_charge` + `force_teleport` every 6) + DT Lag Options "Always On" while the weapon can fire (never with Peek Assist held) → **12 hidden angles** (`rage.antiaim:override_hidden_pitch/yaw_offset` + Yaw > Hidden, cleared on falling edge) → **13 fake lag limit** (per-state value, Fluctuate `5 + tick % 11` → 1/14, or ±2 around the captured NL value) → **14 auto fake-duck while moving** (dirty-tracked).
 
-### Sel01-Config presets (v3.x)
+### Sel01-Config presets (v4.0 — `AA_PRESETS`, data)
 
-| Toggle | Aggressive | Dynamic | Defensive | Spin |
-|---|---|---|---|---|
-| desync | 58 | 45 | 35 | 58 |
-| jitter mag | 45 | 28 | 15 | 58 |
-| jitter interval (ticks) | 2 | 3 | 4 | 1 |
-| freestanding | ON | ON | ON | **OFF** |
-| at-targets | OFF | ON | OFF | OFF |
-| on-shot AA | ON | ON | ON | OFF |
-| air desync | ON | ON | ON | ON |
-| anti-BF | ON | ON | **OFF** | ON (25°) |
-| fake-duck assist | ON | ON | ON | ON |
-| move-desync override (v3.2) | **ON** | OFF | OFF | OFF |
-| pitch jitter (v3.0/3.2) | **ON** | OFF | OFF | OFF |
-| move-fakeduck (v3.0/3.2) | **ON** | OFF | OFF | OFF |
-| NL fake-lag limit | 7 | 5 | 3 | (varies) |
+| | Aggressive | Dynamic (= defaults) | Defensive | Spin | Troll |
+|---|---|---|---|---|---|
+| Global yaw | Center 30 ±6 rnd 6 | Center 24 ±4 rnd 4 | Center 14 ±3 rnd 3 | Spin 40 | Random 90 rnd 30 |
+| Global body | Jitter, Random 38-60 | Jitter, Random 42-60 | Jitter, Fixed 60/60 | Jitter, Random 30-60 | Random side, Random 10-60 |
+| Global switch | Random 1-3 | Random 1-3 | Random 2-4 | Every send | Every send |
+| Slow-Walk | Center 14 ±8 rnd 10, Random 45-60, Random 1-2, free OFF, def Always | Center 12 ±6 rnd 8, Random 45-60, Random 1-2, free OFF, def On threat | Center 8 ±4, Random 50-60, free ON, def On threat | → Global | → Global |
+| Air | Random 34, Random 25-60, Every send, def Always | Random 26, Random 30-60, Every send, def Always | Random 20, Random 30-60 | Spin 60, Random side | → Global |
+| Defensive | N=2, clean Random+flick, DT lag Always On, air-lag, hidden Cycle / Sideways | N=3, clean Random | On threat, fake lag Off | Always | N=2, air-lag, hidden Random / Spin, Always |
+| Reactions | AB all + delay, hit 2000ms | AB flip+limit+yaw, hit 1500ms | AB flip only, head-safe ON | AB off, hit-react off | AB all |
+| Extras | pitch jitter, idle spin, all visuals | — | — | idle spin, no avoid-backstab | pitch jitter, move-FD @50, idle spin, 🤡 banner |
 
-### Anti-resolver bundle (v3.6 - v3.9, separate from presets — opt-in toggles)
+### Copy Last Logs (v4.0) / Dump Debug Stats
 
-| Toggle | Default | Effect |
-|---|---|---|
-| **Defensive AA on hit-taken** (v3.6, bullet-only since v3.7) | ON | `player_hurt` with `hitgroup 1-7` (skip nade / world / fall) → for `aa_def_duration` ms: max desync 58 + 2× anti-BF variance + random body-yaw inverter every periodic tick. v3.7 dropped the force-fakeduck (was crouching mid-escape). |
-| **Slow-walk AA boost** (v3.6) | ON | When NL Slow Walk hotkey is held: same chaos package as defensive — slow walkers are easy targets, this hides the magnitude / side. |
-| **Fake-lag variance** (v3.6) | OFF | Periodically (every 1-3s) overrides NL Fake Lag Limit by ±2 ticks. Captures user's base value once on first activation so it doesn't drift away. Toggle-off clears. |
-| **Yaw base rotation** (v3.7) | OFF | Periodically (every 4-8s random) rotates NL Yaw Base through Forward / Backward / Left / Right via `:override(string)` — combo string override is safe; combo `:override(bool)` segfaults. |
-| **Side-streak limit** (v3.7) | ON, threshold 3 | aim_ack reads NL body-yaw inverter after every shot, counts consecutive same-side. When the streak crosses the threshold, queues a force-flip for the next periodic sync. |
-| **Magnitude jitter** (v3.9, per-tick) | OFF, range 35-58° | Randomizes the base desync magnitude inside [min, max] every periodic-sync tick. EMA-based resolvers (including Sel01-Solver v9.x) lock onto the AVERAGE, leaving the actual fake yaw 5-15° off that average every shot. |
-
-### Comprehensive Dump Debug Stats (v3.8)
-
-The `Dump Debug Stats` button now emits 9 sections to chat in one click: SESSION + DEALT (shots / hits / HS% / dmg / kills / KD-ish) + RECENT EVENTS (last 8 from `hit_log`) + HITS TAKEN (all 10 incidents w/ full AA snapshots) + AA CONFIG (every slider + switch) + ANTI-RESOLVER state (v3.6 / v3.7 toggles + live activity windows) + NL RAGEBOT live (reads user's NL HC / MinDmg / Penetrate / SafePoints / HitboxSafety / FakeLag / SlowWalk / FakeDuck via `nl_refs[...]:get()`) + PERF (FPS / ping / velocity / airborne).
+`📋 Copy Last Logs` (Info tab) prints + writes `nl/Sel01-Config/last_logs.txt` + copies to the clipboard: `[TIME]`, `[SESSION]` dealt + taken (near-misses, flips, defensive pulses/ticks, switches per sends), `[AA]` full engine config (globals, defensive, reactions, live state, one line per state), `[NL]` live ragebot + anti-aim values (`_nl_get` reads, never writes), `[ATTACKERS]` per name (hits / head / dmg / states you were in / weapons), `[HITS TAKEN]` last 25 with the 3-line `aa_fmt_snapshot` (state, side, written yaw / limits, modifier, modes, DT charge, defensive pulse / ticks, dtlag, hidden, choke, fake lag, velocity, air/duck, hp, weapon, threat + distance, reaction, anti-BF, head-safe, manual), `[TIMELINE]` last 100 ring events (STATE / HIT-TAKEN / NEAR-MISS / REACT / DEF / MANUAL / PRESET / ROUND / HIT / MISS / KILL / ENGINE / ERROR), `[HINTS]` from `aa_hints()`. `Dump Debug Stats` keeps the v3.8 sections but the AA part is `aa_engine_config_lines()` + the same snapshot format.
 
 ### Sel01-Config V2-V3 feature timeline
 
@@ -427,10 +414,18 @@ The `Dump Debug Stats` button now emits 9 sections to chat in one click: SESSION
 - **V3.19-3.20 (visual additions)**: 7 read-only/render features all auto-enabled in Aggressive — desync %, skeet indicator panel, netgraph (`utils.net_channel().latency[1]/.loss[1]/.choke[1]` + `globals.choked_commands` LC warn), model-fade-when-scoped (`events.localplayer_transparency(fn→alpha)` call-form), remove-sleeves (`events.draw_model(fn)→false` on "sleeve"), menu blur, custom scope overlay (Scope-Overlay combo `:override("Remove All")` STRING-only). **V3.20**: premium velocity indicator (frostlive-style: icon box + label box + blur + clipped color-by-% fill bar + smooth fade; loads Verdana 16) + animated HSV menu border (layered frame + `color():as_hsv` flow around `ui.get_position/size`).
 - **V3.21-3.23**: chernobl-style group headers (icon + `Sel01 » Section`) + multi-color welcome → then **V3.22** full horizontal TABS (`Main`/`Anti-Aim`/`Visuals` via distinct `ui.create` first-args + `ui.sidebar(TAB,"sliders")`, left/right columns). **V3.23** menu blur OFF by default. Smoothed the jumpy desync number (EMA, was raw per-tick jitter).
 - **V3.24-3.27 (indicator presentation)**: `_vis_pill` then `_vis_chip` premium pills → consolidated the AA-state strip + skeet panel + desync into ONE deduped list → readable NAMES (not "FL-VAR" abbreviations) → **V3.27** replaced the whole panel with a MINIMAL JAG0YAW-style centered indicator under the crosshair (plain text: `SEL01` title + `- STANDING/MOVING/AIR/CROUCH -` movement + optional `DESYNC NN` + short curated active states; drops always-on noise). User iterated HARD on indicator legibility — keep it minimal, centered, plain.
+- **V3.28-3.32**: AI Peek (auto peek-shoot-retreat, hittable-gate via `aim_fire` damage ≥ NL Min. Damage), version checker + on-screen banner.
+- **V4.0 (2026-09-07, full AA rework)**: the v3 presets only wrote Body Yaw limits + inverter noise — Pitch / Yaw Base / Yaw Modifier / Jitter combos were decorative and yaw-base rotation wrote invalid strings (Base takes "At Target" / "Local View"). Replaced by the per-state engine (see layout + flow above), data presets, defensive AA (`cmd.force_defensive` pulses, DT lag Always On, hidden angles, air-lag, record cleaning), anti-bruteforce on `bullet_impact` (point-to-shot-line distance, per shooter), hit-taken reaction, manual keys, idle spin, head-safe pulses, and `📋 Copy Last Logs`. Removed: on-shot AA, fake-duck assist (weapon_fire), air/move override blocks, anti-BF variance, mag-jitter / bimodal / correlated switches (now the per-state `Body magnitude` modes), yaw-base rotation, side-streak limit, smart freestand (now `hit_nofree`). Main chunk 194 → 167 locals. Reference material: nyanza / angelnbone / gingersense / gazolina / JAG0YAW dumps in the NL scripts folder; the docs `?ask=` endpoint refuses anti-aim questions, but `docs-csgo.neverlose.cc/documentation/variables/rage.md` + `events.md` list the API verbatim.
 
 ### Common Sel01-Config gotchas (each has bitten)
 
-- **`events.antiaim` cmd-writes crash CSGO** (v1.6 incident). No other NL script does this. Always drive AA through `nl_refs.aa_bodyyaw_l/r:override(...)`.
+- **NL Anti Aim option strings (v4.0, verified from nyanza / bloodwings / gingersense on this build):** Pitch `"Disabled" | "Down" | "Fake Up" | "Fake Down"`; Yaw `"Disabled" | "Backward" | "Static"`; Yaw Base `"Local View" | "At Target"` (direction is Yaw OFFSET math: backward 0 / left +90 / right -90 / forward 180 — "Forward/Left/Right" on Base is a silent no-op); Yaw Modifier `"Disabled" | "Offset" | "Center" | "Random" | "Spin" | "3-Way" | "5-Way"`; Body Yaw Options (multi-select, table or `""`) `"Avoid Overlap" | "Jitter" | "Randomize Jitter" | "Anti Bruteforce"`; Body Yaw > Freestanding `"Off" | "Peek Fake" | "Peek Real"`; Leg Movement `"Walking" | "Sliding"`; DT Lag Options `"On Peek" | "Always On"`; Hide Shots Options `"Favor Fire Rate" | "Favor Fake Lag" | "Break LC"`. Matching is case-insensitive. Always write through `aa_ov` / `aa_ov_str` (type-guarded).
+- **Defensive needs a CHARGED Double Tap** — `cmd.force_defensive` does nothing at `rage.exploit:get() < 1`; the engine also skips revolvers. Only ever ASSERT `force_defensive = true`, never write `false` (a second script like 12_silentflick pulsing it would be fought). Do NOT spam `rage.exploit:force_charge()` outside air-lag (realsilentff: it bounced the HS charge to 0).
+- **Side timing is counted in un-choked sends** (`cmd.choked_commands == 0`), never ticks — a flip inside a choke window is invisible to the enemy. Same for the body-magnitude re-roll.
+- **Hidden angles (`rage.antiaim:override_hidden_*`) fight 11_fakeflick / 12_silentflick** — both write the same thing. `AA.dh_enable` defaults OFF; only the Aggressive / Troll presets turn it on.
+- **`player_hurt` never reads the attacker entity** (transition-state crash) — the hit snapshot uses the createmove-cached threat (`aa_eng.threat_*`); `bullet_impact` DOES read the shooter (alive + non-dormant + enemy checks first, gazolina / gingersense pattern).
+
+- **`events.antiaim` cmd-writes crash CSGO** (v1.6 incident). No other NL script does this. Always drive AA through `:override` on NL's own Anti Aim elements (v4.0: `aa_ov` / `aa_ov_str` in `aa_engine_tick`).
 - **Combo `:set(int)` freezes menu** (v1.4 incident). Pass the option string. Better: skip combo `:set` in button callbacks entirely (decorative-only).
 - **Preset button callbacks must not synchronously mutate UI** (v1.5 incident). Set `pending_preset = name`; drain from createmove.
 - **`ui.find` raises popup-dialog on missing paths** (v1.3 incident). Use `pui.find` as primary.
