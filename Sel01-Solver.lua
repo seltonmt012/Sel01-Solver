@@ -1,18 +1,19 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 11.29                                  ║
+-- ║  Version: 11.30                                  ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 11.29
--- @description v11.29: fake-lag-aware tracking — update_jitter samples once per SERVER
+-- @version 11.30
+-- @description v11.30: choke average ignores bursts above 14 ticks (fl_max keeps them).
+--   v11.29: fake-lag-aware tracking — update_jitter samples once per SERVER
 --   tick (yaw_rate in sim time, no duplicate frames in the jitter ring) and keeps a
 --   per-player choke profile (fl_avg/fl_max, fl_heavy) used proactively for lead -1 +
 --   full multipoint; [FL] hit-rate by target choke; animation-layer read scored in
 --   shadow ([ANIM] line) while the toggle stays off. v11.28 SSG body-hit fix. History in git.
 
-local SEL01_VERSION = "11.29"
+local SEL01_VERSION = "11.30"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -4332,9 +4333,16 @@ local function update_jitter(p, s)
             local ti = (tick_cache and tick_cache.tickint) or (1 / 64)
             local ticks = math.floor(sim_dt / ti + 0.5)
             if ticks >= 1 and ticks <= 20 then
+                if ticks > (s.fl_max or 0) then s.fl_max = ticks end
+                -- V11.30: steady fake-lag on this build tops out at 14 ticks (NL limit,
+                -- sv_maxusrcmdprocessticks 16). Anything above is a tickbase burst / peek
+                -- flush, not his choke setting — first v11.29 dump showed fl_max 16-20 on
+                -- EVERY enemy while the averages sat at 1.5-4.8. Bursts stay in fl_max
+                -- (and the DT detector) but must not inflate the choke average.
+            end
+            if ticks >= 1 and ticks <= 14 then
                 s.fl_n   = (s.fl_n or 0) + 1
                 s.fl_avg = (s.fl_avg or 1) * 0.85 + ticks * 0.15
-                if ticks > (s.fl_max or 0) then s.fl_max = ticks end
                 s.fl_last = ticks
                 -- heavy = averaging 5+ ticks per update over 8+ updates. Sticky-ish via
                 -- the EMA; clears on its own when they stop choking.
