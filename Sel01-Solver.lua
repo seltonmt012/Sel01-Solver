@@ -1,12 +1,13 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 11.31                                  ║
+-- ║  Version: 11.32                                  ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 11.31
--- @description v11.31: dump-readiness % (Logging label + HUD line, 20 shots = 100%),
+-- @version 11.32
+-- @description v11.32: HUD corner panel ON in every preset + in the Lean visual set.
+--   v11.31: dump-readiness % (Logging label + HUD line, 20 shots = 100%),
 --   SSG-Pro: HUD panel ON / custom crosshair OFF, alt_side_pick honours 2+ real hits
 --   on one side over a seeded tie. v11.30: choke average ignores bursts above 14 ticks.
 --   v11.29: fake-lag-aware tracking — update_jitter samples once per SERVER
@@ -15,7 +16,7 @@
 --   full multipoint; [FL] hit-rate by target choke; animation-layer read scored in
 --   shadow ([ANIM] line) while the toggle stays off. v11.28 SSG body-hit fix. History in git.
 
-local SEL01_VERSION = "11.31"
+local SEL01_VERSION = "11.32"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -555,10 +556,12 @@ strat_visual:set_callback(function(r)
     elseif v == "Lean (labels + confidence)" then
         -- V11.19: the per-frame budget. One symbol line + the confidence bar per enemy,
         -- nothing else: no wedge (3 world_to_screen per enemy per frame), no flash box,
-        -- no shot-dots / tags, no HUD panel, no event ticker (per-frame string.format).
+        -- no shot-dots / tags, no event ticker (per-frame string.format).
+        -- V11.32: HUD corner panel stays ON in Lean (user: always on, whatever preset) —
+        -- its compute is 10 Hz cached, the draw is a handful of cached strings.
         safe_set_local(exp_esp_overlay, true);  safe_set_local(esp_master, true)
         safe_set_local(esp_show_labels, true);  safe_set_local(esp_show_confbar, true)
-        safe_set_local(esp_show_hud, false)
+        safe_set_local(esp_show_hud, true)
         safe_set_local(esp_wedge, false);       safe_set_local(esp_flash, false)
         safe_set_local(esp_enh, false);         safe_set_local(esp_event_ticker, false)
     else -- Full
@@ -2679,6 +2682,7 @@ local function apply_preset(name)
         safe_set(strat_learning,     "Adaptive (Recommended)")
         safe_set(strat_predict,      "Normal")
         safe_set(strat_visual,       "Standard (ESP + HUD)")
+        safe_set(esp_show_hud,       true)    -- V11.32: HUD corner panel ON in every preset
         safe_set(strat_hitbox,       "Head Bias")
         safe_set(onshot_flip_tog,    true)
         safe_set(switch_pred_tog,    false)
@@ -2720,6 +2724,11 @@ local function apply_preset(name)
         safe_set(strat_learning,     "Smart")
         safe_set(strat_predict,      "Off")
         safe_set(strat_visual,       "None")
+        -- V11.32: HUD corner panel ON in every preset (user request) — the panel needs
+        -- the ESP master; labels / bars stay off so Defensive keeps its quiet screen.
+        safe_set(exp_esp_overlay,    true)
+        safe_set(esp_master,         true)
+        safe_set(esp_show_hud,       true)
         safe_set(strat_hitbox,       "NL Default (manual)")
         safe_set(onshot_flip_tog,    false)
         safe_set(switch_pred_tog,    false)
@@ -2760,6 +2769,7 @@ local function apply_preset(name)
         safe_set(strat_learning,     "Smart")
         safe_set(strat_predict,      "Normal")
         safe_set(strat_visual,       "Standard (ESP + HUD)")
+        safe_set(esp_show_hud,       true)    -- V11.32: HUD corner panel ON in every preset
         safe_set(strat_hitbox,       "Head + Chest Fallback")
         -- V9.67: dynamic = the experimental showcase — all learning levers incl switch-period
         safe_set(onshot_flip_tog,    true)
@@ -2798,6 +2808,7 @@ local function apply_preset(name)
         safe_set(strat_learning,     "Adaptive (Recommended)")
         safe_set(strat_predict,      "Aggressive")
         safe_set(strat_visual,       "Minimal (HUD only)")
+        safe_set(esp_show_hud,       true)    -- V11.32: HUD corner panel ON in every preset
         safe_set(strat_hitbox,       "NoSpread (head always)")
         -- V9.67: nospread is aggressive — on-shot flip (side still matters)
         safe_set(onshot_flip_tog,    true)
@@ -2900,6 +2911,7 @@ local function apply_preset(name)
         safe_set(strat_learning,     "Adaptive (Recommended)")
         safe_set(strat_predict,      "Normal")
         safe_set(strat_visual,       "Standard (ESP + HUD)")
+        safe_set(esp_show_hud,       true)    -- V11.32: HUD corner panel ON in every preset
         safe_set(strat_hitbox,       "Head Only")
         safe_set(exp_head_strict,    true)        -- V7.9: every shot head
         -- V9.67: precision spread — on-shot flip (correct side = the head)
