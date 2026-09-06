@@ -1,17 +1,18 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 11.28                                  ║
+-- ║  Version: 11.29                                  ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 11.28
--- @description v11.28: SSG body-hit fix — the DT-peek response no longer forces
---   full-spread multipoint + safepoint-off on a sniper with "Respect Manual" on
---   (head points on the hitbox edge failed NL's hitchance, NL took the body point).
---   Respect paths are now a uniform 0.75 multipoint hint. History in git.
+-- @version 11.29
+-- @description v11.29: fake-lag-aware tracking — update_jitter samples once per SERVER
+--   tick (yaw_rate in sim time, no duplicate frames in the jitter ring) and keeps a
+--   per-player choke profile (fl_avg/fl_max, fl_heavy) used proactively for lead -1 +
+--   full multipoint; [FL] hit-rate by target choke; animation-layer read scored in
+--   shadow ([ANIM] line) while the toggle stays off. v11.28 SSG body-hit fix. History in git.
 
-local SEL01_VERSION = "11.28"
+local SEL01_VERSION = "11.29"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -1264,6 +1265,15 @@ sel01_keep_stats = { stat = { lo = { hit = 0, miss = 0 }, hi = { hit = 0, miss =
 sel01_cancel_stats = { sd = 0, conf = 0, blind = 0, mismatch = 0, episodes = 0, hold_ticks = 0, then_hit = 0, then_miss = 0 }
 -- V11.27: where the hits land (from player_hurt-reliable event.hitgroup on the ack)
 sel01_hg_stats = { head = 0, chest = 0, stomach = 0, arms = 0, legs = 0, other = 0 }
+-- V11.29: shots bucketed by the target's fake-lag profile (fl_avg ticks per update)
+sel01_fl_stats = { light = { hit = 0, miss = 0 }, mid = { hit = 0, miss = 0 }, heavy = { hit = 0, miss = 0 } }
+function sel01_fl_note(s, hit)
+    local a = s and s.fl_avg or 1
+    local b = (a >= 5) and sel01_fl_stats.heavy or ((a >= 3) and sel01_fl_stats.mid or sel01_fl_stats.light)
+    if hit then b.hit = b.hit + 1 else b.miss = b.miss + 1 end
+end
+-- V11.29: animation-layer shadow score (vote vs confirmed hit side)
+sel01_anim_shadow = { ok = 0, bad = 0, none = 0 }
 function session_push_desync(v)
     if not v or v < 5 or v > 58 then return end  -- V9.33: cap at 58 (max desync) so >58 reads can't bias the median high
     local r = sel01_session_desyncs
@@ -1575,6 +1585,36 @@ local log_copy_btn = g_logging:button("📋 Copy Last Logs (for share)", functio
         _cs_log_raw(string.format("[DT] rejected: %d stale/dormant gap, %d no peek context (fake-lag noise)",
             d.reject_gap or 0, d.reject_ctx or 0))
     end
+    -- V11.29: fake-lag profile — shots bucketed by the TARGET's choke at ack time.
+    -- light < 3 ticks/update, mid 3-5, heavy >= 5. If heavy hits far below light, the
+    -- fake-laggers are where the misses live and the proactive fl_heavy handling matters.
+    do
+        local f = sel01_fl_stats
+        local function _fb(b)
+            local n = b.hit + b.miss
+            if n == 0 then return "-" end
+            return string.format("%d/%d (%.0f%%)", b.hit, n, b.hit / n * 100)
+        end
+        local heavy_now = 0
+        pcall(function()
+            for _, s in pairs(PlayerState) do if s.fl_heavy then heavy_now = heavy_now + 1 end end
+        end)
+        _cs_log_raw(string.format("[FL] shots by target choke — light %s, mid %s, heavy %s | heavy fake-laggers tracked now: %d",
+            _fb(f.light), _fb(f.mid), _fb(f.heavy), heavy_now))
+    end
+    -- V11.29: animation-layer SHADOW score — the layer read now always computes its vote
+    -- (it only steers the resolve when the toggle is ON). Every hit asks: would the vote
+    -- have named the side we actually hit? This is the number that says whether to turn
+    -- the toggle on, without risking a single shot on it.
+    do
+        local a = sel01_anim_shadow
+        local n = (a.ok or 0) + (a.bad or 0)
+        _cs_log_raw(string.format("[ANIM] shadow side-vote at hit time: %d right / %d wrong%s | no vote on %d hits%s",
+            a.ok or 0, a.bad or 0,
+            n > 0 and string.format(" (%.0f%%)", (a.ok or 0) / n * 100) or "",
+            a.none or 0,
+            (anim_side_tog and anim_side_tog:get()) and " | toggle ON (steering *-Guess)" or " | toggle OFF (shadow only)"))
+    end
     -- V10.4: was the KEEP worth its shot? Each keep holds the shot side and schedules a
     -- retry of the same angle. This scores what the NEXT landed hit actually used. A
     -- low-bt bucket dominated by "opposite" means the keep is burning a shot and the
@@ -1697,7 +1737,7 @@ local log_copy_btn = g_logging:button("📋 Copy Last Logs (for share)", functio
             if ok then _cs_log_raw(line)
             else _cs_log_raw("[P] (format error idx=" .. tostring(idx) .. ")") end
             pcall(function()
-                _cs_log_raw(string.format("    └ flags{slow=%s still=%s def=%s lby=%s ff=%s/%d silent=%s/w%d/n%d/%.0f°%+d alt=%s/%d} streak{L=%d R=%d} corr{L=%d R=%d} yaw_rate=%.1f last_hit=%d dist=%.0f miss_rate=%.0f%% p_hits=%d/%d sf=%d spr=%d btRes=%s stand=%d/%d move=%d/%d hist=%s pass=%d pL=%d pR=%d",
+                _cs_log_raw(string.format("    └ flags{slow=%s still=%s def=%s lby=%s ff=%s/%d silent=%s/w%d/n%d/%.0f°%+d alt=%s/%d} streak{L=%d R=%d} corr{L=%d R=%d} yaw_rate=%.1f last_hit=%d dist=%.0f miss_rate=%.0f%% p_hits=%d/%d sf=%d spr=%d btRes=%s fl=%.1f/%d%s stand=%d/%d move=%d/%d hist=%s pass=%d pL=%d pR=%d",
                     tostring(s.is_slow_target), tostring(s.is_stationary or false),
                     tostring(s.defensive_aa), tostring(s.lby_snap),
                     tostring(s.fake_flick or false), tonumber(s.ff_score) or 0,
@@ -1712,6 +1752,7 @@ local log_copy_btn = g_logging:button("📋 Copy Last Logs (for share)", functio
                     tonumber(s.p_hits) or 0, tonumber(s.p_miss) or 0,
                     tonumber(s.serverfail_misses) or 0, tonumber(s.spread_misses) or 0,
                     s.backtrack_resistant and "Y" or "N",
+                    tonumber(s.fl_avg) or 1, tonumber(s.fl_max) or 0, s.fl_heavy and "H" or "",  -- V11.29
                     tonumber(s.stand_n_l) or 0, tonumber(s.stand_n_r) or 0,
                     tonumber(s.move_n_l) or 0, tonumber(s.move_n_r) or 0,
                     hist,
@@ -1917,6 +1958,8 @@ local log_reset_session = g_logging:button("🗑 Reset Session Stats (in-memory)
     pcall(sel01_ack_reset)
     sel01_cancel_stats = { sd = 0, conf = 0, blind = 0, mismatch = 0, episodes = 0, hold_ticks = 0, then_hit = 0, then_miss = 0 }  -- V11.20
     sel01_hg_stats = { head = 0, chest = 0, stomach = 0, arms = 0, legs = 0, other = 0 }  -- V11.27
+    sel01_fl_stats = { light = { hit = 0, miss = 0 }, mid = { hit = 0, miss = 0 }, heavy = { hit = 0, miss = 0 } }  -- V11.29
+    sel01_anim_shadow = { ok = 0, bad = 0, none = 0 }  -- V11.29
     sel01_dt_stats = { seen = 0, max = 0, b3 = 0, b6 = 0, air = 0, duck = 0, fired = 0, reject_gap = 0, reject_ctx = 0, shot_hit = 0, shot_miss = 0 }
 sel01_keep_stats = { stat = { lo = { hit = 0, miss = 0 }, hi = { hit = 0, miss = 0 } },
                      mov  = { lo = { hit = 0, miss = 0 }, hi = { hit = 0, miss = 0 } } }  -- V10.0
@@ -3859,6 +3902,7 @@ events.aim_ack:set(function(event)
           end  -- FIX #4: closes if _conf_corr >= 15
         end
         if s.dtpeek_active then sel01_dt_stats.shot_miss = (sel01_dt_stats.shot_miss or 0) + 1 end  -- V11.16
+        pcall(sel01_fl_note, s, false)  -- V11.29
         if s.cc_held_pending then sel01_cancel_stats.then_miss = sel01_cancel_stats.then_miss + 1; s.cc_held_pending = nil end  -- V11.20
         cs_log_verbose("MISS [%s] target=%d count=%d mode=%s",
                        tostring(reason), Ent:get_index(), s.missed, tostring(s.mode))
@@ -3941,6 +3985,7 @@ events.aim_ack:set(function(event)
         pcall(sel01_hit_bt_note, bt)  -- V11.15: calibrate the stale-record bt line off real hits
         if s.cc_held_pending then sel01_cancel_stats.then_hit = sel01_cancel_stats.then_hit + 1; s.cc_held_pending = nil end  -- V11.20
         if s.dtpeek_active then sel01_dt_stats.shot_hit = (sel01_dt_stats.shot_hit or 0) + 1 end  -- V11.16
+        pcall(sel01_fl_note, s, true)  -- V11.29
         -- HIT: prefer snapshot from aim_fire if available (accurate per-shot state)
         local src_eye, src_res = s.last_eye_yaw, s.last_resolved
         if exp_aim_fire_snap and exp_aim_fire_snap:get() and #s.shot_snapshots > 0 then
@@ -4258,6 +4303,47 @@ events.aim_ack:set(function(event)
 end)
 
 local function update_jitter(p, s)
+    -- V11.29: ONE SAMPLE PER SERVER TICK. This ran on every createmove (64/s) whether
+    -- or not the enemy had sent a new tick. Against a fake-lagger (choke N) that meant:
+    -- yaw_cache filled with N-1 duplicates per real update (a per-tick jitter AA read
+    -- as "static"/"switch" — too few >=10° steps in an 8-slot ring), yaw_rate was 0 on
+    -- the duplicates and then the WHOLE accumulated turn divided by ONE client frame
+    -- on the update tick (30° / 15ms = 1900°/s → clamped to 0 by the 720 guard). So a
+    -- heavy fake-lagger had no usable yaw_rate at all: no extrapolation, no interp-comp,
+    -- spinner detection blind, yaw_rate_consistent stuck false. Gate on
+    -- m_flSimulationTime like anim_side_update / passive_learn_tick, and measure dt in
+    -- SERVER time (the sim delta) so the rate is the real turn rate. The same delta is
+    -- the enemy's choke count — kept as a per-player fake-lag profile (fl_avg / fl_max).
+    local st = 0
+    pcall(function() st = p.m_flSimulationTime or 0 end)
+    local now = globals.curtime
+    if st > 0 and st == (s.jit_simtime or -1) then return end   -- choked / duplicate tick
+    local sim_dt = nil
+    if st > 0 and s.jit_simtime and s.jit_simtime > 0 and st > s.jit_simtime then
+        sim_dt = st - s.jit_simtime
+    end
+    if st > 0 then s.jit_simtime = st end
+    -- fake-lag profile: ticks of simulation this update carried (1 = no choke).
+    -- Only between consecutive observations (<= 0.25s real time) so a wall / dormancy
+    -- gap is not read as choke (the v10.1 lesson), capped at 20 like the DT detector.
+    do
+        local rt = globals.realtime or 0
+        if sim_dt and s.jit_rt and (rt - s.jit_rt) <= 0.25 then
+            local ti = (tick_cache and tick_cache.tickint) or (1 / 64)
+            local ticks = math.floor(sim_dt / ti + 0.5)
+            if ticks >= 1 and ticks <= 20 then
+                s.fl_n   = (s.fl_n or 0) + 1
+                s.fl_avg = (s.fl_avg or 1) * 0.85 + ticks * 0.15
+                if ticks > (s.fl_max or 0) then s.fl_max = ticks end
+                s.fl_last = ticks
+                -- heavy = averaging 5+ ticks per update over 8+ updates. Sticky-ish via
+                -- the EMA; clears on its own when they stop choking.
+                s.fl_heavy = (s.fl_n >= 8) and (s.fl_avg >= 5)
+            end
+        end
+        s.jit_rt = rt
+    end
+
     local ok, ang = pcall(function() return p:get_angles() end)
     if not ok or not ang then return end
     local yaw = ang.y
@@ -4265,9 +4351,9 @@ local function update_jitter(p, s)
     s.yaw_cache[s.yaw_idx % JitterBuffer] = yaw
     s.yaw_idx = (s.yaw_idx + 1) % (JitterBuffer * 2)
 
-    -- yaw-rate for extrapolation
-    local now = globals.curtime
+    -- yaw-rate for extrapolation — dt in SERVER time when we have it (V11.29)
     local dt = now - s.last_yaw_time
+    if sim_dt and sim_dt > 0 then dt = sim_dt end
     if dt > 0 and dt < 0.5 and s.last_yaw_time > 0 then
         local delta = NormalizeAngle(yaw - s.last_yaw)
         local raw_rate = delta / dt
@@ -4693,10 +4779,12 @@ function anim_state_get(p)
     return a
 end
 
--- one resolve tick of evidence. Cheap-exits when the toggle is off.
+-- one resolve tick of evidence.
+-- V11.29: runs in SHADOW when the toggle is off — the vote is computed and scored
+-- against every confirmed hit (sel01_anim_shadow, [ANIM] dump line) but anim_side_get
+-- still returns 0, so the resolve is untouched. Polarity learning also runs in shadow,
+-- so the day the toggle goes on the sign conventions are already calibrated.
 function anim_side_update(s, p, now)
-    if not (anim_side_tog and anim_side_tog:get()) then return end
-
     -- a choked / duplicate tick carries no new server data: its deltas are all
     -- zero and would only dilute the vote.
     local st = 0
@@ -4775,11 +4863,21 @@ end
 
 -- confirmed-hit scoring: flips a signal whose convention is backwards on this build
 function anim_pol_feedback(s, hit_side)
-    if not (anim_side_tog and anim_side_tog:get()) then return end
-    if not s.anim_sig or hit_side == 0 then return end
+    if hit_side == 0 then return end
     local now = 0
     pcall(function() now = globals.curtime or 0 end)
-    if (now - (s.anim_side_t or -9)) > 1.0 then return end
+    local fresh = (now - (s.anim_side_t or -9)) <= 1.0
+    -- V11.29: shadow score — the smoothed vote as anim_side_get would read it
+    do
+        local v = s.anim_vote or 0
+        if fresh and math.abs(v) >= 0.35 then
+            if (v > 0 and 1 or -1) == hit_side then sel01_anim_shadow.ok = sel01_anim_shadow.ok + 1
+            else sel01_anim_shadow.bad = sel01_anim_shadow.bad + 1 end
+        else
+            sel01_anim_shadow.none = sel01_anim_shadow.none + 1
+        end
+    end
+    if not s.anim_sig or not fresh then return end
     local e = anim_pol[s.anim_sig]
     if not e then return end
     local pred = (s.anim_vote or 0) >= 0 and 1 or -1
@@ -4903,7 +5001,10 @@ local function _pick_first_shot_impl(p, s, anim, eye_yaw, max_desync, preset)
                 ticks = ticks + 1
             end
             -- V9.9-G: backtrack-resistant player → -1 tick (NL backtrack can't replay them)
-            if s.backtrack_resistant then ticks = math.max(1, ticks - 1) end
+            -- V11.29: same for a PROFILED heavy fake-lagger (fl_avg >= 5 ticks/update) —
+            -- proactive, before the first stale-record miss flags him resistant. The
+            -- server only holds the ticks he sent; leading past them aims at nothing.
+            if s.backtrack_resistant or s.fl_heavy then ticks = math.max(1, ticks - 1) end
             ticks = math.max(1, math.min(4, ticks))   -- hard cap 4 (was 6)
             -- peek-snap reduces — V9.9-E: use tick_cache.lp
             local lp_peek = false
@@ -7152,7 +7253,8 @@ pcall(function()
                 -- Widen to full spread when this target is already flagged stale-record.
                 pcall(sel01_ov, ctx, "override_multipoint", true)
                 -- V9.46: full spread when stale-record-flagged OR mid teleport-peek blink.
-                pcall(sel01_ov, ctx, "override_multipoint_scale", (s and (s.backtrack_resistant or s.tp_peek_active or s.dtpeek_active)) and 1.0 or 0.85)
+                -- V11.29: OR a profiled heavy fake-lagger (proactive stale-record cover).
+                pcall(sel01_ov, ctx, "override_multipoint_scale", (s and (s.backtrack_resistant or s.tp_peek_active or s.dtpeek_active or s.fl_heavy)) and 1.0 or 0.85)
             end
             cs_log_verbose("close-priority idx=%d dist=%.0f reason=%s hc=%d (eff=%d) wc=%s",
                            target:get_index(), target_dist, priority_reason, priority_hc, effective_hc, tostring(wc))
@@ -7775,6 +7877,7 @@ local esp_paint_handler = function()
                 if s.fake_flick then tag = tag .. "⚡FF " end   -- V9.87: hidden-yaw fake flick
                 if (s.serverfail_misses or 0) > 0 then tag = tag .. string.format("⚠×%d ", s.serverfail_misses) end
                 if s.backtrack_resistant then tag = tag .. "bt " end
+                if s.fl_heavy then tag = tag .. string.format("fl%d ", math.floor((s.fl_avg or 0) + 0.5)) end  -- V11.29: choke ticks/update
                 if s.tp_peek_active then tag = tag .. "pk " end
                 if s.dtpeek_active then tag = tag .. (s.air_duck and "dt^ " or "dt ") end  -- V9.99: dt^ = air-duck
                 s._espc_tag = tag
