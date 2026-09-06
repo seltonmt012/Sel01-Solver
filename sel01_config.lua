@@ -1,12 +1,19 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Config — Neverlose CSGO HvH config        ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 4.1                                    ║
+-- ║  Version: 4.2                                    ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Config
 -- @author seltonmt01
--- @version 4.1
--- @description v4.1 AI PEEK REWRITE + first-dump fixes:
+-- @version 4.2
+-- @description v4.2 bindable switches instead of hotkeys:
+--   * AI Peek trigger = one "active" switch (bind it in NL, hold or toggle) — the
+--     v4.1 trigger combo + hotkey are gone. Manual Left/Right/Forward and Force
+--     defensive are switches too. NL can bind any switch, no script hotkeys needed.
+--   * AI Peek reset every tick in v4.1 because the "manual movement" pause read
+--     cmd.forwardmove/sidemove, which NL itself writes (auto-stop / peek assist).
+--     It now reads the button bits (in_forward / in_back / in_moveleft / in_moveright).
+-- @description-prev v4.1 AI PEEK REWRITE + first-dump fixes:
 --   * AI Peek now holds an anchor and only steps out when utils.trace_bullet from a
 --     candidate peek position (perpendicular to the threat, wall-traced, eye height)
 --     would deal NL Min. Damage - 5 to an enemy hitbox (aiPeek_61044 algorithm).
@@ -103,7 +110,7 @@
 --     variance for full per-side chaos.
 --   * MAG-JIT indicator added to bottom HvH strip; dumped in v3.8 stats.
 
-local SEL01_CFG_VERSION = "4.1"
+local SEL01_CFG_VERSION = "4.2"
 
 -- DEBUG: print to CSGO console at major load checkpoints. Plain print() bypasses
 -- NL chat (which may not flush before crash) and writes directly to CSGO console.
@@ -210,9 +217,10 @@ AA.base      = g_aa:combo("Yaw Base", { "At Target", "Local View" }, 1)
 AA.dir       = g_aa:combo("Direction", { "Backward", "Left", "Right", "Forward" }, 1)
 AA.avoid_bs  = g_aa:switch("Avoid Backstab", true)
 AA.legs      = g_aa:combo("Leg Movement", { "Keep NL", "Sliding", "Walking" }, 1)
-AA.key_l     = g_aa:hotkey("Manual Left")
-AA.key_r     = g_aa:hotkey("Manual Right")
-AA.key_f     = g_aa:hotkey("Manual Forward")
+-- v4.2: switches, not hotkeys — bind them in NL (right-click), hold or toggle as you like
+AA.key_l     = g_aa:switch("Manual Left (bind in NL)", false)
+AA.key_r     = g_aa:switch("Manual Right (bind in NL)", false)
+AA.key_f     = g_aa:switch("Manual Forward (bind in NL)", false)
 AA.man_static= g_aa:switch("  └ Manual = static (no jitter / desync)", false)
 AA.idle_spin = g_aa:switch("Idle spin (warmup / round end, no threat)", false)
 pcall(function()
@@ -318,7 +326,7 @@ g_aa_def:label(accent .. ui.get_icon"bolt" .. accent .. "  Defensive AA (needs N
 AA.def_enable = g_aa_def:switch("Defensive AA master", true)
 AA.def_int    = g_aa_def:slider("Pulse every N commands", 1, 8, 3)
 AA.def_rand   = g_aa_def:switch("  └ Randomize N (N-1 .. N+1)", true)
-AA.def_key    = g_aa_def:hotkey("Force defensive (hold)")
+AA.def_key    = g_aa_def:switch("Force defensive (bind in NL)", false)
 AA.def_clean  = g_aa_def:combo("After discharge: clean records", { "Off", "Random +/-12", "Random + flick 60-72" }, 2)
 AA.def_lag    = g_aa_def:switch("DT Lag Options = Always On while weapon ready", false)
 AA.airlag     = g_aa_def:switch("Air-lag (force defensive + teleport airborne)", false)
@@ -394,7 +402,7 @@ end
 g_move:label(accent .. ui.get_icon"running" .. accent .. "  Movement helpers")
 -- V2.8 + V3.1: Peek Boost = HOLD hotkey. Lowers ragebot HC while held.
 -- V3.5: MinDmg slider REMOVED — lua never overrides NL min_dmg (was eating user's 100).
-local mv_peek_boost_k = g_move:hotkey("Peek Boost (hold)")
+local mv_peek_boost_k = g_move:switch("Peek Boost (bind in NL)", false)   -- v4.2: switch, not hotkey
 local mv_peek_hc      = g_move:slider("Peek HC", 10, 80, 30)
 g_move:label(" ")
 g_move:label(accent .. "  Bind same key as NL Peek Assist for 2-in-1")
@@ -419,8 +427,9 @@ g_move:label(accent .. ui.get_icon"crosshairs" .. accent .. "  AI Peek (hold cov
 -- Elements live in one table (main-chunk local budget).
 local AIP = {}
 AIP.enable   = g_move:switch("Enable AI Peek", false)
-AIP.mode     = g_move:combo("Trigger", { "Hold Hotkey", "Always On" }, 1)
-AIP.key      = g_move:hotkey("AI Peek Key (hold)")
+-- v4.2: plain switch instead of trigger combo + hotkey. NL can bind ANY switch to a key
+-- (right-click), so one bindable "active" switch replaces the whole hold/always/key setup.
+AIP.active   = g_move:switch("  └ AI Peek active (bind this switch in NL)", false)
 AIP.dist     = g_move:slider("Peek distance (u)", 10, 120, 40)
 AIP.delay    = g_move:slider("Confirm ticks before peeking", 0, 5, 1)
 AIP.expose   = g_move:slider("Max exposure without a shot (ms)", 150, 1500, 450)
@@ -436,7 +445,8 @@ AIP.wpn      = g_move:combo("Weapon Filter", { "All", "Snipers only", "Pistols o
 AIP.vis      = g_move:switch("Draw peek point + target hitbox", true)
 AIP.dev      = g_move:switch("Dev Mode (console debug)", false)
 pcall(function()
-    AIP.enable:tooltip("Stand still behind cover with the key held (or Always On). The bot only moves when a traced bullet from a peek position would deal NL Min. Damage (-5) to an enemy.")
+    AIP.enable:tooltip("Master. Stand still behind cover with 'active' on. The bot only moves when a traced bullet from a peek position would deal NL Min. Damage (-5) to an enemy.")
+    AIP.active:tooltip("Right-click this switch in NL and bind it to a key (hold or toggle, your choice). While it is on the peek logic runs; off = the bot never touches your movement.")
     AIP.dist:tooltip("How far left/right of the anchor the peek positions are searched. Walls cut it short automatically.")
     AIP.delay:tooltip("Consecutive ticks a shot must exist before committing. 0 = instant, 1-2 filters flickering sightlines.")
     AIP.expose:tooltip("Safety: standing on the peek point this long without the ragebot firing → retreat anyway.")
@@ -1637,11 +1647,11 @@ local function ai_peek_tick(cmd)
     local now  = globals.realtime or 0
     local tick = globals.tickcount or 0
 
-    -- trigger (hold-hotkey vs always-on)
-    local triggered = true
-    pcall(function() if AIP.mode:get() == "Hold Hotkey" then triggered = AIP.key:get() and true or false end end)
+    -- v4.2: one bindable switch is the trigger
+    local triggered = false
+    pcall(function() triggered = AIP.active:get() and true or false end)
     if not triggered then
-        if ai_peek.phase ~= "off" then ai_peek_reset("key released") end
+        if ai_peek.phase ~= "off" then ai_peek_reset("active switch off") end
         return
     end
 
@@ -1655,9 +1665,13 @@ local function ai_peek_tick(cmd)
     if not lo then return end
     local on_ground = bit.band(flags, 1) ~= 0
 
-    -- manual movement pauses the bot and re-anchors where you stop
+    -- manual movement pauses the bot and re-anchors where you stop. v4.2: read the
+    -- BUTTON bits (what you press), not forwardmove/sidemove — NL itself writes those
+    -- (auto-stop / peek assist), which made v4.1 reset the anchor every tick.
     local user_moving = false
-    pcall(function() user_moving = (cmd.forwardmove ~= 0 or cmd.sidemove ~= 0) end)
+    pcall(function()
+        user_moving = (cmd.in_forward or cmd.in_back or cmd.in_moveleft or cmd.in_moveright) and true or false
+    end)
     if AIP.keys:get() and user_moving then
         if ai_peek.anchor then ai_peek_reset("manual movement") end
         return
@@ -3325,8 +3339,8 @@ local function config_copy_logs()
         _fmt_val(_nl_get(nl_refs.aa_yawmod, "?")), tostring(_nl_get(nl_refs.aa_yawmod_offset, "?")),
         tostring(_nl_get(nl_refs.aa_bodyyaw_l, "?")), tostring(_nl_get(nl_refs.aa_bodyyaw_r, "?")),
         _fmt_val(_nl_get(nl_refs.aa_bodyyaw_opts, "?")), _b(_nl_get(nl_refs.aa_freestand, false))))
-    add(string.format("[AIPEEK] enabled=%s phase=%s anchor=%s side=%s peeks=%d shots=%d exposure-timeouts=%d dist=%d delay=%d expose=%dms retreat=%s dt_wait=%s tele=%s hc=%d",
-        _b(AIP.enable:get()), tostring(ai_peek.phase), ai_peek.anchor and "set" or "none",
+    add(string.format("[AIPEEK] enabled=%s active=%s phase=%s anchor=%s side=%s peeks=%d shots=%d exposure-timeouts=%d dist=%d delay=%d expose=%dms retreat=%s dt_wait=%s tele=%s hc=%d",
+        _b(AIP.enable:get()), _b(AIP.active:get()), tostring(ai_peek.phase), ai_peek.anchor and "set" or "none",
         ai_peek.side == nil and "-" or (ai_peek.side == 0 and "L" or "R"), ai_peek.peeks or 0, ai_peek.shots or 0,
         ai_peek.timeouts or 0, AIP.dist:get(), AIP.delay:get(), AIP.expose:get(), tostring(AIP.retreat:get()),
         _b(AIP.dt_wait:get()), _b(AIP.dt_tele:get()), AIP.hc:get()))
