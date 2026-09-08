@@ -1,12 +1,14 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 11.32                                  ║
+-- ║  Version: 11.33                                  ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 11.32
--- @description v11.32: HUD corner panel ON in every preset + in the Lean visual set.
+-- @version 11.33
+-- @description v11.33: one-sided BF sweep walks OUTWARD from the learned magnitude
+--   (was top-down from 58), the BF list no longer skips its first entry after a
+--   BF:retry, retry window 1s to 2s (sniper cycle time). v11.32: HUD corner panel ON in every preset + in the Lean visual set.
 --   v11.31: dump-readiness % (Logging label + HUD line, 20 shots = 100%),
 --   SSG-Pro: HUD panel ON / custom crosshair OFF, alt_side_pick honours 2+ real hits
 --   on one side over a seeded tie. v11.30: choke average ignores bursts above 14 ticks.
@@ -16,7 +18,7 @@
 --   full multipoint; [FL] hit-rate by target choke; animation-layer read scored in
 --   shadow ([ANIM] line) while the toggle stays off. v11.28 SSG body-hit fix. History in git.
 
-local SEL01_VERSION = "11.32"
+local SEL01_VERSION = "11.33"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -3423,7 +3425,11 @@ function resolver_note_serverfail_retry(s, shot_side, mag)
     s.serverfail_retry_side  = shot_side
     s.serverfail_retry_mag   = mag
     s.serverfail_retry_miss  = s.missed or 0
-    s.serverfail_retry_until = (globals.tickcount or 0) + 64
+    -- V11.33: 64 ticks (1s) expired between two SSG / AWP shots (1.25s+ cycle), so the
+    -- retry almost never fired for snipers — dump idx=1: KEEP "retry same" at 21°, next
+    -- shot 1.3s later went straight to BF:+58. Still bound to the very next shot via
+    -- serverfail_retry_miss == s.missed; only the time box widens to 2s.
+    s.serverfail_retry_until = (globals.tickcount or 0) + 128
 end
 
 function resolver_clear_serverfail_retry(s)
@@ -4311,6 +4317,7 @@ events.aim_ack:set(function(event)
                   s.real_left or 0, s.real_right or 0, s.dtpeek_active, _hb)
         end
         s.missed = 0
+        s.bf_retry_n, s.bf_retry_at_missed = nil, nil  -- V11.33: BF list offset resets with the miss run
         s.expl_l, s.expl_r = false, false  -- V11.2: new engagement, un-burn both sides
         s.bf_cached_missed = nil  -- clear BF cache so next miss recomputes fresh
         s.bf_cached_angle  = nil
@@ -5638,6 +5645,12 @@ local function pick_bruteforce_angle(s, anim, eye_yaw, max_desync, p, preset)
     if s.serverfail_retry_side and s.serverfail_retry_miss == s.missed
        and (s.serverfail_retry_until or 0) >= (globals.tickcount or 0) then
         local side = s.serverfail_retry_side
+        -- V11.33: count this retry once per miss level (the BF cache can re-enter here
+        -- after an eye-drift invalidation at the same s.missed).
+        if s.bf_retry_at_missed ~= s.missed then
+            s.bf_retry_n = (s.bf_retry_n or 0) + 1
+            s.bf_retry_at_missed = s.missed
+        end
         -- FIX #2: BF:retry cap. The same side+mag retry can jitter without converging on a
         -- static enemy we already measured (logs idx=2: our 42.7→43.3→38.2→50.9 vs meas 41.6,
         -- missCount 4). After 2 consecutive correct-angle keeps (serverfail_streak>=2) with
@@ -5729,7 +5742,30 @@ local function pick_bruteforce_angle(s, anim, eye_yaw, max_desync, p, preset)
         -- enemy has NEVER been on = a guaranteed whiff. Sweep MAGNITUDE on the proven
         -- dominant side first and demote "opposite" to last.
         local sgn = (rl > rr) and "-" or "+"   -- dominant real side sign
-        bf_list = {sgn.."58", sgn.."45", sgn.."35", sgn.."29", sgn.."20", "0", "opposite"}
+        -- V11.33: sweep OUTWARD from the LEARNED magnitude instead of top-down from 58.
+        -- Dump idx=1: 13 hits at R 21°, then two bt<=1 misses at 21 → the sweep fired
+        -- +58 (miss), +45 (miss), +35 (hit) — three shots to find a 14° move on a side
+        -- we already knew. Sorted by distance from the learned 21° the order would have
+        -- been +29, +35, +45, +58: the enemy is found in 1-2 shots instead of 3. The
+        -- magnitude within 3° of the learned value is skipped (that is the shot that
+        -- just missed / the retry). Falls back to the old top-down order without data.
+        local lm = effective_desync(s, max_desync, (sgn == "+") and 1 or -1)
+        if lm and lm > 5 and lm < 65 then
+            local cands = {58, 45, 35, 29, 20}
+            table.sort(cands, function(a, b)
+                local da, db = math.abs(a - lm), math.abs(b - lm)
+                if da == db then return a > b end
+                return da < db
+            end)
+            bf_list = {}
+            for _, c in ipairs(cands) do
+                if math.abs(c - lm) >= 3 then bf_list[#bf_list + 1] = sgn .. tostring(c) end
+            end
+            bf_list[#bf_list + 1] = "0"
+            bf_list[#bf_list + 1] = "opposite"
+        else
+            bf_list = {sgn.."58", sgn.."45", sgn.."35", sgn.."29", sgn.."20", "0", "opposite"}
+        end
     elseif s.is_slow_target or s.aa_type == "static" then
         -- static/slow but NOT one-sided (balanced or unknown) → opposite-first sweep.
         bf_list = {"opposite", "+58", "-58", "+45", "-45", "+35", "-35", "+29", "-29", "+20", "-20", "0"}
@@ -5753,7 +5789,12 @@ local function pick_bruteforce_angle(s, anim, eye_yaw, max_desync, p, preset)
         end
     end
 
-    local idx = ((s.missed - 1) % #bf_list) + 1
+    -- V11.33: a BF:retry / Static-Meas commit above consumes a miss level WITHOUT
+    -- walking the list, so the list used to start at entry 2 after any retry (the
+    -- nearest probe / "opposite" was never fired). Offset by the retries taken in
+    -- this miss run; s.bf_retry_n is cleared on the next hit.
+    local off = s.bf_retry_n or 0
+    local idx = (math.max(0, s.missed - 1 - off) % #bf_list) + 1
     local kind = bf_list[idx]
     s.mode = "BF:" .. kind
 
