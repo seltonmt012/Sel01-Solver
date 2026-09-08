@@ -183,6 +183,7 @@ local function styled(group)
         if type(name) ~= "string" then return name end
         if name == " " or name == "" then return name end
         if name:sub(1, 1) == "\a" then return name end                       -- already colored (headers, accent switches)
+        if name:sub(1, 2) == "##" then return name end                        -- hidden / keyed elements
         local tag = name:match("^%[(%u+)%] ")
         if tag then return "\a{Link Active}" .. tag .. "\aDEFAULT  " .. name:sub(#tag + 4) end
         local sub2 = name:match("^      (.+)$")                                -- 2nd-level row
@@ -195,12 +196,15 @@ local function styled(group)
     return setmetatable(P, { __index = function(_, k)
         local f = group[k]
         if type(f) ~= "function" then return f end
-        if k == "label" then return function(_, name, ...) return f(group, name, ...) end end
+        -- labels, buttons and lists keep their text (buttons are icon / alt style, lists are "##" keyed)
+        if k == "label" or k == "button" or k == "list" or k == "listable" then return function(_, name, ...) return f(group, name, ...) end end
         return function(_, name, ...) return f(group, restyle(name), ...) end
     end })
 end
-local g_main    = styled(ui.create(T_MAIN, gi("floppy-disk", "Configs & Presets"), 1))
-local g_qol     = styled(ui.create(T_MAIN, gi("sparkles", "Quality of Life"), 2))
+local g_main    = styled(ui.create(T_MAIN, gi("floppy-disk", "Configs"), 1))
+local g_presets = styled(ui.create(T_MAIN, gi("sliders", "Presets"), 1))
+local g_about   = styled(ui.create(T_MAIN, gi("sparkles", "Sel01-Config"), 2))
+local g_qol     = styled(ui.create(T_MAIN, gi("tag", "Quality of Life"), 2))
 local g_info    = styled(ui.create(T_MAIN, gi("circle-info", "Info & Logs"), 2))
 local g_aa      = styled(ui.create(T_AA,   gi("shield", "Anti-Aim"), 1))
 local g_aa_st   = styled(ui.create(T_AA,   gi("hammer", "State Builder"), 1))
@@ -219,51 +223,64 @@ local g_misc_an = styled(ui.create(T_MISC, gi("person-walking", "Animation break
 -- Header — v3.21: chernobl-style multi-color welcome (\aDEFAULT resets to white
 -- between accent-colored segments, like "Dear <accent>name<reset>, ...").
 local _uname = (common and common.get_username and common.get_username()) or "player"
-g_main:label(ui.get_icon"user" .. "  Dear " .. accent .. _uname .. "\aDEFAULT, have a good game!")
-g_main:label(ui.get_icon"sparkles" .. "  Build " .. accent .. "Sel01-Config" .. "\aDEFAULT  version " .. accent .. SEL01_CFG_VERSION .. "\aDEFAULT")
-g_main:label(ui.get_icon"bolt" .. "  Companion to " .. accent .. "Sel01-Solver" .. "\aDEFAULT (resolver)")
-g_main:label(" ")
-g_main:label(accent .. ui.get_icon"sliders"  .. accent .. "  Meta presets (decoded from gazolina / everlast):")
-
--- Forward-decl preset applier so callbacks see it at call-time, not parse-time
-local apply_preset_fwd
--- v5.0: presets are decoded meta configs (gazolina built-ins + everlast author preset)
-local PRESET_BTNS = {}
-PRESET_BTNS.nyanza     = g_main:button("Nyanza Snapshot (meta default)",   function() apply_preset_fwd("nyanza")     end)
-PRESET_BTNS.aggressive = g_main:button("Aggressive xo-yaw",                function() apply_preset_fwd("aggressive") end)
-PRESET_BTNS.unrivaled  = g_main:button("Unrivaled xo-yaw (static L/R)",    function() apply_preset_fwd("unrivaled")  end)
-PRESET_BTNS.sata       = g_main:button("Sata (chaos jitter)",              function() apply_preset_fwd("sata")       end)
-PRESET_BTNS.everlast   = g_main:button("Everlast Author (center jitter)",  function() apply_preset_fwd("everlast")   end)
-PRESET_BTNS.spin       = g_main:button("Spin (full spinbot)",              function() apply_preset_fwd("spin")       end)
-PRESET_BTNS.troll      = g_main:button("Troll / Bait (run-in chaos)",      function() apply_preset_fwd("troll")      end)
-
-g_main:label(" ")
--- v5.0 config system (meta pattern: slot list + name input + Save / Load / Delete / Export /
--- Import via clipboard; built-in presets stay buttons). 8 fixed slots — NL combos cannot
--- change their items at runtime, so the slot labels are rewritten with :name() instead.
+-- ── Configs (DEMONTIME / nexus / Andromeda preset-manager layout): a LIST you click,
+-- a name field, and inline icon buttons under it. list:get() = 1-based index = slot.
 local CFG = {}
 CFG.SLOTS = 8
-g_main:label(accent .. ui.get_icon"floppy-disk" .. accent .. "  Your configs (8 slots, stored in NL db):")
 do
     local names = {}
-    for i = 1, CFG.SLOTS do names[i] = "Slot " .. i end
-    CFG.slot = g_main:combo("Config slot", names, 1)
+    for i = 1, CFG.SLOTS do names[i] = i .. "   (empty)" end
+    CFG.list = g_main:list("##SEL01_CONFIGS", names)
 end
 CFG.name   = nil
-pcall(function() CFG.name = g_main:input("  └ Name for this slot", "my config") end)
-CFG.b_save = g_main:button("Save to slot", function() end)
-CFG.b_load = g_main:button("Load slot", function() end)
-CFG.b_del  = g_main:button("Delete slot", function() end)
-CFG.b_exp  = g_main:button("Export slot to clipboard", function() end)
-CFG.b_imp  = g_main:button("Import clipboard into slot", function() end)
-CFG.labels = {}
-for i = 1, CFG.SLOTS do CFG.labels[i] = g_main:label("\aA0A6B4FF    " .. i .. "  (empty)") end
-CFG.status = g_main:label(" ")
+pcall(function() CFG.name = g_main:input(ui.get_icon"pen" .. "  name", "my config") end)
+CFG.b_save = g_main:button(ui.get_icon"floppy-disk" .. "  Save", nil, true)
+CFG.b_load = g_main:button(ui.get_icon"upload" .. "  Load", nil, true)
+CFG.b_exp  = g_main:button(ui.get_icon"file-export" .. "  Export", nil, true)
+CFG.b_imp  = g_main:button(ui.get_icon"file-import" .. "  Import", nil, true)
+CFG.b_del  = g_main:button("\aDB6361FF" .. ui.get_icon"trash" .. "  Delete\r", nil, true)
+CFG.status = g_main:label("\aA0A6B4FF  select a slot, type a name, Save")
 pcall(function()
-    CFG.slot:tooltip("Pick a slot, type a name, Save. Load applies every Sel01-Config element (AA states, defensive, misc, visuals). Export puts the slot on the clipboard as text (sel01cfg:...), Import reads such a string back into the slot.")
+    CFG.b_save:tooltip("Save every Sel01-Config element (AA states, defensive, misc, visuals) into the selected slot under the name.")
+    CFG.b_load:tooltip("Apply the selected slot.")
+    CFG.b_exp:tooltip("Copy the selected slot to the clipboard as text (sel01cfg:...). Empty slot = your live settings.")
+    CFG.b_imp:tooltip("Read a sel01cfg: text from the clipboard into the selected slot (then Load).")
+    CFG.b_del:tooltip("Empty the selected slot.")
 end)
-g_main:label(" ")
-local enable_master = g_main:switch(accent .. ui.get_icon"power" .. accent .. "  Master Enable (all features)", true)
+
+-- ── Presets: pick from the list, Apply. Decoded meta configs (gazolina built-ins + the
+-- everlast author preset); the description label follows the selection.
+local apply_preset_fwd   -- forward-decl so the button sees it at call-time
+local PRESET = {}
+PRESET.KEYS  = { "nyanza", "aggressive", "unrivaled", "sata", "everlast", "spin", "troll" }
+PRESET.NAMES = { "Nyanza Snapshot", "Aggressive xo-yaw", "Unrivaled xo-yaw", "Sata", "Everlast Author", "Spin", "Troll / Bait" }
+PRESET.DESC  = {
+    "meta default: -25 / +40 real yaw, 58/58 body, switch sequence [5,5,2,2,20], choke table",
+    "gazolina: random hold 3-8 sends, 3-Way on crouch, defensive always, safe head 60",
+    "gazolina: static asymmetric L/R every send, warmup spin, knife safe head",
+    "gazolina chaos: Bobrinho LUT, tick pulses, A/B limits, wild sequences",
+    "spectral / everlast: center-jitter halves, 60/60, progressive + povorotniki hidden",
+    "NL Spin modifier, random magnitude, every-send switch, no freestanding",
+    "everything random, run in and watch who whiffs (not competitive)",
+}
+PRESET.list  = g_presets:list("##SEL01_PRESETS", PRESET.NAMES)
+PRESET.desc  = g_presets:label("\aA0A6B4FF  " .. PRESET.DESC[1])
+PRESET.apply = g_presets:button(ui.get_icon"check" .. "  Apply preset", function()
+    local key = "nyanza"
+    pcall(function()
+        local v = PRESET.list:get()
+        if type(v) == "number" then key = PRESET.KEYS[math.max(1, math.min(#PRESET.KEYS, v))] or key
+        elseif type(v) == "string" then
+            for i, n in ipairs(PRESET.NAMES) do if n == v then key = PRESET.KEYS[i] end end
+        end
+    end)
+    apply_preset_fwd(key)
+end, true)
+pcall(function() PRESET.apply:tooltip("Writes every AA state, the defensive / anti-bruteforce / safe-head globals and the visual set of the selected preset. Your own configs (left) are not touched.") end)
+
+-- ── About (right column): compact header + master switch
+g_about:label(ui.get_icon"user" .. "  " .. accent .. _uname .. "\aDEFAULT  ·  v" .. accent .. SEL01_CFG_VERSION .. "\aDEFAULT  ·  companion to " .. accent .. "Sel01-Solver")
+local enable_master = g_about:switch(accent .. ui.get_icon"power" .. accent .. "  Master Enable (all features)", true)
 
 -- ══════════════════════════════════════════════════════════════════════════
 -- ANTI-AIM UI
@@ -798,6 +815,18 @@ VIS.side_off     = g_visual:slider("  └ bottom offset (px)", 100, 600, 350)
 VIS.wm_pos       = g_visual:combo("Watermark position", { "Top Right", "Top Left", "Bottom Right", "Bottom Left" }, 1)
 VIS.hitmark_dmg  = g_visual:switch("Hit marker: damage number + kill color", true)
 VIS.def_glyph    = g_visual:switch("Defensive glyph (pulsing star while shifting)", false)
+-- v5.0 draggable panels (elysian / nexus / spectral / evalate pattern): while the NL menu is
+-- open every panel can be grabbed with the mouse; the position lives in two HIDDEN sliders
+-- per panel (-1 = default position) so NL persists it with the config.
+VIS.drag = {}
+for _, nm in ipairs({ "watermark", "keybinds", "spectators", "netgraph", "eventlog", "velocity", "sideind" }) do
+    local sx = g_visual:slider("##drag_" .. nm .. "_x", -1, 8192, -1)
+    local sy = g_visual:slider("##drag_" .. nm .. "_y", -1, 8192, -1)
+    pcall(function() sx:visibility(false); sy:visibility(false) end)
+    VIS.drag[nm] = { x = sx, y = sy }
+end
+VIS.drag_reset = g_visual:button(ui.get_icon"rotate-left" .. "  Reset panel positions", nil, true)
+g_visual:label("\aA0A6B4FF  open the menu and drag any panel with the mouse")
 pcall(function()
     VIS.keybinds_nl:tooltip("Reads ui.get_binds() and lists every active NL bind with its mode (hold / toggle) plus the script's own states.")
     VIS.side_ind:tooltip("Vertical list at the left screen edge stacking upward: DT (fill = charge), HS, FS, FD, DA, PING, LC, DMG. The center indicator stays minimal.")
@@ -873,17 +902,21 @@ local qol_clantag_st = g_qol:combo("Clantag style", {"Wave", "Spin", "Pulse", "L
 -- ══════════════════════════════════════════════════════════════════════════
 -- v4.0: 📋 Copy Last Logs — the Solver-style one-click share dump (hits taken with the
 -- full engine snapshot, attacker table, timeline, NL live values, hints) → clipboard.
-local btn_copy   = g_info:button("📋 Copy Last Logs (hits taken + AA timeline)", function() end)
-local btn_status = g_info:button("Print Status", function() end)
-local btn_reset  = g_info:button("Reset Settings", function() end)
-local btn_stats  = g_info:button("Dump Debug Stats", function() end) -- V2.6
-local btn_clear  = g_info:button("Clear Stats", function() end) -- V2.6
-local btn_recom  = g_info:button("Print Recommendations", function() end) -- V3.1
-local btn_antihs = g_info:button("Toggle Anti-HS Bundle", function() end) -- V3.1
-g_info:label(" ")
+-- v5.0: short inline (alt-style) buttons — long labels got cut off in the NL column
+local btn_copy   = g_info:button(ui.get_icon"clipboard" .. "  Copy Last Logs", nil, true)
+local btn_status = g_info:button(ui.get_icon"circle-info" .. "  Status", nil, true)
+local btn_stats  = g_info:button(ui.get_icon"chart-simple" .. "  Dump Stats", nil, true) -- V2.6
+local btn_clear  = g_info:button(ui.get_icon"eraser" .. "  Clear Stats", nil, true) -- V2.6
+local btn_recom  = g_info:button(ui.get_icon"lightbulb" .. "  Tips", nil, true) -- V3.1
+local btn_antihs = g_info:button(ui.get_icon"skull" .. "  Anti-HS Bundle", nil, true) -- V3.1
+local btn_reset  = g_info:button(ui.get_icon"rotate-left" .. "  Reset to Nyanza", nil, true)
+pcall(function()
+    btn_copy:tooltip("Hits taken with the full engine snapshot, attacker table, timeline, NL live values and hints → clipboard + nl/Sel01-Config/last_logs.txt")
+    btn_recom:tooltip("Data-driven hints from this session's hits taken.")
+    btn_reset:tooltip("Applies the Nyanza Snapshot preset (= the element defaults).")
+end)
 cfg_vc_label = g_info:label("\aAAAAAAFFv" .. SEL01_CFG_VERSION .. " - checking for updates...")
-g_info:label(" ")
-g_info:label("\aA0A6B4FF  Sel01-Solver handles resolving (own tab); this script = AA / Misc / Visuals")
+g_info:label("\aA0A6B4FF  Sel01-Solver = resolving (own tab)  ·  this script = AA / Misc / Visuals")
 
 -- ══════════════════════════════════════════════════════════════════════════
 -- SAFE-SET HELPER (defensive wrapper around NL UI element :set())
@@ -2927,6 +2960,20 @@ local function createmove_unified(cmd)
         pending_cfg = nil
         pcall(cfg_drain, p)
     end
+    -- preset list: the description label follows the selection (polled, :name from createmove)
+    if (globals.tickcount or 0) % 16 == 0 then
+        pcall(function()
+            local v = PRESET.list:get()
+            local idx = nil
+            if type(v) == "number" then idx = math.max(1, math.min(#PRESET.KEYS, v))
+            elseif type(v) == "string" then for i, n in ipairs(PRESET.NAMES) do if n == v then idx = i end end end
+            if idx and idx ~= PRESET.shown then
+                PRESET.shown = idx
+                PRESET.desc:name("\aA0A6B4FF  " .. PRESET.DESC[idx])
+            end
+        end)
+    end
+    if pending_drag_reset then pending_drag_reset = false; pcall(vis_drag_reset_all) end
     -- v5.0: Shuffle choke steps (button callback only sets the flag — v1.5 rule)
     if pending_def_shuffle then
         pending_def_shuffle = false
@@ -3454,6 +3501,79 @@ end
 function vis_accent_bar(x, y1, y2, col)
     pcall(function() render.rect(vector(x, y1), vector(x + 3, y2), col, { 4, 0, 0, 4 }) end)
 end
+-- ── draggable panels ──
+-- vis_drag_frame(): once per render frame — mouse, button edge, menu rect, menu open.
+-- vis_drag_pos(name, dx, dy, w, h): returns the panel position (saved or default), handles
+-- grab / move / release while the menu is open, draws a dashed accent outline so you see
+-- what is draggable. Saved to the hidden sliders on release (pcall'd :set, render context
+-- is fine for sliders — the v1.5 freeze was combo :set inside MENU callbacks).
+VIS_DRAG = { grab = nil, down = false, prev = false, click = false, mx = 0, my = 0, menu = false }
+function vis_drag_frame()
+    local D = VIS_DRAG
+    D.prev = D.down
+    D.menu, D.down = false, false
+    pcall(function() D.menu = ui.get_alpha and ui.get_alpha() > 0.05 end)
+    if not D.menu then D.grab = nil; return end
+    pcall(function() local m = ui.get_mouse_position(); D.mx, D.my = m.x, m.y end)
+    pcall(function() D.down = common.is_button_down(1) and true or false end)
+    D.click = D.down and not D.prev
+    D.in_menu = false
+    pcall(function()
+        local p, s = ui.get_position(), ui.get_size()
+        if p and s then D.in_menu = D.mx >= p.x and D.mx <= p.x + s.x and D.my >= p.y and D.my <= p.y + s.y end
+    end)
+    if not D.down then
+        if D.grab then
+            -- release: persist
+            local P = VIS_DRAG[D.grab]
+            local S = VIS.drag[D.grab]
+            if P and S then pcall(function() S.x:set(math.floor(P.x)); S.y:set(math.floor(P.y)) end) end
+        end
+        D.grab = nil
+    end
+end
+function vis_drag_pos(name, dx, dy, w, h)
+    local D = VIS_DRAG
+    local P = D[name]
+    if not P then
+        P = { x = nil, y = nil }
+        D[name] = P
+    end
+    -- (re)load from the sliders when unset or after a reset
+    if P.x == nil then
+        local sx, sy = -1, -1
+        pcall(function() sx = VIS.drag[name].x:get(); sy = VIS.drag[name].y:get() end)
+        P.x = (sx and sx >= 0) and sx or dx
+        P.y = (sy and sy >= 0) and sy or dy
+        P.custom = (sx and sx >= 0)
+    elseif not P.custom then
+        P.x, P.y = dx, dy   -- default-positioned panels follow their computed default (resolution / combo changes)
+    end
+    if D.menu then
+        local sx, sy = render.screen_size().x, render.screen_size().y
+        if D.grab == name and D.down then
+            P.x = math.max(0, math.min(sx - w, D.mx - P.ox))
+            P.y = math.max(0, math.min(sy - h, D.my - P.oy))
+            P.custom = true
+        elseif D.click and not D.grab and not D.in_menu
+               and D.mx >= P.x and D.mx <= P.x + w and D.my >= P.y and D.my <= P.y + h then
+            D.grab = name
+            P.ox, P.oy = D.mx - P.x, D.my - P.y
+        end
+        -- outline so the panel reads as draggable
+        pcall(function()
+            local c = (D.grab == name) and color(120, 200, 255, 200) or color(120, 200, 255, 90)
+            render.rect_outline(vector(P.x - 2, P.y - 2), vector(P.x + w + 2, P.y + h + 2), c, 1, 5)
+        end)
+    end
+    return P.x, P.y
+end
+function vis_drag_reset_all()
+    for _, nm in ipairs({ "watermark", "keybinds", "spectators", "netgraph", "eventlog", "velocity", "sideind" }) do
+        pcall(function() VIS.drag[nm].x:set(-1); VIS.drag[nm].y:set(-1) end)
+        VIS_DRAG[nm] = nil
+    end
+end
 -- per-key smoothed alpha (keybind rows, log rows): target 0/1, returns 0..1
 VIS_FADE = {}
 function vis_fade(key, want, speed)
@@ -3473,6 +3593,7 @@ pcall(function()
         if not enable_master:get() then return end
         update_perf()
         update_specs()
+        vis_drag_frame()   -- v5.0 draggable panels: mouse / button edge / menu rect once per frame
 
         local sx, sy = render.screen_size().x, render.screen_size().y
         local now = globals.realtime or 0
@@ -3678,6 +3799,7 @@ pcall(function()
             pcall(function()
                 local h = 24
                 local w = tw + pad * 2 + 14
+                wx, wy = vis_drag_pos("watermark", wx, wy, w, h)
                 vis_glass(wx, wy, wx + w, wy + h, 1, 7)
                 -- accent dot (pulses with the DT charge when DT is on, else the RGB wave)
                 local dc = color(g_r, g_g, g_b, 255)
@@ -3875,7 +3997,8 @@ pcall(function()
                 local isz = vector(34, 34)
                 local lw  = render.measure_text(fnt, nil, label).x + 22
                 local box = vector(lw, 34)
-                local base = vector(cx - (isz.x + 6 + box.x) / 2, sy * 0.18)
+                local dbx, dby = vis_drag_pos("velocity", cx - (isz.x + 6 + box.x) / 2, sy * 0.18, isz.x + 6 + box.x, 34)
+                local base = vector(dbx, dby)
                 -- icon box
                 render.blur(base, base + isz, 2, a, rad)
                 render.rect(base, base + isz, bg, rad)
@@ -3903,12 +4026,21 @@ pcall(function()
         -- v5.0: each entry is a glass row with a colored accent bar (kill green / hit by
         -- damage / miss red), slides in from the left for 0.15s and fades out at the end.
         if vis_hitlog:get() then
-            local hx, hy = 16, 16
+            local hx, hy = vis_drag_pos("eventlog", 16, 16, 240, 78)
             local row = 0
             local f = vis_font()
+            -- demo rows while the menu is open (so the box can be placed)
+            if VIS_DRAG.menu and #hit_log == 0 and not _vis_state.demo_log then
+                _vis_state.demo_log = true
+                hit_log[1] = { time = now + 99, kind = "hit", name = "enemy", dmg = 87, hitbox = "head", demo = true }
+                hit_log[2] = { time = now + 99, kind = "miss", name = "enemy", hitbox = "chest", reason = "spread", demo = true }
+            elseif not VIS_DRAG.menu and _vis_state.demo_log then
+                _vis_state.demo_log = false
+                for i = #hit_log, 1, -1 do if hit_log[i].demo then table.remove(hit_log, i) end end
+            end
             for i = #hit_log, 1, -1 do
                 local entry = hit_log[i]
-                local age = now - entry.time
+                local age = entry.demo and 0.5 or (now - entry.time)
                 if age > HITLOG_DURATION_S then
                     table.remove(hit_log, i)
                 else
@@ -3981,8 +4113,10 @@ pcall(function()
                         if b and b.active then
                             local nm = tostring(b.name or "?")
                             nm = nm:gsub("\a%x%x%x%x%x%x%x%x", ""):gsub("\a%b{}", ""):gsub("\aDEFAULT", "")
-                            local mode = tostring(b.mode or "")
-                            if #mode > 0 then mode = " [" .. mode:lower() .. "]" end
+                            -- NL docs: mode 1 = Hold, 2 = Toggle
+                            local m = b.mode
+                            local mode = (m == 1 or m == "1") and " [hold]" or ((m == 2 or m == "2") and " [toggle]" or "")
+                            if mode == "" and type(m) == "string" and #m > 0 then mode = " [" .. m:lower() .. "]" end
                             if #active < 14 then table.insert(active, nm .. mode) end
                         end
                     end
@@ -4000,7 +4134,7 @@ pcall(function()
                 for _, n in ipairs(active) do rows[#rows + 1] = n end
                 for k, _ in pairs(VIS_FADE) do
                     local n = k:match("^kb:(.+)$")
-                    if n and not want[n] then rows[#rows + 1] = n end
+                    if n and n ~= "panel" and not want[n] then rows[#rows + 1] = n end
                 end
                 local vis_rows = {}
                 for _, n in ipairs(rows) do
@@ -4013,7 +4147,7 @@ pcall(function()
                 local lh, pw = 16, 168
                 local h = 22
                 for _, r in ipairs(vis_rows) do h = h + lh * r[2] end
-                local bx, by = sx - 190, sy / 2 + 80
+                local bx, by = vis_drag_pos("keybinds", sx - 190, sy / 2 + 80, pw, h + 4)
                 vis_glass(bx, by, bx + pw, by + h + 4, pa, 6)
                 vis_tsh(f, bx + 9, by + 5, color(180, 220, 255, math.floor(255 * pa)), "keybinds")
                 render.rect(vector(bx + 8, by + 20), vector(bx + pw - 8, by + 21), color(120, 180, 255, math.floor(120 * pa)))
@@ -4041,17 +4175,20 @@ pcall(function()
         -- ── SPECTATOR OVERLAY (left-middle) ──
         if vis_specoverlay:get() then
             pcall(function()
-                local pa = vis_fade("spec:panel", #specs > 0)
+                local menu_open = VIS_DRAG.menu
+                local pa = vis_fade("spec:panel", #specs > 0 or menu_open)
                 if pa <= 0.01 then return end
+                local list = specs
+                if #list == 0 and menu_open then list = { "(nobody yet)" } end
                 local f = vis_font()
                 local lh, pw = 16, 180
-                local h = 26 + #specs * lh
-                local bx, by = 16, sy / 2 - h / 2
+                local h = 26 + #list * lh
+                local bx, by = vis_drag_pos("spectators", 16, sy / 2 - h / 2, pw, h)
                 vis_glass(bx, by, bx + pw, by + h, pa, 6)
                 vis_accent_bar(bx, by + 6, by + h - 6, color(255, 180, 80, math.floor(220 * pa)))
                 vis_tsh(f, bx + 12, by + 5, color(255, 180, 80, math.floor(255 * pa)), string.format("spectators  %d", #specs))
                 render.rect(vector(bx + 11, by + 20), vector(bx + pw - 8, by + 21), color(255, 180, 80, math.floor(90 * pa)))
-                for i, name in ipairs(specs) do
+                for i, name in ipairs(list) do
                     vis_tsh(f, bx + 12, by + 8 + i * lh, color(225, 230, 240, math.floor(240 * pa)), name)
                 end
             end)
@@ -4083,6 +4220,8 @@ pcall(function()
                 if aa_eng.sh_active then rows[#rows+1] = { "SH", white } end
                 local md = nl_refs.rage_mindmg and nl_refs.rage_mindmg:get()
                 if md then rows[#rows+1] = { "DMG " .. tostring(md), grey } end
+                -- demo rows while the menu is open (so the stack can be placed by dragging)
+                if VIS_DRAG.menu and #rows == 0 then rows = { { "DT", white, 0.6 }, { "HS", white }, { "DMG 100", grey } } end
                 -- rows slide in from the left edge and fade out individually (elysian)
                 local want = {}
                 for _, r in ipairs(rows) do want[r[1]] = r end
@@ -4092,8 +4231,11 @@ pcall(function()
                     local n = k:match("^side:(.+)$")
                     if n and not want[n] then all[#all + 1] = n end
                 end
-                local x, y = 6, sy - VIS.side_off:get()
                 local rh, gap, w = 20, 4, 74
+                -- draggable: the box is the stack's full height (rows stack upward from y)
+                local stack_h = math.max(1, #rows) * (rh + gap)
+                local dx, dy = vis_drag_pos("sideind", 6, sy - VIS.side_off:get() - stack_h, w, stack_h)
+                local x, y = dx, dy + stack_h
                 local f = vis_font()
                 for _, name in ipairs(all) do
                     local r = want[name] or _vis_state["side_" .. name]
@@ -4145,7 +4287,7 @@ pcall(function()
                 -- value colored by threshold, panel bottom-left above the netgraph area
                 local f = vis_font()
                 local pw, lh = 150, 15
-                local gx, gy = 20, sy - 30 - 22 - lh * 5
+                local gx, gy = vis_drag_pos("netgraph", 20, sy - 30 - 22 - lh * 5, pw, 22 + lh * 5)
                 vis_glass(gx, gy, gx + pw, gy + 22 + lh * 5, 1, 6)
                 vis_tsh(f, gx + 9, gy + 5, color(180, 220, 255, 255), "network")
                 render.rect(vector(gx + 8, gy + 20), vector(gx + pw - 8, gy + 21), color(120, 180, 255, 120))
@@ -4356,6 +4498,7 @@ local function dump_status()
 end
 pcall(function() btn_status:set_callback(function() dump_status() end) end)
 pcall(function() btn_reset:set_callback(function() apply_preset("nyanza") end) end)
+pcall(function() VIS.drag_reset:set_callback(function() pending_drag_reset = true end) end)
 -- v5.0 warmup config button (Andromeda one-click cvars; only works on your own server)
 pcall(function() MISC.warmup:set_callback(function()
     pcall(function()
@@ -5007,16 +5150,26 @@ local function cfg_store_save()
     end)
     return in_db
 end
+-- selected slot = the list's 1-based index (DEMONTIME indexes its name array with it)
+local function cfg_sel_slot()
+    local v = nil
+    pcall(function() v = CFG.list:get() end)
+    if type(v) == "number" then
+        if v == 0 then v = 1 end
+        return math.max(1, math.min(CFG.SLOTS, math.floor(v)))
+    elseif type(v) == "string" then
+        return tonumber(v:match("^%s*(%d+)")) or 1
+    end
+    return 1
+end
 local function cfg_refresh_labels()
     local st = cfg_store_load()
-    local sel = 1
-    pcall(function() sel = tonumber(tostring(CFG.slot:get()):match("%d+")) or 1 end)
+    local names = {}
     for i = 1, CFG.SLOTS do
         local s = st.slots[i]
-        local txt = s and s.data and (tostring(s.name or "?") .. "  \aA0A6B4FF(" .. tostring(s.n or "?") .. " values)") or "(empty)"
-        local pre = (i == sel) and "\a{Link Active}▸ " or "\aA0A6B4FF    "
-        pcall(function() CFG.labels[i]:name(pre .. i .. "  " .. txt) end)
+        names[i] = s and s.data and (i .. "   " .. tostring(s.name or "?") .. "   (" .. tostring(s.n or "?") .. ")") or (i .. "   (empty)")
     end
+    pcall(function() CFG.list:update(names) end)
 end
 local function cfg_status(text)
     pcall(function() CFG.status:name(text) end)
@@ -5025,8 +5178,7 @@ end
 function cfg_drain(p)
     if #CFG.items == 0 then cfg_build_registry() end
     local st = cfg_store_load()
-    local slot = 1
-    pcall(function() slot = tonumber(tostring(CFG.slot:get()):match("%d+")) or 1 end)
+    local slot = cfg_sel_slot()
     local name = "config"
     pcall(function() if CFG.name then name = tostring(CFG.name:get() or "config") end end)
     if name == "" then name = "config " .. slot end
@@ -5089,8 +5241,8 @@ pcall(function()
     CFG.b_del:set_callback(function()  pending_cfg = { op = "delete" } end)
     CFG.b_exp:set_callback(function()  pending_cfg = { op = "export" } end)
     CFG.b_imp:set_callback(function()  pending_cfg = { op = "import" } end)
-    -- combo callback only queues (v1.5 rule: no :set / :name work inside menu callbacks)
-    CFG.slot:set_callback(function() pending_cfg = { op = "select" } end)
+    -- list callback only queues (v1.5 rule: no :set / :name work inside menu callbacks)
+    CFG.list:set_callback(function() pending_cfg = { op = "select" } end)
 end)
 pcall(cfg_build_registry)
 pcall(cfg_refresh_labels)
