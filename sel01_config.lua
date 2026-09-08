@@ -171,22 +171,50 @@ local T_MAIN = ui.get_icon"sliders" .. "  Main"
 local T_AA   = ui.get_icon"bolt"    .. "  Anti-Aim"
 local T_VIS  = ui.get_icon"eye"     .. "  Visuals"
 local T_MISC = ui.get_icon"puzzle-piece" .. "  Misc"   -- v5.0
-local g_main    = ui.create(T_MAIN, "Presets",         1)
-local g_qol     = ui.create(T_MAIN, "Quality of Life", 2)
-local g_info    = ui.create(T_MAIN, "Info",            2)
-local g_aa      = ui.create(T_AA,   "Anti-Aim",        1)
-local g_aa_st   = ui.create(T_AA,   "State Builder",   1)
-local g_aa_def  = ui.create(T_AA,   "Defensive & Exploit", 2)
-local g_aa_rx   = ui.create(T_AA,   "Anti-Bruteforce & Reactions", 2)
-local g_aa_sh   = ui.create(T_AA,   "Safe Head / Freestanding / Legit", 2)   -- v5.0
-local g_aa_hs   = ui.create(T_AA,   "Anti-Headshot extras", 2)
-local g_visual  = ui.create(T_VIS,  "Visuals",         1)
-local g_move    = ui.create(T_VIS,  "Movement",        2)
+-- v5.0 menu restyle (Andromeda / elysian / evalate look): group titles carry an icon, and
+-- EVERY element name is rewritten by the `styled()` wrapper below — main rows get an accent
+-- bullet, sub rows ("  └ ...") a dimmed "›", per-state rows an accent-colored [TAG]. The
+-- wrapper returns the real NL element, so :get / :set / :tooltip / :visibility all work.
+-- (Renaming re-keys the elements once; click a preset after the first reload.)
+local function gi(icon, name) return ui.get_icon(icon) .. "  " .. name end
+local function styled(group)
+    local DIM = "\aA0A6B4FF"
+    local function restyle(name)
+        if type(name) ~= "string" then return name end
+        if name == " " or name == "" then return name end
+        if name:sub(1, 1) == "\a" then return name end                       -- already colored (headers, accent switches)
+        local tag = name:match("^%[(%u+)%] ")
+        if tag then return "\a{Link Active}" .. tag .. "\aDEFAULT  " .. name:sub(#tag + 4) end
+        local sub2 = name:match("^      (.+)$")                                -- 2nd-level row
+        if sub2 then return DIM .. "        ›  " .. sub2 end
+        local sub = name:match("^  └ (.+)$")                                   -- sub row
+        if sub then return DIM .. "    ›  " .. sub end
+        return "\a{Link Active}•\aDEFAULT  " .. name
+    end
+    local P = {}
+    return setmetatable(P, { __index = function(_, k)
+        local f = group[k]
+        if type(f) ~= "function" then return f end
+        if k == "label" then return function(_, name, ...) return f(group, name, ...) end end
+        return function(_, name, ...) return f(group, restyle(name), ...) end
+    end })
+end
+local g_main    = styled(ui.create(T_MAIN, gi("floppy-disk", "Configs & Presets"), 1))
+local g_qol     = styled(ui.create(T_MAIN, gi("sparkles", "Quality of Life"), 2))
+local g_info    = styled(ui.create(T_MAIN, gi("circle-info", "Info & Logs"), 2))
+local g_aa      = styled(ui.create(T_AA,   gi("shield", "Anti-Aim"), 1))
+local g_aa_st   = styled(ui.create(T_AA,   gi("hammer", "State Builder"), 1))
+local g_aa_def  = styled(ui.create(T_AA,   gi("bolt", "Defensive & Exploit"), 2))
+local g_aa_rx   = styled(ui.create(T_AA,   gi("shield-halved", "Anti-Bruteforce & Reactions"), 2))
+local g_aa_sh   = styled(ui.create(T_AA,   gi("helmet-safety", "Safe Head / Freestanding / Legit"), 2))
+local g_aa_hs   = styled(ui.create(T_AA,   gi("skull", "Anti-Headshot extras"), 2))
+local g_visual  = styled(ui.create(T_VIS,  gi("eye", "Visuals"), 1))
+local g_move    = styled(ui.create(T_VIS,  gi("running", "Movement"), 2))
 -- v5.0 Misc tab (features collected from the current NL meta luas)
-local g_misc_mv = ui.create(T_MISC, "Movement & Exploits", 1)
-local g_misc_gm = ui.create(T_MISC, "Game & Performance",  1)
-local g_misc_ch = ui.create(T_MISC, "Chat & Clantag",      2)
-local g_misc_an = ui.create(T_MISC, "Animation breaker (experimental)", 2)
+local g_misc_mv = styled(ui.create(T_MISC, gi("person-running", "Movement & Exploits"), 1))
+local g_misc_gm = styled(ui.create(T_MISC, gi("gauge-high", "Game & Performance"), 1))
+local g_misc_ch = styled(ui.create(T_MISC, gi("comment", "Chat & Clantag"), 2))
+local g_misc_an = styled(ui.create(T_MISC, gi("person-walking", "Animation breaker (experimental)"), 2))
 
 -- Header — v3.21: chernobl-style multi-color welcome (\aDEFAULT resets to white
 -- between accent-colored segments, like "Dear <accent>name<reset>, ...").
@@ -195,7 +223,7 @@ g_main:label(ui.get_icon"user" .. "  Dear " .. accent .. _uname .. "\aDEFAULT, h
 g_main:label(ui.get_icon"sparkles" .. "  Build " .. accent .. "Sel01-Config" .. "\aDEFAULT  version " .. accent .. SEL01_CFG_VERSION .. "\aDEFAULT")
 g_main:label(ui.get_icon"bolt" .. "  Companion to " .. accent .. "Sel01-Solver" .. "\aDEFAULT (resolver)")
 g_main:label(" ")
-g_main:label(accent .. ui.get_icon"sliders"  .. accent .. "  Playstyle Presets:")
+g_main:label(accent .. ui.get_icon"sliders"  .. accent .. "  Meta presets (decoded from gazolina / everlast):")
 
 -- Forward-decl preset applier so callbacks see it at call-time, not parse-time
 local apply_preset_fwd
@@ -209,6 +237,31 @@ PRESET_BTNS.everlast   = g_main:button("Everlast Author (center jitter)",  funct
 PRESET_BTNS.spin       = g_main:button("Spin (full spinbot)",              function() apply_preset_fwd("spin")       end)
 PRESET_BTNS.troll      = g_main:button("Troll / Bait (run-in chaos)",      function() apply_preset_fwd("troll")      end)
 
+g_main:label(" ")
+-- v5.0 config system (meta pattern: slot list + name input + Save / Load / Delete / Export /
+-- Import via clipboard; built-in presets stay buttons). 8 fixed slots — NL combos cannot
+-- change their items at runtime, so the slot labels are rewritten with :name() instead.
+local CFG = {}
+CFG.SLOTS = 8
+g_main:label(accent .. ui.get_icon"floppy-disk" .. accent .. "  Your configs (8 slots, stored in NL db):")
+do
+    local names = {}
+    for i = 1, CFG.SLOTS do names[i] = "Slot " .. i end
+    CFG.slot = g_main:combo("Config slot", names, 1)
+end
+CFG.name   = nil
+pcall(function() CFG.name = g_main:input("  └ Name for this slot", "my config") end)
+CFG.b_save = g_main:button("Save to slot", function() end)
+CFG.b_load = g_main:button("Load slot", function() end)
+CFG.b_del  = g_main:button("Delete slot", function() end)
+CFG.b_exp  = g_main:button("Export slot to clipboard", function() end)
+CFG.b_imp  = g_main:button("Import clipboard into slot", function() end)
+CFG.labels = {}
+for i = 1, CFG.SLOTS do CFG.labels[i] = g_main:label("\aA0A6B4FF    " .. i .. "  (empty)") end
+CFG.status = g_main:label(" ")
+pcall(function()
+    CFG.slot:tooltip("Pick a slot, type a name, Save. Load applies every Sel01-Config element (AA states, defensive, misc, visuals). Export puts the slot on the clipboard as text (sel01cfg:...), Import reads such a string back into the slot.")
+end)
 g_main:label(" ")
 local enable_master = g_main:switch(accent .. ui.get_icon"power" .. accent .. "  Master Enable (all features)", true)
 
@@ -716,7 +769,7 @@ local vis_keybinds   = g_visual:switch(accent .. ui.get_icon"user"       .. acce
 local vis_dmgind     = g_visual:switch(accent .. ui.get_icon"skull"      .. accent .. "  Damage popup (-X HP on enemy)", true)
 local vis_specoverlay= g_visual:switch(accent .. ui.get_icon"eye"        .. accent .. "  Spectator overlay", true)
 g_visual:label(" ")
-g_visual:label(accent .. ui.get_icon"sliders" .. accent .. "  v3.19 extras (read-only / render):")
+g_visual:label(accent .. ui.get_icon"sliders" .. accent .. "  Render extras:")
 local vis_desyncpct  = g_visual:switch(accent .. ui.get_icon"bolt"       .. accent .. "  Desync delta % (real vs fake yaw)", true)
 local vis_skeet      = g_visual:switch(accent .. ui.get_icon"bolt"       .. accent .. "  Skeet indicator panel (DT/FS/SAFE/BODY/MD/DUCK)", false)
 local vis_netgraph   = g_visual:switch(accent .. ui.get_icon"feather"    .. accent .. "  Netgraph (ping / loss / choke + LC warn)", false)
@@ -732,7 +785,7 @@ local vis_menuborder = g_visual:switch(accent .. ui.get_icon"sliders"    .. acce
 -- spectral / nexus), left-edge side indicators (elysian / Andromeda / nexus / arc).
 local VIS = {}
 g_visual:label(" ")
-g_visual:label(accent .. ui.get_icon"sliders" .. accent .. "  v5.0 extras:")
+g_visual:label(accent .. ui.get_icon"eye" .. accent .. "  Indicators & panels:")
 VIS.arrows_style = g_visual:combo("Manual arrow style", { "Classic < >", "Modern (Verdana 27)", "Triangles (gazolina TS)" }, 1)
 VIS.arrows_off   = g_visual:slider("  └ arrow offset (px)", 20, 120, 45)
 VIS.dt_ring      = g_visual:switch("DT charge ring under the crosshair", true)
@@ -803,8 +856,7 @@ local function _vis_chip(x, y, name, col)
     return h
 end
 g_visual:label(" ")
-g_visual:label(accent .. "  NL Hit Marker Sound / Force Thirdperson / Scope Overlay:")
-g_visual:label(accent .. "  Set those directly in NL Visuals tab (they're combo elements)")
+g_visual:label("\aA0A6B4FF  Hit Marker Sound / Force Thirdperson: set them in the NL Visuals tab")
 -- V1.7: self-glow toggle dropped — NL glow is a multi-value combo, our :override(true)
 -- on a combo silently no-op'd. Users can configure glow directly in NL Visuals tab.
 
@@ -831,8 +883,7 @@ local btn_antihs = g_info:button("Toggle Anti-HS Bundle", function() end) -- V3.
 g_info:label(" ")
 cfg_vc_label = g_info:label("\aAAAAAAFFv" .. SEL01_CFG_VERSION .. " - checking for updates...")
 g_info:label(" ")
-g_info:label(accent .. "  Sel01-Solver handles RESOLVING (separate tab)")
-g_info:label(accent .. "  This script handles AA / Movement / Visuals / QoL only")
+g_info:label("\aA0A6B4FF  Sel01-Solver handles resolving (own tab); this script = AA / Misc / Visuals")
 
 -- ══════════════════════════════════════════════════════════════════════════
 -- SAFE-SET HELPER (defensive wrapper around NL UI element :set())
@@ -2870,6 +2921,12 @@ local function createmove_unified(cmd)
         pending_preset = nil
         pcall(_do_apply_preset, name)
     end
+    -- v5.0 config system actions (Save / Load / Delete / Export / Import) — drained here
+    if pending_cfg then
+        local p = pending_cfg
+        pending_cfg = nil
+        pcall(cfg_drain, p)
+    end
     -- v5.0: Shuffle choke steps (button callback only sets the flag — v1.5 rule)
     if pending_def_shuffle then
         pending_def_shuffle = false
@@ -3359,6 +3416,54 @@ local function pulse_alpha(hz)
     return math.floor(127 + 127 * math.sin((globals.realtime or 0) * math.pi * 2 * hz))
 end
 
+-- ══════════════════════════════════════════════════════════════════════════
+-- v5.0 VISUAL LANGUAGE — the elysian / nexus / evalate "glass" look, all pcall'd:
+--   vis_glass(x1, y1, x2, y2, a, rad): outer 22%-alpha shadow, blur, dark body, a top gloss
+--   (44% height, alpha 22), 1px outline (255,255,255,40). vis_tsh: text with a 45% black
+--   shadow 1px offset. vis_font(): Verdana 12 panel font (fallback int font 3). Globals —
+--   the main chunk is at the local cap.
+-- ══════════════════════════════════════════════════════════════════════════
+VIS_COL_BG   = { 15, 15, 18 }
+function vis_font()
+    if _vis_fonts.panel == nil then
+        _vis_fonts.panel = false
+        pcall(function() _vis_fonts.panel = render.load_font("Verdana", 12, "a") end)
+    end
+    return _vis_fonts.panel or 3
+end
+function vis_glass(x1, y1, x2, y2, a, rad)
+    a = a or 1
+    rad = rad or 6
+    pcall(function()
+        local p1, p2 = vector(x1, y1), vector(x2, y2)
+        render.rect(vector(x1 - 1, y1 + 1), vector(x2 + 1, y2 + 3), color(0, 0, 0, math.floor(56 * a)), rad + 1)
+        render.blur(p1, p2, 3, 0.85 * a, rad)
+        render.rect(p1, p2, color(VIS_COL_BG[1], VIS_COL_BG[2], VIS_COL_BG[3], math.floor(210 * a)), rad)
+        render.rect(p1, vector(x2, y1 + (y2 - y1) * 0.44), color(255, 255, 255, math.floor(22 * a)), { rad, rad, 0, 0 })
+        render.rect_outline(p1, p2, color(255, 255, 255, math.floor(40 * a)), 1, rad)
+    end)
+end
+function vis_tsh(font, x, y, col, text, flags)
+    pcall(function()
+        local a = col.a or 255
+        render.text(font, vector(x + 1, y + 1), color(0, 0, 0, math.floor(a * 0.45)), flags, text)
+        render.text(font, vector(x, y), col, flags, text)
+    end)
+end
+-- accent bar on the left of a row (event log / spectators): 3px, rounded left corners
+function vis_accent_bar(x, y1, y2, col)
+    pcall(function() render.rect(vector(x, y1), vector(x + 3, y2), col, { 4, 0, 0, 4 }) end)
+end
+-- per-key smoothed alpha (keybind rows, log rows): target 0/1, returns 0..1
+VIS_FADE = {}
+function vis_fade(key, want, speed)
+    local a = VIS_FADE[key] or 0
+    a = a + ((want and 1 or 0) - a) * (speed or 0.18)
+    if a < 0.01 and not want then VIS_FADE[key] = nil; return 0 end
+    VIS_FADE[key] = a
+    return a
+end
+
 -- Render loop
 pcall(function()
     events.render:set(function()
@@ -3425,11 +3530,18 @@ pcall(function()
                 if VIS.hitmark_dmg:get() and (_vis_state.hitmark_dmg or 0) > 0 then
                     pcall(function() render.text(3, vector(cx + 18, cy + 12), col, nil, "-" .. tostring(_vis_state.hitmark_dmg)) end)
                 end
+                -- v5.0 arc-style: radius eases 5 → 10 (cubic ease-out) with a 1px black shadow
+                local e = 1 - (1 - math.min(1, age / HITMARK_DURATION_S)) ^ 3
+                L = 5 + 5 * e
+                local sh = color(0, 0, 0, math.floor(alpha * 0.5))
                 pcall(function()
-                    render.line(vector(cx - L*2, cy - L*2), vector(cx - L, cy - L), col)
-                    render.line(vector(cx + L,   cy - L),   vector(cx + L*2, cy - L*2), col)
-                    render.line(vector(cx - L*2, cy + L*2), vector(cx - L, cy + L), col)
-                    render.line(vector(cx + L,   cy + L),   vector(cx + L*2, cy + L*2), col)
+                    for _, o in ipairs({ { sh, 1 }, { col, 0 } }) do
+                        local c, d = o[1], o[2]
+                        render.line(vector(cx - L*2 + d, cy - L*2 + d), vector(cx - L + d, cy - L + d), c)
+                        render.line(vector(cx + L + d,   cy - L + d),   vector(cx + L*2 + d, cy - L*2 + d), c)
+                        render.line(vector(cx - L*2 + d, cy + L*2 + d), vector(cx - L + d, cy + L + d), c)
+                        render.line(vector(cx + L + d,   cy + L + d),   vector(cx + L*2 + d, cy + L*2 + d), c)
+                    end
                 end)
             end
         end
@@ -3530,17 +3642,13 @@ pcall(function()
                     elseif hb == 4 then r, g, b = 255, 220, 80
                     elseif hb == 6 or hb == 7 then r, g, b = 120, 180, 255
                     end
-                    local y = stack_y_base + row * 16
-                    pcall(function()
-                        render.text(4, vector(stack_x, y),
-                                    color(r, g, b, alpha), nil,
-                                    string.format("-%d HP", pop.dmg))
-                        if pop.hp_left > 0 then
-                            render.text(3, vector(stack_x + 60, y + 2),
-                                        color(180, 180, 180, alpha), nil,
-                                        string.format("(%d hp)", pop.hp_left))
-                        end
-                    end)
+                    -- v5.0: shadowed, the newest entry pops (scale-in over 0.12s = extra x offset)
+                    local pop_in = math.min(1, age / 0.12)
+                    local y = stack_y_base + row * 16 - (1 - pop_in) * 6
+                    vis_tsh(4, stack_x, y, color(r, g, b, alpha), string.format("-%d HP", pop.dmg))
+                    if pop.hp_left > 0 then
+                        vis_tsh(3, stack_x + 60, y + 2, color(180, 180, 180, alpha), string.format("(%d hp)", pop.hp_left))
+                    end
                     row = row + 1
                 end
             end
@@ -3561,18 +3669,33 @@ pcall(function()
                 elseif p == "Bottom Right" then wy = sy - 34
                 elseif p == "Bottom Left" then wx, wy = 12, sy - 34 end
             end)
-            -- animated RGB via 3 phase-shifted sine waves (no neverlose/gradient dep)
+            -- v5.0 glass pill (elysian modern watermark): accent dot + name + fps + ping,
+            -- a shimmer sweeping through the text every ~3s
             local t = now * 1.5
             local g_r = math.floor(160 + 60 * math.sin(t))
             local g_g = math.floor(160 + 60 * math.sin(t + 2.09))  -- +2pi/3
             local g_b = math.floor(220 + 35 * math.sin(t + 4.19))  -- +4pi/3
             pcall(function()
-                render.rect(vector(wx, wy), vector(wx + tw + pad * 2, wy + 22), color(15, 15, 20, 220))
-                render.rect_outline(vector(wx, wy), vector(wx + tw + pad * 2, wy + 22), color(g_r, g_g, g_b, 255), 1)
-                -- "Sel01" prefix gets the animated color, rest is white-ish
-                render.text(3, vector(wx + pad, wy + 5), color(g_r, g_g, g_b, 255), nil, "Sel01")
-                render.text(3, vector(wx + pad + 32, wy + 5), color(220, 230, 255, 255), nil,
-                            string.format("| %s | %d fps | %d ms", lp_name, perf.fps, perf.ping))
+                local h = 24
+                local w = tw + pad * 2 + 14
+                vis_glass(wx, wy, wx + w, wy + h, 1, 7)
+                -- accent dot (pulses with the DT charge when DT is on, else the RGB wave)
+                local dc = color(g_r, g_g, g_b, 255)
+                if nl_refs.rage_dt and nl_refs.rage_dt:get() then
+                    dc = ((aa_eng.charge or 0) >= 1) and color(120, 255, 120, 255) or color(255, 90, 90, 255)
+                end
+                render.rect(vector(wx + 8, wy + h / 2 - 3), vector(wx + 14, wy + h / 2 + 3), dc, 3)
+                local f = vis_font()
+                vis_tsh(f, wx + 20, wy + 5, color(g_r, g_g, g_b, 255), "Sel01")
+                local rest = string.format("  %s  |  %d fps  |  %d ms", lp_name, perf.fps, perf.ping)
+                local sw = 0
+                pcall(function() sw = render.measure_text(f, nil, "Sel01").x end)
+                vis_tsh(f, wx + 20 + sw, wy + 5, color(225, 230, 240, 255), rest)
+                -- shimmer: a soft highlight band sweeping left → right
+                local ph = (now % 3) / 3
+                local sx0 = wx + 4 + (w - 8) * ph
+                render.gradient(vector(sx0 - 18, wy + 1), vector(sx0, wy + h - 1), color(255, 255, 255, 0), color(255, 255, 255, 26), color(255, 255, 255, 0), color(255, 255, 255, 26))
+                render.gradient(vector(sx0, wy + 1), vector(sx0 + 18, wy + h - 1), color(255, 255, 255, 26), color(255, 255, 255, 0), color(255, 255, 255, 26), color(255, 255, 255, 0))
             end)
         end
 
@@ -3659,11 +3782,15 @@ pcall(function()
                         end
                     end)
                 end
-                local function ctext(font, txt, col)
+                -- v5.0: shadowed text (readable on bright maps), the state line cross-fades
+                -- when the state changes (per-line alpha via vis_fade)
+                local function ctext(font, txt, col, key)
                     local tw = 0
                     pcall(function() tw = render.measure_text(font, nil, txt).x end)
                     if tw <= 0 then tw = #txt * 6 end
-                    pcall(function() render.text(font, vector(cx - tw / 2, y), col, nil, txt) end)
+                    local a = 1
+                    if key then a = vis_fade(key, true, 0.25) end
+                    vis_tsh(font, cx - tw / 2, y, color(col.r, col.g, col.b, math.floor((col.a or 255) * a)), txt)
                     y = y + (font >= 4 and 16 or 13)
                 end
                 ctext(4, "SEL01", color(120, 200, 255, 255))
@@ -3679,9 +3806,23 @@ pcall(function()
                     end)
                     y = y + 6
                 end
-                ctext(3, "- " .. mstate .. " -", color(210, 215, 225, 215))
+                -- state line cross-fade: the previous state word keeps its fade key alive
+                -- (vis_fade drops it once it is off), so the switch reads as a soft blend
+                if _vis_state.last_mstate ~= mstate then
+                    if _vis_state.last_mstate then VIS_FADE["st:" .. mstate] = 0 end
+                    _vis_state.last_mstate = mstate
+                end
+                ctext(3, "- " .. mstate .. " -", color(210, 215, 225, 215), "st:" .. mstate)
                 if dline then ctext(3, dline, color(150, 200, 255, 215)) end
-                for i = 1, #subs do ctext(3, subs[i], color(170, 230, 175, 230)) end
+                for i = 1, #subs do ctext(3, subs[i], color(170, 230, 175, 230), "sub:" .. subs[i]) end
+                -- retire fade keys of sub states no longer shown (keeps the table small)
+                for k, _ in pairs(VIS_FADE) do
+                    if k:sub(1, 4) == "sub:" then
+                        local keep = false
+                        for i = 1, #subs do if "sub:" .. subs[i] == k then keep = true; break end end
+                        if not keep then vis_fade(k, false, 0.25) end
+                    elseif k:sub(1, 3) == "st:" and k ~= "st:" .. mstate then vis_fade(k, false, 0.25) end
+                end
                 -- v5.0 min-damage indicator (Andromeda / spectral / nexus): above-right of the
                 -- crosshair while a Min. Damage bind is active or an override exists (or menu open)
                 if VIS.md_ind:get() then
@@ -3759,44 +3900,46 @@ pcall(function()
         -- KILL: green block "▶ KILL <name>"
         -- HIT:  yellow/green "✓ hit <name> [hb] +<dmg>"
         -- MISS: red          "✗ miss <name> [hb] (<reason>)"
+        -- v5.0: each entry is a glass row with a colored accent bar (kill green / hit by
+        -- damage / miss red), slides in from the left for 0.15s and fades out at the end.
         if vis_hitlog:get() then
             local hx, hy = 16, 16
             local row = 0
+            local f = vis_font()
             for i = #hit_log, 1, -1 do
                 local entry = hit_log[i]
                 local age = now - entry.time
                 if age > HITLOG_DURATION_S then
                     table.remove(hit_log, i)
                 else
-                    local alpha = math.floor(255 * (1 - age / HITLOG_DURATION_S))
-                    local y     = hy + row * 14
+                    local fade = 1
+                    if age > HITLOG_DURATION_S - 0.8 then fade = (HITLOG_DURATION_S - age) / 0.8 end
+                    local slide = math.min(1, age / 0.15)
+                    local ease = 1 - (1 - slide) * (1 - slide)
+                    local alpha = math.floor(255 * fade)
+                    local y     = hy + row * 20
                     local kind  = entry.kind or "hit"
+                    local txt, col
+                    if kind == "kill" then
+                        txt, col = string.format("KILL   %s", entry.name or "?"), color(120, 255, 120, alpha)
+                    elseif kind == "miss" then
+                        txt, col = string.format("MISS   %s  [%s]  %s", entry.name or "?", entry.hitbox or "?", entry.reason or "?"), color(255, 100, 100, alpha)
+                    else
+                        local dmg = entry.dmg or 0
+                        local r, g, b = 220, 220, 220
+                        if dmg >= 100 then r, g, b = 255, 200, 60
+                        elseif dmg >= 70 then r, g, b = 255, 170, 80
+                        elseif dmg >= 40 then r, g, b = 200, 220, 120 end
+                        txt, col = string.format("HIT    %s  [%s]  +%d", entry.name or "?", entry.hitbox or "?", dmg), color(r, g, b, alpha)
+                    end
                     pcall(function()
-                        if kind == "kill" then
-                            render.text(4, vector(hx, y),
-                                color(120, 255, 120, alpha), nil,
-                                string.format("KILL  %s", entry.name or "?"))
-                        elseif kind == "miss" then
-                            render.text(3, vector(hx, y),
-                                color(255, 100, 100, alpha), nil,
-                                string.format("MISS  %s  [%s]  (%s)",
-                                    entry.name or "?",
-                                    entry.hitbox or "?",
-                                    entry.reason or "?"))
-                        else  -- hit
-                            local dmg = entry.dmg or 0
-                            local dmg_r, dmg_g, dmg_b = 220, 220, 220
-                            if dmg >= 100 then dmg_r, dmg_g, dmg_b = 255, 100, 100
-                            elseif dmg >= 70 then dmg_r, dmg_g, dmg_b = 255, 200, 80
-                            elseif dmg >= 40 then dmg_r, dmg_g, dmg_b = 200, 220, 120
-                            end
-                            render.text(3, vector(hx, y),
-                                color(dmg_r, dmg_g, dmg_b, alpha), nil,
-                                string.format("HIT   %s  [%s]  +%d",
-                                    entry.name or "?",
-                                    entry.hitbox or "?",
-                                    dmg))
-                        end
+                        local tw = 0
+                        pcall(function() tw = render.measure_text(f, nil, txt).x end)
+                        local x = hx - 40 * (1 - ease)
+                        local w = tw + 22
+                        vis_glass(x, y, x + w, y + 18, fade, 5)
+                        vis_accent_bar(x, y + 3, y + 15, col)
+                        vis_tsh(f, x + 10, y + 3, col, txt)
                     end)
                     row = row + 1
                 end
@@ -3845,21 +3988,49 @@ pcall(function()
                     end
                 end)
             end
-            -- NL manual binds + double-tap if enabled show as fallback
-            if #active > 0 then
-                local lh = 14
-                local h = #active * lh + 18
-                local bx, by = sx - 180, sy / 2 + 80
-                pcall(function()
-                    render.rect(vector(bx, by), vector(bx + 160, by + h), color(15, 15, 20, 200))
-                    render.rect_outline(vector(bx, by), vector(bx + 160, by + h), color(120, 180, 255, 220), 1)
-                    render.text(3, vector(bx + 8, by + 4), color(180, 220, 255, 255), nil, "keybinds")
-                    for i, name in ipairs(active) do
-                        render.text(3, vector(bx + 8, by + 4 + i * lh), color(220, 220, 220, 240), nil,
-                                    "• " .. name)
+            -- v5.0 glass panel (nexus / spectral keybinds): header row with an accent line,
+            -- rows fade in / out individually, the [mode] sits right-aligned and dimmed.
+            -- Demo rows while the menu is open so the panel can be seen / placed.
+            pcall(function()
+                local menu_open = ui.get_alpha and ui.get_alpha() > 0
+                if #active == 0 and menu_open then active = { "double tap [toggle]", "hide shots [hold]" } end
+                local want = {}
+                for _, n in ipairs(active) do want[n] = true end
+                local rows = {}
+                for _, n in ipairs(active) do rows[#rows + 1] = n end
+                for k, _ in pairs(VIS_FADE) do
+                    local n = k:match("^kb:(.+)$")
+                    if n and not want[n] then rows[#rows + 1] = n end
+                end
+                local vis_rows = {}
+                for _, n in ipairs(rows) do
+                    local a = vis_fade("kb:" .. n, want[n] == true)
+                    if a > 0.01 then vis_rows[#vis_rows + 1] = { n, a } end
+                end
+                local pa = vis_fade("kb:panel", #vis_rows > 0)
+                if pa <= 0.01 then return end
+                local f = vis_font()
+                local lh, pw = 16, 168
+                local h = 22
+                for _, r in ipairs(vis_rows) do h = h + lh * r[2] end
+                local bx, by = sx - 190, sy / 2 + 80
+                vis_glass(bx, by, bx + pw, by + h + 4, pa, 6)
+                vis_tsh(f, bx + 9, by + 5, color(180, 220, 255, math.floor(255 * pa)), "keybinds")
+                render.rect(vector(bx + 8, by + 20), vector(bx + pw - 8, by + 21), color(120, 180, 255, math.floor(120 * pa)))
+                local y = by + 24
+                for _, r in ipairs(vis_rows) do
+                    local n, a = r[1], r[2] * pa
+                    local nm, mode = n:match("^(.-)%s*(%[.-%])$")
+                    if not nm then nm, mode = n, "" end
+                    vis_tsh(f, bx + 9, y, color(225, 230, 240, math.floor(240 * a)), nm)
+                    if #mode > 0 then
+                        local mw = 0
+                        pcall(function() mw = render.measure_text(f, nil, mode).x end)
+                        vis_tsh(f, bx + pw - 9 - mw, y, color(150, 158, 175, math.floor(220 * a)), mode)
                     end
-                end)
-            end
+                    y = y + lh * r[2]
+                end
+            end)
         end
 
         -- ── CLANTAG UPDATE ── (v3.18: moved OUT of render → net_update_end below.
@@ -3868,17 +4039,20 @@ pcall(function()
         -- working bloodwings pattern drives it from events.net_update_end.)
 
         -- ── SPECTATOR OVERLAY (left-middle) ──
-        if vis_specoverlay:get() and #specs > 0 then
-            local lh = 14
-            local h = #specs * lh + 18
-            local bx, by = 16, sy / 2 - h / 2
+        if vis_specoverlay:get() then
             pcall(function()
-                render.rect(vector(bx, by), vector(bx + 180, by + h), color(15, 15, 20, 200))
-                render.rect_outline(vector(bx, by), vector(bx + 180, by + h), color(255, 180, 80, 220), 1)
-                render.text(3, vector(bx + 8, by + 4), color(255, 180, 80, 255), nil,
-                            string.format("Spectators (%d)", #specs))
+                local pa = vis_fade("spec:panel", #specs > 0)
+                if pa <= 0.01 then return end
+                local f = vis_font()
+                local lh, pw = 16, 180
+                local h = 26 + #specs * lh
+                local bx, by = 16, sy / 2 - h / 2
+                vis_glass(bx, by, bx + pw, by + h, pa, 6)
+                vis_accent_bar(bx, by + 6, by + h - 6, color(255, 180, 80, math.floor(220 * pa)))
+                vis_tsh(f, bx + 12, by + 5, color(255, 180, 80, math.floor(255 * pa)), string.format("spectators  %d", #specs))
+                render.rect(vector(bx + 11, by + 20), vector(bx + pw - 8, by + 21), color(255, 180, 80, math.floor(90 * pa)))
                 for i, name in ipairs(specs) do
-                    render.text(3, vector(bx + 8, by + 4 + i * lh), color(220, 220, 220, 240), nil, name)
+                    vis_tsh(f, bx + 12, by + 8 + i * lh, color(225, 230, 240, math.floor(240 * pa)), name)
                 end
             end)
         end
@@ -3909,21 +4083,39 @@ pcall(function()
                 if aa_eng.sh_active then rows[#rows+1] = { "SH", white } end
                 local md = nl_refs.rage_mindmg and nl_refs.rage_mindmg:get()
                 if md then rows[#rows+1] = { "DMG " .. tostring(md), grey } end
+                -- rows slide in from the left edge and fade out individually (elysian)
+                local want = {}
+                for _, r in ipairs(rows) do want[r[1]] = r end
+                local all = {}
+                for _, r in ipairs(rows) do all[#all + 1] = r[1] end
+                for k, _ in pairs(VIS_FADE) do
+                    local n = k:match("^side:(.+)$")
+                    if n and not want[n] then all[#all + 1] = n end
+                end
                 local x, y = 6, sy - VIS.side_off:get()
                 local rh, gap, w = 20, 4, 74
-                local bg, trans = color(10, 12, 18, 170), color(10, 12, 18, 0)
-                for _, r in ipairs(rows) do
-                    local txt, col, fill = r[1], r[2], r[3]
-                    local y1, y2 = y - rh, y
-                    render.gradient(vector(x, y1), vector(x + w / 2, y2), trans, bg, trans, bg)
-                    render.gradient(vector(x + w / 2, y1), vector(x + w, y2), bg, trans, bg, trans)
-                    if fill then
-                        local fc = color(col.r, col.g, col.b, 60)
-                        render.rect(vector(x + 4, y2 - 3), vector(x + 4 + (w - 8) * fill, y2 - 1), fc)
+                local f = vis_font()
+                for _, name in ipairs(all) do
+                    local r = want[name] or _vis_state["side_" .. name]
+                    if r then
+                        _vis_state["side_" .. name] = r
+                        local a = vis_fade("side:" .. name, want[name] ~= nil, 0.2)
+                        if a > 0.01 then
+                            local txt, col, fill = r[1], r[2], r[3]
+                            local h = rh * a
+                            local y1, y2 = y - h, y
+                            local xx = x - (1 - a) * 30
+                            local bg, trans = color(10, 12, 18, math.floor(170 * a)), color(10, 12, 18, 0)
+                            render.gradient(vector(xx, y1), vector(xx + w / 2, y2), trans, bg, trans, bg)
+                            render.gradient(vector(xx + w / 2, y1), vector(xx + w, y2), bg, trans, bg, trans)
+                            render.rect(vector(xx + 6, y1), vector(xx + w - 6, y1 + 1), color(255, 255, 255, math.floor(28 * a)))
+                            if fill then
+                                render.rect(vector(xx + 4, y2 - 3), vector(xx + 4 + (w - 8) * fill, y2 - 1), color(col.r, col.g, col.b, math.floor(70 * a)))
+                            end
+                            vis_tsh(f, xx + 8, y1 + 3, color(col.r, col.g, col.b, math.floor((col.a or 255) * a)), txt)
+                            y = y1 - gap * a
+                        end
                     end
-                    render.text(3, vector(x + 9, y1 + 4), color(0, 0, 0, 120), nil, txt)
-                    render.text(3, vector(x + 8, y1 + 3), col, nil, txt)
-                    y = y1 - gap
                 end
             end)
         end
@@ -3949,18 +4141,31 @@ pcall(function()
                 local ping  = math.floor(math.min(999, (nc.latency and nc.latency[1] or 0) * 1000))
                 local loss  = nc.loss  and nc.loss[1]  or 0
                 local choke = nc.choke and math.floor(nc.choke[1] or 0) or 0
-                local gx, gy = 20, sy - 96
-                local function line(i, txt, c) render.text(3, vector(gx, gy + i * 13), c, nil, txt) end
-                local white = color(210, 220, 235, 240)
-                line(0, "ping:  " .. ping .. "ms",  ping > 120 and color(255, 120, 60, 240) or white)
-                line(1, "loss:  " .. loss .. "%",   loss > 0 and color(255, 120, 60, 240) or white)
-                line(2, "choke: " .. choke .. "%",  choke > 0 and color(255, 200, 60, 240) or white)
+                -- v5.0 glass panel (arc network metrics): fps / ping / loss / choke / LC, each
+                -- value colored by threshold, panel bottom-left above the netgraph area
+                local f = vis_font()
+                local pw, lh = 150, 15
+                local gx, gy = 20, sy - 30 - 22 - lh * 5
+                vis_glass(gx, gy, gx + pw, gy + 22 + lh * 5, 1, 6)
+                vis_tsh(f, gx + 9, gy + 5, color(180, 220, 255, 255), "network")
+                render.rect(vector(gx + 8, gy + 20), vector(gx + pw - 8, gy + 21), color(120, 180, 255, 120))
+                local white = color(225, 230, 240, 240)
+                local function line(i, key, val, c)
+                    vis_tsh(f, gx + 9, gy + 24 + i * lh, color(150, 158, 175, 220), key)
+                    local vw = 0
+                    pcall(function() vw = render.measure_text(f, nil, val).x end)
+                    vis_tsh(f, gx + pw - 9 - vw, gy + 24 + i * lh, c, val)
+                end
+                line(0, "fps",   tostring(perf.fps), perf.fps < 60 and color(255, 120, 60, 240) or white)
+                line(1, "ping",  ping .. " ms",  ping > 120 and color(255, 120, 60, 240) or white)
+                line(2, "loss",  loss .. " %",   loss > 0 and color(255, 120, 60, 240) or white)
+                line(3, "choke", choke .. " %",  choke > 0 and color(255, 200, 60, 240) or white)
                 -- lag-comp warn: heavy choke = packets held = LC likely breaking
                 local ck = globals.choked_commands or 0
                 if ck >= 6 then
-                    line(3, "LC: BREAKING (" .. ck .. ")", color(255, 70, 90, 240))
+                    line(4, "lc", "BREAKING " .. ck, color(255, 70, 90, 240))
                 else
-                    line(3, "LC: ok", color(143, 194, 21, 240))
+                    line(4, "lc", "ok", color(143, 194, 21, 240))
                 end
             end)
         end
@@ -4653,6 +4858,243 @@ local function config_copy_logs()
     end
 end
 pcall(function() btn_copy:set_callback(function() pcall(config_copy_logs) end) end)
+
+-- ══════════════════════════════════════════════════════════════════════════
+-- v5.0 CONFIG SYSTEM — the meta luas' preset managers (nexus / Andromeda / spectral /
+-- DEMONTIME / evalate) boiled down to what this build verifiably supports: 8 fixed slots
+-- (combos cannot change items at runtime; slot labels are rewritten via :name()), values
+-- read with :get() from every element the script owns, written back with :set() from the
+-- createmove drain (menu-callback rule), persisted in the NL `db` table (file fallback),
+-- shared as `sel01cfg:<base64>` text over the clipboard. Own base64 + line encoder — no
+-- json / base64 lib dependency.
+-- ══════════════════════════════════════════════════════════════════════════
+pending_cfg = nil   -- global: button callbacks below + the createmove drain
+do -- (do-block: the helpers below are locals of this block, not of the main chunk)
+CFG.items = {}
+CFG.SKIP = { ["aa.key_l"] = true, ["aa.key_r"] = true, ["aa.key_f"] = true, ["aa.key_b"] = true,
+             ["aa.def_key"] = true, ["aa.fs_key"] = true, ["aip.active"] = true, ["mv.peek_boost"] = true,
+             ["aa.state_sel"] = true }
+local function cfg_is_el(v)
+    local ok, r = pcall(function() return v ~= nil and type(v) ~= "table" and type(v) ~= "string" and type(v) ~= "number"
+        and type(v) ~= "boolean" and type(v) ~= "function" and v.get ~= nil and v.set ~= nil end)
+    return ok and r == true
+end
+local function cfg_reg(key, el)
+    if CFG.SKIP[key] then return end
+    if cfg_is_el(el) then CFG.items[#CFG.items + 1] = { key, el } end
+end
+function cfg_build_registry()
+    CFG.items = {}
+    for k, v in pairs(AA) do cfg_reg("aa." .. k, v) end
+    for sk, S in pairs(AA.st) do for k, v in pairs(S) do cfg_reg("st." .. sk .. "." .. k, v) end end
+    for i, el in ipairs(AA.def_seq) do cfg_reg("aa.def_seq" .. i, el) end
+    for k, v in pairs(AIP) do cfg_reg("aip." .. k, v) end
+    for k, v in pairs(MISC) do cfg_reg("misc." .. k, v) end
+    for k, v in pairs(VIS) do cfg_reg("vis." .. k, v) end
+    local extra = {
+        ["v.watermark"] = vis_watermark, ["v.indicators"] = vis_indicators, ["v.velwarn"] = vis_velwarn,
+        ["v.aaarrows"] = vis_aaarrows, ["v.hitmarker"] = vis_hitmarker, ["v.hitlog"] = vis_hitlog,
+        ["v.keybinds"] = vis_keybinds, ["v.dmgind"] = vis_dmgind, ["v.specoverlay"] = vis_specoverlay,
+        ["v.desyncpct"] = vis_desyncpct, ["v.skeet"] = vis_skeet, ["v.netgraph"] = vis_netgraph,
+        ["v.scopefade"] = vis_scopefade, ["v.sleeves"] = vis_sleeves, ["v.menublur"] = vis_menublur,
+        ["v.custscope"] = vis_custscope, ["v.scope_rot"] = vis_scope_rot, ["v.menuborder"] = vis_menuborder,
+        ["qol.clantag"] = qol_clantag, ["qol.clantag_st"] = qol_clantag_st, ["mv.peek_hc"] = mv_peek_hc,
+    }
+    for k, v in pairs(extra) do cfg_reg(k, v) end
+    table.sort(CFG.items, function(a, b) return a[1] < b[1] end)
+end
+-- own base64 (RFC 4648) — the lua may run on a build without neverlose/base64
+local CFG_B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+local function cfg_b64enc(s)
+    local out = {}
+    for i = 1, #s, 3 do
+        local a, b, c = s:byte(i, i + 2)
+        local n = a * 65536 + (b or 0) * 256 + (c or 0)
+        local c1 = math.floor(n / 262144) % 64; local c2 = math.floor(n / 4096) % 64
+        local c3 = math.floor(n / 64) % 64;     local c4 = n % 64
+        out[#out + 1] = CFG_B64:sub(c1 + 1, c1 + 1) .. CFG_B64:sub(c2 + 1, c2 + 1)
+            .. (b and CFG_B64:sub(c3 + 1, c3 + 1) or "=") .. (c and CFG_B64:sub(c4 + 1, c4 + 1) or "=")
+    end
+    return table.concat(out)
+end
+local function cfg_b64dec(s)
+    s = tostring(s or ""):gsub("[^%w%+/=]", "")
+    local out, map = {}, {}
+    for i = 1, 64 do map[CFG_B64:sub(i, i)] = i - 1 end
+    for i = 1, #s, 4 do
+        local q = { s:byte(i, i + 3) }
+        local v, pad = 0, 0
+        for j = 1, 4 do
+            local ch = q[j] and string.char(q[j]) or "="
+            if ch == "=" then pad = pad + 1; v = v * 64 else v = v * 64 + (map[ch] or 0) end
+        end
+        local b1 = math.floor(v / 65536) % 256; local b2 = math.floor(v / 256) % 256; local b3 = v % 256
+        out[#out + 1] = string.char(b1)
+        if pad < 2 then out[#out + 1] = string.char(b2) end
+        if pad < 1 then out[#out + 1] = string.char(b3) end
+    end
+    return table.concat(out)
+end
+function cfg_snapshot()
+    local t = {}
+    for _, it in ipairs(CFG.items) do
+        local ok, v = pcall(function() return it[2]:get() end)
+        if ok and (type(v) == "boolean" or type(v) == "number" or type(v) == "string") then t[it[1]] = v end
+    end
+    return t
+end
+local function cfg_encode(t)
+    local L = {}
+    for k, v in pairs(t) do
+        local tv = type(v)
+        local sv = tostring(v):gsub("\\", "\\\\"):gsub("\n", "\\n")
+        L[#L + 1] = k .. "=" .. tv:sub(1, 1) .. ":" .. sv
+    end
+    table.sort(L)
+    return table.concat(L, "\n")
+end
+local function cfg_decode(s)
+    local t, n = {}, 0
+    for line in tostring(s or ""):gmatch("[^\n]+") do
+        local k, tv, sv = line:match("^([^=]+)=(%a):(.*)$")
+        if k then
+            sv = sv:gsub("\\n", "\n"):gsub("\\\\", "\\")
+            if tv == "b" then t[k] = (sv == "true")
+            elseif tv == "n" then t[k] = tonumber(sv)
+            else t[k] = sv end
+            n = n + 1
+        end
+    end
+    return t, n
+end
+function cfg_apply(t)
+    local n = 0
+    for _, it in ipairs(CFG.items) do
+        local v = t[it[1]]
+        if v ~= nil then
+            local ok, cur = pcall(function() return it[2]:get() end)
+            if ok and type(cur) == type(v) then safe_set(it[2], v); n = n + 1 end
+        end
+    end
+    return n
+end
+-- persistence: NL db table when present, else nl/Sel01-Config/configs.txt
+CFG.store = nil
+local function cfg_store_load()
+    if CFG.store then return CFG.store end
+    local st = nil
+    pcall(function() if type(db) == "table" and type(db["sel01_config_v5"]) == "table" then st = db["sel01_config_v5"] end end)
+    -- no file READ here: files.read on a missing path raises an unsuppressable popup and
+    -- there is no exists-check. The db table is the store (every meta lua uses it); the
+    -- configs.txt written on save is a human-readable backup you can Import by hand.
+    if not st then st = { slots = {} } end
+    st.slots = st.slots or {}
+    CFG.store = st
+    return st
+end
+local function cfg_store_save()
+    local st = CFG.store or cfg_store_load()
+    local in_db = false
+    pcall(function() if type(db) == "table" then db["sel01_config_v5"] = st; in_db = true end end)
+    pcall(function()
+        local L = {}
+        for i = 1, CFG.SLOTS do
+            local s = st.slots[i]
+            if s and s.data then L[#L + 1] = i .. "\t" .. tostring(s.name or "") .. "\t" .. cfg_b64enc(s.data) end
+        end
+        files.create_folder("nl/Sel01-Config/")
+        files.write("nl/Sel01-Config/configs.txt", table.concat(L, "\n"))
+    end)
+    return in_db
+end
+local function cfg_refresh_labels()
+    local st = cfg_store_load()
+    local sel = 1
+    pcall(function() sel = tonumber(tostring(CFG.slot:get()):match("%d+")) or 1 end)
+    for i = 1, CFG.SLOTS do
+        local s = st.slots[i]
+        local txt = s and s.data and (tostring(s.name or "?") .. "  \aA0A6B4FF(" .. tostring(s.n or "?") .. " values)") or "(empty)"
+        local pre = (i == sel) and "\a{Link Active}▸ " or "\aA0A6B4FF    "
+        pcall(function() CFG.labels[i]:name(pre .. i .. "  " .. txt) end)
+    end
+end
+local function cfg_status(text)
+    pcall(function() CFG.status:name(text) end)
+    cs_log_color("[config] " .. tostring(text):gsub("\a%x%x%x%x%x%x%x%x", ""):gsub("\a%b{}", ""))
+end
+function cfg_drain(p)
+    if #CFG.items == 0 then cfg_build_registry() end
+    local st = cfg_store_load()
+    local slot = 1
+    pcall(function() slot = tonumber(tostring(CFG.slot:get()):match("%d+")) or 1 end)
+    local name = "config"
+    pcall(function() if CFG.name then name = tostring(CFG.name:get() or "config") end end)
+    if name == "" then name = "config " .. slot end
+    if p.op == "save" then
+        local snap = cfg_snapshot()
+        local n = 0
+        for _ in pairs(snap) do n = n + 1 end
+        st.slots[slot] = { name = name, data = cfg_encode(snap), n = n }
+        local in_db = cfg_store_save()
+        cfg_status(string.format("\a55DD55FFsaved slot %d '%s' (%d values, %s)", slot, name, n, in_db and "db + file" or "file"))
+        aa_tl_push("CONFIG", "saved slot " .. slot .. " " .. name)
+    elseif p.op == "load" then
+        local s = st.slots[slot]
+        if not (s and s.data) then cfg_status("\aFF5555FFslot " .. slot .. " is empty"); return end
+        local t, n = cfg_decode(s.data)
+        local applied = cfg_apply(t)
+        pcall(aa_state_vis); pcall(aa_def_vis)
+        cfg_status(string.format("\a55DD55FFloaded slot %d '%s' (%d / %d values applied)", slot, tostring(s.name), applied, n))
+        aa_tl_push("CONFIG", "loaded slot " .. slot .. " " .. tostring(s.name))
+    elseif p.op == "delete" then
+        st.slots[slot] = nil
+        cfg_store_save()
+        cfg_status("\aFFAA55FFslot " .. slot .. " deleted")
+    elseif p.op == "export" then
+        local s = st.slots[slot]
+        local data, nm = nil, name
+        if s and s.data then data, nm = s.data, s.name else
+            local snap = cfg_snapshot(); data = cfg_encode(snap)   -- empty slot: export the live values
+        end
+        local text = "sel01cfg:" .. cfg_b64enc(tostring(nm) .. "\n" .. data)
+        local ok = false
+        pcall(function() local cb = require("neverlose/clipboard"); if cb and cb.set then cb.set(text); ok = true end end)
+        if not ok then ok = set_clipboard(text) end
+        cfg_status(ok and string.format("\a55DD55FFexported '%s' to the clipboard (%d chars) - paste it anywhere", tostring(nm), #text)
+                      or "\aFF5555FFclipboard write failed")
+    elseif p.op == "select" then
+        local s = st.slots[slot]
+        pcall(function() if s and CFG.name then CFG.name:set(tostring(s.name or "")) end end)
+    elseif p.op == "import" then
+        local text = nil
+        pcall(function() local cb = require("neverlose/clipboard"); if cb and cb.get then text = cb.get() end end)
+        if not text then cfg_status("\aFF5555FFclipboard read not available on this build (neverlose/clipboard)"); return end
+        local b64 = tostring(text):match("sel01cfg:([%w%+/=]+)")
+        if not b64 then cfg_status("\aFF5555FFno sel01cfg: string on the clipboard"); return end
+        local raw = cfg_b64dec(b64)
+        local nm, data = raw:match("^([^\n]*)\n(.*)$")
+        if not data then cfg_status("\aFF5555FFcorrupt config string"); return end
+        local t, n = cfg_decode(data)
+        if n == 0 then cfg_status("\aFF5555FFconfig string holds no values"); return end
+        st.slots[slot] = { name = nm ~= "" and nm or name, data = data, n = n }
+        cfg_store_save()
+        pcall(function() if CFG.name then CFG.name:set(st.slots[slot].name) end end)
+        cfg_status(string.format("\a55DD55FFimported '%s' into slot %d (%d values) - press Load slot to apply", tostring(st.slots[slot].name), slot, n))
+    end
+    cfg_refresh_labels()
+end
+pcall(function()
+    CFG.b_save:set_callback(function() pending_cfg = { op = "save" } end)
+    CFG.b_load:set_callback(function() pending_cfg = { op = "load" } end)
+    CFG.b_del:set_callback(function()  pending_cfg = { op = "delete" } end)
+    CFG.b_exp:set_callback(function()  pending_cfg = { op = "export" } end)
+    CFG.b_imp:set_callback(function()  pending_cfg = { op = "import" } end)
+    -- combo callback only queues (v1.5 rule: no :set / :name work inside menu callbacks)
+    CFG.slot:set_callback(function() pending_cfg = { op = "select" } end)
+end)
+pcall(cfg_build_registry)
+pcall(cfg_refresh_labels)
+end -- config do-block
 
 -- V3.1: Anti-HS Bundle = enable pitch_jitter + move_fakeduck + reasonable threshold
 pcall(function() btn_antihs:set_callback(function()
