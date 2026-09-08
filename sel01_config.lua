@@ -5142,7 +5142,7 @@ local function cfg_store_save()
     pcall(function()
         local L = {}
         for i = 1, CFG.SLOTS do
-            local s = st.slots[i]
+            local s = st.slots["s" .. i]
             if s and s.data then L[#L + 1] = i .. "\t" .. tostring(s.name or "") .. "\t" .. cfg_b64enc(s.data) end
         end
         files.create_folder("nl/Sel01-Config/")
@@ -5166,7 +5166,7 @@ local function cfg_refresh_labels()
     local st = cfg_store_load()
     local names = {}
     for i = 1, CFG.SLOTS do
-        local s = st.slots[i]
+        local s = st.slots["s" .. i]
         names[i] = s and s.data and (i .. "   " .. tostring(s.name or "?") .. "   (" .. tostring(s.n or "?") .. ")") or (i .. "   (empty)")
     end
     pcall(function() CFG.list:update(names) end)
@@ -5186,12 +5186,12 @@ function cfg_drain(p)
         local snap = cfg_snapshot()
         local n = 0
         for _ in pairs(snap) do n = n + 1 end
-        st.slots[slot] = { name = name, data = cfg_encode(snap), n = n }
+        st.slots["s" .. slot] = { name = name, data = cfg_encode(snap), n = n }
         local in_db = cfg_store_save()
         cfg_status(string.format("\a55DD55FFsaved slot %d '%s' (%d values, %s)", slot, name, n, in_db and "db + file" or "file"))
         aa_tl_push("CONFIG", "saved slot " .. slot .. " " .. name)
     elseif p.op == "load" then
-        local s = st.slots[slot]
+        local s = st.slots["s" .. slot]
         if not (s and s.data) then cfg_status("\aFF5555FFslot " .. slot .. " is empty"); return end
         local t, n = cfg_decode(s.data)
         local applied = cfg_apply(t)
@@ -5199,11 +5199,11 @@ function cfg_drain(p)
         cfg_status(string.format("\a55DD55FFloaded slot %d '%s' (%d / %d values applied)", slot, tostring(s.name), applied, n))
         aa_tl_push("CONFIG", "loaded slot " .. slot .. " " .. tostring(s.name))
     elseif p.op == "delete" then
-        st.slots[slot] = nil
+        st.slots["s" .. slot] = nil
         cfg_store_save()
         cfg_status("\aFFAA55FFslot " .. slot .. " deleted")
     elseif p.op == "export" then
-        local s = st.slots[slot]
+        local s = st.slots["s" .. slot]
         local data, nm = nil, name
         if s and s.data then data, nm = s.data, s.name else
             local snap = cfg_snapshot(); data = cfg_encode(snap)   -- empty slot: export the live values
@@ -5215,7 +5215,7 @@ function cfg_drain(p)
         cfg_status(ok and string.format("\a55DD55FFexported '%s' to the clipboard (%d chars) - paste it anywhere", tostring(nm), #text)
                       or "\aFF5555FFclipboard write failed")
     elseif p.op == "select" then
-        local s = st.slots[slot]
+        local s = st.slots["s" .. slot]
         pcall(function() if s and CFG.name then CFG.name:set(tostring(s.name or "")) end end)
     elseif p.op == "import" then
         local text = nil
@@ -5228,10 +5228,10 @@ function cfg_drain(p)
         if not data then cfg_status("\aFF5555FFcorrupt config string"); return end
         local t, n = cfg_decode(data)
         if n == 0 then cfg_status("\aFF5555FFconfig string holds no values"); return end
-        st.slots[slot] = { name = nm ~= "" and nm or name, data = data, n = n }
+        st.slots["s" .. slot] = { name = nm ~= "" and nm or name, data = data, n = n }
         cfg_store_save()
-        pcall(function() if CFG.name then CFG.name:set(st.slots[slot].name) end end)
-        cfg_status(string.format("\a55DD55FFimported '%s' into slot %d (%d values) - press Load slot to apply", tostring(st.slots[slot].name), slot, n))
+        pcall(function() if CFG.name then CFG.name:set(st.slots["s" .. slot].name) end end)
+        cfg_status(string.format("\a55DD55FFimported '%s' into slot %d (%d values) - press Load slot to apply", tostring(st.slots["s" .. slot].name), slot, n))
     end
     cfg_refresh_labels()
 end
@@ -5262,31 +5262,66 @@ end) end)
 -- SHUTDOWN
 -- ══════════════════════════════════════════════════════════════════════════
 -- Clear all NL :override() writes so user's manual UI returns to its real state.
-local function clear_all_nl_overrides()
-    for _, ref in pairs(nl_refs) do nl_clear(ref) end
-    pcall(function() rage.antiaim:override_hidden_yaw_offset(0) end)
-    pcall(function() rage.antiaim:override_hidden_pitch(0) end)
+-- v5.0 unload crash fix: the old cleanup called :override() on EVERY nl_refs entry (~55,
+-- incl. hotkey-bound elements like Double Tap / Hide Shots / Peek Assist / Slow Walk that
+-- the script never writes) plus every cvar restore in one shutdown frame → CSGO crashed on
+-- unload. Now: only the refs this script actually overrides, and only the ones that carry
+-- a live override (get_override ~= nil), each in its own pcall; hidden angles only when we
+-- set them; cvars only when we changed them; clantag only when we drove it.
+local SEL01_OVERRIDE_KEYS = {}
+for _, k in ipairs(AA_REF_KEYS) do SEL01_OVERRIDE_KEYS[#SEL01_OVERRIDE_KEYS + 1] = k end
+for _, k in ipairs({ "rage_hc", "rage_safepoint", "misc_airstrafe", "rage_as_ssg_opts", "rage_as_opts", "rage_hide", "vis_scope_ovl" }) do
+    SEL01_OVERRIDE_KEYS[#SEL01_OVERRIDE_KEYS + 1] = k
+end
+local function nl_clear_if_overridden(ref)
+    if not ref then return false end
+    local has = true
+    pcall(function() if ref.get_override then has = (ref:get_override() ~= nil) end end)
+    if not has then return false end
+    pcall(function() ref:override() end)
+    return true
+end
+local function clear_all_nl_overrides(reason)
+    local n = 0
+    for _, k in ipairs(SEL01_OVERRIDE_KEYS) do
+        if nl_clear_if_overridden(nl_refs[k]) then n = n + 1 end
+    end
+    if aa_eng.hidden_active then
+        pcall(function() rage.antiaim:override_hidden_yaw_offset(0) end)
+        pcall(function() rage.antiaim:override_hidden_pitch(0) end)
+    end
     aa_eng.active = false
-    -- v5.0: misc cvars back to the saved originals + misc overrides
-    pcall(misc_cvars_sync, true)
-    pcall(misc_clear_overrides)
+    aa_eng.fl_active, aa_eng.dtlag_active, aa_eng.hidden_active, aa_eng.fd_active = false, false, false, false
+    aa_eng.fs_static_active, aa_eng.hs_active, aa_eng.fl_dis_active, aa_eng.air_fd_active, aa_eng.air_fl_active = false, false, false, false, false
+    _peek_boost_active = false
+    ai_peek.hc_active, ai_peek.sp_active = false, false
     misc_eng.hs_ov, misc_eng.airstrafe_ov, misc_eng.autostop_ov, misc_eng.legs_ov = false, false, false, false
+    -- cvars: misc_cvars_sync(true) only touches cvars whose original it saved
+    pcall(misc_cvars_sync, true)
+    return n
 end
 
+local _shutdown_done = false
 pcall(function()
     events.shutdown:set(function()
-        pcall(function() common.set_clan_tag("") end)
-        clear_all_nl_overrides()
-        cs_log_color("Sel01-Config v" .. SEL01_CFG_VERSION .. " — unloaded (overrides cleared)")
+        if _shutdown_done then return end
+        _shutdown_done = true
+        pcall(function()
+            local n = clear_all_nl_overrides("unload")
+            if clantag_last_sent then pcall(function() common.set_clan_tag("") end) end
+            pcall(function() print(CS_PREFIX .. " v" .. SEL01_CFG_VERSION .. " unloaded (" .. n .. " overrides cleared)") end)
+        end)
     end)
 end)
 
 -- Also clear on master-disable
 enable_master:set_callback(function(r)
     if not r:get() then
-        clear_all_nl_overrides()
-        pcall(function() common.set_clan_tag("") end)
-        cs_log_color("Master DISABLED — overrides + clantag cleared")
+        pcall(function()
+            local n = clear_all_nl_overrides("master off")
+            if clantag_last_sent then pcall(function() common.set_clan_tag("") end) end
+            cs_log_color("Master DISABLED — " .. n .. " overrides + clantag cleared")
+        end)
     end
 end)
 
