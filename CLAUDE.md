@@ -39,6 +39,8 @@ Solver runtime data (private, gitignored):
 - JSON backup + human-readable: `nl/Sel01-Solver/learned.json`
 - Copy-logs file fallback: `nl/Sel01-Solver/last_logs.txt`
 
+**Meta-lua knowledge base (READ FIRST for any AA / visual / config-system question): `docs/meta-luas/README.md`** (shared AA meta, config-system patterns, menu + HUD visual language, the union of verified `ui.find` paths, API facts) plus one MD per surveyed lua (`elysian.md`, `andromeda.md`, `evalate.md`, `spectral.md`, `nexus.md`, `gasolina.md` with the 4 decoded presets, `arc.md`, `demontime.md`, `worldeditor.md`). These replace re-reading the ~84k-line scriptleaks sources (that survey cost ~1.5M tokens on 2026-09-08) — only re-clone the repo when a fact is genuinely missing from the docs.
+
 Solver architecture + bug history + UI doc lives in `README.md`. NL API docs at `https://docs-csgo.neverlose.cc/readme.md?ask=<keywords>` — consult before guessing API names. Config script has no separate README; this file is canonical.
 
 **Git repo.** Remote: `origin https://github.com/seltonmt012/Sel01-Solver.git` (branch `master`). `.gitignore` excludes private data + `.claude/` + `.vscode/`. Auto-commit + push on version bumps per project policy.
