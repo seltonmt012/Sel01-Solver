@@ -1,11 +1,11 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Config — Neverlose CSGO HvH config        ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 5.0                                    ║
+-- ║  Version: 5.1                                    ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Config
 -- @author seltonmt01
--- @version 5.0
+-- @version 5.1
 -- @description v5.0 META REWORK (best-of from 10 current NL luas: elysian, Andromeda,
 --   evalate 2, spectral/everlast, nexus, gazolina, arc, DEMONTIME) + new Misc tab:
 --   * Presets are now REAL meta configs with decoded values: Nyanza Snapshot (default),
@@ -133,7 +133,7 @@
 --     variance for full per-side chaos.
 --   * MAG-JIT indicator added to bottom HvH strip; dumped in v3.8 stats.
 
-local SEL01_CFG_VERSION = "5.0"
+local SEL01_CFG_VERSION = "5.1"
 
 -- DEBUG: print to CSGO console at major load checkpoints. Plain print() bypasses
 -- NL chat (which may not flush before crash) and writes directly to CSGO console.
@@ -676,8 +676,8 @@ pcall(function()
     AIP.active:tooltip("Right-click this switch in NL and bind it to a key (hold or toggle, your choice). While it is on the peek logic runs; off = the bot never touches your movement.")
     AIP.dist:tooltip("How far left/right of the anchor the peek positions are searched. Walls cut it short automatically.")
     AIP.delay:tooltip("Consecutive ticks a shot must exist before committing. 0 = instant, 1-2 filters flickering sightlines.")
-    AIP.expose:tooltip("Safety: standing on the peek point this long without the ragebot firing → retreat anyway.")
-    AIP.retreat:tooltip("After the shot = go back the moment events.aim_fire says the ragebot committed (default). When no shot exists = stay out while a shot is still possible.")
+    AIP.expose:tooltip("Safety: AFTER arriving on the peek point, this long without the ragebot firing → retreat. Walk-out time is not counted. Default 450ms is tight for a sniper — raise it if you get there but don't shoot.")
+    AIP.retreat:tooltip("After the shot = stay out until the ragebot fires (or the expose timer). When no shot exists = stay out while a traced shot is still possible, with a few ticks of hysteresis so a 1-tick flicker does not yank you back.")
     AIP.hc:tooltip("0 keeps your NL Hit Chance (recommended - the bot stops on the point, NL auto-stop handles the rest). A value here overrides HC only while peeking.")
 end)
 
@@ -2094,7 +2094,9 @@ local function aa_engine_tick(cmd)
     end
 
     -- ── 14. auto fake-duck while moving (dirty-tracked, v3.3 falling-edge clear) ──
-    local want_fd = AA.move_fd:get() and not airborne and vel > AA.move_fd_thr:get()
+    -- skip while AI Peek owns movement (global: aa_engine is defined above the
+    -- local ai_peek table, so it must not capture that local)
+    local want_fd = AA.move_fd:get() and not airborne and vel > AA.move_fd_thr:get() and not sel01_ai_peek_busy
     if want_fd and not aa_eng.fd_active then
         aa_ov(nl_refs.aa_fakeduck, true)
         aa_eng.fd_active = true
@@ -2233,8 +2235,12 @@ local ai_peek = {
     lock_tick = 0,         -- last tick a shot existed (unlock after 25)
     confirm = 0,           -- consecutive ticks with a shot point
     shoot = nil,           -- { pos, hb, side, ent, dmg }
+    goal = nil,            -- committed peek stand-pos (locked; do not re-pick every tick)
     points = {},           -- candidate positions (for the drawing)
-    peek_t0 = 0,           -- when we reached / started moving to the point
+    peek_t0 = 0,           -- when we ARRIVED on the peek point (expose timer)
+    peek_start = 0,        -- when we started walking out (stuck-walk cap)
+    arrived = false,
+    miss_streak = 0,       -- consecutive no-shot ticks while peeking
     retreat_until = 0, cooldown_until = 0,
     shot_tick = -1,        -- events.aim_fire tick (ragebot committed)
     tele_done = false,
@@ -2242,6 +2248,7 @@ local ai_peek = {
     dev_t = 0, def_until = {},   -- per-enemy defensive window (sim time went backwards)
     peeks = 0, shots = 0, timeouts = 0,
 }
+sel01_ai_peek_busy = false   -- module global: aa_engine (defined above) reads this at call-time
 
 -- weapon filter: combo :get() returns the option STRING (NL convention)
 local function ai_peek_weapon_ok(lp)
@@ -2316,8 +2323,10 @@ end
 local function ai_peek_reset(reason)
     if ai_peek.phase ~= "off" then aa_tl_push("AIPEEK", "off (" .. tostring(reason) .. ")") end
     ai_peek_set_overrides(false)
-    ai_peek.anchor, ai_peek.side, ai_peek.ent, ai_peek.shoot = nil, nil, nil, nil
+    ai_peek.anchor, ai_peek.side, ai_peek.ent, ai_peek.shoot, ai_peek.goal = nil, nil, nil, nil, nil
     ai_peek.points, ai_peek.confirm, ai_peek.phase = {}, 0, "off"
+    ai_peek.arrived, ai_peek.miss_streak, ai_peek.peek_t0, ai_peek.peek_start = false, 0, 0, 0
+    sel01_ai_peek_busy = false
 end
 
 -- P-controlled move toward a world point (WalkBot-style world-space move_yaw; the
@@ -2325,7 +2334,10 @@ end
 local function ai_peek_go_to(cmd, lp, lo, pos)
     local dx, dy = pos.x - lo.x, pos.y - lo.y
     local d = math.sqrt(dx * dx + dy * dy)
-    pcall(function() cmd.in_duck = false; cmd.in_jump = false; cmd.in_speed = false end)
+    pcall(function()
+        cmd.in_duck = false; cmd.in_jump = false; cmd.in_speed = false
+        cmd.in_back = false; cmd.in_moveleft = false; cmd.in_moveright = false
+    end)
     if d < 5 then
         -- angelwings / gazolina quick-stop: thrust AGAINST the current velocity so we
         -- stand dead on the point within a tick (NL auto-stop then has nothing to do)
@@ -2339,6 +2351,7 @@ local function ai_peek_go_to(cmd, lp, lo, pos)
                 cmd.forwardmove = 0
             end
             cmd.sidemove = 0
+            cmd.in_forward = false
         end)
         return d
     end
@@ -2346,6 +2359,7 @@ local function ai_peek_go_to(cmd, lp, lo, pos)
         cmd.move_yaw = math.deg(math.atan2(dy, dx))
         cmd.forwardmove = (d < 20) and math.max(120, d * 22) or 450
         cmd.sidemove = 0
+        cmd.in_forward = true
     end)
     return d
 end
@@ -2411,58 +2425,98 @@ local function ai_peek_tick(cmd)
     local d_anchor = math.sqrt((lo.x - anchor.x) ^ 2 + (lo.y - anchor.y) ^ 2)
 
     -- retreat / cooldown phases: drive back, no searching
-    local function go_home(why)
+    -- tele=true only for a REAL retreat (shot / timeout / airborne). A 1-tick
+    -- search flicker must not DT-teleport us back to cover.
+    local function go_home(why, tele)
         if ai_peek.phase == "peek" then
             ai_peek.phase = "retreat"
             ai_peek.retreat_until = now + 0.6
             ai_peek_set_overrides(false)
             aa_tl_push("AIPEEK", "retreat: " .. tostring(why))
             ai_peek_dev("RETREAT " .. tostring(why), true)
-            -- DT teleport back (aiPeek pattern): one shot per retreat, only when charged
-            if AIP.dt_tele:get() and not ai_peek.tele_done then
+            if tele and AIP.dt_tele:get() and not ai_peek.tele_done then
                 local ch = 0
                 pcall(function() ch = rage.exploit:get() or 0 end)
                 if ch >= 1 then pcall(function() rage.exploit:force_teleport() end); ai_peek.tele_done = true end
             end
         end
-        if d_anchor > 3 then ai_peek_go_to(cmd, lp, lo, anchor) else pcall(function() cmd.forwardmove = 0; cmd.sidemove = 0 end) end
+        if d_anchor > 3 then ai_peek_go_to(cmd, lp, lo, anchor) else pcall(function() cmd.forwardmove = 0; cmd.sidemove = 0; cmd.in_forward = false end) end
     end
-    if not on_ground then go_home("airborne"); return end
+    sel01_ai_peek_busy = (ai_peek.phase == "peek" or ai_peek.phase == "retreat")
+    if not on_ground then go_home("airborne", true); return end
     if ai_peek.phase == "retreat" then
-        go_home("continuing")
+        go_home("continuing", false)
         if d_anchor <= 3 or now >= ai_peek.retreat_until then
             ai_peek.phase = "hold"
             ai_peek.cooldown_until = now + (AIP.cooldown:get() / 1000)
-            ai_peek.side, ai_peek.ent, ai_peek.confirm, ai_peek.shoot = nil, nil, 0, nil
+            ai_peek.side, ai_peek.ent, ai_peek.confirm, ai_peek.shoot, ai_peek.goal = nil, nil, 0, nil, nil
+            ai_peek.arrived, ai_peek.miss_streak, ai_peek.peek_t0, ai_peek.peek_start = false, 0, 0, 0
+            sel01_ai_peek_busy = false
         end
         return
     end
-    if now < ai_peek.cooldown_until then go_home("cooldown"); return end
+    if now < ai_peek.cooldown_until then go_home("cooldown", false); return end
 
     -- the ragebot committed a shot (events.aim_fire) → retreat immediately
     if AIP.retreat:get() == "After the shot" and ai_peek.phase == "peek" and ai_peek.shot_tick >= ai_peek.peek_tick then
         ai_peek.shots = ai_peek.shots + 1
-        go_home("shot fired")
+        go_home("shot fired", true)
         return
     end
+
+    local peeking = (ai_peek.phase == "peek")
 
     -- gates that mean "hold / go back": no threat, wrong weapon, weapon busy, DT charging
     local threat = nil
     pcall(function() threat = entity.get_threat() end)
-    if not threat then ai_peek.points = {}; ai_peek.shoot = nil; go_home("no threat"); return end
+    if not threat then
+        -- while peeking keep the locked enemy — get_threat() drops for a tick
+        -- the moment we strafe off the crosshair and used to abort every peek
+        if not (peeking and ai_peek.ent) then
+            ai_peek.points = {}; ai_peek.shoot = nil; go_home("no threat", false); return
+        end
+    end
     local wok, wwhy = ai_peek_weapon_ok(lp)
-    if not wok then ai_peek.shoot = nil; go_home(wwhy or "weapon"); ai_peek_dev("hold: " .. tostring(wwhy)); return end
+    if not wok then
+        -- empty clip / no gun → real retreat. weapon busy (between shots / DT
+        -- recharge) → stay on the peek point and wait, do NOT yank back.
+        if peeking and wwhy == "weapon busy" then
+            local stay = ai_peek.goal or ai_peek.anchor
+            if stay then ai_peek_go_to(cmd, lp, lo, stay) end
+            ai_peek_dev("peek: weapon busy, holding point")
+            return
+        end
+        ai_peek.shoot = nil; go_home(wwhy or "weapon", peeking and wwhy ~= "weapon busy"); ai_peek_dev("hold: " .. tostring(wwhy)); return
+    end
     if AIP.dt_wait:get() then
         local dt_on, ch = false, 1
         pcall(function() dt_on = (nl_refs.rage_dt and nl_refs.rage_dt:get()) and true or false end)
         if dt_on then pcall(function() ch = rage.exploit:get() or 0 end) end
-        if dt_on and ch < 1 then ai_peek.shoot = nil; go_home("DT charging"); ai_peek_dev("hold: DT charging"); return end
+        if dt_on and ch < 1 then
+            if peeking then
+                local stay = ai_peek.goal or ai_peek.anchor
+                if stay then ai_peek_go_to(cmd, lp, lo, stay) end
+                ai_peek_dev("peek: DT charging, holding point")
+                return
+            end
+            ai_peek.shoot = nil; go_home("DT charging", false); ai_peek_dev("hold: DT charging"); return
+        end
     end
 
     -- ── candidate peek positions (eye height), perpendicular to the threat ──
     local to = nil
-    pcall(function() to = threat:get_origin() end)
-    if not to then go_home("no threat origin"); return end
+    pcall(function()
+        local src = threat or ai_peek.ent
+        if src then to = src:get_origin() end
+    end)
+    if not to then
+        if peeking and ai_peek.goal then
+            -- origin read failed one tick — keep walking the committed point
+            ai_peek_go_to(cmd, lp, lo, ai_peek.goal)
+            return
+        end
+        go_home("no threat origin", false); return
+    end
     local yaw_to = math.deg(math.atan2(to.y - anchor.y, to.x - anchor.x))
     local eye_off = 64
     pcall(function() eye_off = lp:get_eye_position().z - lo.z end)
@@ -2472,17 +2526,36 @@ local function ai_peek_tick(cmd)
         local a = math.rad(yaw_to + ((side == 0) and -90 or 90))
         return math.cos(a), math.sin(a)
     end
+    -- stand 14u in front of a wall hit so the hull fits and bullet traces
+    -- don't start in solid (old end_pos-in-wall made the shot flicker off)
     local function traced_point(fx, fy, fz, tx, ty, tz)
         local ex, ey, ez, frac = tx, ty, tz, 1
         pcall(function()
             local tr = utils.trace_line(vector(fx, fy, fz), vector(tx, ty, tz), lp, AIP_BRUSH_MASK)
             if tr and tr.end_pos then ex, ey, ez, frac = tr.end_pos.x, tr.end_pos.y, tr.end_pos.z, tr.fraction or 1 end
         end)
+        if frac < 1 then
+            local dx, dy = ex - fx, ey - fy
+            local len = math.sqrt(dx * dx + dy * dy)
+            if len > 1 then
+                local back = 14
+                if len <= back then
+                    ex, ey = fx, fy
+                else
+                    local s = (len - back) / len
+                    ex, ey = fx + dx * s, fy + dy * s
+                end
+            end
+        end
         return ex, ey, ez, frac
     end
     local az = anchor.z + eye_off
-    if ai_peek.side ~= nil then
-        -- locked side: 7 steps along it so we peek only as far as needed
+    -- committed peek: only re-check the locked goal + current feet (do NOT
+    -- rebuild a 7-step ladder that throws away the far hittable point)
+    if peeking and ai_peek.goal then
+        points[#points + 1] = { x = ai_peek.goal.x, y = ai_peek.goal.y, z = az, side = ai_peek.side or 1 }
+        points[#points + 1] = { x = lo.x, y = lo.y, z = az, side = ai_peek.side or 1 }
+    elseif ai_peek.side ~= nil then
         local cx, cy = side_dir(ai_peek.side)
         local px, py = anchor.x, anchor.y
         for i = 1, 7 do
@@ -2491,11 +2564,22 @@ local function ai_peek_tick(cmd)
             px, py = nx, ny
             if frac < 1 then break end
         end
+        -- keep the full-distance point too so an early wall-break cannot
+        -- drop the only actually-hittable far spot
+        local fx, fy, fz = traced_point(anchor.x, anchor.y, az, anchor.x + cx * dist, anchor.y + cy * dist, az)
+        points[#points + 1] = { x = fx, y = fy, z = fz, side = ai_peek.side }
     else
         for side = 0, 1 do
             local cx, cy = side_dir(side)
-            local nx, ny, nz = traced_point(anchor.x, anchor.y, az, anchor.x + cx * dist, anchor.y + cy * dist, az)
-            points[#points + 1] = { x = nx, y = ny, z = nz, side = side }
+            local px, py = anchor.x, anchor.y
+            for i = 1, 7 do
+                local nx, ny, nz, frac = traced_point(px, py, az, px + cx * dist / 7, py + cy * dist / 7, az)
+                points[#points + 1] = { x = nx, y = ny, z = nz, side = side }
+                px, py = nx, ny
+                if frac < 1 then break end
+            end
+            local fx, fy, fz = traced_point(anchor.x, anchor.y, az, anchor.x + cx * dist, anchor.y + cy * dist, az)
+            points[#points + 1] = { x = fx, y = fy, z = fz, side = side }
         end
     end
     ai_peek.points = points
@@ -2509,19 +2593,26 @@ local function ai_peek_tick(cmd)
     local enemies = nil
     pcall(function() enemies = entity.get_players(true) end)
     local list = {}
-    if ai_peek.ent then list[1] = ai_peek.ent elseif enemies then list = enemies end
+    -- never lock the search onto a single userdata: NL wraps the same player
+    -- in a new entity object next tick and `hit_e == e` then fails forever
+    if enemies then list = enemies end
     -- angelwings check: a shot that already exists from the ANCHOR eye needs no peek —
     -- the ragebot fires from cover; the anchor itself is candidate #0 while we hold
-    if ai_peek.phase ~= "peek" and d_anchor <= 5 then
+    if not peeking and d_anchor <= 5 then
         table.insert(points, 1, { x = anchor.x, y = anchor.y, z = az, side = -1 })
     end
+    local lock_idx = 0
+    if ai_peek.ent then pcall(function() lock_idx = ai_peek.ent:get_index() or 0 end) end
     for _, e in ipairs(list) do
         if shoot then break end
         local ok_e, e_alive, e_dorm = pcall(function() return e:is_alive(), e:is_dormant() end)
         if ok_e and e_alive and not e_dorm then
-            -- enemy defensive (sim time went backwards) → body only for 12 ticks, ground only
             local idx = 0
             pcall(function() idx = e:get_index() end)
+            -- after commit, only the locked enemy (by INDEX, not userdata)
+            if lock_idx ~= 0 and idx ~= lock_idx then
+                -- skip
+            else
             pcall(function()
                 local st = e:get_simulation_time()
                 if st and st.current and st.old and (st.current - st.old) <= -0.01 then
@@ -2553,55 +2644,104 @@ local function ai_peek_tick(cmd)
                         dmg = tonumber(d) or 0
                         hit_e = tr and tr.entity or nil
                     end)
-                    if hit_e == e and dmg >= need then
-                        shoot = { pos = pt, hb = hb, side = pt.side, ent = e, dmg = dmg, idx = idx }
-                        break
+                    if dmg >= need then
+                        local same = (hit_e == e)
+                        if not same then
+                            local hi = -1
+                            pcall(function() if hit_e then hi = hit_e:get_index() end end)
+                            same = (hi == idx and idx ~= 0)
+                            -- damage to this exact hitbox but no entity userdata
+                            -- (NL identity flickers) — still a valid peek shot
+                            if not same and hit_e == nil then same = true end
+                        end
+                        if same then
+                            shoot = { pos = pt, hb = hb, side = pt.side, ent = e, dmg = dmg, idx = idx }
+                            break
+                        end
                     end
                 end
+            end
             end
         end
     end
 
     -- ── confirm + side lock ──
-    if shoot and shoot.side == -1 then
+    if shoot and shoot.side == -1 and not peeking then
         -- hittable from cover already: stay, let the ragebot work, keep the lock fresh
         ai_peek.lock_tick = tick
         ai_peek.shoot = shoot
         ai_peek_dev("hittable from cover, holding")
-        go_home("hittable from cover")
+        go_home("hittable from cover", false)
         return
     end
     if shoot then
         ai_peek.confirm = ai_peek.confirm + 1
         ai_peek.lock_tick = tick
-        if ai_peek.confirm < AIP.delay:get() then shoot = nil
+        ai_peek.miss_streak = 0
+        if not peeking and ai_peek.confirm < AIP.delay:get() then shoot = nil
         elseif ai_peek.side == nil then
             ai_peek.side, ai_peek.ent = shoot.side, shoot.ent
             aa_tl_push("AIPEEK", string.format("shot found: side %s dmg %d (need %d) → peek", shoot.side == 0 and "L" or "R", shoot.dmg, mindmg))
         end
     else
         ai_peek.confirm = 0
-        if tick - ai_peek.lock_tick > 25 or not ai_peek.ent then ai_peek.side, ai_peek.ent = nil, nil end
+        if not peeking then
+            if tick - ai_peek.lock_tick > 25 or not ai_peek.ent then ai_peek.side, ai_peek.ent = nil, nil end
+        end
     end
     ai_peek.shoot = shoot
 
     -- ── move ──
-    if shoot then
-        if ai_peek.phase ~= "peek" then
-            ai_peek.phase = "peek"
-            ai_peek.peek_t0, ai_peek.peek_tick, ai_peek.tele_done = now, tick, false
-            ai_peek.peeks = ai_peek.peeks + 1
-            ai_peek_set_overrides(true)
-            ai_peek_dev(string.format("PEEK side=%s dmg=%d", shoot.side == 0 and "L" or "R", shoot.dmg), true)
+    -- v5.1: once we commit a peek we LOCK the goal and walk there even if this
+    -- tick's trace_bullet flickers off. The old path did go_home("no shot") on
+    -- the very next tick → PEEK / RETREAT loop, never actually stepped out.
+    if shoot and not peeking then
+        ai_peek.phase = "peek"
+        ai_peek.goal = { x = shoot.pos.x, y = shoot.pos.y, z = lo.z }
+        ai_peek.peek_tick, ai_peek.tele_done = tick, false
+        ai_peek.peek_start, ai_peek.peek_t0 = now, 0
+        ai_peek.arrived, ai_peek.miss_streak = false, 0
+        ai_peek.peeks = ai_peek.peeks + 1
+        ai_peek_set_overrides(true)
+        sel01_ai_peek_busy = true
+        ai_peek_dev(string.format("PEEK side=%s dmg=%d", shoot.side == 0 and "L" or "R", shoot.dmg), true)
+        peeking = true
+    end
+
+    if peeking and ai_peek.goal then
+        local d_goal = ai_peek_go_to(cmd, lp, lo, ai_peek.goal)
+        if d_goal <= 8 then
+            if not ai_peek.arrived then
+                ai_peek.arrived = true
+                ai_peek.peek_t0 = now
+                ai_peek_dev("arrived on peek point", true)
+            end
         end
-        ai_peek_go_to(cmd, lp, lo, shoot.pos)
-        -- safety: exposed without a shot for too long → back
-        if now - ai_peek.peek_t0 > (AIP.expose:get() / 1000) then
+        -- expose timer starts on ARRIVAL, not on walk-out (walk used to eat the
+        -- whole 450ms and we retreated before the ragebot could fire)
+        if ai_peek.arrived and (now - ai_peek.peek_t0) > (AIP.expose:get() / 1000) then
             ai_peek.timeouts = ai_peek.timeouts + 1
-            go_home("exposure timeout")
+            go_home("exposure timeout", true)
+            return
         end
+        -- stuck walking into a wall: give up after 1.2s without arriving
+        if (not ai_peek.arrived) and (now - ai_peek.peek_start) > 1.2 then
+            ai_peek.timeouts = ai_peek.timeouts + 1
+            go_home("walk stuck", true)
+            return
+        end
+        if not shoot then
+            ai_peek.miss_streak = (ai_peek.miss_streak or 0) + 1
+            -- After the shot: stay until aim_fire or expose. When no shot exists:
+            -- need 8 consecutive misses (~125ms) so a 1-tick flicker is ignored.
+            if AIP.retreat:get() == "When no shot exists" and ai_peek.miss_streak >= 8 then
+                go_home("no shot", false)
+            end
+        end
+    elseif peeking and not ai_peek.goal then
+        go_home("no shot", false)
     else
-        go_home("no shot")
+        go_home("no shot", false)
     end
 end
 
@@ -4949,10 +5089,11 @@ local function config_copy_logs()
         _fmt_val(_nl_get(nl_refs.aa_yawmod, "?")), tostring(_nl_get(nl_refs.aa_yawmod_offset, "?")),
         tostring(_nl_get(nl_refs.aa_bodyyaw_l, "?")), tostring(_nl_get(nl_refs.aa_bodyyaw_r, "?")),
         _fmt_val(_nl_get(nl_refs.aa_bodyyaw_opts, "?")), _b(_nl_get(nl_refs.aa_freestand, false))))
-    add(string.format("[AIPEEK] enabled=%s active=%s phase=%s anchor=%s side=%s peeks=%d shots=%d exposure-timeouts=%d dist=%d delay=%d expose=%dms retreat=%s dt_wait=%s tele=%s hc=%d",
+    add(string.format("[AIPEEK] enabled=%s active=%s phase=%s anchor=%s goal=%s arrived=%s side=%s peeks=%d shots=%d timeouts=%d miss=%d dist=%d delay=%d expose=%dms retreat=%s dt_wait=%s tele=%s hc=%d",
         _b(AIP.enable:get()), _b(AIP.active:get()), tostring(ai_peek.phase), ai_peek.anchor and "set" or "none",
+        ai_peek.goal and "set" or "none", ai_peek.arrived and "Y" or "N",
         ai_peek.side == nil and "-" or (ai_peek.side == 0 and "L" or "R"), ai_peek.peeks or 0, ai_peek.shots or 0,
-        ai_peek.timeouts or 0, AIP.dist:get(), AIP.delay:get(), AIP.expose:get(), tostring(AIP.retreat:get()),
+        ai_peek.timeouts or 0, ai_peek.miss_streak or 0, AIP.dist:get(), AIP.delay:get(), AIP.expose:get(), tostring(AIP.retreat:get()),
         _b(AIP.dt_wait:get()), _b(AIP.dt_tele:get()), AIP.hc:get()))
     -- attackers, most hits first
     local names = {}
@@ -5445,7 +5586,7 @@ do
 end
 
 cs_log_color("══════════════════════════════════════════")
-cs_log_color("Sel01-Config v" .. SEL01_CFG_VERSION .. " loaded (v5.0 META rework: decoded presets, choke tables, safe head, legit AA, Misc tab)")
+cs_log_color("Sel01-Config v" .. SEL01_CFG_VERSION .. " loaded (v5.1 AI Peek: lock goal + stay out until shot/timeout, no more PEEK/RETREAT loop)")
 cs_log(string.format("  hooks  createmove=%s  createmove_run=%s  aim_fire=%s  bullet_impact=%s  anim=%s",
     tostring(_hooks_status.createmove or "MISSING"),
     tostring(_hooks_status.createmove_run or "MISSING"),
