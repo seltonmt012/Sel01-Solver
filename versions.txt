@@ -2,6 +2,6 @@
 # Every script fetches this file once at load and compares it to its own constant.
 # Format: key=version   (bump the line in the SAME commit as the version constant)
 solver=11.36
-config=5.3
+config=5.4
 walkbot=2.2
 plantbot=1.10

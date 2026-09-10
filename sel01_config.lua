@@ -1,11 +1,11 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Config — Neverlose CSGO HvH config        ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 5.3                                    ║
+-- ║  Version: 5.4                                    ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Config
 -- @author seltonmt01
--- @version 5.3
+-- @version 5.4
 -- @description v5.0 META REWORK (best-of from 10 current NL luas: elysian, Andromeda,
 --   evalate 2, spectral/everlast, nexus, gazolina, arc, DEMONTIME) + new Misc tab:
 --   * Presets are now REAL meta configs with decoded values: Nyanza Snapshot (default),
@@ -133,7 +133,7 @@
 --     variance for full per-side chaos.
 --   * MAG-JIT indicator added to bottom HvH strip; dumped in v3.8 stats.
 
-local SEL01_CFG_VERSION = "5.3"
+local SEL01_CFG_VERSION = "5.4"
 
 -- DEBUG: print to CSGO console at major load checkpoints. Plain print() bypasses
 -- NL chat (which may not flush before crash) and writes directly to CSGO console.
@@ -658,7 +658,7 @@ AIP.enable   = g_move:switch("Enable AI Peek", false)
 -- (right-click), so one bindable "active" switch replaces the whole hold/always/key setup.
 AIP.active   = g_move:switch("  └ AI Peek active (bind this switch in NL)", false)
 AIP.dist     = g_move:slider("Peek distance (u)", 10, 120, 55)
-AIP.delay    = g_move:slider("Confirm ticks before peeking", 0, 5, 1)
+AIP.delay    = g_move:slider("Confirm ticks before peeking", 0, 5, 2)
 AIP.expose   = g_move:slider("Max exposure without a shot (ms)", 80, 400, 200)
 AIP.cooldown = g_move:slider("Cooldown after retreat (ms)", 0, 2000, 250)
 AIP.retreat  = g_move:combo("Retreat", { "After the shot", "When no shot exists" }, 1)
@@ -672,11 +672,11 @@ AIP.wpn      = g_move:combo("Weapon Filter", { "All", "Snipers only", "Pistols o
 AIP.vis      = g_move:switch("Draw peek point + target hitbox", true)
 AIP.dev      = g_move:switch("Dev Mode (console debug)", false)
 pcall(function()
-    AIP.enable:tooltip("Master. Stand still behind cover with 'active' on. The bot only moves when a traced bullet from a peek position would deal NL Min. Damage (-5) to an enemy.")
+    AIP.enable:tooltip("Master. Stand still behind cover with 'active' on. The bot only moves when a traced bullet from a peek position would deal at least your NL Min. Damage (no -5 fudge — that peeked on 91 dmg when mindmg is 100, so the ragebot never fired).")
     AIP.active:tooltip("Right-click this switch in NL and bind it to a key (hold or toggle, your choice). While it is on the peek logic runs; off = the bot never touches your movement.")
     AIP.dist:tooltip("How far left/right of the anchor the peek positions are searched. Walls cut it short automatically.")
     AIP.delay:tooltip("Consecutive ticks a shot must exist before committing. 0 = instant, 1-2 filters flickering sightlines.")
-    AIP.expose:tooltip("AFTER arriving, this long without the ragebot firing → DT-teleport home. Hard-capped at 250ms so a 450ms leftover from an old config cannot leave you standing in a spray. Early peek is fine; sitting on the point is not.")
+    AIP.expose:tooltip("AFTER arriving, this long without a shot → walk back, then DT-blink. Hard-capped at 140ms. The blink waits one tick of movement toward cover so the charge has a direction (standing still then teleporting is how you die on the point).")
     AIP.retreat:tooltip("After the shot = blink back the moment the ragebot commits (hit or miss, does not wait for ack). When no shot exists = blink back a few ticks after arrival if the point is not actually shootable. Taking damage always blinks back.")
     AIP.hc:tooltip("0 = peek floor 50 (NL 72 never lands in a jiggle, so the ragebot would not fire). A value here is used as-is only while peeking, then restored.")
 end)
@@ -2245,6 +2245,7 @@ local ai_peek = {
     shot_tick = -1,        -- events.aim_fire tick (ragebot committed)
     hurt_tick = -1,        -- events.player_hurt: WE took damage during the peek
     tele_done = false,
+    blink_at = -1,         -- tick we are allowed to DT-blink (after 1 tick of return movement)
     hc_active = false, sp_active = false,
     dev_t = 0, def_until = {},   -- per-enemy defensive window (sim time went backwards)
     peeks = 0, shots = 0, timeouts = 0,
@@ -2348,7 +2349,7 @@ local function ai_peek_reset(reason)
     ai_peek.anchor, ai_peek.side, ai_peek.ent, ai_peek.shoot, ai_peek.goal = nil, nil, nil, nil, nil
     ai_peek.points, ai_peek.confirm, ai_peek.phase = {}, 0, "off"
     ai_peek.arrived, ai_peek.miss_streak, ai_peek.peek_t0, ai_peek.peek_start = false, 0, 0, 0
-    ai_peek.hurt_tick, ai_peek.shot_tick, ai_peek.tele_done = -1, -1, false
+    ai_peek.hurt_tick, ai_peek.shot_tick, ai_peek.tele_done, ai_peek.blink_at = -1, -1, false, -1
     sel01_ai_peek_busy = false
 end
 
@@ -2447,20 +2448,29 @@ local function ai_peek_tick(cmd)
     local anchor = ai_peek.anchor
     local d_anchor = math.sqrt((lo.x - anchor.x) ^ 2 + (lo.y - anchor.y) ^ 2)
 
-    -- retreat / cooldown: DT-blink home (hit, miss, no-shot, damage — all the same).
-    -- Walking 0.6s after sitting on the point is how the first peek ate 91 dmg.
+    -- retreat: MOVE toward cover FIRST, then DT-blink. force_teleport uses the
+    -- current cmd move direction — blinking while quick-stopped on the point
+    -- (v5.3) left the charge with no heading, so you died 38u out.
+    -- First retreat tick = only movement; blink_at = next tick.
     local function go_home(why, tele)
         if ai_peek.phase == "peek" then
             ai_peek.phase = "retreat"
-            local blinked = sel01_ai_peek_blink()
-            ai_peek.retreat_until = now + (blinked and 0.18 or 0.40)
+            ai_peek.blink_at = tick + 1
+            ai_peek.retreat_until = now + 0.35
             ai_peek_set_overrides(false)
-            aa_tl_push("AIPEEK", "retreat: " .. tostring(why) .. (blinked and " DT" or ""))
-            ai_peek_dev("RETREAT " .. tostring(why) .. (blinked and " (DT blink)" or ""), true)
-        elseif ai_peek.phase == "retreat" and tele then
-            sel01_ai_peek_blink()
+            aa_tl_push("AIPEEK", "retreat: " .. tostring(why))
+            ai_peek_dev("RETREAT " .. tostring(why) .. " (move then blink)", true)
         end
-        if d_anchor > 3 then ai_peek_go_to(cmd, lp, lo, anchor) else pcall(function() cmd.forwardmove = 0; cmd.sidemove = 0; cmd.in_forward = false end) end
+        if d_anchor > 3 then
+            ai_peek_go_to(cmd, lp, lo, anchor)
+        else
+            pcall(function() cmd.forwardmove = 0; cmd.sidemove = 0; cmd.in_forward = false end)
+        end
+        if tele ~= false and (ai_peek.blink_at or 0) >= 0 and tick >= ai_peek.blink_at then
+            if sel01_ai_peek_blink() then
+                ai_peek_dev("DT blink (had return heading)", true)
+            end
+        end
     end
     sel01_ai_peek_busy = (ai_peek.phase == "peek" or ai_peek.phase == "retreat")
     if not on_ground then go_home("airborne", true); return end
@@ -2471,7 +2481,7 @@ local function ai_peek_tick(cmd)
             ai_peek.cooldown_until = now + (AIP.cooldown:get() / 1000)
             ai_peek.side, ai_peek.ent, ai_peek.confirm, ai_peek.shoot, ai_peek.goal = nil, nil, 0, nil, nil
             ai_peek.arrived, ai_peek.miss_streak, ai_peek.peek_t0, ai_peek.peek_start = false, 0, 0, 0
-            ai_peek.hurt_tick = -1
+            ai_peek.hurt_tick, ai_peek.blink_at = -1, -1
             sel01_ai_peek_busy = false
         end
         return
@@ -2613,9 +2623,14 @@ local function ai_peek_tick(cmd)
     end
     ai_peek.points = points
 
-    -- ── trace bullets: candidate eye → enemy hitboxes, need NL Min. Damage - 5 ──
-    local mindmg = 5
-    pcall(function() mindmg = math.max((tonumber(nl_refs.rage_mindmg and nl_refs.rage_mindmg:get()) or 10) - 5, 5) end)
+    -- ── trace bullets: candidate eye → enemy hitboxes, need NL Min. Damage ──
+    -- v5.4: NO -5 fudge. Dump PEEK dmg=91 with mindmg 100 → ragebot never fired,
+    -- sat until expose, died. If the ref is missing, assume 50 not 5.
+    local mindmg = 50
+    pcall(function()
+        local v = tonumber(nl_refs.rage_mindmg and nl_refs.rage_mindmg:get())
+        if v then mindmg = math.max(v, 5) end
+    end)
     local hbsel = "Head + Body"
     pcall(function() hbsel = AIP.hitboxes:get() end)
     local shoot = nil
@@ -2773,7 +2788,7 @@ local function ai_peek_tick(cmd)
         -- → arrived → RETREAT no shot, ragebot never got a tick to fire.
         -- Leave on: shot / damage / this timer.
         local wait_ms = AIP.expose:get()
-        if wait_ms > 250 then wait_ms = 250 end
+        if wait_ms > 140 then wait_ms = 140 end
         if ai_peek.arrived and (now - ai_peek.peek_t0) > (wait_ms / 1000) then
             ai_peek.timeouts = ai_peek.timeouts + 1
             go_home("exposure timeout", true)
@@ -3227,12 +3242,11 @@ pcall(function()
                 if not event then return end
                 -- v4.1: the ragebot committed a shot → AI Peek retreats on the next tick.
                 -- Reads NOTHING from event.target (transition-state crash source).
-                -- v5.2: blink THIS tick (hit or miss — ack comes later). Waiting for
-                -- createmove is one extra exposed tick after the shot.
+                -- v5.4: do NOT blink here — no cmd, so the charge has no heading.
+                -- createmove go_home walks toward cover one tick, THEN blinks.
                 ai_peek.shot_tick = globals.tickcount or 0
                 aa_eng.last_fire_t = globals.realtime or 0   -- v5.0: defensive pause window
                 if ai_peek.phase == "peek" then
-                    sel01_ai_peek_blink()
                     aa_tl_push("AIPEEK", string.format("ragebot fired (dmg %d hc %d)", tonumber(event.damage) or 0, tonumber(event.hitchance) or 0))
                 end
             end)
@@ -3439,10 +3453,10 @@ pcall(function()
 
             -- V2.8: WE got hit (victim == lp, attacker is someone else)
             if victim == lp and attacker and attacker ~= lp then
-                -- v5.2: peeked and got tagged → DT-blink home this tick
+                -- v5.4: flag only — blink happens from createmove after we are
+                -- already moving toward cover (same heading problem as aim_fire).
                 if ai_peek.phase == "peek" then
                     ai_peek.hurt_tick = globals.tickcount or 0
-                    sel01_ai_peek_blink()
                 end
                 stats.hits_taken = (stats.hits_taken or 0) + 1
                 misc_eng.last_attacker = event.attacker   -- v5.0 revenge kill say
@@ -5641,7 +5655,7 @@ do
 end
 
 cs_log_color("══════════════════════════════════════════")
-cs_log_color("Sel01-Config v" .. SEL01_CFG_VERSION .. " loaded (v5.3 AI Peek: walk out >=22u, HC floor 50, no 3-tick no-shot bail)")
+cs_log_color("Sel01-Config v" .. SEL01_CFG_VERSION .. " loaded (v5.4 AI Peek: mindmg exact, move-then-blink, expose 140ms)")
 cs_log(string.format("  hooks  createmove=%s  createmove_run=%s  aim_fire=%s  bullet_impact=%s  anim=%s",
     tostring(_hooks_status.createmove or "MISSING"),
     tostring(_hooks_status.createmove_run or "MISSING"),
