@@ -1,12 +1,14 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 11.34                                  ║
+-- ║  Version: 11.35                                  ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 11.34
--- @description v11.34: Air+Peek required yaw_rate_consistent and now leads the EYE
+-- @version 11.35
+-- @description v11.35: tracking + guess-mag. Slow-walk no longer kills eye-lead;
+--   Networked-Guess uses the player's measured desync (dump CL_RunFramee 4 hits @9°
+--   fired lobby-median 20.4). v11.34: Air+Peek required yaw_rate_consistent and now leads the EYE
 --   (ground-parallel) so a noisy air rate cannot drag a locked desync off by 3-4°.
 --   Dump v11.33 EVG: Air+Peek R 23.1 vs locked 19.5, err=3.6 KEEP, then BF:retry
 --   at 19.5 was the body. v11.33: one-sided BF sweep walks OUTWARD from the learned magnitude
@@ -21,7 +23,7 @@
 --   full multipoint; [FL] hit-rate by target choke; animation-layer read scored in
 --   shadow ([ANIM] line) while the toggle stays off. v11.28 SSG body-hit fix. History in git.
 
-local SEL01_VERSION = "11.34"
+local SEL01_VERSION = "11.35"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -1414,6 +1416,15 @@ function sel01_side_mag(s, side)
     end
     if (s.measured_desync or 0) > 5 then return s.measured_desync end
     return 0
+end
+
+-- V11.35: *-Guess fallbacks used adaptive_guess_mag() (lobby median) even with
+-- real hits. Dump CL_RunFramee: 4 R-hits @9°, Networked-Guess fired 20.4 (median),
+-- KEEP err=11.4. Prefer that side's measured/passive, then global EMA, then median.
+function sel01_guess_mag(s, side)
+    local m = sel01_side_mag(s, side)
+    if m > 5 then return m end
+    return adaptive_guess_mag()
 end
 
 function learned_dom_side(s)
@@ -4784,8 +4795,28 @@ local function extrapolate_yaw(s, current_yaw)
     -- neptune2much (still=true, 5 L-hits @ ~11°): Static-Server-Dom-Recall fired
     -- -23.9 = 11.5 learned + 12.4 comp → miss. Stationary / slow enemies and an
     -- inconsistent yaw_rate buffer get no comp; a sustained turn still does.
-    if s.is_stationary or s.is_slow_target then return current_yaw end
-    if s.yaw_rate_buf and #s.yaw_rate_buf >= 4 and not s.yaw_rate_consistent then return current_yaw end
+    -- V11.35: slow-walk is the tracking case (strafe + look). Only a TRUE
+    -- standstill with almost no yaw skips interp-comp. v11.20 skipped ALL
+    -- slow/still and killed tracking (dump: CEO/ПЕДОФИ slow=still=true with
+    -- yaw_rate 40-237).
+    if s.is_stationary and math.abs(s.yaw_rate or 0) < 20 then return current_yaw end
+    if s.yaw_rate_buf and #s.yaw_rate_buf >= 4 and not s.yaw_rate_consistent then
+        -- sign-stable turn through jitter: still apply a damped mean-rate lead
+        local pos, neg, sum, n = 0, 0, 0, 0
+        for _, r in ipairs(s.yaw_rate_buf) do
+            n = n + 1; sum = sum + r
+            if r > 12 then pos = pos + 1 elseif r < -12 then neg = neg + 1 end
+        end
+        if (pos >= 4 or neg >= 4) and n > 0 and not s.jittering then
+            local mean = sum / n
+            local lerp_ms = 16
+            pcall(function() lerp_ms = (entity.get_lerp_time and entity.get_lerp_time() * 1000) or 16 end)
+            local extra = mean * ((lerp_ms + (tick_cache.ping_ms or 0) * 0.5) / 1000) * 0.6
+            if extra > 25 then extra = 25 elseif extra < -25 then extra = -25 end
+            return current_yaw + extra
+        end
+        return current_yaw
+    end
     local lerp_ms = 16
     pcall(function() lerp_ms = (entity.get_lerp_time and entity.get_lerp_time() * 1000) or 16 end)
     -- V9.3: add ping/2 (one-way latency) — high ping needs more extrapolation
@@ -5014,13 +5045,23 @@ local function _pick_first_shot_impl(p, s, anim, eye_yaw, max_desync, preset)
         local p_conf = confidence(s)
 
         -- V8.0 gate 1: jitter/spinner with inconsistent yaw_rate → skip
+        -- V11.35: a TURN with jitter on top still has a stable SIGN — 1-tick
+        -- damped lead so we track a look-around instead of sitting still.
         if s.yaw_rate_buf and #s.yaw_rate_buf >= 4 and not s.yaw_rate_consistent then
             can_predict = false
+            if not s.jittering and s.aa_type ~= "jitter" and s.aa_type ~= "spinner" then
+                local pos, neg = 0, 0
+                for _, r in ipairs(s.yaw_rate_buf) do
+                    if r > 12 then pos = pos + 1 elseif r < -12 then neg = neg + 1 end
+                end
+                if pos >= 4 or neg >= 4 then can_predict = true; s._track_damp = true end
+            end
         end
         -- V8.1 gate 2: confidence raised 30 → 40 (less greedy)
         if p_conf < 40 then can_predict = false end
-        -- V8.0 gate 3: slow-walker → no extrapolation
-        if s.is_slow_target then can_predict = false end
+        -- V11.35: slow-walk is tracking, not "stand still". Only a true standstill
+        -- with no yaw skips the predictor (was: ALL slow-walkers).
+        if s.is_stationary and math.abs(s.yaw_rate or 0) < 20 then can_predict = false end
         -- V8.1 gate 4: no extrapolation on first engagement (samples < 1)
         -- V11.6: 8+ UNIQUE passive obs (simtime-gated) is enough to unlock a small
         -- lead — waiting for a hit before predicting is how peek first-contacts miss.
@@ -5069,6 +5110,15 @@ local function _pick_first_shot_impl(p, s, anim, eye_yaw, max_desync, preset)
             -- server only holds the ticks he sent; leading past them aims at nothing.
             if s.backtrack_resistant or s.fl_heavy then ticks = math.max(1, ticks - 1) end
             ticks = math.max(1, math.min(4, ticks))   -- hard cap 4 (was 6)
+            if s._track_damp then
+                ticks = 1
+                s._track_damp = nil
+                local sum, n = 0, 0
+                if s.yaw_rate_buf then
+                    for _, r in ipairs(s.yaw_rate_buf) do sum = sum + r; n = n + 1 end
+                end
+                if n > 0 then s._track_yr = sum / n end
+            end
             -- peek-snap reduces — V9.9-E: use tick_cache.lp
             local lp_peek = false
             pcall(function()
@@ -5091,7 +5141,8 @@ local function _pick_first_shot_impl(p, s, anim, eye_yaw, max_desync, preset)
             local comp_dt = (lerp_ms + (tick_cache.ping_ms or 0) * 0.5) / 1000
             -- decel-damp factor for the lead term only
             local lead_factor = 1.0
-            local ya, yr = s.yaw_accel or 0, s.yaw_rate or 0
+            local ya, yr = s.yaw_accel or 0, (s._track_yr or s.yaw_rate or 0)
+            s._track_yr = nil
             if yr ~= 0 and ya ~= 0 and ((ya > 0) ~= (yr > 0)) then
                 -- braking: |accel| relative to |rate| over one tick = how much the rate
                 -- will bleed off. Strong brake → minimal lead.
@@ -5367,7 +5418,7 @@ local function _pick_first_shot_impl(p, s, anim, eye_yaw, max_desync, preset)
                 side = asd
                 s.mode = "Static-AnimGuess"
             end
-            return eye_yaw + adaptive_guess_mag() * side
+            return eye_yaw + sel01_guess_mag(s, side) * side
         elseif s.aa_type == "jitter" and s.last_hit_side ~= 0
            and ((s.real_left or 0) + (s.real_right or 0)) >= 1 then
             -- V11.10: last_hit_side is also booted from persist.dom / steam-mem
@@ -5398,7 +5449,7 @@ local function _pick_first_shot_impl(p, s, anim, eye_yaw, max_desync, preset)
                 if asd ~= 0 then side = asd; s.mode = "Networked-AnimGuess" end
             end
             if s.mode ~= "Networked-AnimGuess" then s.mode = "Networked-Guess" end
-            return eye_yaw + adaptive_guess_mag() * side
+            return eye_yaw + sel01_guess_mag(s, side) * side
         end
         -- V10.3: same learned-magnitude guard as the Static-Server path
         local sy2, clamped = clamp_learned_serveryaw(s, eye_yaw, sy)
@@ -5598,7 +5649,7 @@ local function _pick_first_shot_impl(p, s, anim, eye_yaw, max_desync, preset)
     s.guess_cached_miss = s.missed
     s.mode = s._anim_guess and "Networked-AnimGuess" or "Networked-Guess"
     s._anim_guess = nil
-    return eye_yaw + adaptive_guess_mag() * side
+    return eye_yaw + sel01_guess_mag(s, side) * side
 end
 
 -- wrapper: caches first-shot result for ~150ms to prevent branch oscillation
@@ -6421,6 +6472,10 @@ local function resolve_player(p)
         s.air_duck = air_duck
     end
     s.dtpeek_active = (s.dtpeek_until or 0) > (globals.realtime or 0)
+    -- air is never "standing still" — stale still=true from before takeoff
+    -- was killing extrapolate_yaw on landing (dump: still=true + yaw_rate 237).
+    s.is_stationary = false
+    s.still_ticks = 0
 
     -- V9.74: a scheduled BF:retry (from the server-fail KEEP path) is consumed ONLY
     -- inside pick_bruteforce_angle, which the air-branch below short-circuits with an
@@ -6647,7 +6702,7 @@ local function resolve_player(p)
             sp = math.sqrt((v.x or 0)^2 + (v.y or 0)^2)
         end)
         local yr = math.abs(s.yaw_rate or 0)
-        local spike = yr > 100 or sp > 50
+        local spike = yr > 80 or sp > 50
         if spike then
             s.slow_ticks = 0
             s.still_ticks = 0
@@ -6657,7 +6712,10 @@ local function resolve_player(p)
             else
                 s.slow_ticks = math.max((s.slow_ticks or 0) - 2, 0)
             end
-            if sp < 5 and yr < 5 then
+            -- turning in place is not stationary (dump: still=true with yaw_rate 237)
+            if yr > 25 then
+                s.still_ticks = 0
+            elseif sp < 5 and yr < 5 then
                 s.still_ticks = math.min((s.still_ticks or 0) + 1, 64)
             else
                 s.still_ticks = math.max((s.still_ticks or 0) - 3, 0)
@@ -7290,10 +7348,10 @@ pcall(function()
         if lp then
             local cooldown_skip = false
             pcall(function()
-                local wpn = lp:get_weapon()
+                local wpn = (lp.get_weapon and lp:get_weapon()) or (lp.get_player_weapon and lp:get_player_weapon())
                 if wpn and wpn.m_flNextPrimaryAttack then
                     local next_attack = wpn.m_flNextPrimaryAttack
-                    if next_attack > (globals.curtime or 0) + 0.05 then
+                    if next_attack > (globals.curtime or 0) + 0.02 then
                         cooldown_skip = true
                     end
                 end
@@ -8579,5 +8637,6 @@ _cs_log_color_raw("V11.25: bug pass only (dump v11.24). (1) The passive per-side
 _cs_log_color_raw("V11.26: bug pass only (dump v11.25: 74%, first-shot 76%). (1) last_eye_yaw stored the RAW eye while the first-shot resolve was built on the interp-comp / lead eye, so every lead showed up as magnitude error in the ack (kurokoai Networked-Meas R 40.0 vs 26.4 measured = 26.4 + 13.6 lead at -209°/s, then NOFREEZE) and was LEARNED as desync on a hit. The eye the resolve used is stored now; the first-contact 58° cap keeps the raw eye on purpose. (2) V9.2 idle decay shrank REAL measurements: brandogdsa 1 real L-hit 37.5, six minutes away, live EMA 26.3 (persist 37.5), Static-ServerBoost-Recall fired 26.3 at bt=0, miss. Decay now only for seed-only enemies. (3) [KEEP] STATIC always read '-': reset_state cleared pending_keep_side on dormancy, i.e. for exactly the static enemies you re-engage after a gap. Kept until the next shot settles it.")
 _cs_log_color_raw("V11.27: bug pass (dump v11.26: 85.4%, first-shot 89%). (1) Both resolve caches returned an ABSOLUTE angle: the first-shot cache for 150 ms, the BF cache for as long as the miss count stood still — while the enemy's eye kept moving, with invalidation only at 20° drift. On a turning enemy the resolve drifted off the head by the eye movement since caching (APILAS: Static-Meas fired -63.2 on a 58.5° lock). Both now re-anchor the cached DELTA on the current eye; side / magnitude / mode are unchanged, only the anchor follows. (2) [HITBOX] dump line (head / chest / stomach / arms / legs) and the hitgroup on every ACK entry (hit group on a HIT, aimed group on a MISS) — the data to answer 'why not the head'.")
 _cs_log_color_raw("V11.34: Air+Peek (dump v11.33 EVG: Air+Peek R 23.1 vs locked 19.5, err=3.6 KEEP, BF:retry at 19.5 was the body). Lead now needs yaw_rate_consistent (ground predictor has since V8.0; air yaw at ~230°/s is abs_yaw noise) and leads the EYE so ack err is the desync, not mag+lead. Side was already right the whole session.")
+_cs_log_color_raw("V11.35: tracking + guess-mag (dump v11.34: 72%, CANCEL 0 holds — not-firing was not cancel-conf). (1) Networked-Guess/Static-Guess used lobby-median even with real hits — CL_RunFramee 4 R-hits @9° fired 20.4, KEEP err=11.4; now sel01_guess_mag uses that side's measured. (2) Slow-walk no longer disables eye-lead / predictor (HvH tracking case); only a true standstill with yaw<20°/s skips. Sign-stable yaw_rate (4/6 samples same direction) gets a 1-tick damped lead through jitter. (3) still_ticks clear when yaw_rate>25; air clears still so landing is not stale. (4) shot-cooldown buffer 50ms→20ms so the first fireable frame is not hc=99.")
 _cs_log_color_raw("Logging: " .. (log_enabled:get() and ("ON" .. (log_verbose:get() and " (verbose)" or ""))  or "OFF"))
 _cs_log_color_raw("=========================================")
