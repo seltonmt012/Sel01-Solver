@@ -1,11 +1,11 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Config — Neverlose CSGO HvH config        ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 5.4                                    ║
+-- ║  Version: 5.5                                    ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Config
 -- @author seltonmt01
--- @version 5.4
+-- @version 5.5
 -- @description v5.0 META REWORK (best-of from 10 current NL luas: elysian, Andromeda,
 --   evalate 2, spectral/everlast, nexus, gazolina, arc, DEMONTIME) + new Misc tab:
 --   * Presets are now REAL meta configs with decoded values: Nyanza Snapshot (default),
@@ -133,7 +133,7 @@
 --     variance for full per-side chaos.
 --   * MAG-JIT indicator added to bottom HvH strip; dumped in v3.8 stats.
 
-local SEL01_CFG_VERSION = "5.4"
+local SEL01_CFG_VERSION = "5.5"
 
 -- DEBUG: print to CSGO console at major load checkpoints. Plain print() bypasses
 -- NL chat (which may not flush before crash) and writes directly to CSGO console.
@@ -281,6 +281,7 @@ pcall(function() PRESET.apply:tooltip("Writes every AA state, the defensive / an
 -- ── About (right column): compact header + master switch
 g_about:label(ui.get_icon"user" .. "  " .. accent .. _uname .. "\aDEFAULT  ·  v" .. accent .. SEL01_CFG_VERSION .. "\aDEFAULT  ·  companion to " .. accent .. "Sel01-Solver")
 local enable_master = g_about:switch(accent .. ui.get_icon"power" .. accent .. "  Master Enable (all features)", true)
+-- AA.lua_aa is created just below with the AA table (g_about already exists).
 
 -- ══════════════════════════════════════════════════════════════════════════
 -- ANTI-AIM UI
@@ -298,6 +299,10 @@ local enable_master = g_about:switch(accent .. ui.get_icon"power" .. accent .. "
 --   Leg Movement : "Walking" | "Sliding"
 --   DT Lag Options: "On Peek" | "Always On"
 local AA = {}
+AA.lua_aa = g_about:switch(accent .. ui.get_icon"target" .. accent .. "  Anti-Aim from this lua", true)
+pcall(function()
+    AA.lua_aa:tooltip("OFF = this lua does not touch NL Anti Aim (all AA overrides cleared). Visuals, Misc, AI Peek and configs stay. Use NL's own AA or another AA script.")
+end)
 local AA_STATES = {
     { key = "global",  name = "Global",      tag = "GL"  },
     { key = "stand",   name = "Standing",    tag = "ST"  },
@@ -336,7 +341,7 @@ AA.idle_mode = g_aa:combo("Idle AA (warmup / round end / no enemy)", { "Off", "S
 AA.idle_speed= g_aa:slider("  └ Idle speed", 1, 100, 50)
 AA.idle_pitch= g_aa:combo("  └ Idle pitch", { "Down", "Disabled", "Fake Up" }, 1)
 pcall(function()
-    AA.enable:tooltip("Master for the per-state engine. OFF = all NL Anti Aim overrides cleared, your NL config is back in control.")
+    AA.enable:tooltip("Engine on the Anti-Aim tab. The Main-tab switch 'Anti-Aim from this lua' is the one that drops every AA override and leaves Visuals / Misc / Peek running.")
     AA.dir:tooltip("Applied as Yaw Offset math on top of the state offset: Backward 0 / Left +90 / Right -90 / Forward 180.")
     AA.man_static:tooltip("While a manual key is held: yaw modifier off and body yaw fixed 60/60 on the manual side.")
     AA.idle_mode:tooltip("Only when nobody can hurt you: warmup, round end without a threat, or no alive enemy. Spin = spinbot, Distortion = sine sweep, L/R = flip every send.")
@@ -1532,7 +1537,7 @@ local function aa_edge_delta(lp, view_yaw)
 end
 
 local function aa_engine_tick(cmd)
-    local on = enable_master:get() and AA.enable:get()
+    local on = enable_master:get() and AA.lua_aa:get() and AA.enable:get()
     local lp = on and entity.get_local_player() or nil
     local alive = false
     if lp then pcall(function() alive = lp:is_alive() end) end
@@ -3554,7 +3559,7 @@ end
 pcall(function()
     events.bullet_impact:set(function(event)
         pcall(function()
-            if not (enable_master:get() and AA.enable:get() and AA.ab_enable:get()) then return end
+            if not (enable_master:get() and AA.lua_aa:get() and AA.enable:get() and AA.ab_enable:get()) then return end
             if not event or not event.userid then return end
             local tick = globals.tickcount or 0
             if aa_eng.ab_tick == tick then return end
@@ -3886,7 +3891,7 @@ pcall(function()
             local lp = entity.get_local_player()
             if lp and lp:is_alive() then
                 local side
-                if AA.enable:get() then
+                if AA.lua_aa:get() and AA.enable:get() then
                     side = aa_jitter_dir or 1
                 else
                     side = 1
@@ -4052,7 +4057,7 @@ pcall(function()
             pcall(function()
                 local lp = entity.get_local_player()
                 if not (lp and lp:is_alive()) then return end
-                local aa_on = AA.enable:get() and aa_eng.active
+                local aa_on = AA.lua_aa:get() and AA.enable:get() and aa_eng.active
                 -- v4.0: movement line = the engine's own state (what the AA is built for)
                 local AA_STATE_LABEL = { stand = "STANDING", move = "MOVING", slow = "SLOW-WALK", duck = "CROUCH",
                                          duckmv = "CROUCH-MOVE", air = "AIR", airduck = "AIR-CROUCH" }
@@ -5534,6 +5539,15 @@ enable_master:set_callback(function(r)
         end)
     end
 end)
+pcall(function()
+    AA.lua_aa:set_callback(function(r)
+        if not r:get() then
+            pcall(aa_clear_overrides)
+            aa_eng.active = false
+            cs_log_color("Lua Anti-Aim OFF — NL AA / other AA lua is in control. Visuals, Misc, AI Peek stay.")
+        end
+    end)
+end)
 
 -- ══════════════════════════════════════════════════════════════════════════
 -- LOAD BANNER
@@ -5655,7 +5669,7 @@ do
 end
 
 cs_log_color("══════════════════════════════════════════")
-cs_log_color("Sel01-Config v" .. SEL01_CFG_VERSION .. " loaded (v5.4 AI Peek: mindmg exact, move-then-blink, expose 140ms)")
+cs_log_color("Sel01-Config v" .. SEL01_CFG_VERSION .. " loaded (v5.5 Main: Anti-Aim from this lua switch — rest stays)")
 cs_log(string.format("  hooks  createmove=%s  createmove_run=%s  aim_fire=%s  bullet_impact=%s  anim=%s",
     tostring(_hooks_status.createmove or "MISSING"),
     tostring(_hooks_status.createmove_run or "MISSING"),
