@@ -1,12 +1,15 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 11.35                                  ║
+-- ║  Version: 11.36                                  ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 11.35
--- @description v11.35: tracking + guess-mag. Slow-walk no longer kills eye-lead;
+-- @version 11.36
+-- @description v11.36: spend FPS where it hits. Nearby off-FOV enemies are fully
+--   resolved (backtrack records ready on peek). Anim-layer vote is a weighted
+--   blend (not first-wins) and steers two-side jitter once shadow is calibrated.
+--   v11.35: tracking + guess-mag. Slow-walk no longer kills eye-lead;
 --   Networked-Guess uses the player's measured desync (dump CL_RunFramee 4 hits @9°
 --   fired lobby-median 20.4). v11.34: Air+Peek required yaw_rate_consistent and now leads the EYE
 --   (ground-parallel) so a noisy air rate cannot drag a locked desync off by 3-4°.
@@ -23,7 +26,7 @@
 --   full multipoint; [FL] hit-rate by target choke; animation-layer read scored in
 --   shadow ([ANIM] line) while the toggle stays off. v11.28 SSG body-hit fix. History in git.
 
-local SEL01_VERSION = "11.35"
+local SEL01_VERSION = "11.36"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -1666,7 +1669,9 @@ local log_copy_btn = g_logging:button("📋 Copy Last Logs (for share)", functio
             a.ok or 0, a.bad or 0,
             n > 0 and string.format(" (%.0f%%)", (a.ok or 0) / n * 100) or "",
             a.none or 0,
-            (anim_side_tog and anim_side_tog:get()) and " | toggle ON (steering *-Guess)" or " | toggle OFF (shadow only)"))
+            (anim_side_tog and anim_side_tog:get()) and " | toggle ON (steering *-Guess)"
+                or (anim_side_ready() and " | toggle OFF, calibrated (steers two-side jitter)"
+                                      or " | toggle OFF (shadow only)")))
     end
     -- V10.4: was the KEEP worth its shot? Each keep holds the shot side and schedules a
     -- retry of the same angle. This scores what the NEXT landed hit actually used. A
@@ -4920,33 +4925,50 @@ function anim_side_update(s, p, now)
     local d = {}
     for k, v in pairs(cur) do d[k] = v - (prev[k] or 0) end
 
-    -- priority cascade: the strongest, least ambiguous signal wins the tick.
-    local sig, raw
-    if math.abs(d.w6) > 0.05 then          sig, raw = "w6",   (d.w6 > 0 and 1 or -1) * base
-    elseif math.abs(d.wdr6) > 0.35 then    sig, raw = "wdr6", (d.wdr6 > 0 and 1 or -1)
-    elseif math.abs(d.p6) > 0.20 then      sig, raw = "p6",   (d.p6 > 0 and 1 or -1)
-    elseif math.abs(d.w7) > 0.03 then      sig, raw = "w7",   (d.w7 > 0 and 1 or -1)
-    elseif math.abs(d.w8) > 0.03 then      sig, raw = "w8",   (d.w8 > 0 and 1 or -1)
-    elseif math.abs(d.w4) > 0.03 then      sig, raw = "w4",   base
-    elseif math.abs(d.lean) > 0.02 then    sig, raw = "lean", (d.lean > 0 and 1 or -1)
-    elseif (cur.w3 or 0) > 0.40 then       sig, raw = "w3",   base
+    -- V11.36: weighted blend of every live signal, not first-wins. A noisy
+    -- w6 delta of 0.051 used to beat a clean w7 and is why shadow swung
+    -- 38% → 67% between dumps. Strongest signal still tagged as anim_sig
+    -- for polarity feedback.
+    local acc, wsum, best_sig, best_w = 0, 0, nil, 0
+    local function add(sig, raw, w)
+        if not raw then return end
+        local v = raw * ((anim_pol[sig] and anim_pol[sig].sign) or 1)
+        acc = acc + v * w
+        wsum = wsum + w
+        if w > best_w then best_w, best_sig = w, sig end
     end
-    if not sig then
-        -- no evidence this tick: bleed the vote toward neutral so stale evidence
-        -- cannot outlive the situation that produced it
+    if math.abs(d.w6)   > 0.05 then add("w6",   (d.w6   > 0 and 1 or -1) * base, 3) end
+    if math.abs(d.wdr6) > 0.35 then add("wdr6", (d.wdr6 > 0 and 1 or -1),        2) end
+    if math.abs(d.p6)   > 0.20 then add("p6",   (d.p6   > 0 and 1 or -1),        2) end
+    if math.abs(d.w7)   > 0.03 then add("w7",   (d.w7   > 0 and 1 or -1),        2) end
+    if math.abs(d.w8)   > 0.03 then add("w8",   (d.w8   > 0 and 1 or -1),        1) end
+    if math.abs(d.w4)   > 0.03 then add("w4",   base,                            1) end
+    if math.abs(d.lean) > 0.02 then add("lean", (d.lean > 0 and 1 or -1),        1) end
+    if (cur.w3 or 0)    > 0.40 then add("w3",   base,                            1) end
+    if wsum <= 0 then
         s.anim_vote = (s.anim_vote or 0) * 0.90
         return
     end
-
-    local vote = raw * (anim_pol[sig].sign or 1)
+    local vote = acc / wsum
     s.anim_vote = (s.anim_vote or 0) * 0.60 + vote * 0.40
-    s.anim_sig  = sig
+    s.anim_sig  = best_sig
     s.anim_side_t = now
 end
 
+-- V11.36: shadow is calibrated enough to STEER (not just score). 8+ scored
+-- hits at ≥60% right — polarity has had a chance to self-flip (dump w4).
+function anim_side_ready()
+    local a = sel01_anim_shadow
+    if not a then return false end
+    local n = (a.ok or 0) + (a.bad or 0)
+    return n >= 8 and (a.ok or 0) * 10 >= n * 6
+end
+
 -- smoothed read: -1 left / +1 right / 0 = no usable signal
-function anim_side_get(s)
-    if not (anim_side_tog and anim_side_tog:get()) then return 0 end
+-- force=true: ignore the menu toggle (used once shadow is calibrated)
+function anim_side_get(s, force)
+    local on = force or (anim_side_tog and anim_side_tog:get())
+    if not on then return 0 end
     local v = s.anim_vote or 0
     if math.abs(v) < 0.35 then return 0 end
     local now = 0
@@ -5426,6 +5448,18 @@ local function _pick_first_shot_impl(p, s, anim, eye_yaw, max_desync, preset)
             -- without a hit it is a Guess wearing a lock label.
             -- Dump v11.8 idx=10 666: Jitter-Cls R +30.6 real=0 then FLIP,
             -- persist dom=1 from seed. Need a confirmed hit before locking.
+            -- V11.36: two-side jitterer (real hits L AND R) — Jitter-Cls locks
+            -- last_hit_side and waits for a miss + BF to find the other side
+            -- (dump ПЕДОФИ L11/R4, Jitter-Cls 10/12, the misses were the switch).
+            -- Once shadow is calibrated, the layer vote is THIS tick's side.
+            -- One-sided locks stay on last_hit_side (83% this dump).
+            if (s.real_left or 0) >= 1 and (s.real_right or 0) >= 1 and anim_side_ready() then
+                local asd = anim_side_get(s, true)
+                if asd ~= 0 then
+                    s.mode = "Jitter-Anim"
+                    return eye_yaw + effective_desync(s, max_desync, asd) * asd
+                end
+            end
             s.mode = "Jitter-Cls"
             return eye_yaw + desync * s.last_hit_side
         elseif s.aa_type == "spinner" and s.yaw_rate and math.abs(s.yaw_rate) > 60 then
@@ -6345,20 +6379,16 @@ local function resolve_player(p)
         local to_yaw = math.deg(math.atan2(dy, dx))
         local fov = math.abs(NormalizeAngle(to_yaw - tick_cache.lp_yaw))
         if fov > 110 then
-            -- V11.6: nearby off-FOV still OBSERVE. The old return skipped anim +
-            -- yaw_rate + passive entirely, so an enemy next to you was a stranger the
-            -- tick they peeked into 110° — cold AA model AND yaw_rate=0, which is
-            -- exactly the peek this resolver is supposed to hit. Dist < 2000 = duel
-            -- range; further behind-you is still culled (no point tracking spawn).
-            if s.tmp_dist < 2000 then
-                local anim = GetAnimStateCached(p)
-                if anim and anim ~= false then
-                    pcall(update_jitter, p, s)
-                    pcall(anim_side_update, s, p, now)
-                    pcall(passive_learn_tick, p, s, anim)
-                end
+            -- V11.6: nearby off-FOV still OBSERVE (yaw_rate / anim / passive).
+            -- V11.36: nearby off-FOV is FULLY resolved. Observe-only left the
+            -- model's feet on the fake, so the backtrack records waiting when
+            -- they peeked into 110° were unresolved — the peek this resolver
+            -- exists to hit. Dist < 2000 = duel range; further behind-you is
+            -- still culled. Costs one extra resolve per nearby off-screen
+            -- enemy; that is the FPS the user said we may spend.
+            if s.tmp_dist >= 2000 then
+                return
             end
-            return
         end
     else
         s.tmp_dist = 0
@@ -8638,5 +8668,6 @@ _cs_log_color_raw("V11.26: bug pass only (dump v11.25: 74%, first-shot 76%). (1)
 _cs_log_color_raw("V11.27: bug pass (dump v11.26: 85.4%, first-shot 89%). (1) Both resolve caches returned an ABSOLUTE angle: the first-shot cache for 150 ms, the BF cache for as long as the miss count stood still — while the enemy's eye kept moving, with invalidation only at 20° drift. On a turning enemy the resolve drifted off the head by the eye movement since caching (APILAS: Static-Meas fired -63.2 on a 58.5° lock). Both now re-anchor the cached DELTA on the current eye; side / magnitude / mode are unchanged, only the anchor follows. (2) [HITBOX] dump line (head / chest / stomach / arms / legs) and the hitgroup on every ACK entry (hit group on a HIT, aimed group on a MISS) — the data to answer 'why not the head'.")
 _cs_log_color_raw("V11.34: Air+Peek (dump v11.33 EVG: Air+Peek R 23.1 vs locked 19.5, err=3.6 KEEP, BF:retry at 19.5 was the body). Lead now needs yaw_rate_consistent (ground predictor has since V8.0; air yaw at ~230°/s is abs_yaw noise) and leads the EYE so ack err is the desync, not mag+lead. Side was already right the whole session.")
 _cs_log_color_raw("V11.35: tracking + guess-mag (dump v11.34: 72%, CANCEL 0 holds — not-firing was not cancel-conf). (1) Networked-Guess/Static-Guess used lobby-median even with real hits — CL_RunFramee 4 R-hits @9° fired 20.4, KEEP err=11.4; now sel01_guess_mag uses that side's measured. (2) Slow-walk no longer disables eye-lead / predictor (HvH tracking case); only a true standstill with yaw<20°/s skips. Sign-stable yaw_rate (4/6 samples same direction) gets a 1-tick damped lead through jitter. (3) still_ticks clear when yaw_rate>25; air clears still so landing is not stale. (4) shot-cooldown buffer 50ms→20ms so the first fireable frame is not hc=99.")
+_cs_log_color_raw("V11.36: spend FPS where it hits (no pose/bone 'model tracking' — that path is a proven dead-end on this build). (1) Nearby off-FOV (<2000u) is FULLY resolved so backtrack records are already correct when they peek into 110°. (2) Anim-layer vote is a weighted blend of every live signal, not first-wins. (3) Once shadow is calibrated (8+ scored hits, ≥60% right) the vote steers two-side jitter THIS tick (Jitter-Anim) — one-sided Jitter-Cls locks stay.")
 _cs_log_color_raw("Logging: " .. (log_enabled:get() and ("ON" .. (log_verbose:get() and " (verbose)" or ""))  or "OFF"))
 _cs_log_color_raw("=========================================")
