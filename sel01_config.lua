@@ -1,11 +1,11 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Config — Neverlose CSGO HvH config        ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 5.2                                    ║
+-- ║  Version: 5.3                                    ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Config
 -- @author seltonmt01
--- @version 5.2
+-- @version 5.3
 -- @description v5.0 META REWORK (best-of from 10 current NL luas: elysian, Andromeda,
 --   evalate 2, spectral/everlast, nexus, gazolina, arc, DEMONTIME) + new Misc tab:
 --   * Presets are now REAL meta configs with decoded values: Nyanza Snapshot (default),
@@ -133,7 +133,7 @@
 --     variance for full per-side chaos.
 --   * MAG-JIT indicator added to bottom HvH strip; dumped in v3.8 stats.
 
-local SEL01_CFG_VERSION = "5.2"
+local SEL01_CFG_VERSION = "5.3"
 
 -- DEBUG: print to CSGO console at major load checkpoints. Plain print() bypasses
 -- NL chat (which may not flush before crash) and writes directly to CSGO console.
@@ -657,7 +657,7 @@ AIP.enable   = g_move:switch("Enable AI Peek", false)
 -- v4.2: plain switch instead of trigger combo + hotkey. NL can bind ANY switch to a key
 -- (right-click), so one bindable "active" switch replaces the whole hold/always/key setup.
 AIP.active   = g_move:switch("  └ AI Peek active (bind this switch in NL)", false)
-AIP.dist     = g_move:slider("Peek distance (u)", 10, 120, 40)
+AIP.dist     = g_move:slider("Peek distance (u)", 10, 120, 55)
 AIP.delay    = g_move:slider("Confirm ticks before peeking", 0, 5, 1)
 AIP.expose   = g_move:slider("Max exposure without a shot (ms)", 80, 400, 200)
 AIP.cooldown = g_move:slider("Cooldown after retreat (ms)", 0, 2000, 250)
@@ -678,7 +678,7 @@ pcall(function()
     AIP.delay:tooltip("Consecutive ticks a shot must exist before committing. 0 = instant, 1-2 filters flickering sightlines.")
     AIP.expose:tooltip("AFTER arriving, this long without the ragebot firing → DT-teleport home. Hard-capped at 250ms so a 450ms leftover from an old config cannot leave you standing in a spray. Early peek is fine; sitting on the point is not.")
     AIP.retreat:tooltip("After the shot = blink back the moment the ragebot commits (hit or miss, does not wait for ack). When no shot exists = blink back a few ticks after arrival if the point is not actually shootable. Taking damage always blinks back.")
-    AIP.hc:tooltip("0 keeps your NL Hit Chance (recommended - the bot stops on the point, NL auto-stop handles the rest). A value here overrides HC only while peeking.")
+    AIP.hc:tooltip("0 = peek floor 50 (NL 72 never lands in a jiggle, so the ragebot would not fire). A value here is used as-is only while peeking, then restored.")
 end)
 
 -- ══════════════════════════════════════════════════════════════════════════
@@ -2301,19 +2301,22 @@ local function ai_peek_weapon_ok(lp)
     return true
 end
 
--- raise ragebot HC + optionally drop Safe Points for the peek window only.
+-- raise ragebot HC + drop Safe Points for the peek window only.
 -- BREAKS the never-override rule on purpose (user-requested). Restored on (false).
+-- hc slider 0 used to mean "keep NL 72" — a jiggle peek never reaches 72% so
+-- the ragebot does not fire (dump: PEEK dmg=153 → 3 ticks → RETREAT no shot).
+-- 0 now means peek-floor 50. Safe-points always Off while peeked: Prefer would
+-- refuse the peek shot the same way.
 local function ai_peek_set_overrides(on)
     if on then
         local hc = 0
         pcall(function() hc = AIP.hc:get() end)
-        if hc and hc > 0 and nl_refs.rage_hc and not ai_peek.hc_active then
+        if (not hc) or hc <= 0 then hc = 50 end
+        if nl_refs.rage_hc and not ai_peek.hc_active then
             nl_override(nl_refs.rage_hc, hc)
             ai_peek.hc_active = true
         end
-        local unsafe = false
-        pcall(function() unsafe = AIP.unsafe:get() end)
-        if unsafe and nl_refs.rage_safepoint and not ai_peek.sp_active then
+        if nl_refs.rage_safepoint and not ai_peek.sp_active then
             -- Safe Points is a COMBO on this build — string :override only (bool
             -- segfaults). "Off" is best-effort; pcall'd so a bad label no-ops.
             pcall(function() nl_refs.rage_safepoint:override("Off") end)
@@ -2506,13 +2509,8 @@ local function ai_peek_tick(cmd)
         -- empty clip / no gun → real retreat. weapon busy (between shots / DT
         -- recharge) → stay on the peek point and wait, do NOT yank back.
         if peeking and wwhy == "weapon busy" then
-            -- still walking out: keep going, gun may be ready on arrival.
-            -- already on the point with a gun that cannot fire → blink home
-            -- (sitting there is how the first peek ate a spray).
-            if ai_peek.arrived then
-                go_home("weapon busy on point", true)
-                return
-            end
+            -- keep walking / stay; expose + damage + aim_fire pull us back.
+            -- blinking here the moment we arrive is why PEEK dmg=153 never fired.
             local stay = ai_peek.goal or ai_peek.anchor
             if stay then ai_peek_go_to(cmd, lp, lo, stay) end
             return
@@ -2569,7 +2567,7 @@ local function ai_peek_tick(cmd)
             local dx, dy = ex - fx, ey - fy
             local len = math.sqrt(dx * dx + dy * dy)
             if len > 1 then
-                local back = 14
+                local back = 8
                 if len <= back then
                     ex, ey = fx, fy
                 else
@@ -2621,6 +2619,7 @@ local function ai_peek_tick(cmd)
     local hbsel = "Head + Body"
     pcall(function() hbsel = AIP.hitboxes:get() end)
     local shoot = nil
+    local peek_hits = {}
     local enemies = nil
     pcall(function() enemies = entity.get_players(true) end)
     local list = {}
@@ -2635,7 +2634,7 @@ local function ai_peek_tick(cmd)
     local lock_idx = 0
     if ai_peek.ent then pcall(function() lock_idx = ai_peek.ent:get_index() or 0 end) end
     for _, e in ipairs(list) do
-        if shoot then break end
+        if shoot and shoot.side == -1 then break end
         local ok_e, e_alive, e_dorm = pcall(function() return e:is_alive(), e:is_dormant() end)
         if ok_e and e_alive and not e_dorm then
             local idx = 0
@@ -2666,7 +2665,7 @@ local function ai_peek_tick(cmd)
             pcall(function() hp = e.m_iHealth or 100 end)
             local need = math.min(mindmg, hp)
             for _, pt in ipairs(points) do
-                if shoot then break end
+                if shoot and shoot.side == -1 then break end
                 local from = vector(pt.x, pt.y, pt.z)
                 for _, hb in ipairs(hbs) do
                     local dmg, hit_e = 0, nil
@@ -2681,19 +2680,37 @@ local function ai_peek_tick(cmd)
                             local hi = -1
                             pcall(function() if hit_e then hi = hit_e:get_index() end end)
                             same = (hi == idx and idx ~= 0)
-                            -- damage to this exact hitbox but no entity userdata
-                            -- (NL identity flickers) — still a valid peek shot
                             if not same and hit_e == nil then same = true end
                         end
                         if same then
-                            shoot = { pos = pt, hb = hb, side = pt.side, ent = e, dmg = dmg, idx = idx }
-                            break
+                            local rec = { pos = pt, hb = hb, side = pt.side, ent = e, dmg = dmg, idx = idx }
+                            if pt.side == -1 then
+                                shoot = rec
+                                break
+                            end
+                            peek_hits[#peek_hits + 1] = rec
+                            if peeking then shoot = rec; break end
                         end
                     end
                 end
             end
             end
         end
+    end
+    -- among peekable points take the CLOSEST that is actually out of cover
+    -- (>=22u). Closest-first used to commit a 5-8u autowall lie → "arrived"
+    -- still in cover → RETREAT no shot. If nothing reaches 22u, take farthest.
+    if (not shoot) and (not peeking) and #peek_hits > 0 then
+        local min_out = 22
+        local best_c, best_cd = nil, 9999
+        local best_f, best_fd = nil, -1
+        for _, h in ipairs(peek_hits) do
+            local dx, dy = h.pos.x - anchor.x, h.pos.y - anchor.y
+            local d = math.sqrt(dx * dx + dy * dy)
+            if d > best_fd then best_f, best_fd = h, d end
+            if d >= min_out and d < best_cd then best_c, best_cd = h, d end
+        end
+        shoot = best_c or best_f
     end
 
     -- ── confirm + side lock ──
@@ -2741,15 +2758,20 @@ local function ai_peek_tick(cmd)
 
     if peeking and ai_peek.goal then
         local d_goal = ai_peek_go_to(cmd, lp, lo, ai_peek.goal)
-        if d_goal <= 8 then
+        -- arrive only when we are ON the point (4u), not 8u short of a short
+        -- goal which is still in cover. A goal < 20u from cover is a short
+        -- peek — still arrive when d_goal <= 4 so we can fire.
+        if d_goal <= 4 then
             if not ai_peek.arrived then
                 ai_peek.arrived = true
                 ai_peek.peek_t0 = now
-                ai_peek_dev("arrived on peek point", true)
+                ai_peek_dev(string.format("arrived on peek point (out=%.0f)", d_anchor), true)
             end
         end
-        -- expose timer starts on ARRIVAL. Hard-cap 250ms: a leftover 450 from
-        -- an older config is how the first peek sat in a spray for 91 dmg.
+        -- expose timer starts on ARRIVAL. Hard-cap 250ms.
+        -- v5.3: do NOT bail on a 3-tick trace flicker — that was PEEK dmg=153
+        -- → arrived → RETREAT no shot, ragebot never got a tick to fire.
+        -- Leave on: shot / damage / this timer.
         local wait_ms = AIP.expose:get()
         if wait_ms > 250 then wait_ms = 250 end
         if ai_peek.arrived and (now - ai_peek.peek_t0) > (wait_ms / 1000) then
@@ -2762,20 +2784,6 @@ local function ai_peek_tick(cmd)
             ai_peek.timeouts = ai_peek.timeouts + 1
             go_home("walk stuck", true)
             return
-        end
-        -- arrived but the point is not actually shootable (early peek / autowall
-        -- lie): 3 ticks then blink home. Do NOT wait the full expose. Walking
-        -- out still ignores flicker (v5.1 lock).
-        if ai_peek.arrived then
-            if not shoot then
-                ai_peek.miss_streak = (ai_peek.miss_streak or 0) + 1
-                if ai_peek.miss_streak >= 3 then
-                    go_home("no shot on point", true)
-                    return
-                end
-            else
-                ai_peek.miss_streak = 0
-            end
         end
     elseif peeking and not ai_peek.goal then
         go_home("no shot", false)
@@ -5633,7 +5641,7 @@ do
 end
 
 cs_log_color("══════════════════════════════════════════")
-cs_log_color("Sel01-Config v" .. SEL01_CFG_VERSION .. " loaded (v5.2 AI Peek: DT-blink home on shot / no-shot-on-point / damage, expose capped 250ms)")
+cs_log_color("Sel01-Config v" .. SEL01_CFG_VERSION .. " loaded (v5.3 AI Peek: walk out >=22u, HC floor 50, no 3-tick no-shot bail)")
 cs_log(string.format("  hooks  createmove=%s  createmove_run=%s  aim_fire=%s  bullet_impact=%s  anim=%s",
     tostring(_hooks_status.createmove or "MISSING"),
     tostring(_hooks_status.createmove_run or "MISSING"),
