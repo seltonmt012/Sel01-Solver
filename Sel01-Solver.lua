@@ -1,12 +1,15 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 11.33                                  ║
+-- ║  Version: 11.34                                  ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 11.33
--- @description v11.33: one-sided BF sweep walks OUTWARD from the learned magnitude
+-- @version 11.34
+-- @description v11.34: Air+Peek required yaw_rate_consistent and now leads the EYE
+--   (ground-parallel) so a noisy air rate cannot drag a locked desync off by 3-4°.
+--   Dump v11.33 EVG: Air+Peek R 23.1 vs locked 19.5, err=3.6 KEEP, then BF:retry
+--   at 19.5 was the body. v11.33: one-sided BF sweep walks OUTWARD from the learned magnitude
 --   (was top-down from 58), the BF list no longer skips its first entry after a
 --   BF:retry, retry window 1s to 2s (sniper cycle time). v11.32: HUD corner panel ON in every preset + in the Lean visual set.
 --   v11.31: dump-readiness % (Logging label + HUD line, 20 shots = 100%),
@@ -18,7 +21,7 @@
 --   full multipoint; [FL] hit-rate by target choke; animation-layer read scored in
 --   shadow ([ANIM] line) while the toggle stays off. v11.28 SSG body-hit fix. History in git.
 
-local SEL01_VERSION = "11.33"
+local SEL01_VERSION = "11.34"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -6589,6 +6592,14 @@ local function resolve_player(p)
         -- branch never reaches. Dump v11.6: Air 16/18, ZERO +Peek in 24 shots —
         -- the peeks were airborne. Same 1-tick cap, slightly higher yaw_rate bar
         -- because air yaw is noisier.
+        -- V11.34: two bugs in that lead (dump v11.33 EVG Air+Peek R +23.1 vs
+        -- locked 19.5, err=3.6 KEEP, then BF:retry at 19.5 hit). (1) no
+        -- yaw_rate_consistent gate — ground's main predictor has had it since
+        -- V8.0; air yaw at 230°/s is usually jitter of abs_yaw, not a turn.
+        -- (2) lead was added to FEET while last_eye_yaw stayed the RAW eye, so
+        -- ack saw mag+lead as a desync overshoot. Mirror ground V11.26: lead
+        -- the eye, keep the desync offset, store the eye the resolve used.
+        local air_eye = anim.m_flEyeYaw
         do
             local sp = 0
             pcall(function()
@@ -6597,15 +6608,17 @@ local function resolve_player(p)
             end)
             if math.abs(s.yaw_rate or 0) > 120 and sp > 80
                and not s.jittering and (s.tmp_dist or 9999) < 1500
-               and not s.tp_peek_active and not s.dtpeek_active then
+               and not s.tp_peek_active and not s.dtpeek_active
+               and s.yaw_rate_consistent then
                 local lead = (s.yaw_rate or 0) * ((tick_cache and tick_cache.tickint) or (1 / 64))
                 if math.abs(lead) >= 2 and math.abs(lead) <= 18 then
+                    air_eye    = NormalizeAngle(air_eye + lead)
                     server_yaw = NormalizeAngle(server_yaw + lead)
                     s.mode = tostring(s.mode or "Air") .. "+Peek"
                 end
             end
         end
-        s.last_eye_yaw  = anim.m_flEyeYaw
+        s.last_eye_yaw  = air_eye
         s.last_resolved = NormalizeAngle(server_yaw)  -- V10.9: store normalized
         -- V9.33: push to recent_resolved (mirrors the ground path) so cancel-conf's
         -- stddev gate + confidence() reflect AIR volatility, not stale ground data.
@@ -6614,7 +6627,7 @@ local function resolve_player(p)
         local _ri = (s.recent_resolved_idx or 0) % 5 + 1
         s.recent_resolved_idx = _ri
         local _re = s.recent_resolved[_ri]
-        local _d = NormalizeAngle(server_yaw - (anim.m_flEyeYaw or 0))
+        local _d = NormalizeAngle(server_yaw - air_eye)
         if _re then _re.a = server_yaw; _re.t = now_ct; _re.d = _d
         else s.recent_resolved[_ri] = {a = server_yaw, t = now_ct, d = _d} end
         anim.m_flGoalFeetYaw = NormalizeAngle(server_yaw)
@@ -8565,5 +8578,6 @@ _cs_log_color_raw("V11.24: bug pass only (dump v11.23: 75%, first-shot 75%). (1)
 _cs_log_color_raw("V11.25: bug pass only (dump v11.24). (1) The passive per-side seed was written once (gated on samples==0) and then frozen while passive_* kept updating — Zero: seeded L 32.4 at 12 obs, passive L drifted to 18.0 over 1219 obs, both shots fired the frozen 32.4 because effective_desync ranks a seeded EMA above the live passive value. A side with no real hit now tracks the live passive magnitude; sides with real hits untouched, no new side seeded. (2) Global passive seed took max(L, R): Zero R 56.9 from 189 obs beat L 18.0 from 1219. Now the better-observed side. Note: two different players both named '0' share one persist entry (name-hash sid) — a limitation of the name fallback, not fixable without a real Steam ID on this build.")
 _cs_log_color_raw("V11.26: bug pass only (dump v11.25: 74%, first-shot 76%). (1) last_eye_yaw stored the RAW eye while the first-shot resolve was built on the interp-comp / lead eye, so every lead showed up as magnitude error in the ack (kurokoai Networked-Meas R 40.0 vs 26.4 measured = 26.4 + 13.6 lead at -209°/s, then NOFREEZE) and was LEARNED as desync on a hit. The eye the resolve used is stored now; the first-contact 58° cap keeps the raw eye on purpose. (2) V9.2 idle decay shrank REAL measurements: brandogdsa 1 real L-hit 37.5, six minutes away, live EMA 26.3 (persist 37.5), Static-ServerBoost-Recall fired 26.3 at bt=0, miss. Decay now only for seed-only enemies. (3) [KEEP] STATIC always read '-': reset_state cleared pending_keep_side on dormancy, i.e. for exactly the static enemies you re-engage after a gap. Kept until the next shot settles it.")
 _cs_log_color_raw("V11.27: bug pass (dump v11.26: 85.4%, first-shot 89%). (1) Both resolve caches returned an ABSOLUTE angle: the first-shot cache for 150 ms, the BF cache for as long as the miss count stood still — while the enemy's eye kept moving, with invalidation only at 20° drift. On a turning enemy the resolve drifted off the head by the eye movement since caching (APILAS: Static-Meas fired -63.2 on a 58.5° lock). Both now re-anchor the cached DELTA on the current eye; side / magnitude / mode are unchanged, only the anchor follows. (2) [HITBOX] dump line (head / chest / stomach / arms / legs) and the hitgroup on every ACK entry (hit group on a HIT, aimed group on a MISS) — the data to answer 'why not the head'.")
+_cs_log_color_raw("V11.34: Air+Peek (dump v11.33 EVG: Air+Peek R 23.1 vs locked 19.5, err=3.6 KEEP, BF:retry at 19.5 was the body). Lead now needs yaw_rate_consistent (ground predictor has since V8.0; air yaw at ~230°/s is abs_yaw noise) and leads the EYE so ack err is the desync, not mag+lead. Side was already right the whole session.")
 _cs_log_color_raw("Logging: " .. (log_enabled:get() and ("ON" .. (log_verbose:get() and " (verbose)" or ""))  or "OFF"))
 _cs_log_color_raw("=========================================")
