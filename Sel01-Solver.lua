@@ -1,12 +1,15 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 11.36                                  ║
+-- ║  Version: 11.37                                  ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 11.36
--- @description v11.36: spend FPS where it hits. Nearby off-FOV enemies are fully
+-- @version 11.37
+-- @description v11.37: a BF:+90 / flick hit on the body no longer counts as side
+--   evidence (only head/neck does), so one stomach probe can't turn a one-sided
+--   enemy into a "two-side" switcher.
+--   v11.36: spend FPS where it hits. Nearby off-FOV enemies are fully
 --   resolved (backtrack records ready on peek). Anim-layer vote is a weighted
 --   blend (not first-wins) and steers two-side jitter once shadow is calibrated.
 --   v11.35: tracking + guess-mag. Slow-walk no longer kills eye-lead;
@@ -26,7 +29,7 @@
 --   full multipoint; [FL] hit-rate by target choke; animation-layer read scored in
 --   shadow ([ANIM] line) while the toggle stays off. v11.28 SSG body-hit fix. History in git.
 
-local SEL01_VERSION = "11.36"
+local SEL01_VERSION = "11.37"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -4090,7 +4093,22 @@ events.aim_ack:set(function(event)
             -- Dump: LBY-Snap "hit" at -172.2 gave Dance (8/8 RIGHT) a real_left=1 and
             -- a persisted L=1/0.0°, which made him a "two-side switcher" for the keep
             -- logic. BF:+90 / flick hits (80-100°) still count; 120 is the cut.
-            if math.abs(d) > 3 and math.abs(d) <= 120 then
+            -- V11.37: a probe hit (|d|>65, BF:+90 / flick) only proves the SIDE when it
+            -- landed on head/neck. Chest / stomach / limbs sit near the spine axis and
+            -- barely move with a yaw rotation, so a 90° body hit is hit regardless of the
+            -- real side. Dump idx=7: L proven by an Air head hit at 47.7, then BF:+90
+            -- STOMACH hit made him real L1/R1 = "two-side" (no-freeze keep, alt picks).
+            local _probe_body = false
+            if math.abs(d) > 65 then
+                local _hg = -1
+                pcall(function() _hg = event.hitgroup or -1 end)
+                _probe_body = (_hg ~= 1 and _hg ~= 8)
+                if _probe_body then
+                    cs_log_verbose("probe body-hit idx=%d delta=%.1f hitgroup=%s → no side learned",
+                                   Ent:get_index(), d, tostring(_hg))
+                end
+            end
+            if math.abs(d) > 3 and math.abs(d) <= 120 and not _probe_body then
                 hit_side = d > 0 and 1 or -1
                 s.last_hit_side = hit_side
             end
@@ -4285,10 +4303,12 @@ events.aim_ack:set(function(event)
             end
         end
         -- streak side memory (uses freshly computed last_hit_side)
-        if s.last_hit_side > 0 then
+        -- V11.37: keyed on THIS hit's side — a no-evidence hit (body probe / near-180)
+        -- left last_hit_side on the previous side and bumped that streak for free.
+        if hit_side > 0 then
             s.hit_streak_right = s.hit_streak_right + 1
             s.hit_streak_left  = math.max(s.hit_streak_left - 1, 0)
-        elseif s.last_hit_side < 0 then
+        elseif hit_side < 0 then
             s.hit_streak_left  = s.hit_streak_left + 1
             s.hit_streak_right = math.max(s.hit_streak_right - 1, 0)
         end
@@ -8669,5 +8689,6 @@ _cs_log_color_raw("V11.27: bug pass (dump v11.26: 85.4%, first-shot 89%). (1) Bo
 _cs_log_color_raw("V11.34: Air+Peek (dump v11.33 EVG: Air+Peek R 23.1 vs locked 19.5, err=3.6 KEEP, BF:retry at 19.5 was the body). Lead now needs yaw_rate_consistent (ground predictor has since V8.0; air yaw at ~230°/s is abs_yaw noise) and leads the EYE so ack err is the desync, not mag+lead. Side was already right the whole session.")
 _cs_log_color_raw("V11.35: tracking + guess-mag (dump v11.34: 72%, CANCEL 0 holds — not-firing was not cancel-conf). (1) Networked-Guess/Static-Guess used lobby-median even with real hits — CL_RunFramee 4 R-hits @9° fired 20.4, KEEP err=11.4; now sel01_guess_mag uses that side's measured. (2) Slow-walk no longer disables eye-lead / predictor (HvH tracking case); only a true standstill with yaw<20°/s skips. Sign-stable yaw_rate (4/6 samples same direction) gets a 1-tick damped lead through jitter. (3) still_ticks clear when yaw_rate>25; air clears still so landing is not stale. (4) shot-cooldown buffer 50ms→20ms so the first fireable frame is not hc=99.")
 _cs_log_color_raw("V11.36: spend FPS where it hits (no pose/bone 'model tracking' — that path is a proven dead-end on this build). (1) Nearby off-FOV (<2000u) is FULLY resolved so backtrack records are already correct when they peek into 110°. (2) Anim-layer vote is a weighted blend of every live signal, not first-wins. (3) Once shadow is calibrated (8+ scored hits, ≥60% right) the vote steers two-side jitter THIS tick (Jitter-Anim) — one-sided Jitter-Cls locks stay.")
+_cs_log_color_raw("V11.37: probe-hit side fix (dump v11.36: 63%). A hit at a 65°+ probe angle (BF:+90 / flick) only proves the side on head/neck — chest/stomach sit near the spine axis and get hit whatever the real side is. idx=7: L proven by an Air head hit, then a BF:+90 STOMACH hit made him real L1/R1 = two-side (no-freeze keeps, alternating picks). Body probe hits now learn no side; the hit streak also keys on this hit's side instead of the previous one.")
 _cs_log_color_raw("Logging: " .. (log_enabled:get() and ("ON" .. (log_verbose:get() and " (verbose)" or ""))  or "OFF"))
 _cs_log_color_raw("=========================================")
