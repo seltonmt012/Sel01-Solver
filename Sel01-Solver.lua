@@ -1,12 +1,16 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 11.37                                  ║
+-- ║  Version: 11.38                                  ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 11.37
--- @description v11.37: a BF:+90 / flick hit on the body no longer counts as side
+-- @version 11.38
+-- @description v11.38: a spread miss on a proven side no longer flags defensive AA
+--   (and -DefInv never inverts away from the proven side), a hard one-sided lock gets
+--   one magnitude probe before the ±90 flick BF entries, air shots use a validated
+--   per-side magnitude with a 15° floor when unproven.
+--   v11.37: a BF:+90 / flick hit on the body no longer counts as side
 --   evidence (only head/neck does), so one stomach probe can't turn a one-sided
 --   enemy into a "two-side" switcher.
 --   v11.36: spend FPS where it hits. Nearby off-FOV enemies are fully
@@ -29,7 +33,7 @@
 --   full multipoint; [FL] hit-rate by target choke; animation-layer read scored in
 --   shadow ([ANIM] line) while the toggle stays off. v11.28 SSG body-hit fix. History in git.
 
-local SEL01_VERSION = "11.37"
+local SEL01_VERSION = "11.38"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -1427,6 +1431,20 @@ end
 -- V11.35: *-Guess fallbacks used adaptive_guess_mag() (lobby median) even with
 -- real hits. Dump CL_RunFramee: 4 R-hits @9°, Networked-Guess fired 20.4 (median),
 -- KEEP err=11.4. Prefer that side's measured/passive, then global EMA, then median.
+-- V11.38: air-branch magnitude. The two air paths read measured_left/right with no
+-- sample check, so a decayed / seeded per-side EMA just above 5 fired. Dump v11.37
+-- idx=4: never hit, passive L 6.3°, Air shot -5.0 (near the eye) and missed; the
+-- next four hits all landed at 16.8. Uses sel01_side_mag (needs a real sample on that
+-- side for the measured value) and floors an unvalidated number at 15 — below that a
+-- passive seed is feet-yaw lag noise, not a desync.
+function sel01_air_mag(s, side, fallback)
+    local m = sel01_side_mag(s, side)
+    if m <= 5 then m = fallback or 0 end
+    local real_side = (side > 0 and (s.real_right or 0)) or (side < 0 and (s.real_left or 0)) or 0
+    if real_side == 0 and m < 15 then m = 15 end
+    return m
+end
+
 function sel01_guess_mag(s, side)
     local m = sel01_side_mag(s, side)
     if m > 5 then return m end
@@ -3657,7 +3675,16 @@ events.aim_ack:set(function(event)
         end
         steam_mem_on_miss(Ent)
         -- defensive-AA hint: enemy moved post-fire ("spread" state)
-        if reason == "spread" and exp_def_aa and exp_def_aa:get() then
+        -- V11.38: not on a PROVEN angle. Since V9.72 spread = angle accepted, bullet RNG,
+        -- so a spread miss on a side with 2+ real hits is no evidence of anything. Dump
+        -- v11.37: idx=1 (22 L / 0 R) and idx=7 (0 L / 20 R) got def=true from Air spread
+        -- misses — def_delta just copied OUR shot delta, and the flag arms the -DefInv
+        -- side inversion on the next first shot (missed resets on dormancy, the flag
+        -- does not) = onto the side they have never been on.
+        local _spr_side = tonumber(ack_shot_side) or 0
+        local _spr_real = (_spr_side > 0 and (s.real_right or 0))
+                          or (_spr_side < 0 and (s.real_left or 0)) or 0
+        if reason == "spread" and exp_def_aa and exp_def_aa:get() and _spr_real < 2 then
             s.defensive_aa = true
             -- V9.3: fingerprint def-AA delta — magnitude of post-fire jump
             local d_mag = math.abs(NormalizeAngle((s.last_resolved or 0) - (s.last_eye_yaw or 0)))
@@ -5608,7 +5635,10 @@ local function _pick_first_shot_impl(p, s, anim, eye_yaw, max_desync, preset)
             side = sign(rel) * -1
         end
         -- defensive-AA: invert + V9.3 use def_delta fingerprint
-        if s.defensive_aa and exp_def_aa and exp_def_aa:get() then
+        -- V11.38: never invert AWAY from the proven side (real hits / streak lead 2+).
+        -- A stale flag (set before a dormancy reset) flipped Predicted-Streak off a
+        -- 22-0 enemy. With no proven side the inversion runs as before.
+        if s.defensive_aa and exp_def_aa and exp_def_aa:get() and learned_dom_side(s) ~= side then
             side = -side
             s.mode = s.mode .. "-DefInv"
             -- V9.3: if we learned the def-AA jump magnitude, use it directly
@@ -5894,6 +5924,23 @@ local function pick_bruteforce_angle(s, anim, eye_yaw, max_desync, p, preset)
             bf_list = {"-90", "+90", "opposite", "+58", "-58", "0"}
         else
             bf_list = {"+90", "-90", "opposite", "+58", "-58", "0"}
+        end
+        -- V11.38: a HARD one-sided lock (5+ real hits, other side 0) gets one magnitude
+        -- probe on its proven side before the ±90 flick entries. Dump v11.37 idx=1:
+        -- 22 L / 0 R at 31.6°, silent-flick flag from 11 wide feet-yaw reads on +1 —
+        -- a bt=0 miss fired BF:+90 (R, 90°) and missed; the later -35 probe on L hit.
+        -- Flickers without real hits (the V11.22 Burgie case) keep ±90 first.
+        if one_sided and math.max(rl, rr) >= 5 then
+            local sgn = (rl > rr) and "-" or "+"
+            local lm = effective_desync(s, max_desync, (sgn == "+") and 1 or -1)
+            local near, nd = 35, 999
+            if lm and lm > 5 and lm < 65 then
+                for _, c in ipairs({58, 45, 35, 29, 20}) do
+                    local d = math.abs(c - lm)
+                    if d >= 3 and d < nd then near, nd = c, d end
+                end
+            end
+            table.insert(bf_list, 1, sgn .. tostring(near))
         end
     end
 
@@ -6629,9 +6676,7 @@ local function resolve_player(p)
             -- V9.19: dom-bias for Air-Alt — prefer dom if it leads by 2+
             local side = alt_side_pick(s)
             if side == 0 then side = -s.last_hit_side end
-            local mag = (side > 0 and s.measured_right > 5) and s.measured_right
-                     or (side < 0 and s.measured_left > 5)  and s.measured_left
-                     or s.measured_desync
+            local mag = sel01_air_mag(s, side, air_guess_mag)
             server_yaw = anim.m_flEyeYaw + mag * side
             s.mode = "Air-Alt"
         -- correction-aware: if recent corrections on one side, flip
@@ -6657,9 +6702,7 @@ local function resolve_player(p)
             end
             -- V9.34: per-side magnitude (was global measured_desync — wrong for
             -- bimodal / per-side enemies; same class as the v9.22 ground fix).
-            local mag = (side > 0 and (s.measured_right or 0) > 5) and s.measured_right
-                     or (side < 0 and (s.measured_left or 0) > 5)  and s.measured_left
-                     or s.measured_desync
+            local mag = sel01_air_mag(s, side, air_guess_mag)
             server_yaw = anim.m_flEyeYaw + mag * side
         end
         -- FIX #3: cold air → force the alternating guess (do NOT trust RebuildServerYaw).
@@ -8689,6 +8732,7 @@ _cs_log_color_raw("V11.27: bug pass (dump v11.26: 85.4%, first-shot 89%). (1) Bo
 _cs_log_color_raw("V11.34: Air+Peek (dump v11.33 EVG: Air+Peek R 23.1 vs locked 19.5, err=3.6 KEEP, BF:retry at 19.5 was the body). Lead now needs yaw_rate_consistent (ground predictor has since V8.0; air yaw at ~230°/s is abs_yaw noise) and leads the EYE so ack err is the desync, not mag+lead. Side was already right the whole session.")
 _cs_log_color_raw("V11.35: tracking + guess-mag (dump v11.34: 72%, CANCEL 0 holds — not-firing was not cancel-conf). (1) Networked-Guess/Static-Guess used lobby-median even with real hits — CL_RunFramee 4 R-hits @9° fired 20.4, KEEP err=11.4; now sel01_guess_mag uses that side's measured. (2) Slow-walk no longer disables eye-lead / predictor (HvH tracking case); only a true standstill with yaw<20°/s skips. Sign-stable yaw_rate (4/6 samples same direction) gets a 1-tick damped lead through jitter. (3) still_ticks clear when yaw_rate>25; air clears still so landing is not stale. (4) shot-cooldown buffer 50ms→20ms so the first fireable frame is not hc=99.")
 _cs_log_color_raw("V11.36: spend FPS where it hits (no pose/bone 'model tracking' — that path is a proven dead-end on this build). (1) Nearby off-FOV (<2000u) is FULLY resolved so backtrack records are already correct when they peek into 110°. (2) Anim-layer vote is a weighted blend of every live signal, not first-wins. (3) Once shadow is calibrated (8+ scored hits, ≥60% right) the vote steers two-side jitter THIS tick (Jitter-Anim) — one-sided Jitter-Cls locks stay.")
+_cs_log_color_raw("V11.38: dump v11.37 (85.5%). (1) Spread misses on a side with 2+ real hits no longer set defensive AA (idx=1 22-0 and idx=7 0-20 got def=true; the flag arms -DefInv, which flips the next first shot off the proven side) and -DefInv never inverts away from learned_dom_side. (2) Silent-flick BF on a hard one-sided lock (5+ real, other side 0) probes the proven side's nearest magnitude before ±90 (idx=1 BF:+90 R missed, -35 L hit). (3) Air paths use sel01_side_mag + a 15° floor when unproven (idx=4 Air shot -5.0 from a 6° passive seed, real 16.8).")
 _cs_log_color_raw("V11.37: probe-hit side fix (dump v11.36: 63%). A hit at a 65°+ probe angle (BF:+90 / flick) only proves the side on head/neck — chest/stomach sit near the spine axis and get hit whatever the real side is. idx=7: L proven by an Air head hit, then a BF:+90 STOMACH hit made him real L1/R1 = two-side (no-freeze keeps, alternating picks). Body probe hits now learn no side; the hit streak also keys on this hit's side instead of the previous one.")
 _cs_log_color_raw("Logging: " .. (log_enabled:get() and ("ON" .. (log_verbose:get() and " (verbose)" or ""))  or "OFF"))
 _cs_log_color_raw("=========================================")
