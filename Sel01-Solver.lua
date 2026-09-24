@@ -1,12 +1,15 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 11.38                                  ║
+-- ║  Version: 11.39                                  ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 11.38
--- @description v11.38: a spread miss on a proven side no longer flags defensive AA
+-- @version 11.39
+-- @description v11.39: flick-hit memory — a head hit at a ±90 probe angle is remembered
+--   and fired as the next first shot (Flick-Recall, also from the air); a legal hit or
+--   a missed recall spends a charge.
+--   v11.38: a spread miss on a proven side no longer flags defensive AA
 --   (and -DefInv never inverts away from the proven side), a hard one-sided lock gets
 --   one magnitude probe before the ±90 flick BF entries, air shots use a validated
 --   per-side magnitude with a 15° floor when unproven.
@@ -33,7 +36,7 @@
 --   full multipoint; [FL] hit-rate by target choke; animation-layer read scored in
 --   shadow ([ANIM] line) while the toggle stays off. v11.28 SSG body-hit fix. History in git.
 
-local SEL01_VERSION = "11.38"
+local SEL01_VERSION = "11.39"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -1816,7 +1819,7 @@ local log_copy_btn = g_logging:button("📋 Copy Last Logs (for share)", functio
             if ok then _cs_log_raw(line)
             else _cs_log_raw("[P] (format error idx=" .. tostring(idx) .. ")") end
             pcall(function()
-                _cs_log_raw(string.format("    └ flags{slow=%s still=%s def=%s lby=%s ff=%s/%d silent=%s/w%d/n%d/%.0f°%+d alt=%s/%d} streak{L=%d R=%d} corr{L=%d R=%d} yaw_rate=%.1f last_hit=%d dist=%.0f miss_rate=%.0f%% p_hits=%d/%d sf=%d spr=%d btRes=%s fl=%.1f/%d%s stand=%d/%d move=%d/%d hist=%s pass=%d pL=%d pR=%d",
+                _cs_log_raw(string.format("    └ flags{slow=%s still=%s def=%s lby=%s ff=%s/%d silent=%s/w%d/n%d/%.0f°%+d alt=%s/%d} streak{L=%d R=%d} corr{L=%d R=%d} yaw_rate=%.1f last_hit=%d dist=%.0f miss_rate=%.0f%% p_hits=%d/%d sf=%d spr=%d btRes=%s fl=%.1f/%d%s stand=%d/%d move=%d/%d hist=%s pass=%d pL=%d pR=%d fmem=%d/%+d/%.0f",
                     tostring(s.is_slow_target), tostring(s.is_stationary or false),
                     tostring(s.defensive_aa), tostring(s.lby_snap),
                     tostring(s.fake_flick or false), tonumber(s.ff_score) or 0,
@@ -1836,7 +1839,9 @@ local log_copy_btn = g_logging:button("📋 Copy Last Logs (for share)", functio
                     tonumber(s.move_n_l) or 0, tonumber(s.move_n_r) or 0,
                     hist,
                     tonumber(s.passive_samples) or 0,
-                    tonumber(s.passive_n_left) or 0, tonumber(s.passive_n_right) or 0))
+                    tonumber(s.passive_n_left) or 0, tonumber(s.passive_n_right) or 0,
+                    tonumber(s.flick_mem_n) or 0, tonumber(s.flick_mem_side) or 0,   -- V11.39
+                    tonumber(s.flick_mem_mag) or 0))
             end)
             end  -- end skip-idx-0 filter
         end
@@ -2585,7 +2590,9 @@ local function learning_update_hit(p, side, desync_value, aa_type, mode, speed2d
         -- not an AA-pattern. Stored as best_static/best_switch it never triggers the fast-path
         -- (3400 only acts on Static/Jitter) but DOES break intel.mode_match on grounded resolves
         -- (4435) → false mismatch → +15 conf cancel threshold → good shots cancelled. Pure liability.
-        local is_fallback = clean:find("^BF:") or clean:find("Guess") or clean:find("^Air") or clean == "Init"
+        -- V11.39: Flick-* are 90° probe answers, never a best-mode for Recall.
+        local is_fallback = clean:find("^BF:") or clean:find("Guess") or clean:find("^Air")
+                            or clean:find("^Flick") or clean == "Init"
         if not is_fallback then
             -- V11.4: sticky vote, not last-write-wins. A single Static-Server hit after
             -- 20 Static-Meas hits used to replace the best and Recall fired the worse mode.
@@ -4036,6 +4043,12 @@ events.aim_ack:set(function(event)
                            Ent:get_index(), tostring(s.mode), s.spread_misses, sel01_session_spreadfails)
         else
             s.last_miss_server_fail = false  -- FIX #6: real resolver miss — mode-confidence MAY decay
+            -- V11.39: a missed Flick-Recall spends a charge; with charges left try the
+            -- other side next (Silent flick flips its sign every send).
+            if tostring(s.mode or ""):find("^Flick%-Recall") and (s.flick_mem_n or 0) > 0 then
+                s.flick_mem_n = s.flick_mem_n - 1
+                if s.flick_mem_n > 0 then s.flick_mem_side = -(s.flick_mem_side or 1) end
+            end
             learning_update_miss(Ent)
             mode_stats_update(tostring(s.mode), false)
             record_player_shot(s, false)  -- V8.0: per-player hit-rate
@@ -4138,6 +4151,23 @@ events.aim_ack:set(function(event)
             if math.abs(d) > 3 and math.abs(d) <= 120 and not _probe_body then
                 hit_side = d > 0 and 1 or -1
                 s.last_hit_side = hit_side
+            end
+            -- V11.39: FLICK-HIT MEMORY. A head hit at a probe angle (|d| > 65) proves this
+            -- enemy is hittable ~90° off the eye, but nothing remembered it: persist stores
+            -- the side only, the EMA refuses > 65, and missed resets on the hit — so the
+            -- very next first shot went back to the legal ~30°. Dump j (silent-flagged):
+            -- BF:+90 HIT R → Air R 30.4 miss → Air L -32.5 miss → BF:+90 HIT; ±90 went 2/2,
+            -- legal 1/4. Remember it; sel01_flick_recall_ok feeds the first shot. A legal
+            -- hit or a missed recall each take one charge off, so it never outlives the
+            -- evidence (cap 3).
+            if math.abs(d) > 65 and math.abs(d) <= 120 and not _probe_body then
+                s.flick_mem_side = d > 0 and 1 or -1
+                s.flick_mem_mag  = math.min(math.abs(d), 100)
+                s.flick_mem_n    = math.min((s.flick_mem_n or 0) + 1, 3)
+                cs_log_verbose("flick-mem idx=%d side=%d mag=%.1f charges=%d (head hit at probe angle)",
+                               Ent:get_index(), s.flick_mem_side, s.flick_mem_mag, s.flick_mem_n)
+            elseif math.abs(d) >= 1 and math.abs(d) <= 65 and (s.flick_mem_n or 0) > 0 then
+                s.flick_mem_n = s.flick_mem_n - 1
             end
         end
         -- V9.67 #A: feed the pose-param calibrator the confirmed hit-side so it can find
@@ -5064,6 +5094,13 @@ function anim_pol_dump()
     end
 end
 
+-- V11.39: GLOBAL (main chunk at the 200-local cap). Also read by the air-branch gate,
+-- which otherwise returns before the first-shot picker could fire the recall.
+function sel01_flick_recall_ok(s)
+    return s and exp_silentflick and exp_silentflick:get()
+           and (s.flick_mem_n or 0) >= 1 and (s.flick_mem_side or 0) ~= 0
+end
+
 local function _pick_first_shot_impl(p, s, anim, eye_yaw, max_desync, preset)
     local vx, vy = 0, 0
     pcall(function()
@@ -5098,6 +5135,12 @@ local function _pick_first_shot_impl(p, s, anim, eye_yaw, max_desync, preset)
                         or (guess_side ~= 0 and guess_side or 1)
         s.mode = "Flick-Meas"
         return NormalizeAngle(eye_yaw + ff_mag * ff_side)
+    end
+    -- V11.39: remembered flick hit (see flick-mem in aim_ack). This tick's server side
+    -- wins when the impossible band is live (handled above); otherwise the side that hit.
+    if sel01_flick_recall_ok(s) then
+        s.mode = "Flick-Recall"
+        return NormalizeAngle(eye_yaw + (s.flick_mem_mag or 90) * s.flick_mem_side)
     end
 
     -- V9.66 #1: keep the RAW eye for the sanity bound below. extrapolate_yaw applies
@@ -6597,6 +6640,8 @@ local function resolve_player(p)
     -- that already routes a pending BF:retry this way). Cold air (no measurement)
     -- keeps the air-branch: its own Air-BFGuess alternation (FIX #3) covers that.
     local air_yield_bf = (s.missed or 0) > 0 and (s.measured_desync or 0) > 5
+    -- V11.39: a remembered flick hit fires from the ground path's first-shot picker.
+    if (s.missed or 0) == 0 and sel01_flick_recall_ok(s) then air_yield_bf = true end
     -- airborne: enemies still have desync in air. Use server-yaw reconstruction
     -- (old approach assumed 0 desync → broke on nospread)
     if tick_cache.ui_air_resolve and not anim.m_bOnGround and not bf_retry_pending and not air_yield_bf then  -- V9.71: per-tick cached; V9.74: yield to pending BF:retry; V11.15: yield to BF after a miss
@@ -8733,6 +8778,7 @@ _cs_log_color_raw("V11.34: Air+Peek (dump v11.33 EVG: Air+Peek R 23.1 vs locked 
 _cs_log_color_raw("V11.35: tracking + guess-mag (dump v11.34: 72%, CANCEL 0 holds — not-firing was not cancel-conf). (1) Networked-Guess/Static-Guess used lobby-median even with real hits — CL_RunFramee 4 R-hits @9° fired 20.4, KEEP err=11.4; now sel01_guess_mag uses that side's measured. (2) Slow-walk no longer disables eye-lead / predictor (HvH tracking case); only a true standstill with yaw<20°/s skips. Sign-stable yaw_rate (4/6 samples same direction) gets a 1-tick damped lead through jitter. (3) still_ticks clear when yaw_rate>25; air clears still so landing is not stale. (4) shot-cooldown buffer 50ms→20ms so the first fireable frame is not hc=99.")
 _cs_log_color_raw("V11.36: spend FPS where it hits (no pose/bone 'model tracking' — that path is a proven dead-end on this build). (1) Nearby off-FOV (<2000u) is FULLY resolved so backtrack records are already correct when they peek into 110°. (2) Anim-layer vote is a weighted blend of every live signal, not first-wins. (3) Once shadow is calibrated (8+ scored hits, ≥60% right) the vote steers two-side jitter THIS tick (Jitter-Anim) — one-sided Jitter-Cls locks stay.")
 _cs_log_color_raw("V11.38: dump v11.37 (85.5%). (1) Spread misses on a side with 2+ real hits no longer set defensive AA (idx=1 22-0 and idx=7 0-20 got def=true; the flag arms -DefInv, which flips the next first shot off the proven side) and -DefInv never inverts away from learned_dom_side. (2) Silent-flick BF on a hard one-sided lock (5+ real, other side 0) probes the proven side's nearest magnitude before ±90 (idx=1 BF:+90 R missed, -35 L hit). (3) Air paths use sel01_side_mag + a 15° floor when unproven (idx=4 Air shot -5.0 from a 6° passive seed, real 16.8).")
+_cs_log_color_raw("V11.39: flick-hit memory (dump v11.38 65.6%, j: ±90 2/2 vs legal 1/4). A HEAD hit at a probe angle (|d|>65) stores side + magnitude as up to 3 charges; the next first shot fires it as Flick-Recall (the air-branch yields to it). A legal hit or a missed recall spends a charge; a miss with charges left swaps the side (Silent flick alternates). Dump shows fmem=charges/side/mag.")
 _cs_log_color_raw("V11.37: probe-hit side fix (dump v11.36: 63%). A hit at a 65°+ probe angle (BF:+90 / flick) only proves the side on head/neck — chest/stomach sit near the spine axis and get hit whatever the real side is. idx=7: L proven by an Air head hit, then a BF:+90 STOMACH hit made him real L1/R1 = two-side (no-freeze keeps, alternating picks). Body probe hits now learn no side; the hit streak also keys on this hit's side instead of the previous one.")
 _cs_log_color_raw("Logging: " .. (log_enabled:get() and ("ON" .. (log_verbose:get() and " (verbose)" or ""))  or "OFF"))
 _cs_log_color_raw("=========================================")
