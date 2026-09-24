@@ -5,7 +5,7 @@
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Config
 -- @author seltonmt01
--- @version 5.5
+-- @version 5.6
 -- @description v5.0 META REWORK (best-of from 10 current NL luas: elysian, Andromeda,
 --   evalate 2, spectral/everlast, nexus, gazolina, arc, DEMONTIME) + new Misc tab:
 --   * Presets are now REAL meta configs with decoded values: Nyanza Snapshot (default),
@@ -133,7 +133,7 @@
 --     variance for full per-side chaos.
 --   * MAG-JIT indicator added to bottom HvH strip; dumped in v3.8 stats.
 
-local SEL01_CFG_VERSION = "5.5"
+local SEL01_CFG_VERSION = "5.6"
 
 -- DEBUG: print to CSGO console at major load checkpoints. Plain print() bypasses
 -- NL chat (which may not flush before crash) and writes directly to CSGO console.
@@ -4771,7 +4771,11 @@ local function aa_state_line(key)
 end
 local function aa_engine_config_lines()
     local L = {}
-    L[#L + 1] = string.format("  engine=%s active=%s pitch=%s base=%s dir=%s avoid_bs=%s legs=%s idle=%s/%d/%s manual_static=%s man_base=%s",
+    -- v5.6: all three gates of aa_engine_tick. The dump used to print only AA.enable,
+    -- so "engine=ON active=OFF" hid WHICH switch was off (a 32-min session ran with the
+    -- Main-tab "Anti-Aim from this lua" OFF and every hint below described an idle engine).
+    L[#L + 1] = string.format("  master=%s lua_aa=%s engine=%s active=%s pitch=%s base=%s dir=%s avoid_bs=%s legs=%s idle=%s/%d/%s manual_static=%s man_base=%s",
+        _b(enable_master:get()), _b(AA.lua_aa:get()),
         _b(AA.enable:get()), _b(aa_eng.active), tostring(AA.pitch:get()), tostring(AA.base:get()), tostring(AA.dir:get()),
         _b(AA.avoid_bs:get()), tostring(AA.legs:get()), tostring(AA.idle_mode:get()), AA.idle_speed:get(), tostring(AA.idle_pitch:get()),
         _b(AA.man_static:get()), tostring(AA.man_base:get()))
@@ -4818,6 +4822,22 @@ local function aa_hints()
     local H = {}
     local n = #hits_taken_log
     if n == 0 then H[#H + 1] = "no hits taken this session — nothing to tune yet"; return H end
+    -- v5.6: a snapshot taken while the engine was idle carries its frozen defaults
+    -- (state=?, side=L, yaw=0, DT off) — every per-state / side / switch hint built on
+    -- it is fiction. Say that once and stop instead of tuning settings that never ran.
+    local off_n = 0
+    for _, e in ipairs(hits_taken_log) do
+        if not (e.snapshot and e.snapshot.engine) then off_n = off_n + 1 end
+    end
+    if off_n * 2 >= n then
+        local why = (not enable_master:get()) and "Master switch OFF"
+                    or (not AA.lua_aa:get()) and "Main tab 'Anti-Aim from this lua' OFF"
+                    or (not AA.enable:get()) and "Anti-Aim tab engine OFF"
+                    or "engine was off at the time (dead / not in game)"
+        H[#H + 1] = string.format("%d/%d hits taken while this lua's AA engine was NOT running (%s) — the [AA] snapshots are idle defaults, so no AA tuning hints. You were on NL's own Anti Aim (see [NL] AA line).", off_n, n, why)
+        H[#H + 1] = "turn 'Anti-Aim from this lua' back ON (Main tab) to let the per-state engine + defensive + anti-BF run, then dump again"
+        return H
+    end
     local by_state, by_side, head, nodt, uncharged, nothreat, pulsing, late_sw, react_hits, air = {}, { L = 0, R = 0 }, 0, 0, 0, 0, 0, 0, 0, 0
     local def_active_hits, ug_hits, deaths = 0, 0, 0
     for _, e in ipairs(hits_taken_log) do
@@ -5669,7 +5689,7 @@ do
 end
 
 cs_log_color("══════════════════════════════════════════")
-cs_log_color("Sel01-Config v" .. SEL01_CFG_VERSION .. " loaded (v5.5 Main: Anti-Aim from this lua switch — rest stays)")
+cs_log_color("Sel01-Config v" .. SEL01_CFG_VERSION .. " loaded (v5.6 dump names the AA switch that is off; no AA hints from idle snapshots)")
 cs_log(string.format("  hooks  createmove=%s  createmove_run=%s  aim_fire=%s  bullet_impact=%s  anim=%s",
     tostring(_hooks_status.createmove or "MISSING"),
     tostring(_hooks_status.createmove_run or "MISSING"),
