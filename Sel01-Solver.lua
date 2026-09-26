@@ -1,12 +1,15 @@
 -- ╔══════════════════════════════════════════════════╗
 -- ║  Sel01-Solver — Neverlose CS2 Custom Resolver    ║
 -- ║  Author: seltonmt01                              ║
--- ║  Version: 11.39                                  ║
+-- ║  Version: 11.40                                  ║
 -- ╚══════════════════════════════════════════════════╝
 -- @name Sel01-Solver
 -- @author seltonmt01
--- @version 11.39
--- @description v11.39: flick-hit memory — a head hit at a ±90 probe angle is remembered
+-- @version 11.40
+-- @description v11.40: never-hit jitter no longer flips a stale on-angle miss, a burned
+--   side survives the next peek (dormancy was restoring the passive side), and a
+--   two-magnitude bruteforce no longer repeats the two resting angles.
+--   v11.39: flick-hit memory — a head hit at a ±90 probe angle is remembered
 --   and fired as the next first shot (Flick-Recall, also from the air); a legal hit or
 --   a missed recall spends a charge.
 --   v11.38: a spread miss on a proven side no longer flags defensive AA
@@ -36,7 +39,7 @@
 --   full multipoint; [FL] hit-rate by target choke; animation-layer read scored in
 --   shadow ([ANIM] line) while the toggle stays off. v11.28 SSG body-hit fix. History in git.
 
-local SEL01_VERSION = "11.39"
+local SEL01_VERSION = "11.40"
 
 local pui = require("neverlose/pui");
 local ffi = require("ffi");
@@ -3454,13 +3457,16 @@ end
 
 function resolver_side_conflicts(s, shot_side)
     if not s or not shot_side or shot_side == 0 then return false end
-    local sl, sr = s.samples_left or 0, s.samples_right or 0
     local rl, rr = s.real_left or 0, s.real_right or 0
     local hl, hr = s.hit_streak_left or 0, s.hit_streak_right or 0
+    -- V11.40: samples_left/right are also written by the passive seed (samples=2,
+    -- real=0). That imbalance is not a lock. Dump v11.39 idx=12: samp R2 / real 0/0,
+    -- every left shot came back side_bad and flipped, including bt=17 err=1.4.
+    -- A streak only counts when that side has a real hit behind it.
     if shot_side > 0 then
-        return (sl >= 1 and sr == 0) or (rl >= 1 and rr == 0) or (hl >= 2 and hr == 0)
+        return (rl >= 1 and rr == 0) or (hl >= 2 and hr == 0 and rl >= 1)
     end
-    return (sr >= 1 and sl == 0) or (rr >= 1 and rl == 0) or (hr >= 2 and hl == 0)
+    return (rr >= 1 and rl == 0) or (hr >= 2 and hl == 0 and rr >= 1)
 end
 
 function resolver_note_serverfail_retry(s, shot_side, mag)
@@ -3799,7 +3805,21 @@ events.aim_ack:set(function(event)
             -- real_active==0 so a LEARNED one-sided jitter (idx=8, 8 real L-hits, streak L=8)
             -- keeps its proven side — this only touches the blind never-hit case. Mirrors the
             -- v9.74 "jitter has no stable delta" precedent (BF skips def_delta on jitter).
-            if s.aa_type == "jitter" and real_active == 0 then do_flip = true
+            -- V11.40: that flip ran before both-sides-burned and before any backtrack
+            -- check, so a never-hit jitter ping-ponged. Dump idx=12 (0/4): FLIP at
+            -- bt=20 err=0.0, then bt=17 err=1.4, both Predicted first shots. idx=11
+            -- Air bt=18 err=0.0 FLIP. idx=10 bt=20 err=0.0 FLIP off the side that
+            -- later hit. A stale on-angle miss (bt above what hits land at, err<=5)
+            -- keeps ONCE — the second falls through and flips (v11.9: two keeps and
+            -- they die). The other side already burned: don't force the flip; the
+            -- else branch keeps and lets BF sweep magnitude.
+            local other_tried = (ack_shot_side > 0 and s.expl_l) or (ack_shot_side < 0 and s.expl_r)
+            if s.aa_type == "jitter" and real_active == 0
+               and bt > stale_bt and ack_angle_err <= 5
+               and (s.serverfail_streak or 0) < 1 then
+                do_flip = false
+            elseif s.aa_type == "jitter" and real_active == 0 and not other_tried then
+                do_flip = true
             elseif two_side_switcher and (ack_angle_err <= 10 or bt > 8) then do_flip = false
             -- FIX #1: one-sided switch enemy, correct magnitude (err<2), 2+ consecutive
             -- correct-angle KEEPs on the same side = the switch moved to the other side and
@@ -3858,7 +3878,9 @@ events.aim_ack:set(function(event)
                     do_flip = true
                 end
             end
-            -- V11.2: burn the side we just missed on (per-engagement, cleared on hit).
+            -- V11.2: burn the side we just missed on (survives dormancy, cleared on hit).
+            -- V11.40: still burned on a KEEP. The next peek tells a keep from a flip by
+            -- whether last_hit_side still points at the burned side (keep) or away (flip).
             if ack_shot_side > 0 then s.expl_r = true else s.expl_l = true end
             -- V9.49: never-hit explore. The bt>8 / bt>6 keep branches above rest on pure
             -- passive seed when we have NEVER hit this enemy (real_active==0) — both the
@@ -4415,6 +4437,7 @@ events.aim_ack:set(function(event)
         s.missed = 0
         s.bf_retry_n, s.bf_retry_at_missed = nil, nil  -- V11.33: BF list offset resets with the miss run
         s.expl_l, s.expl_r = false, false  -- V11.2: new engagement, un-burn both sides
+        s._burn_logged = nil  -- V11.40
         s.bf_cached_missed = nil  -- clear BF cache so next miss recomputes fresh
         s.bf_cached_angle  = nil
         s.fs_cached_time   = nil  -- clear FS cache so re-engagement re-evaluates
@@ -5141,6 +5164,41 @@ local function _pick_first_shot_impl(p, s, anim, eye_yaw, max_desync, preset)
     if sel01_flick_recall_ok(s) then
         s.mode = "Flick-Recall"
         return NormalizeAngle(eye_yaw + (s.flick_mem_mag or 90) * s.flick_mem_side)
+    end
+    -- V11.40: a side burn survives dormancy, missed does not. The next peek was a
+    -- fresh first shot and re-fired the same seed — boot restored the passive dom
+    -- and Predicted ignored the correction. Dump idx=12: Air, BF:opposite, then two
+    -- Predicted first shots, 0/4. One side burned and last_hit still on it means the
+    -- miss was a KEEP: retry that side. last_hit pointing away means we flipped:
+    -- shoot the open side. Both burned: the seed magnitude failed twice, step it up.
+    if ((s.real_left or 0) + (s.real_right or 0)) == 0 and (s.expl_l or s.expl_r) then
+        local side = s.last_hit_side or 0
+        local widened = false
+        if s.expl_l and s.expl_r then
+            if side == 0 then side = 1 end
+            widened = true
+            s.mode = "Guess-Wide"
+        elseif s.expl_r then
+            if side ~= 1 then side = -1 end
+            s.mode = (side == 1) and "Guess-Retry" or "Guess-Other"
+        else
+            if side ~= -1 then side = 1 end
+            s.mode = (side == -1) and "Guess-Retry" or "Guess-Other"
+        end
+        local mag = sel01_guess_mag(s, side)
+        if widened then
+            if mag < 42 then mag = math.min(58, mag + 16) else mag = 58 end
+        elseif s.mode == "Guess-Other" and mag < 15 then
+            mag = 15
+        end
+        if mag > 58 then mag = 58 end
+        if mag < 5 then mag = adaptive_guess_mag() end
+        if s._burn_logged ~= s.mode then
+            s._burn_logged = s.mode
+            cs_log_verbose("burned-side first shot idx=%d %s side=%d mag=%.1f",
+                           p:get_index(), s.mode, side, mag)
+        end
+        return NormalizeAngle(eye_yaw + mag * side)
     end
 
     -- V9.66 #1: keep the RAW eye for the sanity bound below. extrapolate_yaw applies
@@ -5947,6 +6005,13 @@ local function pick_bruteforce_angle(s, anim, eye_yaw, max_desync, p, preset)
         else
             bf_list = {sgn.."58", sgn.."45", sgn.."35", sgn.."29", sgn.."20", "0", "opposite"}
         end
+    elseif (rl >= 2 and rr >= 2)
+       and math.abs((s.measured_left or 0) - (s.measured_right or 0)) > 10 then
+        -- V11.40: two resting magnitudes. preset "desync"/"-desync" re-fire them.
+        -- Dump idx=3 j (L 18.4° / R 34.5°, 5 hits each): Jitter-Cls R +34.5 miss,
+        -- BF:opposite L -18.4 miss, BF:desync R +34.5 miss — the third shot was the
+        -- first miss again. opposite tries the other resting magnitude once.
+        bf_list = {"opposite", "+45", "-45", "+58", "-58", "+29", "-29", "0"}
     elseif s.is_slow_target or s.aa_type == "static" then
         -- static/slow but NOT one-sided (balanced or unknown) → opposite-first sweep.
         bf_list = {"opposite", "+58", "-58", "+45", "-45", "+35", "-35", "+29", "-29", "+20", "-20", "0"}
@@ -6332,7 +6397,8 @@ local function resolve_player(p)
         -- boot last_hit_side from steam-memory if available
         local mem = get_steam_mem(p)
         if mem and mem.dominant_side ~= 0
-           and (s.real_left or 0) + (s.real_right or 0) == 0 then
+           and (s.real_left or 0) + (s.real_right or 0) == 0
+           and not (s.expl_l or s.expl_r) then  -- V11.40: a miss this life outranks the steam seed
             s.last_hit_side = mem.dominant_side
             cs_log_verbose("Steam mem boot idx=%d side=%d", p:get_index(), mem.dominant_side)
         end
@@ -6364,7 +6430,9 @@ local function resolve_player(p)
             -- session hits on a side, keep the live EMA; only fill sides not yet learned.
             local _has_sess_l = (s.real_left  or 0) >= 1  -- FIX #5
             local _has_sess_r = (s.real_right or 0) >= 1  -- FIX #5
-            if (lrn.dom or 0) ~= 0 and not (_has_sess_l or _has_sess_r) then s.last_hit_side = lrn.dom end  -- FIX #5: keep session side
+            if (lrn.dom or 0) ~= 0 and not (_has_sess_l or _has_sess_r)
+               and not (s.expl_l or s.expl_r) then  -- V11.40: don't put the passive dom back over a miss
+                s.last_hit_side = lrn.dom end
             if lsl >= 2 and ldl > 0 and not _has_sess_l then  -- FIX #5: keep session L EMA
                 s.measured_left = ldl
                 s.samples_left  = math.min(lsl, 10)
@@ -6383,6 +6451,14 @@ local function resolve_player(p)
             -- count them as real. Seed when we hold no session real hit on that side yet.
             if not _has_sess_l and lsl >= 1 then s.real_left  = math.min(lsl, 10) end
             if not _has_sess_r and lsr >= 1 then s.real_right = math.min(lsr, 10) end
+            -- V11.40: reset_state clears bimodal and only a later hit sets it again.
+            -- Dump idx=3 re-engaged at L 18.4 / R 34.6 with 5 real hits each, bimod=N.
+            if (s.real_left or 0) >= 2 and (s.real_right or 0) >= 2 then
+                local _bml, _bmr = s.measured_left or 0, s.measured_right or 0
+                if _bml > 5 and _bmr > 5 and math.abs(_bml - _bmr) > 12 then
+                    s.bimodal = true
+                end
+            end
             -- V11.1 (B1): restore passive knowledge into the PASSIVE fields. Same data
             -- the old code smuggled in through sl/sr, now landing where effective_desync's
             -- passive branch and the v9.72 passive-side-keep already expect it — without
@@ -6642,6 +6718,15 @@ local function resolve_player(p)
     local air_yield_bf = (s.missed or 0) > 0 and (s.measured_desync or 0) > 5
     -- V11.39: a remembered flick hit fires from the ground path's first-shot picker.
     if (s.missed or 0) == 0 and sel01_flick_recall_ok(s) then air_yield_bf = true end
+    -- V11.40: dormancy zeroes missed, the burn does not. A never-hit enemy whose last
+    -- peek missed would re-enter Air and fire the same seed. Yield so the first-shot
+    -- picker shoots the open side or a wider magnitude. Learned air stays here —
+    -- Air was 83% in the v11.39 dump.
+    if (s.missed or 0) == 0
+       and ((s.real_left or 0) + (s.real_right or 0)) == 0
+       and (s.expl_l or s.expl_r) then
+        air_yield_bf = true
+    end
     -- airborne: enemies still have desync in air. Use server-yaw reconstruction
     -- (old approach assumed 0 desync → broke on nospread)
     if tick_cache.ui_air_resolve and not anim.m_bOnGround and not bf_retry_pending and not air_yield_bf then  -- V9.71: per-tick cached; V9.74: yield to pending BF:retry; V11.15: yield to BF after a miss
@@ -8779,6 +8864,7 @@ _cs_log_color_raw("V11.35: tracking + guess-mag (dump v11.34: 72%, CANCEL 0 hold
 _cs_log_color_raw("V11.36: spend FPS where it hits (no pose/bone 'model tracking' — that path is a proven dead-end on this build). (1) Nearby off-FOV (<2000u) is FULLY resolved so backtrack records are already correct when they peek into 110°. (2) Anim-layer vote is a weighted blend of every live signal, not first-wins. (3) Once shadow is calibrated (8+ scored hits, ≥60% right) the vote steers two-side jitter THIS tick (Jitter-Anim) — one-sided Jitter-Cls locks stay.")
 _cs_log_color_raw("V11.38: dump v11.37 (85.5%). (1) Spread misses on a side with 2+ real hits no longer set defensive AA (idx=1 22-0 and idx=7 0-20 got def=true; the flag arms -DefInv, which flips the next first shot off the proven side) and -DefInv never inverts away from learned_dom_side. (2) Silent-flick BF on a hard one-sided lock (5+ real, other side 0) probes the proven side's nearest magnitude before ±90 (idx=1 BF:+90 R missed, -35 L hit). (3) Air paths use sel01_side_mag + a 15° floor when unproven (idx=4 Air shot -5.0 from a 6° passive seed, real 16.8).")
 _cs_log_color_raw("V11.39: flick-hit memory (dump v11.38 65.6%, j: ±90 2/2 vs legal 1/4). A HEAD hit at a probe angle (|d|>65) stores side + magnitude as up to 3 charges; the next first shot fires it as Flick-Recall (the air-branch yields to it). A legal hit or a missed recall spends a charge; a miss with charges left swaps the side (Silent flick alternates). Dump shows fmem=charges/side/mag.")
+_cs_log_color_raw("V11.40: dump v11.39 67.8% early 60% → recent 40%. (1) Never-hit jitter flipped every miss, including bt=20 err=0 (idx=12 0/4, idx=11, idx=10). A stale on-angle miss now keeps once; the other side already burned falls through to the magnitude sweep. Passive sample seeds no longer count as a side lock. (2) Dormancy zeroed missed and boot put the passive dom back, so the next peek re-fired the same guess. A burned side survives: open side, retry of a keep, or +16° once both sides missed (Guess-Other / Guess-Retry / Guess-Wide). Air yields for that case only. (3) Two-magnitude BF repeated the two resting angles (idx=3 L18/R35: +34.5, -18.4, +34.5). opposite once, then 45/58/29. Bimodal is restored on re-engage.")
 _cs_log_color_raw("V11.37: probe-hit side fix (dump v11.36: 63%). A hit at a 65°+ probe angle (BF:+90 / flick) only proves the side on head/neck — chest/stomach sit near the spine axis and get hit whatever the real side is. idx=7: L proven by an Air head hit, then a BF:+90 STOMACH hit made him real L1/R1 = two-side (no-freeze keeps, alternating picks). Body probe hits now learn no side; the hit streak also keys on this hit's side instead of the previous one.")
 _cs_log_color_raw("Logging: " .. (log_enabled:get() and ("ON" .. (log_verbose:get() and " (verbose)" or ""))  or "OFF"))
 _cs_log_color_raw("=========================================")
